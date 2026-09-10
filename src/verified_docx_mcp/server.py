@@ -15,10 +15,18 @@ Entry point dispatch
   verified-docx-mcp            -> start the stdio MCP server
   verified-docx-mcp doctor     -> run the local diagnostic (see doctor())
 
-Tools registered here (WP-02): ``export_pdf``, ``lock_status``. Neither is a
-mutating tool (export_pdf writes a PDF, never the source .docx; lock_status
-only reads filesystem metadata), so MUTATING_TOOLS (middleware.py) stays
-empty until WP-04's markdown writers land.
+Tools registered here (WP-02): ``export_pdf``, ``lock_status``. WP-03 adds
+five more READ tools — ``list_parts``, ``read_document``, ``find_sections``,
+``list_page_sections``, ``list_styles`` — built on ``projection.py``. None
+of the seven is a mutating tool (export_pdf writes a PDF, never the source
+.docx; every other tool here only reads), so MUTATING_TOOLS (middleware.py)
+stays empty until WP-04's markdown writers land.
+
+Every WP-03 read tool honors core/document-backend-protocol.md §4's "reads
+never refuse" rule via ``_read_local_copy`` below: when Word's owner file is
+present, the tool reads a validated snapshot (``paths.snapshot_docx_package``)
+instead of the live file, rather than returning DOCX_LOCKED (which gates
+writes only).
 """
 
 from __future__ import annotations
@@ -35,7 +43,7 @@ from typing import Any, NoReturn
 
 from fastmcp import FastMCP
 
-from . import paths
+from . import paths, projection
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .middleware import EvidenceEnforcementMiddleware
@@ -393,6 +401,271 @@ def lock_status(path: str) -> dict[str, Any]:
     """
     try:
         return execute_lock_status(path)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Read tools (WP-03): list_parts, read_document, find_sections,
+# list_page_sections, list_styles — all built on projection.py.
+# ---------------------------------------------------------------------------
+
+
+def _read_local_copy(resolved: Path) -> tuple[Path, bool]:
+    """Return (path_to_read, is_temp) for *resolved* per
+    core/document-backend-protocol.md §4's "reads never refuse" rule:
+    when Word's (or LibreOffice's) owner file is present, read a validated
+    snapshot instead of the live file (DOCX_LOCKED gates writes only — see
+    lock_status's own docstring above). The caller is responsible for
+    deleting the temp file (is_temp=True) once done, typically in a
+    ``finally`` block.
+    """
+    owner_file = _find_owner_file(resolved.parent, resolved.name)
+    if owner_file["present"]:
+        snapshot = paths.snapshot_docx_package(resolved)
+        return snapshot, True
+    return resolved, False
+
+
+_VALID_READ_FORMATS = frozenset({"markdown", "text", "runs"})
+
+
+def execute_list_parts(path: str) -> dict[str, Any]:
+    """List the package parts read_document(part=...) may target."""
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    local_path, is_temp = _read_local_copy(resolved)
+    try:
+        return {"path": str(resolved), "parts": projection.list_parts_impl(local_path)}
+    finally:
+        if is_temp:
+            local_path.unlink(missing_ok=True)
+
+
+@mcp.tool()
+def list_parts(path: str) -> dict[str, Any]:
+    """List the package parts of a .docx that read_document(part=...) can
+    target: the document body (word/document.xml), every header/footer,
+    and footnotes/endnotes if present.
+
+    Returns path, parts (list of {part, kind, header_footer_type}).
+    header_footer_type ("default"|"first"|"even") is resolved via
+    word/document.xml's own header/footer references where possible; None
+    when it cannot be determined.
+
+    Not gated by DOCX_LOCKED — reads a validated snapshot instead when
+    Word's owner file is present (core/document-backend-protocol.md §4).
+
+    Errors:
+      INVALID_INPUT   - path does not exist or is outside the allowed roots
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return execute_list_parts(path)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+def execute_read_document(path: str, format: str = "markdown", part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+    if format not in _VALID_READ_FORMATS:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"format must be one of {sorted(_VALID_READ_FORMATS)}, got {format!r}",
+            {"format": format},
+        )
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    local_path, is_temp = _read_local_copy(resolved)
+    try:
+        revision = projection.compute_revision(local_path)
+        result: dict[str, Any] = {
+            "path": str(resolved),
+            "part": part,
+            "format": format,
+            "revision": revision["token"],
+            "revision_detail": revision["detail"],
+        }
+        if format == "text":
+            result["text"] = projection.read_document_text(local_path, part)
+            result["warnings"] = projection.project_part(local_path, part).warnings
+        elif format == "runs":
+            result["runs"] = projection.read_document_runs(local_path, part)
+            result["warnings"] = projection.project_part(local_path, part).warnings
+        else:  # markdown
+            markdown, warnings = projection.read_document_markdown(local_path, part)
+            result["markdown"] = markdown
+            result["warnings"] = warnings
+        return result
+    finally:
+        if is_temp:
+            local_path.unlink(missing_ok=True)
+
+
+@mcp.tool()
+def read_document(path: str, format: str = "markdown", part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+    """Read a .docx part's content as markdown, flat text, or a run-level
+    structural list.
+
+    part scopes the read to one package part — word/document.xml's body
+    (the default) is a completely separate scope from a header, footer,
+    footnotes, or endnotes part; a text box's own w:txbxContent is a
+    further, separate sub-scope never merged into its host part's text
+    (see projection.py's module docstring). Call list_parts first to
+    enumerate the parts actually present in this .docx.
+
+    format="text" returns the flat projected string (runs concatenated in
+    document order; a paragraph break is "\\n"). format="runs" returns, in
+    document order, run records {text, rPr, para_ref} interleaved with
+    structural records: {"type":"table_start"|"table_end", table_id},
+    {"type":"drawing", blip_rid, media_part, extent_in, para_ref} for every
+    w:drawing/a:blip, and {"type":"field", instr, result_text}.
+    format="markdown" (default) renders headings/bold/italic and stable
+    placeholder tokens ([TABLE], [GRAPHIC], [FIELD:instr]) for constructs
+    markdown cannot represent — WP-04's inverse (markdown -> OOXML) is not
+    implemented here.
+
+    A deleted span (w:del/w:delText) and a field's own instruction text
+    (w:instrText) are excluded from every format; a field's RESULT text
+    (between fldChar "separate" and "end", or all of a w:fldSimple's
+    nested runs) IS included.
+
+    Returns path, part, format, revision (the "<doc8>:<cmt8>" token),
+    revision_detail (the full {document_sha256, comments_sha256, size,
+    mtime_ns} tuple), warnings, plus text|runs|markdown per format.
+
+    Not gated by DOCX_LOCKED — see list_parts' docstring.
+
+    Errors:
+      INVALID_INPUT   - a bad path or an unrecognized format
+      PART_NOT_FOUND  - part names a package part absent from this .docx
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return execute_read_document(path, format, part)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+def execute_find_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    local_path, is_temp = _read_local_copy(resolved)
+    try:
+        return {"path": str(resolved), "part": part, "sections": projection.find_sections_impl(local_path, part)}
+    finally:
+        if is_temp:
+            local_path.unlink(missing_ok=True)
+
+
+@mcp.tool()
+def find_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+    """List heading-delimited section ranges in a .docx part.
+
+    DISAMBIGUATION: this is about DOCUMENT SECTIONS (heading ranges, by
+    style/outline level) — see list_page_sections for PAGE-LAYOUT sections
+    (w:sectPr page size/margins/columns). The two are unrelated OOXML
+    concepts that happen to share the English word "section".
+
+    A heading paragraph's w:pStyle is mapped through list_styles to an
+    outline level, falling back to the paragraph's own direct
+    w:outlineLvl. A section runs from one heading (inclusive) to the next
+    heading at any level, or the end of the document. section_key =
+    slug(heading text) + a 1-based ordinal disambiguating duplicate
+    headings. Headings inside a table cell are out of scope (not a real
+    document section boundary).
+
+    Returns path, part, sections (list of {section_key, heading_text,
+    outline_level, start_para_ref, end_para_ref, paragraph_count}).
+
+    Not gated by DOCX_LOCKED — see list_parts' docstring.
+
+    Errors:
+      INVALID_INPUT   - a bad path
+      PART_NOT_FOUND  - part names a package part absent from this .docx
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return execute_find_sections(path, part)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+def execute_list_page_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    local_path, is_temp = _read_local_copy(resolved)
+    try:
+        return {
+            "path": str(resolved),
+            "part": part,
+            "page_sections": projection.list_page_sections_impl(local_path, part),
+        }
+    finally:
+        if is_temp:
+            local_path.unlink(missing_ok=True)
+
+
+@mcp.tool()
+def list_page_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+    """List w:sectPr PAGE-LAYOUT sections in a .docx part.
+
+    DISAMBIGUATION: this is about PAGE-LAYOUT sections (page size,
+    margins, column widths) — see find_sections for DOCUMENT sections
+    (heading ranges). The two are unrelated OOXML concepts that happen to
+    share the English word "section".
+
+    Page size, margins, and text-column widths are reported in inches,
+    converted from OOXML's own unit for page geometry — twentieths of a
+    point (dxa), NOT EMU (dxa: 1440 = 1 inch; EMU, used for a drawing's own
+    extent instead, is 914400 = 1 inch — see projection.py's
+    list_page_sections_impl for the note on why these are not the same
+    conversion).
+
+    Returns path, part, page_sections (list of {page_width_in,
+    page_height_in, orientation, margin_top_in, margin_bottom_in,
+    margin_left_in, margin_right_in, column_widths_in}).
+
+    Not gated by DOCX_LOCKED — see list_parts' docstring.
+
+    Errors:
+      INVALID_INPUT   - a bad path
+      PART_NOT_FOUND  - part names a package part absent from this .docx
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return execute_list_page_sections(path, part)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+def execute_list_styles(path: str) -> dict[str, Any]:
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    local_path, is_temp = _read_local_copy(resolved)
+    try:
+        return {"path": str(resolved), "styles": projection.list_styles_impl(local_path)}
+    finally:
+        if is_temp:
+            local_path.unlink(missing_ok=True)
+
+
+@mcp.tool()
+def list_styles(path: str) -> dict[str, Any]:
+    """Enumerate word/styles.xml's styles: ids, names, types, outline
+    levels.
+
+    find_sections' heading detection and read_document(format="markdown")'s
+    heading rendering both resolve a paragraph's outline level through
+    this same list (style-level w:outlineLvl, falling back to a
+    "Heading1".."Heading9" style-id pattern) — call this tool directly
+    when you need to know what styles a .docx actually defines before
+    targeting one.
+
+    Returns path, styles (list of {style_id, name, type, outline_lvl}).
+
+    Not gated by DOCX_LOCKED — see list_parts' docstring.
+
+    Errors:
+      INVALID_INPUT   - path does not exist or is outside the allowed roots
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return execute_list_styles(path)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

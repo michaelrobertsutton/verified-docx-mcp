@@ -1,0 +1,1158 @@
+# New for issue #28 WP-03. No GoogleDocs-MCP analogue exists to lift here:
+# the Google server projects the Docs API's own JSON tree (docs.py), which
+# has no OOXML package underneath it. This module is the docx-side
+# equivalent — it walks the raw XML of one package part into a flat text
+# projection, an offset map, and a document-order block list — and is what
+# WP-06's locate() (lifted from GoogleDocs-MCP verify.py) will run against
+# once it lands. The revision-token, find_sections/list_page_sections/
+# list_styles/list_parts logic below is new; it has no Google-side
+# counterpart either (Google Docs carries its own server-side revision id).
+"""OOXML projection: walk one package part into a flat string + offset map
++ document-order block list, plus the read tools built on top of it
+(list_parts, read_document, find_sections, list_page_sections,
+list_styles) and the revision token.
+
+Scope = one part (issue #28 plan WP-03). ``word/document.xml``'s ``w:body``
+is the default; a header, footer, footnotes, or endnotes part is addressed
+by its own part name (``part=`` on every tool below). A text box's
+``w:txbxContent`` is projected as its own sub-scope with its own
+``section_key``, never merged into the body's offsets — see
+``iter_textbox_scopes``.
+
+Paragraph walk order (issue #28 plan WP-03, "Codex defects folded in"):
+every ``w:p`` in document order, including paragraphs inside
+``w:tbl/w:tr/w:tc``, ``w:sdt/w:sdtContent`` (block-level), and text that is
+wrapped (at the run level, inside an otherwise-ordinary paragraph) in
+``w:smartTag``, ``w:hyperlink``, ``w:ins``, an inline ``w:sdt``, or
+``w:fldSimple``. Each table-cell paragraph records its container chain
+(table id, row, cell) so a future structural-boundary check (WP-06) can be
+computed from it.
+
+Text mapping: ``w:t`` verbatim; ``w:tab`` -> ``\\t``; ``w:br``/``w:cr`` ->
+``\\n``; ``w:noBreakHyphen`` -> ``-``; ``w:softHyphen`` -> U+00AD.
+``w:del``/``w:delText`` is EXCLUDED from the projection (its span is
+recorded separately, ``deleted_spans``); ``w:instrText`` (a field's
+instruction code) is EXCLUDED entirely; a field's RESULT runs (the ones
+between ``w:fldChar fldCharType="separate"`` and ``"end"``, or all of a
+``w:fldSimple``'s nested runs) ARE included, each tagged
+``field_result=True`` internally for the RUNG_FIELD rung WP-06 adds.
+``w:sym`` is mapped to a character only when ``w:font`` is Symbol,
+Wingdings, or Webdings, via the small table in ``_SYM_TABLE`` below (NOT a
+complete 256-glyph mapping for any of the three — see that table's own
+docstring); every other case (an unmapped font, or a code point this
+module's table does not cover) emits U+FFFD and adds ``"unmapped_symbol"``
+to the read warnings.
+
+Only the DrawingML branch of a drawing (``w:drawing``, inside
+``mc:Choice``) is walked, never the legacy VML fallback (``w:pict``, inside
+``mc:Fallback``) — ``mc:AlternateContent`` gives the SAME visual object in
+both branches (confirmed against a real Word-authored text box in this
+WP's own fixture generation: both branches carried byte-identical text),
+so walking both would double-count every drawing and every text box.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import re
+import zipfile
+from pathlib import Path
+from typing import Any
+
+from .errors import ErrorCode, _make_error
+
+# ---------------------------------------------------------------------------
+# Namespaces / tag helpers
+# ---------------------------------------------------------------------------
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+DEFAULT_PART = "word/document.xml"
+
+
+def _ln(elem: Any) -> str:
+    """Local (unprefixed) tag name of *elem* — namespace-agnostic dispatch.
+
+    Every tag this module matches (r, t, tab, br, p, tbl, tc, sdt, ...) is
+    unambiguous by local name alone within a .docx package; comparing only
+    the local name (not the full ``{ns}tag``) keeps the dispatch tables
+    below readable and robust to a producer using an unexpected namespace
+    prefix (prefixes are cosmetic in XML; only the URI + local name pair is
+    semantically meaningful, and collisions across namespaces on these
+    specific local names do not occur in practice in a .docx package).
+    """
+    tag = elem.tag
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _attr(elem: Any, local_name: str) -> str | None:
+    """Get an attribute by local name regardless of its namespace prefix
+    (``w:val``, ``r:embed``, ``r:id`` all reach here from different
+    namespaces depending on the element)."""
+    for key, value in elem.attrib.items():
+        key_local = key.rsplit("}", 1)[-1] if "}" in key else key
+        if key_local == local_name:
+            return value
+    return None
+
+
+def _bool_toggle(pr_elem: Any | None, tag: str) -> bool:
+    """OOXML boolean-toggle convention: the element's mere presence means
+    true UNLESS it carries an explicit ``w:val="false"``/``"0"``."""
+    if pr_elem is None:
+        return False
+    for child in pr_elem:
+        if _ln(child) == tag:
+            val = _attr(child, "val")
+            if val is None:
+                return True
+            return val.strip().lower() not in ("false", "0", "off")
+    return False
+
+
+def _run_properties(rpr_elem: Any | None) -> dict[str, Any]:
+    if rpr_elem is None:
+        return {"bold": False, "italic": False, "underline": None, "strike": False}
+    underline = None
+    for child in rpr_elem:
+        if _ln(child) == "u":
+            underline = _attr(child, "val") or "single"
+            break
+    return {
+        "bold": _bool_toggle(rpr_elem, "b"),
+        "italic": _bool_toggle(rpr_elem, "i"),
+        "underline": underline,
+        "strike": _bool_toggle(rpr_elem, "strike"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# w:sym mapping — SMALL, deliberately partial (see module docstring).
+# ---------------------------------------------------------------------------
+
+# Keyed by (font family lowercased, char code as a 4-hex-digit string,
+# e.g. "F0B7" as Word emits it in w:char). Only the handful of glyphs a
+# JennyStack-authored or reviewed proposal has actually been seen to use
+# (bullets, arrows, a check mark) are covered; anything else — including a
+# genuinely unmapped code point in one of these three fonts — falls back to
+# U+FFFD + the "unmapped_symbol" warning, per the module docstring.
+_SYM_TABLE: dict[tuple[str, str], str] = {
+    ("symbol", "F0B7"): "•",  # bullet
+    ("symbol", "F0E0"): "←",  # left arrow
+    ("symbol", "F0E8"): "→",  # right arrow (Symbol's "Þ")
+    ("wingdings", "F0FC"): "✓",  # check mark
+    ("wingdings", "F0A7"): "▪",  # black small square
+    ("webdings", "F050"): "•",  # webdings ball -> bullet (approximate)
+}
+
+
+def _map_sym(font: str | None, char_code: str | None) -> str | None:
+    if not font or not char_code:
+        return None
+    key = (font.strip().lower(), char_code.strip().upper())
+    return _SYM_TABLE.get(key)
+
+
+# ---------------------------------------------------------------------------
+# Internal event model
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class RunEvent:
+    text: str
+    rpr: dict[str, Any]
+    para_ref: str
+    run_ref: str
+    field_result: bool = False
+
+
+@dataclasses.dataclass
+class TableBoundaryEvent:
+    kind: str  # "table_start" | "table_end"
+    table_id: int
+
+
+@dataclasses.dataclass
+class DrawingEvent:
+    blip_rid: str | None
+    media_part: str | None
+    extent_in: list[float] | None
+    para_ref: str
+
+
+@dataclasses.dataclass
+class FieldEvent:
+    instr: str
+    result_text: str
+    para_ref: str
+
+
+@dataclasses.dataclass
+class DeletedSpan:
+    text: str
+    para_ref: str
+    author: str | None
+    date: str | None
+
+
+Event = RunEvent | TableBoundaryEvent | DrawingEvent | FieldEvent
+
+
+# ---------------------------------------------------------------------------
+# Ids
+# ---------------------------------------------------------------------------
+
+
+class _Ids:
+    def __init__(self) -> None:
+        self._para_counter = 0
+        self._table_counter = 0
+
+    def next_para_ref(self) -> str:
+        ref = f"p{self._para_counter}"
+        self._para_counter += 1
+        return ref
+
+    def next_table_id(self) -> int:
+        self._table_counter += 1
+        return self._table_counter
+
+
+# Non-content wrapper/marker tags a walker explicitly skips (present but
+# carry no projectable text of their own — either formatting properties or
+# empty markers). Listed explicitly, rather than relying on an unmatched
+# tag silently falling through to "recurse into children" in every call
+# site, so a genuinely new/unexpected tag is recursed into defensively
+# (better to over-discover nested w:r/w:t than silently drop text) while
+# these known-empty ones are not descended into pointlessly.
+_SKIP_TAGS = frozenset(
+    {
+        "pPr",
+        "rPr",
+        "bookmarkStart",
+        "bookmarkEnd",
+        "commentRangeStart",
+        "commentRangeEnd",
+        "commentReference",
+        "proofErr",
+        "lastRenderedPageBreak",
+        "moveFromRangeStart",
+        "moveFromRangeEnd",
+        "moveToRangeStart",
+        "moveToRangeEnd",
+        "permStart",
+        "permEnd",
+        "tblPr",
+        "tblGrid",
+        "trPr",
+        "tcPr",
+        "sdtPr",
+        "sdtEndPr",
+    }
+)
+
+
+@dataclasses.dataclass
+class ParagraphMeta:
+    para_ref: str
+    style_id: str | None
+    outline_lvl: int | None
+    container_chain: list[dict[str, int]]
+
+
+class _PartWalker:
+    """Walks one part's block content (a ``w:body``, ``w:hdr``, ``w:ftr``,
+    or a ``w:tc``/``w:sdtContent`` fragment) into a flat ``events`` list, in
+    document order, plus per-paragraph metadata."""
+
+    def __init__(self) -> None:
+        self.ids = _Ids()
+        self.events: list[Event] = []
+        self.paragraphs: list[ParagraphMeta] = []
+        self.deleted_spans: list[DeletedSpan] = []
+        self.warnings: list[str] = []
+        self._first_para = True
+
+    # -- block level -----------------------------------------------------
+
+    def walk_block_container(self, container: Any, chain: list[dict[str, int]]) -> None:
+        for child in container:
+            tag = _ln(child)
+            if tag == "p":
+                self._walk_paragraph(child, chain)
+            elif tag == "tbl":
+                self._walk_table(child, chain)
+            elif tag == "sdt":
+                content = self._find_child(child, "sdtContent")
+                if content is not None:
+                    self.walk_block_container(content, chain)
+            elif tag in _SKIP_TAGS:
+                continue
+            else:
+                # Defensive: an unrecognized block-level wrapper might still
+                # carry paragraphs (e.g. a future/unknown OOXML extension).
+                self.walk_block_container(child, chain)
+
+    def _walk_table(self, tbl: Any, chain: list[dict[str, int]]) -> None:
+        table_id = self.ids.next_table_id()
+        self.events.append(TableBoundaryEvent("table_start", table_id))
+        row_idx = 0
+        for row in tbl:
+            if _ln(row) != "tr":
+                continue
+            row_idx += 1
+            cell_idx = 0
+            for cell in row:
+                if _ln(cell) != "tc":
+                    continue
+                cell_idx += 1
+                cell_chain = chain + [{"table_id": table_id, "row": row_idx, "cell": cell_idx}]
+                self.walk_block_container(cell, cell_chain)
+        self.events.append(TableBoundaryEvent("table_end", table_id))
+
+    def _find_child(self, elem: Any, local_name: str) -> Any | None:
+        for child in elem:
+            if _ln(child) == local_name:
+                return child
+        return None
+
+    # -- paragraph / run level --------------------------------------------
+
+    def _walk_paragraph(self, p: Any, chain: list[dict[str, int]]) -> None:
+        para_ref = self.ids.next_para_ref()
+        ppr = self._find_child(p, "pPr")
+        style_id = None
+        outline_lvl = None
+        if ppr is not None:
+            pstyle = self._find_child(ppr, "pStyle")
+            if pstyle is not None:
+                style_id = _attr(pstyle, "val")
+            outline = self._find_child(ppr, "outlineLvl")
+            if outline is not None:
+                raw = _attr(outline, "val")
+                if raw is not None and raw.isdigit():
+                    outline_lvl = int(raw)
+        self.paragraphs.append(ParagraphMeta(para_ref, style_id, outline_lvl, chain))
+
+        if not self._first_para:
+            self.events.append(RunEvent("\n", {}, para_ref, f"{para_ref}/break"))
+        self._first_para = False
+
+        run_counter = [0]
+        field_stack: list[dict[str, Any]] = []
+        self._walk_runs(p, para_ref, run_counter, field_stack)
+        # A field left open at paragraph end (malformed input) still gets
+        # flushed as a FieldEvent so no data is silently dropped.
+        while field_stack:
+            self._flush_field(field_stack.pop(), para_ref)
+
+    def _next_run_ref(self, para_ref: str, counter: list[int]) -> str:
+        ref = f"{para_ref}/r{counter[0]}"
+        counter[0] += 1
+        return ref
+
+    def _flush_field(self, frame: dict[str, Any], para_ref: str) -> None:
+        self.events.append(
+            FieldEvent(
+                instr=frame["instr"].strip(),
+                result_text="".join(frame["result_parts"]),
+                para_ref=para_ref,
+            )
+        )
+
+    def _emit_text(
+        self,
+        text: str,
+        rpr: dict[str, Any],
+        para_ref: str,
+        counter: list[int],
+        field_stack: list[dict[str, Any]],
+    ) -> None:
+        if not text:
+            return
+        in_result = bool(field_stack) and field_stack[-1]["mode"] == "result"
+        run_ref = self._next_run_ref(para_ref, counter)
+        self.events.append(RunEvent(text, rpr, para_ref, run_ref, field_result=in_result))
+        if in_result:
+            field_stack[-1]["result_parts"].append(text)
+
+    def _walk_runs(
+        self,
+        container: Any,
+        para_ref: str,
+        counter: list[int],
+        field_stack: list[dict[str, Any]],
+    ) -> None:
+        for child in container:
+            tag = _ln(child)
+            if tag == "r":
+                self._walk_run(child, para_ref, counter, field_stack)
+            elif tag in ("hyperlink", "smartTag", "ins"):
+                self._walk_runs(child, para_ref, counter, field_stack)
+            elif tag == "sdt":
+                content = self._find_child(child, "sdtContent")
+                if content is not None:
+                    self._walk_runs(content, para_ref, counter, field_stack)
+            elif tag == "del":
+                self._record_deleted(child, para_ref)
+            elif tag == "fldSimple":
+                self._walk_fld_simple(child, para_ref, counter)
+            elif tag in _SKIP_TAGS:
+                continue
+            else:
+                self._walk_runs(child, para_ref, counter, field_stack)
+
+    def _record_deleted(self, del_elem: Any, para_ref: str) -> None:
+        author = _attr(del_elem, "author")
+        date = _attr(del_elem, "date")
+        for run in del_elem:
+            if _ln(run) != "r":
+                continue
+            for piece in run:
+                if _ln(piece) == "delText":
+                    self.deleted_spans.append(DeletedSpan(piece.text or "", para_ref, author, date))
+
+    def _walk_fld_simple(self, fld: Any, para_ref: str, counter: list[int]) -> None:
+        instr = _attr(fld, "instr") or ""
+        result_parts: list[str] = []
+        # A w:fldSimple's own nested runs ARE the field result (there is no
+        # separate begin/separate/end sequence for the simple form).
+        nested_field_stack: list[dict[str, Any]] = [{"instr": instr, "mode": "result", "result_parts": result_parts}]
+        for child in fld:
+            if _ln(child) == "r":
+                self._walk_run(child, para_ref, counter, nested_field_stack)
+            elif _ln(child) not in _SKIP_TAGS:
+                self._walk_runs(child, para_ref, counter, nested_field_stack)
+        self.events.append(FieldEvent(instr=instr.strip(), result_text="".join(result_parts), para_ref=para_ref))
+
+    def _walk_run(
+        self,
+        run: Any,
+        para_ref: str,
+        counter: list[int],
+        field_stack: list[dict[str, Any]],
+    ) -> None:
+        rpr_elem = self._find_child(run, "rPr")
+        rpr = _run_properties(rpr_elem)
+        for child in run:
+            tag = _ln(child)
+            if tag == "rPr":
+                continue
+            elif tag == "t":
+                self._emit_text(child.text or "", rpr, para_ref, counter, field_stack)
+            elif tag == "tab":
+                self._emit_text("\t", rpr, para_ref, counter, field_stack)
+            elif tag in ("br", "cr"):
+                self._emit_text("\n", rpr, para_ref, counter, field_stack)
+            elif tag == "noBreakHyphen":
+                self._emit_text("-", rpr, para_ref, counter, field_stack)
+            elif tag == "softHyphen":
+                self._emit_text("­", rpr, para_ref, counter, field_stack)
+            elif tag == "sym":
+                font = _attr(child, "font")
+                code = _attr(child, "char")
+                mapped = _map_sym(font, code)
+                if mapped is None:
+                    mapped = "�"
+                    self.warnings.append("unmapped_symbol")
+                self._emit_text(mapped, rpr, para_ref, counter, field_stack)
+            elif tag == "fldChar":
+                fld_type = _attr(child, "fldCharType")
+                if fld_type == "begin":
+                    field_stack.append({"instr": "", "mode": "instr", "result_parts": []})
+                elif fld_type == "separate" and field_stack:
+                    field_stack[-1]["mode"] = "result"
+                elif fld_type == "end" and field_stack:
+                    self._flush_field(field_stack.pop(), para_ref)
+            elif tag == "instrText":
+                if field_stack:
+                    field_stack[-1]["instr"] += child.text or ""
+                # else: an instrText outside any begin/separate — malformed
+                # input; excluded from the projection either way.
+            elif tag == "delText":
+                # A delText directly under a bare w:r (not wrapped in
+                # w:del) is malformed, but exclude it from the projection
+                # defensively rather than emit deleted text as if live.
+                self.deleted_spans.append(DeletedSpan(child.text or "", para_ref, None, None))
+            elif tag == "drawing":
+                self._emit_drawing(child, para_ref)
+            elif tag == "AlternateContent":
+                # Real Word wraps a text box's/picture's w:drawing here:
+                # <w:r><w:rPr/><mc:AlternateContent><mc:Choice Requires="wps">
+                # <w:drawing>...</w:drawing></mc:Choice><mc:Fallback><w:pict>
+                # ...</w:pict></mc:Fallback></mc:AlternateContent></w:r>
+                # (confirmed against this WP's own Word-authored
+                # textbox.docx fixture). Choice and Fallback encode the
+                # SAME visual object for different Word versions — only
+                # Choice (the modern w:drawing branch) is walked; Fallback
+                # (the legacy w:pict/VML branch) is skipped entirely, or
+                # every drawing/text box would be double-counted. See the
+                # module docstring.
+                choice = self._find_child(child, "Choice")
+                if choice is not None:
+                    for grandchild in choice:
+                        if _ln(grandchild) == "drawing":
+                            self._emit_drawing(grandchild, para_ref)
+            elif tag in _SKIP_TAGS:
+                continue
+            # Anything else inside a run (proofErr, lastRenderedPageBreak,
+            # etc.) carries no text and is silently skipped.
+
+    def _emit_drawing(self, drawing: Any, para_ref: str) -> None:
+        blip_rid: str | None = None
+        extent_in: list[float] | None = None
+        for extent in drawing.iter():
+            if _ln(extent) == "extent":
+                cx = extent.get("cx")
+                cy = extent.get("cy")
+                if cx is not None and cy is not None:
+                    extent_in = [round(int(cx) / 914400, 4), round(int(cy) / 914400, 4)]
+                break
+        for blip in drawing.iter():
+            if _ln(blip) == "blip":
+                blip_rid = _attr(blip, "embed")
+                break
+        self.events.append(
+            DrawingEvent(blip_rid=blip_rid, media_part=None, extent_in=extent_in, para_ref=para_ref)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Projection result
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class Projection:
+    part: str
+    text: str
+    # Sorted, non-overlapping spans: (start, end, para_ref, run_ref).
+    offset_map: list[tuple[int, int, str, str]]
+    events: list[Event]
+    paragraphs: list[ParagraphMeta]
+    deleted_spans: list[DeletedSpan]
+    warnings: list[str]
+
+    def locate_offset(self, offset: int) -> tuple[str, str, int] | None:
+        """(para_ref, run_ref, run_offset) for *offset* in ``text``, or
+        None if *offset* falls in a paragraph break / outside any run."""
+        for start, end, para_ref, run_ref in self.offset_map:
+            if start <= offset < end:
+                return para_ref, run_ref, offset - start
+        return None
+
+
+def _rels_path_for(part_name: str) -> str:
+    if "/" in part_name:
+        directory, base = part_name.rsplit("/", 1)
+        return f"{directory}/_rels/{base}.rels"
+    return f"_rels/{part_name}.rels"
+
+
+def _load_rels(zf: zipfile.ZipFile, part_name: str) -> dict[str, str]:
+    """rId -> Target for *part_name*'s own relationships part. Empty dict
+    if the .rels part does not exist (a part with no relationships)."""
+    rels_path = _rels_path_for(part_name)
+    if rels_path not in zf.namelist():
+        return {}
+    data = zf.read(rels_path)
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(data)
+    out: dict[str, str] = {}
+    for rel in root:
+        rid = rel.get("Id")
+        target = rel.get("Target")
+        if rid and target:
+            out[rid] = target
+    return out
+
+
+def _resolve_media_part(part_name: str, rels: dict[str, str], rid: str | None) -> str | None:
+    if not rid or rid not in rels:
+        return None
+    target = rels[rid]
+    if target.startswith("/"):
+        return target.lstrip("/")
+    # Relative to the part's own directory (word/ for document.xml/headerN.xml).
+    directory = part_name.rsplit("/", 1)[0] if "/" in part_name else ""
+    return f"{directory}/{target}" if directory else target
+
+
+def read_part_xml(zf: zipfile.ZipFile, part_name: str) -> Any | None:
+    """Parsed root element of *part_name*, or None if the part is absent
+    from the package (a header/footer/footnotes/endnotes part is optional;
+    a caller asking for one that does not exist gets PART_NOT_FOUND, not a
+    silent empty projection — see project_part)."""
+    if part_name not in zf.namelist():
+        return None
+    import xml.etree.ElementTree as ET
+
+    return ET.fromstring(zf.read(part_name))
+
+
+def project_part(docx_path: Path, part_name: str = DEFAULT_PART) -> Projection:
+    """Walk *part_name* (default ``word/document.xml``'s body) into a
+    Projection. Raises VerifyError(PART_NOT_FOUND) if the part is absent.
+    """
+    with zipfile.ZipFile(docx_path) as zf:
+        root = read_part_xml(zf, part_name)
+        if root is None:
+            raise _make_error(
+                ErrorCode.PART_NOT_FOUND,
+                f"Part not found in package: {part_name!r}",
+                {"part": part_name, "available_parts": sorted(zf.namelist())},
+            )
+        rels = _load_rels(zf, part_name)
+
+        walker = _PartWalker()
+        root_tag = _ln(root)
+        if root_tag == "document":
+            body = walker._find_child(root, "body")
+            if body is not None:
+                walker.walk_block_container(body, [])
+        elif root_tag in ("footnotes", "endnotes"):
+            # Each w:footnote/w:endnote is its own mini-story; concatenated
+            # here into one flat projection for the part (WP-03 scope —
+            # per-story addressing is not required by any acceptance test
+            # in this WP). Separator/continuation-separator stories (ids
+            # -1 and 0) carry no real content and are skipped.
+            child_tag = "footnote" if root_tag == "footnotes" else "endnote"
+            for story in root:
+                if _ln(story) != child_tag:
+                    continue
+                story_id = _attr(story, "id")
+                if story_id in ("-1", "0"):
+                    continue
+                walker.walk_block_container(story, [])
+        else:
+            # w:hdr / w:ftr (headers/footers): block content is direct.
+            walker.walk_block_container(root, [])
+
+        # Resolve media parts on drawing events now that rels are loaded.
+        for event in walker.events:
+            if isinstance(event, DrawingEvent) and event.blip_rid:
+                event.media_part = _resolve_media_part(part_name, rels, event.blip_rid)
+
+    # Build flat text + offset map from RunEvents only.
+    text_parts: list[str] = []
+    offset_map: list[tuple[int, int, str, str]] = []
+    cursor = 0
+    for event in walker.events:
+        if isinstance(event, RunEvent):
+            length = len(event.text)
+            if length:
+                offset_map.append((cursor, cursor + length, event.para_ref, event.run_ref))
+                cursor += length
+            text_parts.append(event.text)
+
+    return Projection(
+        part=part_name,
+        text="".join(text_parts),
+        offset_map=offset_map,
+        events=walker.events,
+        paragraphs=walker.paragraphs,
+        deleted_spans=walker.deleted_spans,
+        warnings=walker.warnings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Text boxes: sub-scopes, never merged into body offsets.
+# ---------------------------------------------------------------------------
+
+
+def iter_textbox_scopes(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dict[str, Any]]:
+    """One entry per ``w:txbxContent`` found in *part_name*'s DrawingML
+    branch (``w:drawing``/``mc:Choice`` only — see module docstring), each
+    projected as an independent sub-scope with its own flat text and
+    ``section_key`` (``textbox-<n>``), never merged into the host part's
+    own offsets.
+    """
+    with zipfile.ZipFile(docx_path) as zf:
+        root = read_part_xml(zf, part_name)
+        if root is None:
+            raise _make_error(
+                ErrorCode.PART_NOT_FOUND,
+                f"Part not found in package: {part_name!r}",
+                {"part": part_name},
+            )
+
+    scopes: list[dict[str, Any]] = []
+    n = 0
+    for drawing in root.iter():
+        if _ln(drawing) != "drawing":
+            continue
+        for txbx_content in drawing.iter():
+            if _ln(txbx_content) != "txbxContent":
+                continue
+            n += 1
+            walker = _PartWalker()
+            walker.walk_block_container(txbx_content, [])
+            text_parts = [e.text for e in walker.events if isinstance(e, RunEvent)]
+            scopes.append(
+                {
+                    "section_key": f"textbox-{n}",
+                    "text": "".join(text_parts),
+                    "paragraph_count": len(walker.paragraphs),
+                }
+            )
+    return scopes
+
+
+# ---------------------------------------------------------------------------
+# Revision token
+# ---------------------------------------------------------------------------
+
+# Fixed order (issue #28 plan WP-03's revision-token spec). The rels and
+# [Content_Types].xml parts are included because adding the FIRST comment
+# to a document creates these new parts/relationships without necessarily
+# touching word/document.xml's own text — a document-only hash would miss
+# exactly that case.
+_COMMENT_PARTS_ORDER: tuple[str, ...] = (
+    "word/comments.xml",
+    "word/commentsExtended.xml",
+    "word/commentsIds.xml",
+    "word/commentsExtensible.xml",
+    "word/people.xml",
+    "word/_rels/document.xml.rels",
+    "[Content_Types].xml",
+)
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def compute_revision(docx_path: Path) -> dict[str, Any]:
+    """Revision token for *docx_path*: ``{"token": "<doc8>:<cmt8>",
+    "detail": {...}}``.
+
+    ``document`` hash = sha256(word/document.xml). ``comments`` hash =
+    sha256 over a LENGTH-PREFIXED concatenation of the seven parts in
+    ``_COMMENT_PARTS_ORDER`` (each part missing from the package
+    contributes a zero-length frame, i.e. is "hashed as the empty string")
+    — length-prefixed rather than naive concatenation so that content
+    shifting across a part boundary (e.g. comments.xml growing by exactly
+    as much as commentsIds.xml shrinks) cannot produce a hash collision.
+
+    Equality is defined on ``token`` (the two hashes) ONLY. ``detail``
+    additionally carries ``size``/``mtime_ns`` of *docx_path* itself —
+    informational, for a caller that wants to skip recomputing the hashes
+    when neither has changed; this function itself always recomputes both
+    hashes from the actual bytes, so a `touch` (mtime changes, content and
+    size do not) still yields the SAME token.
+    """
+    with zipfile.ZipFile(docx_path) as zf:
+        names = set(zf.namelist())
+        doc_bytes = zf.read(DEFAULT_PART) if DEFAULT_PART in names else b""
+        doc_hash = _sha256_hex(doc_bytes)
+
+        hasher = hashlib.sha256()
+        for part in _COMMENT_PARTS_ORDER:
+            data = zf.read(part) if part in names else b""
+            hasher.update(len(data).to_bytes(8, "big"))
+            hasher.update(data)
+        cmt_hash = hasher.hexdigest()
+
+    st = docx_path.stat()
+    doc8 = doc_hash[:8]
+    cmt8 = cmt_hash[:8]
+    return {
+        "token": f"{doc8}:{cmt8}",
+        "detail": {
+            "document_sha256": doc_hash,
+            "comments_sha256": cmt_hash,
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# list_parts
+# ---------------------------------------------------------------------------
+
+_HEADER_FOOTER_RE = re.compile(r"^word/(header|footer)(\d+)\.xml$")
+
+
+def list_parts_impl(docx_path: Path) -> list[dict[str, Any]]:
+    """Enumerate the parts a read_document(part=...) call may target:
+    the document body, every header/footer, and footnotes/endnotes if
+    present. header_footer_type ("default"/"first"/"even") is resolved via
+    word/document.xml's own w:headerReference/w:footerReference elements
+    where possible; None when it cannot be determined (a header/footer
+    part present but not referenced from any sectPr — unusual but not
+    invalid OOXML).
+    """
+    with zipfile.ZipFile(docx_path) as zf:
+        names = zf.namelist()
+        parts: list[dict[str, Any]] = []
+        if DEFAULT_PART in names:
+            parts.append({"part": DEFAULT_PART, "kind": "document", "header_footer_type": None})
+
+        ref_type_by_target: dict[str, str] = {}
+        if DEFAULT_PART in names:
+            root = read_part_xml(zf, DEFAULT_PART)
+            rels = _load_rels(zf, DEFAULT_PART)
+            if root is not None:
+                for ref in root.iter():
+                    ln = _ln(ref)
+                    if ln in ("headerReference", "footerReference"):
+                        rid = _attr(ref, "id")
+                        ref_type = _attr(ref, "type")
+                        target = rels.get(rid) if rid else None
+                        if target and ref_type:
+                            target_part = f"word/{target}" if not target.startswith("word/") else target
+                            ref_type_by_target[target_part] = ref_type
+
+        for name in sorted(names):
+            m = _HEADER_FOOTER_RE.match(name)
+            if m:
+                kind = "header" if m.group(1) == "header" else "footer"
+                parts.append(
+                    {
+                        "part": name,
+                        "kind": kind,
+                        "header_footer_type": ref_type_by_target.get(name),
+                    }
+                )
+
+        if "word/footnotes.xml" in names:
+            parts.append({"part": "word/footnotes.xml", "kind": "footnotes", "header_footer_type": None})
+        if "word/endnotes.xml" in names:
+            parts.append({"part": "word/endnotes.xml", "kind": "endnotes", "header_footer_type": None})
+
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# list_styles
+# ---------------------------------------------------------------------------
+
+
+def list_styles_impl(docx_path: Path) -> list[dict[str, Any]]:
+    with zipfile.ZipFile(docx_path) as zf:
+        root = read_part_xml(zf, "word/styles.xml")
+        if root is None:
+            return []
+        styles: list[dict[str, Any]] = []
+        for style in root:
+            if _ln(style) != "style":
+                continue
+            style_id = _attr(style, "styleId")
+            style_type = _attr(style, "type")
+            name = None
+            outline_lvl = None
+            for child in style:
+                if _ln(child) == "name":
+                    name = _attr(child, "val")
+                elif _ln(child) == "pPr":
+                    for grandchild in child:
+                        if _ln(grandchild) == "outlineLvl":
+                            raw = _attr(grandchild, "val")
+                            if raw is not None and raw.isdigit():
+                                outline_lvl = int(raw)
+            styles.append(
+                {
+                    "style_id": style_id,
+                    "name": name,
+                    "type": style_type,
+                    "outline_lvl": outline_lvl,
+                }
+            )
+        return styles
+
+
+# Built-in heading style ids Word emits even when styles.xml's own <w:pPr>
+# carries no explicit <w:outlineLvl> (common for a document whose styles
+# part was never customized) — "Heading1".."Heading9" -> outline level 0-8.
+_HEADING_STYLE_ID_RE = re.compile(r"^Heading(\d)$", re.IGNORECASE)
+
+
+def _resolve_outline_level(style_id: str | None, direct_outline_lvl: int | None, styles_by_id: dict[str, dict]) -> int | None:
+    if direct_outline_lvl is not None:
+        return direct_outline_lvl
+    if style_id and style_id in styles_by_id:
+        style_outline = styles_by_id[style_id].get("outline_lvl")
+        if style_outline is not None:
+            return style_outline
+    if style_id:
+        m = _HEADING_STYLE_ID_RE.match(style_id)
+        if m:
+            return int(m.group(1)) - 1
+    return None
+
+
+# ---------------------------------------------------------------------------
+# find_sections
+# ---------------------------------------------------------------------------
+
+
+def _slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
+    return slug or "section"
+
+
+def find_sections_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dict[str, Any]]:
+    """Heading ranges: a heading paragraph's w:pStyle mapped through
+    list_styles to an outline level (falling back to the paragraph's own
+    direct w:outlineLvl). A section runs from one heading paragraph
+    (inclusive) up to, but not including, the NEXT heading paragraph at
+    any level, or the end of the document for the last heading —
+    WP-03 scope does not nest sections by level; a future WP may.
+
+    section_key = slug(heading text) + "-" + a 1-based ordinal disambiguating
+    duplicate headings (two paragraphs both literally "Introduction" get
+    "introduction-1" and "introduction-2").
+    """
+    styles = list_styles_impl(docx_path)
+    styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
+
+    projection = project_part(docx_path, part_name)
+    heading_paras: list[tuple[ParagraphMeta, int, str]] = []
+    para_text_by_ref: dict[str, list[str]] = {}
+    for event in projection.events:
+        if isinstance(event, RunEvent):
+            para_text_by_ref.setdefault(event.para_ref, []).append(event.text)
+
+    for meta in projection.paragraphs:
+        level = _resolve_outline_level(meta.style_id, meta.outline_lvl, styles_by_id)
+        if level is None or meta.container_chain:
+            # Headings inside a table cell are out of scope for WP-03's
+            # section model (a table-cell "heading" style is common for
+            # emphasis, not a real document section boundary).
+            continue
+        heading_text = "".join(para_text_by_ref.get(meta.para_ref, [])).strip()
+        heading_paras.append((meta, level, heading_text))
+
+    slug_counts: dict[str, int] = {}
+    sections: list[dict[str, Any]] = []
+    all_para_refs = [m.para_ref for m in projection.paragraphs]
+
+    for idx, (meta, level, heading_text) in enumerate(heading_paras):
+        base_slug = _slugify(heading_text)
+        slug_counts[base_slug] = slug_counts.get(base_slug, 0) + 1
+        section_key = f"{base_slug}-{slug_counts[base_slug]}"
+
+        start_idx = all_para_refs.index(meta.para_ref)
+        if idx + 1 < len(heading_paras):
+            next_meta = heading_paras[idx + 1][0]
+            end_idx = all_para_refs.index(next_meta.para_ref)
+        else:
+            end_idx = len(all_para_refs)
+
+        sections.append(
+            {
+                "section_key": section_key,
+                "heading_text": heading_text,
+                "outline_level": level,
+                "start_para_ref": meta.para_ref,
+                "end_para_ref": all_para_refs[end_idx - 1] if end_idx > start_idx else meta.para_ref,
+                "paragraph_count": max(end_idx - start_idx, 1),
+            }
+        )
+    return sections
+
+
+# ---------------------------------------------------------------------------
+# list_page_sections
+# ---------------------------------------------------------------------------
+
+# OOXML page geometry (w:pgSz, w:pgMar, w:cols/w:col) is expressed in
+# twentieths of a point (dxa) — 1440 dxa = 1 inch — NOT in EMU. EMU (the
+# 914400-per-inch unit the issue #28 plan's WP-03 text names) is what
+# DrawingML extents (a w:drawing's wp:extent, handled in _emit_drawing
+# above) use instead. Converting page geometry with the plan's literal
+# "EMU / 914400" phrasing would silently produce numbers 635x too small;
+# see this module's PR notes for the correction against the plan text.
+_DXA_PER_INCH = 1440
+
+
+def _dxa_to_in(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return round(int(value) / _DXA_PER_INCH, 4)
+    except ValueError:
+        return None
+
+
+def list_page_sections_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dict[str, Any]]:
+    with zipfile.ZipFile(docx_path) as zf:
+        root = read_part_xml(zf, part_name)
+        if root is None:
+            raise _make_error(
+                ErrorCode.PART_NOT_FOUND,
+                f"Part not found in package: {part_name!r}",
+                {"part": part_name},
+            )
+        sections: list[dict[str, Any]] = []
+        for sect_pr in root.iter():
+            if _ln(sect_pr) != "sectPr":
+                continue
+            # Two passes, not one: real Word emits pgSz/pgMar before cols,
+            # but nothing in the schema guarantees that order, and cols'
+            # own (no explicit w:col children) branch needs both pgSz and
+            # pgMar already resolved to compute an even column width.
+            pg_sz = next((c for c in sect_pr if _ln(c) == "pgSz"), None)
+            pg_mar = next((c for c in sect_pr if _ln(c) == "pgMar"), None)
+            cols_elem = next((c for c in sect_pr if _ln(c) == "cols"), None)
+
+            # w:pgSz/w:pgMar attributes (w:w, w:h, w:top, ...) are in the
+            # w: namespace, NOT bare — unlike DrawingML's cx/cy (see
+            # _emit_drawing). _attr() (namespace-agnostic by local name)
+            # is required here; a bare .get("w") always returns None.
+            page_w = _dxa_to_in(_attr(pg_sz, "w")) if pg_sz is not None else None
+            page_h = _dxa_to_in(_attr(pg_sz, "h")) if pg_sz is not None else None
+            orientation = _attr(pg_sz, "orient") if pg_sz is not None else None
+            margin_top = _dxa_to_in(_attr(pg_mar, "top")) if pg_mar is not None else None
+            margin_bottom = _dxa_to_in(_attr(pg_mar, "bottom")) if pg_mar is not None else None
+            margin_left = _dxa_to_in(_attr(pg_mar, "left")) if pg_mar is not None else None
+            margin_right = _dxa_to_in(_attr(pg_mar, "right")) if pg_mar is not None else None
+
+            cols_widths: list[float] = []
+            if cols_elem is not None:
+                explicit_cols = [c for c in cols_elem if _ln(c) == "col"]
+                if explicit_cols:
+                    for col in explicit_cols:
+                        w = _dxa_to_in(_attr(col, "w"))
+                        if w is not None:
+                            cols_widths.append(w)
+                else:
+                    num = _attr(cols_elem, "num")
+                    space = _dxa_to_in(_attr(cols_elem, "space"))
+                    if (
+                        num
+                        and num.isdigit()
+                        and page_w is not None
+                        and margin_left is not None
+                        and margin_right is not None
+                    ):
+                        n = int(num)
+                        if n > 0:
+                            usable = page_w - margin_left - margin_right
+                            gap_total = (space or 0.0) * (n - 1)
+                            cols_widths = [round((usable - gap_total) / n, 4)] * n
+
+            sections.append(
+                {
+                    "page_width_in": page_w,
+                    "page_height_in": page_h,
+                    "orientation": orientation or "portrait",
+                    "margin_top_in": margin_top,
+                    "margin_bottom_in": margin_bottom,
+                    "margin_left_in": margin_left,
+                    "margin_right_in": margin_right,
+                    "column_widths_in": cols_widths,
+                }
+            )
+        return sections
+
+
+# ---------------------------------------------------------------------------
+# read_document: text / runs / markdown
+# ---------------------------------------------------------------------------
+
+
+def _run_event_to_dict(event: RunEvent) -> dict[str, Any]:
+    return {"text": event.text, "rPr": event.rpr, "para_ref": event.para_ref}
+
+
+def read_document_runs(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dict[str, Any]]:
+    """``read_document(format="runs")``: run records ``{text, rPr,
+    para_ref}`` interleaved, in document order, with structural records —
+    ``{"type": "table_start"|"table_end", "table_id"}``,
+    ``{"type": "drawing", blip_rid, media_part, extent_in, para_ref}``
+    (emitted for every ``w:drawing``/``a:blip``), and
+    ``{"type": "field", instr, result_text}``.
+    """
+    projection = project_part(docx_path, part_name)
+    out: list[dict[str, Any]] = []
+    for event in projection.events:
+        if isinstance(event, RunEvent):
+            if event.run_ref.endswith("/break"):
+                continue  # internal paragraph-break marker, not a real run
+            out.append(_run_event_to_dict(event))
+        elif isinstance(event, TableBoundaryEvent):
+            out.append({"type": event.kind, "table_id": event.table_id})
+        elif isinstance(event, DrawingEvent):
+            out.append(
+                {
+                    "type": "drawing",
+                    "blip_rid": event.blip_rid,
+                    "media_part": event.media_part,
+                    "extent_in": event.extent_in,
+                    "para_ref": event.para_ref,
+                }
+            )
+        elif isinstance(event, FieldEvent):
+            out.append({"type": "field", "instr": event.instr, "result_text": event.result_text})
+    return out
+
+
+def read_document_text(docx_path: Path, part_name: str = DEFAULT_PART) -> str:
+    return project_part(docx_path, part_name).text
+
+
+def read_document_markdown(docx_path: Path, part_name: str = DEFAULT_PART) -> tuple[str, list[str]]:
+    """A deliberately modest markdown rendering: paragraph text, headings
+    (from find_sections' same outline-level resolution) as ``#`` runs,
+    **bold**/*italic* run markers, tables/drawings/fields as stable
+    placeholder tokens ([TABLE], [GRAPHIC], [FIELD:instr]) — WP-04's
+    markdown -> OOXML direction is the inverse of this and is not built
+    here. Returns (markdown_text, warnings).
+    """
+    styles = list_styles_impl(docx_path)
+    styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
+    projection = project_part(docx_path, part_name)
+
+    lines: list[str] = []
+    current_para_ref: str | None = None
+    current_parts: list[str] = []
+    meta_by_ref = {m.para_ref: m for m in projection.paragraphs}
+
+    def flush() -> None:
+        if current_para_ref is None:
+            return
+        text = "".join(current_parts)
+        meta = meta_by_ref.get(current_para_ref)
+        level = _resolve_outline_level(meta.style_id, meta.outline_lvl, styles_by_id) if meta else None
+        if level is not None and text.strip():
+            lines.append(f"{'#' * (level + 1)} {text.strip()}")
+        else:
+            lines.append(text)
+
+    for event in projection.events:
+        if isinstance(event, RunEvent):
+            if event.run_ref.endswith("/break"):
+                flush()
+                current_para_ref = None
+                current_parts = []
+                continue
+            if current_para_ref is None:
+                current_para_ref = event.para_ref
+            piece = event.text
+            if event.rpr.get("bold") and event.rpr.get("italic"):
+                piece = f"***{piece}***" if piece.strip() else piece
+            elif event.rpr.get("bold"):
+                piece = f"**{piece}**" if piece.strip() else piece
+            elif event.rpr.get("italic"):
+                piece = f"*{piece}*" if piece.strip() else piece
+            current_parts.append(piece)
+        elif isinstance(event, TableBoundaryEvent):
+            if event.kind == "table_start":
+                flush()
+                current_para_ref = None
+                current_parts = []
+                lines.append("[TABLE]")
+        elif isinstance(event, DrawingEvent):
+            current_parts.append("[GRAPHIC]")
+        elif isinstance(event, FieldEvent):
+            current_parts.append(f"[FIELD:{event.instr}]" if event.instr else event.result_text)
+
+    flush()
+    return "\n".join(lines), projection.warnings
