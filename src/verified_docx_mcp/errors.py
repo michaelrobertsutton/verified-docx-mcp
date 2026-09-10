@@ -47,6 +47,9 @@ class ErrorCode(Enum):
     SYNC_IN_FLIGHT = "SYNC_IN_FLIGHT"  # reserved: write guard, WP-04/WP-10
     CONFLICT_COPY_DETECTED = "CONFLICT_COPY_DETECTED"  # reserved: post-write sweep, WP-10
 
+    # Projection / read tools (projection.py, WP-03)
+    PART_NOT_FOUND = "PART_NOT_FOUND"  # read_document(part=...) names a package part that does not exist
+
     # Render path (render.py's module docstring; core doc §4)
     AUTOMATION_NOT_GRANTED = "AUTOMATION_NOT_GRANTED"
     WORD_SANDBOX_UNAVAILABLE = "WORD_SANDBOX_UNAVAILABLE"
