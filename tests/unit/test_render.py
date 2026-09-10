@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# Vendored from JennyStack scripts/test_docx_render.py at commit aedd94c
+# (PR #50), source sha256
+# ecee4997eb13ed7d6b72deb865eb6e48f05f3b2dbf882fe61dc9f70a5a569687, 10
+# tests. Adapted (issue #28 WP-02) for this repo's layout only: the
+# module under test is `verified_docx_mcp.render` here (the source file
+# is `scripts/docx_render.py` there — the scaffold names it `render.py`),
+# so `import docx_render` becomes `from verified_docx_mcp import render`
+# and every `docx_render.` reference becomes `render.`; the two fixture
+# PDFs move from `fixtures/md-render/pdf/` to `tests/fixtures/pdf/`
+# (copied verbatim, same sha256, see that directory). Test logic,
+# assertions, and comments are otherwise unchanged from the source file.
+"""test_render.py — unit tests for src/verified_docx_mcp/render.py
+(vendored from JennyStack's scripts/docx_render.py; see the header above).
+stdlib `unittest`, no third-party dependencies. Run:
+
+  uv run pytest tests/unit
+  # or directly:
+  uv run python -m unittest tests.unit.test_render
+
+Covers:
+  - page_count() against the two committed PDFs in tests/fixtures/pdf/
+    (plain.pdf: pdfinfo and the regex fallback both find 2 pages directly;
+    objstm.pdf: pdfinfo correctly finds 3 pages compressed inside an
+    object stream, while the regex fallback — used only when pdfinfo is
+    absent — finds ZERO literal "/Type /Page" matches and must return
+    None, never 0, per the plan's explicit callout that a 0 would flow
+    into a page-budget check as if it were real).
+  - page_count() on an unreadable/missing path returns (None, None).
+  - render_word()'s error-code mapping: AUTOMATION_NOT_GRANTED (-1712,
+    -1743) and RENDER_FAILED (everything else), exercised WITHOUT a real
+    Word instance by injecting a fake `osascript` earlier on PATH that
+    prints a recorded stderr and exits 1 — an agent cannot revoke a real
+    macOS Automation grant to exercise the failure path for real, so this
+    is the documented substitute (WP-02 acceptance, agent side).
+  - WORD_SANDBOX_UNAVAILABLE when Word's container directory is absent.
+"""
+
+from __future__ import annotations
+
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "src"))
+
+from verified_docx_mcp import render
+
+FIXTURE_DIR = REPO / "tests" / "fixtures" / "pdf"
+PLAIN_PDF = FIXTURE_DIR / "plain.pdf"
+OBJSTM_PDF = FIXTURE_DIR / "objstm.pdf"
+
+
+class PageCountTests(unittest.TestCase):
+    def test_plain_via_pdfinfo(self):
+        if not render._find_pdfinfo():
+            self.skipTest("pdfinfo not installed on this machine")
+        count, source = render.page_count(str(PLAIN_PDF))
+        self.assertEqual(count, 2)
+        self.assertEqual(source, "pdfinfo")
+
+    def test_objstm_via_pdfinfo(self):
+        if not render._find_pdfinfo():
+            self.skipTest("pdfinfo not installed on this machine")
+        count, source = render.page_count(str(OBJSTM_PDF))
+        self.assertEqual(count, 3)
+        self.assertEqual(source, "pdfinfo")
+
+    def test_plain_regex_fallback(self):
+        with mock.patch.object(render, "_find_pdfinfo", return_value=None):
+            count, source = render.page_count(str(PLAIN_PDF))
+        self.assertEqual(count, 2)
+        self.assertEqual(source, "regex")
+
+    def test_objstm_regex_fallback_returns_none_not_zero(self):
+        # The whole point of committing objstm.pdf: its Page objects are
+        # compressed inside an object stream, so a literal byte regex for
+        # "/Type /Page" finds NOTHING. That must surface as (None, None)
+        # — never (0, "regex"), which would look like a real, tiny
+        # document to a caller (e.g. a page-budget check).
+        with mock.patch.object(render, "_find_pdfinfo", return_value=None):
+            count, source = render.page_count(str(OBJSTM_PDF))
+        self.assertIsNone(count)
+        self.assertIsNone(source)
+
+    def test_missing_file_returns_none(self):
+        count, source = render.page_count("/nonexistent/path/does-not-exist.pdf")
+        self.assertIsNone(count)
+        self.assertIsNone(source)
+
+
+def _write_fake_osascript(bin_dir: Path, stderr_text: str, exit_code: int = 1) -> None:
+    script = bin_dir / "osascript"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"echo {stderr_text!r} 1>&2\n"
+        f"exit {exit_code}\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+class ErrorMappingTests(unittest.TestCase):
+    """Exercises render_word()'s error-code mapping by injecting a fake
+    `osascript` earlier on PATH. Guarded on Word's sandbox container
+    directory actually existing — render_word() checks that BEFORE ever
+    invoking osascript, so on a machine without Word installed at all
+    these tests correctly skip rather than false-failing on the wrong
+    error code."""
+
+    def setUp(self):
+        if not render._word_sandbox_root().is_dir():
+            self.skipTest(
+                "Word's sandbox container directory does not exist on this "
+                "machine (Word never launched) — render_word() would raise "
+                "WORD_SANDBOX_UNAVAILABLE before ever reaching osascript."
+            )
+        self._tmp = tempfile.TemporaryDirectory()
+        self._bin_dir = Path(self._tmp.name) / "bin"
+        self._bin_dir.mkdir()
+        self._old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self._bin_dir}{os.pathsep}{self._old_path}"
+
+        self._in_dir = Path(self._tmp.name) / "in"
+        self._in_dir.mkdir()
+        self._in_path = self._in_dir / "test-input.docx"
+        self._in_path.write_bytes(b"not a real docx, but osascript never reads it")
+        self._out_path = Path(self._tmp.name) / "out" / "test-output.pdf"
+
+    def tearDown(self):
+        os.environ["PATH"] = self._old_path
+        self._tmp.cleanup()
+
+    def test_automation_not_granted_1743(self):
+        # Recorded shape of a real macOS "Automation declined" AppleEvent
+        # error (osascript's own message text for -1743, "not authorized
+        # to send Apple events").
+        _write_fake_osascript(
+            self._bin_dir,
+            "execution error: Not authorized to send Apple events to Microsoft Word. (-1743)",
+        )
+        with self.assertRaises(render.RenderError) as ctx:
+            render.render_word(str(self._in_path), str(self._out_path))
+        self.assertEqual(ctx.exception.code, "AUTOMATION_NOT_GRANTED")
+
+    def test_automation_not_granted_1712(self):
+        _write_fake_osascript(
+            self._bin_dir,
+            "execution error: Microsoft Word got an error: Application isn't running. (-1712)",
+        )
+        with self.assertRaises(render.RenderError) as ctx:
+            render.render_word(str(self._in_path), str(self._out_path))
+        self.assertEqual(ctx.exception.code, "AUTOMATION_NOT_GRANTED")
+
+    def test_other_failure_maps_to_render_failed(self):
+        # Recorded shape of this WP's own real, reproduced finding (see
+        # the vendored module's docstring): Word rejecting saveAs with a
+        # generic AppleEvent dispatch error that is NOT one of the two
+        # automation-grant codes.
+        _write_fake_osascript(self._bin_dir, "Error: Message not understood.")
+        with self.assertRaises(render.RenderError) as ctx:
+            render.render_word(str(self._in_path), str(self._out_path))
+        self.assertEqual(ctx.exception.code, "RENDER_FAILED")
+        self.assertIn("Message not understood", ctx.exception.detail or "")
+
+    def test_stage_dir_cleaned_up_on_failure(self):
+        _write_fake_osascript(self._bin_dir, "Error: Message not understood.")
+        sandbox_root = render._word_sandbox_root()
+        before = set(p.name for p in sandbox_root.iterdir())
+        with self.assertRaises(render.RenderError):
+            render.render_word(str(self._in_path), str(self._out_path))
+        after = set(p.name for p in sandbox_root.iterdir())
+        self.assertEqual(
+            before, after, "render_word() left a stray staging directory behind on failure"
+        )
+
+
+class WordSandboxUnavailableTests(unittest.TestCase):
+    def test_missing_container_dir_raises_named_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake_in = Path(td) / "in.docx"
+            fake_in.write_bytes(b"placeholder")
+            missing_root = Path(td) / "no-such-container"
+            with mock.patch.object(render, "_word_sandbox_root", return_value=missing_root):
+                with self.assertRaises(render.RenderError) as ctx:
+                    render.render_word(str(fake_in), str(Path(td) / "out.pdf"))
+            self.assertEqual(ctx.exception.code, "WORD_SANDBOX_UNAVAILABLE")
+            self.assertIn(str(missing_root), ctx.exception.message)
+
+
+if __name__ == "__main__":
+    unittest.main()

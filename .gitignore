@@ -1,0 +1,16 @@
+# No trailing slash on the cache/venv entries below: a trailing "/" in a
+# gitignore pattern matches only a real directory, not a symlink to one —
+# and .venv/.mypy_cache/.pytest_cache/.ruff_cache are conventionally kept
+# as symlinks into /Users/Shared/repo-deps/ on this machine (this repo
+# lives under iCloud Drive, which sets the macOS UF_HIDDEN flag on files
+# under a real .venv here and silently breaks Python's own site.py
+# handling of the editable-install .pth file — see this WP's PR notes).
+.venv
+__pycache__/
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage*
+dist/
+*.egg-info/
