@@ -38,3 +38,24 @@ comment carries. Nothing here needed a `LEAD:` step.
 
 `tests/fixtures/pdf/` and `tests/fixtures/word/one-page.docx` are WP-02's
 existing fixtures; unchanged here.
+
+## Issue #28 WP-04 additions
+
+| File | Purpose | How it was made |
+|---|---|---|
+| `revision/tracked.docx` | `revision/base.docx`, opened with Track Changes turned on (`set track revisions of d to true`), one character inserted ("X", 4 characters in) and a 5-character span deleted, then saved under a new name. Real `w:ins`/`w:del` elements with `w:author`/`w:date`. Tests `replace_body_markdown`'s `TRACKED_CHANGES_PRESENT` refusal (and its `force=True` override) against genuine Word-authored tracked changes, not a hand-built `w:ins`/`w:del` pair. | Word-authored (same AppleScript automation as every other fixture in this file; `create range ... start N end N` + `set content to` for the insertion, `create range ... start N end M` + `delete` for the deletion). |
+| `word/empty-shell.docx` | `word/one-page.docx` (WP-02's Word-authored, pandoc-templated fixture) with its `w:body`'s content children removed programmatically, keeping the trailing `w:sectPr`, `word/styles.xml` (Heading1-9, a table style), and `word/numbering.xml` intact. An empty template shell for `replace_body_markdown`'s round-trip acceptance test (`section.md` -> `replace_body_markdown` -> `read_document(format=markdown)` equals the input modulo whitespace). Not Word-authored itself and does not need to be: nothing about this fixture claims a nuance of Word's own output (unlike the anchor/tracked-change fixtures above) — it is only a container, and the container's real Word provenance already lives in `one-page.docx`. | Derived via `xml.etree.ElementTree`: parsed `one-page.docx`'s `word/document.xml`, removed every `w:body` child except the trailing `w:sectPr`, re-serialized with the original document's own namespace prefixes preserved (`ElementTree.register_namespace` per each `start-ns` event — the same technique `mutations.py`'s `_register_source_namespaces` uses in the server itself), and repacked the zip with every other original part byte-for-byte unchanged. |
+| `markdown/section.md` | Input for the round-trip acceptance test above: two ATX headings (`#`/`##`) and two paragraphs using bold/italic/bold-italic runs — deliberately no lists or tables, since `read_document_markdown` (WP-03) renders both of those lossily (no bullet/number markers, a `[TABLE]` placeholder) by design, so a literal input-equals-reread comparison only holds for the markdown subset WP-03's read side can reproduce exactly. List/table/link rendering is instead tested directly against the OOXML `mutations.py`/`markdown_to_ooxml.py` produce (`tests/unit/test_markdown_to_ooxml.py`), not through a read-side round trip. | Hand-authored plain markdown text, not a `.docx` — no Word involvement to document. |
+
+**Not produced this WP, and named rather than substituted:** a fixture
+combining a heading-delimited section (for `replace_range_markdown`) WITH
+a real comment anchor inside that section was not made — synthesizing one
+by hand-editing `sections.docx` and `commented.docx` together would be
+exactly the "hand-built OOXML constructed to match this repo's own
+assumptions" anti-pattern this file opens by warning against. Coverage
+instead comes from two genuine sources: `replace_body_markdown` against
+the real `commented.docx`/`tracked.docx` fixtures above (the shared hazard
+-scan code path `replace_range_markdown` also calls), and
+`replace_range_markdown`'s own section-targeting logic against the real,
+heading-only `sections.docx` fixture (no comments involved). See
+`tests/unit/test_mutations.py` for both.

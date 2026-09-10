@@ -582,6 +582,20 @@ def _resolve_media_part(part_name: str, rels: dict[str, str], rid: str | None) -
     return f"{directory}/{target}" if directory else target
 
 
+def load_rels_root(zf: zipfile.ZipFile, part_name: str) -> Any | None:
+    """Parsed root element of *part_name*'s own .rels part, or None if it
+    does not exist. Complements _load_rels (rId -> Target map) with the
+    full element tree — mutations.py (WP-04) needs the tree itself so it
+    can append a new <Relationship> (e.g. for a markdown link's
+    hyperlink) rather than just read existing targets."""
+    rels_path = _rels_path_for(part_name)
+    if rels_path not in zf.namelist():
+        return None
+    import xml.etree.ElementTree as ET
+
+    return ET.fromstring(zf.read(rels_path))
+
+
 def read_part_xml(zf: zipfile.ZipFile, part_name: str) -> Any | None:
     """Parsed root element of *part_name*, or None if the part is absent
     from the package (a header/footer/footnotes/endnotes part is optional;
@@ -1184,30 +1198,20 @@ def read_document_text(docx_path: Path, part_name: str = DEFAULT_PART) -> str:
     return project_part(docx_path, part_name).text
 
 
-def markdown_from_projection(docx_path: Path, proj: Projection) -> tuple[str, list[str]]:
-    """The ``read_document(format="markdown")`` rendering, built from an
-    already-resolved Projection — shared by read_document_markdown (a
-    whole package part) and server.py's textbox-scoped read
-    (project_textbox_scope). *docx_path* is still needed for
-    list_styles_impl (a heading's outline level resolves through the
-    package's styles.xml, not through anything the Projection itself
-    carries).
-
-    A deliberately modest markdown rendering: paragraph text, headings
-    (from find_sections' same outline-level resolution) as ``#`` runs,
-    **bold**/*italic* run markers, tables/drawings/fields as stable
-    placeholder tokens ([TABLE], [GRAPHIC], [field:instr]) — WP-04's
-    markdown -> OOXML direction is the inverse of this and is not built
-    here. Returns (markdown_text, warnings).
-    """
-    styles = list_styles_impl(docx_path)
-    styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
-    projection = proj
-
+def _events_to_markdown(
+    events: list[Event],
+    paragraphs: list[ParagraphMeta],
+    styles_by_id: dict[str, dict],
+) -> str:
+    """Shared rendering loop behind markdown_from_projection and
+    markdown_from_elements (mutations.py, WP-04) below — factored out so
+    both a whole-part projection and an ad hoc slice of a few w:body
+    children render through the exact same modest markdown rules (see
+    markdown_from_projection's docstring for what those rules are)."""
     lines: list[str] = []
     current_para_ref: str | None = None
     current_parts: list[str] = []
-    meta_by_ref = {m.para_ref: m for m in projection.paragraphs}
+    meta_by_ref = {m.para_ref: m for m in paragraphs}
 
     def flush() -> None:
         if current_para_ref is None:
@@ -1220,7 +1224,7 @@ def markdown_from_projection(docx_path: Path, proj: Projection) -> tuple[str, li
         else:
             lines.append(text)
 
-    for event in projection.events:
+    for event in events:
         if isinstance(event, RunEvent):
             if event.run_ref.endswith("/break"):
                 flush()
@@ -1258,10 +1262,53 @@ def markdown_from_projection(docx_path: Path, proj: Projection) -> tuple[str, li
                 current_parts.append(f"[field:{event.instr}]")
 
     flush()
-    return "\n".join(lines), projection.warnings
+    return "\n".join(lines)
+
+
+def markdown_from_projection(docx_path: Path, proj: Projection) -> tuple[str, list[str]]:
+    """The ``read_document(format="markdown")`` rendering, built from an
+    already-resolved Projection — shared by read_document_markdown (a
+    whole package part) and server.py's textbox-scoped read
+    (project_textbox_scope). *docx_path* is still needed for
+    list_styles_impl (a heading's outline level resolves through the
+    package's styles.xml, not through anything the Projection itself
+    carries).
+
+    A deliberately modest markdown rendering: paragraph text, headings
+    (from find_sections' same outline-level resolution) as ``#`` runs,
+    **bold**/*italic* run markers, tables/drawings/fields as stable
+    placeholder tokens ([TABLE], [GRAPHIC], [field:instr]) — WP-04's
+    markdown -> OOXML direction is the inverse of this and is not built
+    here. Returns (markdown_text, warnings).
+    """
+    styles = list_styles_impl(docx_path)
+    styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
+    markdown = _events_to_markdown(proj.events, proj.paragraphs, styles_by_id)
+    return markdown, proj.warnings
 
 
 def read_document_markdown(docx_path: Path, part_name: str = DEFAULT_PART) -> tuple[str, list[str]]:
     """``read_document(format="markdown")`` for a whole package part — see
     markdown_from_projection for the rendering rules."""
     return markdown_from_projection(docx_path, project_part(docx_path, part_name))
+
+
+def markdown_from_elements(
+    elements: list[Any],
+    styles_by_id: dict[str, dict],
+) -> str:
+    """Render an arbitrary list of block-level elements (e.g. a slice of a
+    w:body's direct children) through the exact same modest markdown rules
+    as read_document_markdown, without requiring them to already be a part
+    read from a docx on disk.
+
+    Used by mutations.py (WP-04) to compute the ``before``/``after``
+    evidence text for replace_range_markdown and replace_body_markdown: a
+    plain Python list of Element objects is a valid "container" for
+    _PartWalker.walk_block_container (it only ever iterates its argument),
+    so the identical walker + rendering pipeline applies to a range that
+    was never itself written to a temp part.
+    """
+    walker = _PartWalker()
+    walker.walk_block_container(elements, [])
+    return _events_to_markdown(walker.events, walker.paragraphs, styles_by_id)
