@@ -77,6 +77,70 @@ class ReadDocumentToolTests(ReadToolsTestCase):
             server.execute_read_document(str(self.target), format="text", part="word/nope.xml")
         self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.PART_NOT_FOUND)
 
+    def test_section_key_echoed_none_by_default(self):
+        result = server.execute_read_document(str(self.target), format="text")
+        self.assertIsNone(result["section_key"])
+
+    def test_field_markdown_has_no_leaked_instr_or_doubled_result(self):
+        """The exact regression a probe review caught: markdown for
+        fields.docx must not leak "[FIELD:...]"/"[field:...]" or double
+        the field's already-rendered result text."""
+        target = Path(self._tmp.name) / "fields.docx"
+        shutil.copyfile(FIXTURES / "fields.docx", target)
+        result = server.execute_read_document(str(target), format="markdown")
+        self.assertNotIn("[FIELD:", result["markdown"])
+        self.assertNotIn("[field:", result["markdown"])
+        self.assertNotIn("MERGEFORMAT", result["markdown"])
+        self.assertEqual(result["markdown"].count("Target paragraph"), 2)
+
+
+class TextboxReachabilityToolTests(ReadToolsTestCase):
+    """A probe review found text-box content unreachable through any tool
+    call (iter_textbox_scopes existed but nothing in server.py called it).
+    These exercise the actual fix: read_document(section_key=...)."""
+
+    def setUp(self):
+        super().setUp()
+        self.textbox_target = Path(self._tmp.name) / "textbox.docx"
+        shutil.copyfile(FIXTURES / "textbox.docx", self.textbox_target)
+
+    def test_find_sections_lists_the_textbox_key(self):
+        result = server.execute_find_sections(str(self.textbox_target))
+        textbox_entries = [s for s in result["sections"] if s["kind"] == "textbox"]
+        self.assertEqual([e["section_key"] for e in textbox_entries], ["textbox-1"])
+
+    def test_read_document_section_key_returns_textbox_text(self):
+        result = server.execute_read_document(str(self.textbox_target), format="text", section_key="textbox-1")
+        self.assertEqual(result["text"], "Text inside the text box.")
+        self.assertEqual(result["section_key"], "textbox-1")
+
+    def test_read_document_section_key_runs_and_markdown(self):
+        runs_result = server.execute_read_document(str(self.textbox_target), format="runs", section_key="textbox-1")
+        self.assertTrue(any(r.get("text") == "Text inside the text box." for r in runs_result["runs"]))
+
+        md_result = server.execute_read_document(
+            str(self.textbox_target), format="markdown", section_key="textbox-1"
+        )
+        self.assertIn("Text inside the text box.", md_result["markdown"])
+
+    def test_host_part_excludes_textbox_text(self):
+        """The text box's content is reachable via section_key, but NOT
+        double-counted into the host part's own read (no section_key)."""
+        result = server.execute_read_document(str(self.textbox_target), format="text")
+        self.assertNotIn("Text inside the text box.", result["text"])
+
+    def test_unknown_section_key_raises_invalid_input_with_available_keys(self):
+        with self.assertRaises(VerifyError) as ctx:
+            server.execute_read_document(str(self.textbox_target), format="text", section_key="textbox-99")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        self.assertEqual(ctx.exception.envelope.diagnostics["available_textbox_keys"], ["textbox-1"])
+
+    def test_section_key_on_document_with_no_textbox_raises_invalid_input(self):
+        with self.assertRaises(VerifyError) as ctx:
+            server.execute_read_document(str(self.target), format="text", section_key="textbox-1")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        self.assertEqual(ctx.exception.envelope.diagnostics["available_textbox_keys"], [])
+
 
 class FindSectionsToolTests(ReadToolsTestCase):
     def test_no_headings_in_frag_docx(self):
@@ -88,6 +152,7 @@ class FindSectionsToolTests(ReadToolsTestCase):
         shutil.copyfile(FIXTURES / "sections.docx", target)
         result = server.execute_find_sections(str(target))
         self.assertEqual(len(result["sections"]), 3)
+        self.assertTrue(all(s["kind"] == "heading" for s in result["sections"]))
 
 
 class ListPageSectionsToolTests(ReadToolsTestCase):
@@ -95,6 +160,14 @@ class ListPageSectionsToolTests(ReadToolsTestCase):
         result = server.execute_list_page_sections(str(self.target))
         self.assertEqual(len(result["page_sections"]), 1)
         self.assertAlmostEqual(result["page_sections"][0]["page_width_in"], 8.5)
+
+    def test_default_single_column_reports_real_width(self):
+        target = Path(self._tmp.name) / "sections.docx"
+        shutil.copyfile(FIXTURES / "sections.docx", target)
+        result = server.execute_list_page_sections(str(target))
+        widths = result["page_sections"][0]["column_widths_in"]
+        self.assertEqual(len(widths), 1)
+        self.assertAlmostEqual(widths[0], 6.5)
 
 
 class ListStylesToolTests(ReadToolsTestCase):

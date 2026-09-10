@@ -637,7 +637,16 @@ def project_part(docx_path: Path, part_name: str = DEFAULT_PART) -> Projection:
             if isinstance(event, DrawingEvent) and event.blip_rid:
                 event.media_part = _resolve_media_part(part_name, rels, event.blip_rid)
 
-    # Build flat text + offset map from RunEvents only.
+    return _finalize_projection(walker, part_name)
+
+
+def _finalize_projection(walker: _PartWalker, part_name: str) -> Projection:
+    """Build the flat text + offset map (from RunEvents only) and wrap
+    *walker*'s accumulated state into a Projection. Shared by project_part
+    (a package part) and project_textbox_scope (a w:txbxContent sub-scope)
+    — the two differ only in WHICH element was walked, not in how the
+    walk's output is assembled.
+    """
     text_parts: list[str] = []
     offset_map: list[tuple[int, int, str, str]] = []
     cursor = 0
@@ -665,13 +674,7 @@ def project_part(docx_path: Path, part_name: str = DEFAULT_PART) -> Projection:
 # ---------------------------------------------------------------------------
 
 
-def iter_textbox_scopes(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dict[str, Any]]:
-    """One entry per ``w:txbxContent`` found in *part_name*'s DrawingML
-    branch (``w:drawing``/``mc:Choice`` only — see module docstring), each
-    projected as an independent sub-scope with its own flat text and
-    ``section_key`` (``textbox-<n>``), never merged into the host part's
-    own offsets.
-    """
+def _read_part_root_or_raise(docx_path: Path, part_name: str) -> Any:
     with zipfile.ZipFile(docx_path) as zf:
         root = read_part_xml(zf, part_name)
         if root is None:
@@ -680,8 +683,18 @@ def iter_textbox_scopes(docx_path: Path, part_name: str = DEFAULT_PART) -> list[
                 f"Part not found in package: {part_name!r}",
                 {"part": part_name},
             )
+        return root
 
-    scopes: list[dict[str, Any]] = []
+
+def _iter_textbox_content_elements(root: Any) -> list[tuple[str, Any]]:
+    """[(section_key, w:txbxContent element), ...] in document order, from
+    *root*'s DrawingML branch only (``w:drawing``/``mc:Choice`` — see
+    module docstring on why the legacy VML ``mc:Fallback`` is never
+    walked). ``section_key`` is ``textbox-<n>``, 1-based in document
+    order — the shared enumeration behind both iter_textbox_scopes (list)
+    and project_textbox_scope (read one).
+    """
+    found: list[tuple[str, Any]] = []
     n = 0
     for drawing in root.iter():
         if _ln(drawing) != "drawing":
@@ -690,17 +703,52 @@ def iter_textbox_scopes(docx_path: Path, part_name: str = DEFAULT_PART) -> list[
             if _ln(txbx_content) != "txbxContent":
                 continue
             n += 1
-            walker = _PartWalker()
-            walker.walk_block_container(txbx_content, [])
-            text_parts = [e.text for e in walker.events if isinstance(e, RunEvent)]
-            scopes.append(
-                {
-                    "section_key": f"textbox-{n}",
-                    "text": "".join(text_parts),
-                    "paragraph_count": len(walker.paragraphs),
-                }
-            )
+            found.append((f"textbox-{n}", txbx_content))
+    return found
+
+
+def iter_textbox_scopes(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dict[str, Any]]:
+    """One entry per ``w:txbxContent`` found in *part_name*'s DrawingML
+    branch, each projected as an independent sub-scope with its own flat
+    text and ``section_key`` (``textbox-<n>``), never merged into the host
+    part's own offsets. Reachable through a tool call via
+    read_document(..., section_key=<one of these>) and listed alongside
+    heading sections by find_sections (see both for how a caller
+    discovers and then addresses one).
+    """
+    root = _read_part_root_or_raise(docx_path, part_name)
+    scopes: list[dict[str, Any]] = []
+    for section_key, txbx_content in _iter_textbox_content_elements(root):
+        walker = _PartWalker()
+        walker.walk_block_container(txbx_content, [])
+        text_parts = [e.text for e in walker.events if isinstance(e, RunEvent)]
+        scopes.append(
+            {
+                "section_key": section_key,
+                "text": "".join(text_parts),
+                "paragraph_count": len(walker.paragraphs),
+            }
+        )
     return scopes
+
+
+def project_textbox_scope(docx_path: Path, part_name: str, section_key: str) -> Projection | None:
+    """The full Projection (text, offset_map, runs, warnings — same shape
+    project_part returns for a whole part) for one text box's own
+    ``w:txbxContent``, addressed by the ``section_key`` iter_textbox_scopes
+    and find_sections both report (``textbox-<n>``). None if *section_key*
+    does not name a text box found in *part_name* — the caller (server.py)
+    turns that into INVALID_INPUT with the actual available keys attached,
+    not a silent empty read.
+    """
+    root = _read_part_root_or_raise(docx_path, part_name)
+    for key, txbx_content in _iter_textbox_content_elements(root):
+        if key != section_key:
+            continue
+        walker = _PartWalker()
+        walker.walk_block_container(txbx_content, [])
+        return _finalize_projection(walker, f"{part_name}#{section_key}")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -898,7 +946,13 @@ def _slugify(text: str) -> str:
 
 
 def find_sections_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dict[str, Any]]:
-    """Heading ranges: a heading paragraph's w:pStyle mapped through
+    """Heading ranges PLUS text-box sub-scopes, both keyed by
+    ``section_key`` — this is the one discovery call a caller uses to find
+    every ``section_key`` read_document(section_key=...) can then address,
+    of either kind (each entry's ``"kind"`` is ``"heading"`` or
+    ``"textbox"``).
+
+    Heading ranges: a heading paragraph's w:pStyle mapped through
     list_styles to an outline level (falling back to the paragraph's own
     direct w:outlineLvl). A section runs from one heading paragraph
     (inclusive) up to, but not including, the NEXT heading paragraph at
@@ -908,6 +962,13 @@ def find_sections_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[d
     section_key = slug(heading text) + "-" + a 1-based ordinal disambiguating
     duplicate headings (two paragraphs both literally "Introduction" get
     "introduction-1" and "introduction-2").
+
+    Text-box sub-scopes: one entry per iter_textbox_scopes' own
+    ``textbox-<n>`` keys (never merged into the heading list's ordinals —
+    a text box's key never collides with a heading slug). heading_text,
+    outline_level, start_para_ref, end_para_ref are None on a textbox
+    entry; paragraph_count is still meaningful (the text box's own
+    paragraph count).
     """
     styles = list_styles_impl(docx_path)
     styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
@@ -948,6 +1009,7 @@ def find_sections_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[d
         sections.append(
             {
                 "section_key": section_key,
+                "kind": "heading",
                 "heading_text": heading_text,
                 "outline_level": level,
                 "start_para_ref": meta.para_ref,
@@ -955,6 +1017,20 @@ def find_sections_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[d
                 "paragraph_count": max(end_idx - start_idx, 1),
             }
         )
+
+    for textbox_scope in iter_textbox_scopes(docx_path, part_name):
+        sections.append(
+            {
+                "section_key": textbox_scope["section_key"],
+                "kind": "textbox",
+                "heading_text": None,
+                "outline_level": None,
+                "start_para_ref": None,
+                "end_para_ref": None,
+                "paragraph_count": textbox_scope["paragraph_count"],
+            }
+        )
+
     return sections
 
 
@@ -1015,28 +1091,29 @@ def list_page_sections_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> l
             margin_right = _dxa_to_in(_attr(pg_mar, "right")) if pg_mar is not None else None
 
             cols_widths: list[float] = []
-            if cols_elem is not None:
-                explicit_cols = [c for c in cols_elem if _ln(c) == "col"]
-                if explicit_cols:
-                    for col in explicit_cols:
-                        w = _dxa_to_in(_attr(col, "w"))
-                        if w is not None:
-                            cols_widths.append(w)
-                else:
-                    num = _attr(cols_elem, "num")
-                    space = _dxa_to_in(_attr(cols_elem, "space"))
-                    if (
-                        num
-                        and num.isdigit()
-                        and page_w is not None
-                        and margin_left is not None
-                        and margin_right is not None
-                    ):
-                        n = int(num)
-                        if n > 0:
-                            usable = page_w - margin_left - margin_right
-                            gap_total = (space or 0.0) * (n - 1)
-                            cols_widths = [round((usable - gap_total) / n, 4)] * n
+            explicit_cols = [c for c in cols_elem if _ln(c) == "col"] if cols_elem is not None else []
+            if explicit_cols:
+                for col in explicit_cols:
+                    w = _dxa_to_in(_attr(col, "w"))
+                    if w is not None:
+                        cols_widths.append(w)
+            else:
+                # No explicit w:col children — the common case. w:cols'
+                # own w:num attribute DEFAULTS TO 1 when absent; it is not
+                # "no column information". Confirmed against a real
+                # Word-authored fixture (sections.docx): Word's default
+                # single-column section emits a bare <w:cols w:space="720"/>
+                # with no w:num at all, not <w:cols w:num="1" .../>. Both
+                # forms, and cols_elem being entirely absent from sectPr,
+                # are treated identically here: one column spanning the
+                # full usable width (page width minus both side margins).
+                num_raw = _attr(cols_elem, "num") if cols_elem is not None else None
+                space = _dxa_to_in(_attr(cols_elem, "space")) if cols_elem is not None else None
+                n = int(num_raw) if num_raw and num_raw.isdigit() else 1
+                if page_w is not None and margin_left is not None and margin_right is not None and n > 0:
+                    usable = page_w - margin_left - margin_right
+                    gap_total = (space or 0.0) * (n - 1)
+                    cols_widths = [round((usable - gap_total) / n, 4)] * n
 
             sections.append(
                 {
@@ -1062,17 +1139,20 @@ def _run_event_to_dict(event: RunEvent) -> dict[str, Any]:
     return {"text": event.text, "rPr": event.rpr, "para_ref": event.para_ref}
 
 
-def read_document_runs(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dict[str, Any]]:
-    """``read_document(format="runs")``: run records ``{text, rPr,
-    para_ref}`` interleaved, in document order, with structural records —
-    ``{"type": "table_start"|"table_end", "table_id"}``,
-    ``{"type": "drawing", blip_rid, media_part, extent_in, para_ref}``
-    (emitted for every ``w:drawing``/``a:blip``), and
+def runs_from_projection(proj: Projection) -> list[dict[str, Any]]:
+    """The ``read_document(format="runs")`` list, built from an
+    already-resolved Projection — shared by read_document_runs (a whole
+    package part) and server.py's textbox-scoped read
+    (project_textbox_scope), so the two never carry independently
+    maintained copies of this record-shape logic. Run records
+    ``{text, rPr, para_ref}`` interleaved, in document order, with
+    structural records — ``{"type": "table_start"|"table_end",
+    "table_id"}``, ``{"type": "drawing", blip_rid, media_part, extent_in,
+    para_ref}`` (emitted for every ``w:drawing``/``a:blip``), and
     ``{"type": "field", instr, result_text}``.
     """
-    projection = project_part(docx_path, part_name)
     out: list[dict[str, Any]] = []
-    for event in projection.events:
+    for event in proj.events:
         if isinstance(event, RunEvent):
             if event.run_ref.endswith("/break"):
                 continue  # internal paragraph-break marker, not a real run
@@ -1094,21 +1174,35 @@ def read_document_runs(docx_path: Path, part_name: str = DEFAULT_PART) -> list[d
     return out
 
 
+def read_document_runs(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dict[str, Any]]:
+    """``read_document(format="runs")`` for a whole package part — see
+    runs_from_projection for the record shapes."""
+    return runs_from_projection(project_part(docx_path, part_name))
+
+
 def read_document_text(docx_path: Path, part_name: str = DEFAULT_PART) -> str:
     return project_part(docx_path, part_name).text
 
 
-def read_document_markdown(docx_path: Path, part_name: str = DEFAULT_PART) -> tuple[str, list[str]]:
-    """A deliberately modest markdown rendering: paragraph text, headings
+def markdown_from_projection(docx_path: Path, proj: Projection) -> tuple[str, list[str]]:
+    """The ``read_document(format="markdown")`` rendering, built from an
+    already-resolved Projection — shared by read_document_markdown (a
+    whole package part) and server.py's textbox-scoped read
+    (project_textbox_scope). *docx_path* is still needed for
+    list_styles_impl (a heading's outline level resolves through the
+    package's styles.xml, not through anything the Projection itself
+    carries).
+
+    A deliberately modest markdown rendering: paragraph text, headings
     (from find_sections' same outline-level resolution) as ``#`` runs,
     **bold**/*italic* run markers, tables/drawings/fields as stable
-    placeholder tokens ([TABLE], [GRAPHIC], [FIELD:instr]) — WP-04's
+    placeholder tokens ([TABLE], [GRAPHIC], [field:instr]) — WP-04's
     markdown -> OOXML direction is the inverse of this and is not built
     here. Returns (markdown_text, warnings).
     """
     styles = list_styles_impl(docx_path)
     styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
-    projection = project_part(docx_path, part_name)
+    projection = proj
 
     lines: list[str] = []
     current_para_ref: str | None = None
@@ -1152,7 +1246,22 @@ def read_document_markdown(docx_path: Path, part_name: str = DEFAULT_PART) -> tu
         elif isinstance(event, DrawingEvent):
             current_parts.append("[GRAPHIC]")
         elif isinstance(event, FieldEvent):
-            current_parts.append(f"[FIELD:{event.instr}]" if event.instr else event.result_text)
+            # A field's RESULT runs already flowed into current_parts as
+            # ordinary RunEvents (field_result=True) before this FieldEvent
+            # fires — at fldChar "end", or at the close of a w:fldSimple —
+            # so appending event.result_text here would double it. Only
+            # when there is NO result at all does this event contribute
+            # anything: a lowercase "[field:<instr>]" placeholder, so a
+            # field with an instr but no resolved result isn't silently
+            # invisible in the rendered markdown.
+            if not event.result_text and event.instr:
+                current_parts.append(f"[field:{event.instr}]")
 
     flush()
     return "\n".join(lines), projection.warnings
+
+
+def read_document_markdown(docx_path: Path, part_name: str = DEFAULT_PART) -> tuple[str, list[str]]:
+    """``read_document(format="markdown")`` for a whole package part — see
+    markdown_from_projection for the rendering rules."""
+    return markdown_from_projection(docx_path, project_part(docx_path, part_name))

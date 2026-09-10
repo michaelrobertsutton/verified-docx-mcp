@@ -22,6 +22,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -204,6 +205,11 @@ class DrawingRecordTests(unittest.TestCase):
 
 
 class TextboxSubScopeTests(unittest.TestCase):
+    """Text-box content is reachable: iter_textbox_scopes / find_sections
+    discover the textbox-<n> section_key, and project_textbox_scope (the
+    function server.py's read_document(section_key=...) calls) actually
+    returns that scope's content — not just dead internal machinery."""
+
     def test_textbox_projected_as_separate_scope(self):
         scopes = projection.iter_textbox_scopes(FIXTURES / "textbox.docx")
         self.assertEqual(len(scopes), 1)
@@ -212,6 +218,37 @@ class TextboxSubScopeTests(unittest.TestCase):
 
     def test_document_with_no_textbox_has_no_scopes(self):
         self.assertEqual(projection.iter_textbox_scopes(FIXTURES / "frag.docx"), [])
+
+    def test_find_sections_lists_textbox_scope(self):
+        sections = projection.find_sections_impl(FIXTURES / "textbox.docx")
+        textbox_entries = [s for s in sections if s["kind"] == "textbox"]
+        self.assertEqual(len(textbox_entries), 1)
+        entry = textbox_entries[0]
+        self.assertEqual(entry["section_key"], "textbox-1")
+        self.assertIsNone(entry["heading_text"])
+        self.assertIsNone(entry["outline_level"])
+        self.assertEqual(entry["paragraph_count"], 1)
+
+    def test_heading_sections_are_tagged_kind_heading(self):
+        sections = projection.find_sections_impl(FIXTURES / "sections.docx")
+        self.assertTrue(all(s["kind"] == "heading" for s in sections))
+
+    def test_project_textbox_scope_returns_full_projection(self):
+        proj = projection.project_textbox_scope(FIXTURES / "textbox.docx", projection.DEFAULT_PART, "textbox-1")
+        self.assertIsNotNone(proj)
+        self.assertEqual(proj.text, "Text inside the text box.")
+        self.assertEqual(len(proj.paragraphs), 1)
+
+    def test_project_textbox_scope_unknown_key_returns_none(self):
+        result = projection.project_textbox_scope(FIXTURES / "textbox.docx", projection.DEFAULT_PART, "textbox-99")
+        self.assertIsNone(result)
+
+    def test_runs_and_markdown_from_a_textbox_projection(self):
+        proj = projection.project_textbox_scope(FIXTURES / "textbox.docx", projection.DEFAULT_PART, "textbox-1")
+        runs = projection.runs_from_projection(proj)
+        self.assertTrue(any(r.get("text") == "Text inside the text box." for r in runs))
+        markdown, _ = projection.markdown_from_projection(FIXTURES / "textbox.docx", proj)
+        self.assertIn("Text inside the text box.", markdown)
 
 
 class ListPartsTests(unittest.TestCase):
@@ -269,6 +306,22 @@ class ListPageSectionsTests(unittest.TestCase):
         self.assertAlmostEqual(section["margin_left_in"], 1.0)
         self.assertAlmostEqual(section["margin_right_in"], 1.0)
 
+    def test_default_single_column_reports_real_width(self):
+        """sections.docx's real <w:cols w:space="720"/> carries no w:num
+        and no explicit w:col children (Word's own default single-column
+        form) — this must report ONE column of page width minus both side
+        margins, not an empty list."""
+        with zipfile.ZipFile(FIXTURES / "sections.docx") as zf:
+            document_xml = zf.read("word/document.xml").decode("utf-8")
+        self.assertIn('<w:cols w:space="720"/>', document_xml)
+        self.assertNotIn("w:num", document_xml)
+
+        sections = projection.list_page_sections_impl(FIXTURES / "sections.docx")
+        self.assertEqual(len(sections), 1)
+        widths = sections[0]["column_widths_in"]
+        self.assertEqual(len(widths), 1)
+        self.assertAlmostEqual(widths[0], 6.5)  # 8.5in page - 1in - 1in margins
+
 
 class ListStylesTests(unittest.TestCase):
     def test_heading_styles_carry_outline_level(self):
@@ -307,6 +360,49 @@ class MarkdownRenderTests(unittest.TestCase):
         self.assertIn("[TABLE]", table_md)
         graphic_md, _ = projection.read_document_markdown(FIXTURES / "textbox.docx")
         self.assertIn("[GRAPHIC]", graphic_md)
+
+    def test_field_result_not_doubled_and_instr_not_leaked(self):
+        """fields.docx has both a complex PAGE field and a simple REF
+        cross-reference field. The result text (already carried into the
+        markdown as ordinary runs) must appear exactly once each, and
+        neither field's instruction code may leak into the rendering —
+        in any casing."""
+        markdown, _ = projection.read_document_markdown(FIXTURES / "fields.docx")
+        self.assertNotIn("[FIELD:", markdown)
+        self.assertNotIn("[field:", markdown)
+        self.assertNotIn("MERGEFORMAT", markdown)
+        self.assertNotIn("REF Target1", markdown)
+        # The result text appears exactly once each — not doubled by both
+        # the ordinary run stream AND a re-appended FieldEvent.
+        self.assertEqual(markdown.count("1 of the document"), 1)
+        self.assertEqual(markdown.count("Target paragraph"), 2)  # heading + resolved ref, not 3
+        # Matches the flat text/read_document(format="text") exactly.
+        self.assertEqual(markdown, projection.read_document_text(FIXTURES / "fields.docx"))
+
+    def test_field_with_no_result_gets_lowercase_placeholder(self):
+        """A field with an instr but a genuinely empty result_text (never
+        produced by a real Word-authored fixture — Word always resolves a
+        field's result before saving) still renders SOMETHING, not
+        silence. Exercises the real markdown_from_projection against a
+        synthetic single-event Projection (the only way to reach this
+        defensive branch at all); docx_path is only needed for a style
+        lookup that this synthetic paragraph's style_id=None makes moot,
+        so any real .docx satisfies it honestly."""
+        meta = projection.ParagraphMeta(para_ref="p0", style_id=None, outline_lvl=None, container_chain=[])
+        leading_run = projection.RunEvent(text="Author: ", rpr={}, para_ref="p0", run_ref="p0/r0")
+        field_event = projection.FieldEvent(instr="AUTHOR", result_text="", para_ref="p0")
+        synthetic = projection.Projection(
+            part="synthetic-for-this-test-only",
+            text="Author: ",
+            offset_map=[(0, 8, "p0", "p0/r0")],
+            events=[leading_run, field_event],
+            paragraphs=[meta],
+            deleted_spans=[],
+            warnings=[],
+        )
+        markdown, warnings = projection.markdown_from_projection(FIXTURES / "frag.docx", synthetic)
+        self.assertEqual(markdown, "Author: [field:AUTHOR]")
+        self.assertEqual(warnings, [])
 
 
 if __name__ == "__main__":

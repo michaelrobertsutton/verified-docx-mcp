@@ -465,7 +465,12 @@ def list_parts(path: str) -> dict[str, Any]:
         _raise_tool_error(exc)
 
 
-def execute_read_document(path: str, format: str = "markdown", part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+def execute_read_document(
+    path: str,
+    format: str = "markdown",
+    part: str = projection.DEFAULT_PART,
+    section_key: str | None = None,
+) -> dict[str, Any]:
     if format not in _VALID_READ_FORMATS:
         raise _make_error(
             ErrorCode.INVALID_INPUT,
@@ -480,9 +485,36 @@ def execute_read_document(path: str, format: str = "markdown", part: str = proje
             "path": str(resolved),
             "part": part,
             "format": format,
+            "section_key": section_key,
             "revision": revision["token"],
             "revision_detail": revision["detail"],
         }
+
+        if section_key is not None:
+            # Only a textbox-<n> sub-scope resolves here (WP-03 scope —
+            # a heading section_key, listed by find_sections alongside
+            # textbox ones, is not yet readable this way; that arrives
+            # with a later WP). None means section_key named no text box
+            # in this part — INVALID_INPUT with the keys that DO exist,
+            # never a silent empty read.
+            scoped = projection.project_textbox_scope(local_path, part, section_key)
+            if scoped is None:
+                available = [s["section_key"] for s in projection.iter_textbox_scopes(local_path, part)]
+                raise _make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"section_key {section_key!r} does not name a text box in part {part!r}.",
+                    {"section_key": section_key, "part": part, "available_textbox_keys": available},
+                )
+            if format == "text":
+                result["text"] = scoped.text
+            elif format == "runs":
+                result["runs"] = projection.runs_from_projection(scoped)
+            else:  # markdown
+                markdown, _ = projection.markdown_from_projection(local_path, scoped)
+                result["markdown"] = markdown
+            result["warnings"] = scoped.warnings
+            return result
+
         if format == "text":
             result["text"] = projection.read_document_text(local_path, part)
             result["warnings"] = projection.project_part(local_path, part).warnings
@@ -500,16 +532,31 @@ def execute_read_document(path: str, format: str = "markdown", part: str = proje
 
 
 @mcp.tool()
-def read_document(path: str, format: str = "markdown", part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+def read_document(
+    path: str,
+    format: str = "markdown",
+    part: str = projection.DEFAULT_PART,
+    section_key: str | None = None,
+) -> dict[str, Any]:
     """Read a .docx part's content as markdown, flat text, or a run-level
     structural list.
 
     part scopes the read to one package part — word/document.xml's body
     (the default) is a completely separate scope from a header, footer,
-    footnotes, or endnotes part; a text box's own w:txbxContent is a
-    further, separate sub-scope never merged into its host part's text
-    (see projection.py's module docstring). Call list_parts first to
-    enumerate the parts actually present in this .docx.
+    footnotes, or endnotes part. Call list_parts first to enumerate the
+    parts actually present in this .docx.
+
+    A text box's own w:txbxContent is a further, separate sub-scope never
+    merged into its host part's text (see projection.py's module
+    docstring) — call find_sections first to get its section_key
+    ("textbox-<n>"), then pass that section_key here to read JUST that
+    text box's content, scoped to it exactly as if it were its own part.
+    Omitting section_key (the default) reads the whole part named by
+    part, in which a text box's own text is absent (by design — it would
+    otherwise be double-counted between the host part and the text box's
+    own scope). section_key currently resolves a text-box scope only; a
+    heading section_key (also listed by find_sections) is not yet
+    readable this way.
 
     format="text" returns the flat projected string (runs concatenated in
     document order; a paragraph break is "\\n"). format="runs" returns, in
@@ -518,28 +565,32 @@ def read_document(path: str, format: str = "markdown", part: str = projection.DE
     {"type":"drawing", blip_rid, media_part, extent_in, para_ref} for every
     w:drawing/a:blip, and {"type":"field", instr, result_text}.
     format="markdown" (default) renders headings/bold/italic and stable
-    placeholder tokens ([TABLE], [GRAPHIC], [FIELD:instr]) for constructs
+    placeholder tokens ([TABLE], [GRAPHIC], [field:instr]) for constructs
     markdown cannot represent — WP-04's inverse (markdown -> OOXML) is not
     implemented here.
 
     A deleted span (w:del/w:delText) and a field's own instruction text
     (w:instrText) are excluded from every format; a field's RESULT text
     (between fldChar "separate" and "end", or all of a w:fldSimple's
-    nested runs) IS included.
+    nested runs) IS included — in format="markdown" it flows in as
+    ordinary rendered text, never duplicated by a "[field:...]" token
+    (that placeholder appears only when a field carries NO result at all).
 
-    Returns path, part, format, revision (the "<doc8>:<cmt8>" token),
-    revision_detail (the full {document_sha256, comments_sha256, size,
-    mtime_ns} tuple), warnings, plus text|runs|markdown per format.
+    Returns path, part, format, section_key (echoed back, None unless
+    passed), revision (the "<doc8>:<cmt8>" token), revision_detail (the
+    full {document_sha256, comments_sha256, size, mtime_ns} tuple),
+    warnings, plus text|runs|markdown per format.
 
     Not gated by DOCX_LOCKED — see list_parts' docstring.
 
     Errors:
-      INVALID_INPUT   - a bad path or an unrecognized format
+      INVALID_INPUT   - a bad path, an unrecognized format, or a
+                         section_key that names no text box in this part
       PART_NOT_FOUND  - part names a package part absent from this .docx
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
-        return execute_read_document(path, format, part)
+        return execute_read_document(path, format, part, section_key)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -556,7 +607,9 @@ def execute_find_sections(path: str, part: str = projection.DEFAULT_PART) -> dic
 
 @mcp.tool()
 def find_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
-    """List heading-delimited section ranges in a .docx part.
+    """List heading-delimited section ranges AND text-box sub-scopes in a
+    .docx part — this is the one call that discovers every section_key
+    read_document(section_key=...) can then address.
 
     DISAMBIGUATION: this is about DOCUMENT SECTIONS (heading ranges, by
     style/outline level) — see list_page_sections for PAGE-LAYOUT sections
@@ -571,8 +624,16 @@ def find_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, A
     headings. Headings inside a table cell are out of scope (not a real
     document section boundary).
 
-    Returns path, part, sections (list of {section_key, heading_text,
-    outline_level, start_para_ref, end_para_ref, paragraph_count}).
+    Every w:txbxContent in the part (see read_document's docstring) is
+    also listed, each as its own entry with kind="textbox" and
+    section_key="textbox-<n>" (heading_text/outline_level/start_para_ref/
+    end_para_ref are None on these entries; paragraph_count is still the
+    text box's own paragraph count). Pass one of these section_keys to
+    read_document to read that text box's content.
+
+    Returns path, part, sections (list of {section_key, kind
+    ("heading"|"textbox"), heading_text, outline_level, start_para_ref,
+    end_para_ref, paragraph_count}).
 
     Not gated by DOCX_LOCKED — see list_parts' docstring.
 
