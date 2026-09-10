@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -70,16 +71,52 @@ from .projection import DEFAULT_PART, R_NS, W_NS
 # EVERY namespace on the root — which breaks a real Word document, because
 # mc:Ignorable (and w:rsid tracking, mc:AlternateContent Requires=, etc.)
 # names PREFIXES literally, not the namespace URIs those prefixes resolve
-# to. Capturing each source part's own (prefix, uri) declarations via
-# iterparse's "start-ns" event and re-registering them (ET.register_namespace
-# is a process-global table) before serializing keeps every original prefix
-# stable across a parse/mutate/serialize round trip.
+# to.
+#
+# Registering a source part's (prefix, uri) pairs via ET.register_namespace
+# (a process-global table) is NECESSARY but NOT SUFFICIENT: it only fixes
+# the prefix ElementTree's serializer chooses for a namespace that some
+# element or attribute in the MODIFIED tree still actually uses. A
+# namespace declared on the source root but referenced only by content this
+# WP's tools removed (a whole w:body replace drops every w:ins/w:del,
+# every w:tbl, every drawing — and their namespaces along with them) is, as
+# far as ElementTree's serializer can tell, simply not present in the tree
+# any more, so it emits NO declaration for it at all, regardless of what is
+# registered. mc:Ignorable then survives on the root naming prefixes with
+# no declaration anywhere in the file — Word refuses to open it. (Found in
+# PR #3 review: reproduced against tracked.docx and sections.docx, 35
+# declarations collapsing to 2-4, and — the second-order hazard the first
+# pass missed — "r" (the relationships namespace every hyperlink/image
+# r:id depends on) is in the lost set too, independent of whether
+# mc:Ignorable happens to name it.)
+#
+# The fix re-emits, on the ROOT element's own opening tag, EVERY namespace
+# declaration the source root carried — not just the ones ElementTree's
+# serializer decides are still "in use" — via _ensure_namespace_declarations
+# below. This is deliberately a post-serialization byte-level patch rather
+# than adding xmlns:* as literal Element attributes before calling
+# ET.tostring: a namespace that IS still in use would then get declared
+# TWICE (once by ElementTree's own automatic declaration, once by our
+# literal attribute), which is a well-formedness error. Patching the
+# ALREADY-SERIALIZED bytes lets us see exactly what ElementTree did and
+# only add what it left out.
 
 
-def _register_source_namespaces(xml_bytes: bytes) -> None:
+def _capture_source_namespaces(xml_bytes: bytes) -> dict[str, str]:
+    """Return {prefix: uri} for every namespace declared on *xml_bytes*'
+    root — regardless of whether anything in a later-mutated tree still
+    uses it — and register each with ElementTree's global prefix table
+    (so a namespace that IS still in use keeps its original prefix
+    spelling rather than an auto-generated one). The returned map is what
+    _ensure_namespace_declarations re-injects for the ones ElementTree's
+    serializer leaves out; see this module's namespace-preservation
+    comment above for why both steps are required.
+    """
     import io
 
+    captured: dict[str, str] = {}
     for _, (prefix, uri) in ET.iterparse(io.BytesIO(xml_bytes), events=("start-ns",)):
+        captured[prefix] = uri
         try:
             ET.register_namespace(prefix, uri)
         except ValueError:
@@ -94,10 +131,62 @@ def _register_source_namespaces(xml_bytes: bytes) -> None:
             # prefix inside an mc:Ignorable-style attribute value (only
             # real Word namespaces like w14/w15/... ever are).
             pass
+    return captured
 
 
-def _serialize_xml(root: Any) -> bytes:
-    return b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + ET.tostring(root, encoding="utf-8")
+_XMLNS_DECL_RE = re.compile(rb'xmlns(?::([A-Za-z_][\w.-]*))?=')
+_ROOT_TAG_NAME_RE = re.compile(rb"<([^\s/>]+)")
+
+
+def _ensure_namespace_declarations(xml_bytes: bytes, original_decls: dict[str, str]) -> bytes:
+    """Re-declare, on the ROOT element's own opening tag, every namespace
+    prefix in *original_decls* that ElementTree's serializer did not
+    already emit — see this module's namespace-preservation comment for
+    why this is necessary in addition to ET.register_namespace.
+
+    The root tag's boundary is found via the first raw b">" byte. That is
+    not a general XML-safe assumption (an attribute value could in
+    principle contain a literal ">"), but it holds for every root element
+    this function is ever called on (w:document, w:numbering,
+    Relationships, Types): none of their own attribute values — namespace
+    URIs, mc:Ignorable's token list, a style id — contain one.
+    """
+    if not original_decls:
+        return xml_bytes
+    end = xml_bytes.find(b">")
+    if end == -1:
+        return xml_bytes
+    open_tag = xml_bytes[: end + 1]
+
+    declared: set[bytes] = set()
+    for m in _XMLNS_DECL_RE.finditer(open_tag):
+        declared.add(m.group(1) or b"")
+
+    additions = bytearray()
+    for prefix, uri in original_decls.items():
+        key = prefix.encode("utf-8")
+        if key in declared:
+            continue
+        declared.add(key)
+        escaped_uri = uri.replace("&", "&amp;").replace('"', "&quot;")
+        if prefix:
+            additions += f' xmlns:{prefix}="{escaped_uri}"'.encode()
+        else:
+            additions += f' xmlns="{escaped_uri}"'.encode()
+
+    if not additions:
+        return xml_bytes
+
+    tag_name_match = _ROOT_TAG_NAME_RE.match(xml_bytes)
+    insert_at = tag_name_match.end() if tag_name_match else 1
+    return xml_bytes[:insert_at] + bytes(additions) + xml_bytes[insert_at:]
+
+
+def _serialize_xml(root: Any, original_decls: dict[str, str] | None = None) -> bytes:
+    body = ET.tostring(root, encoding="utf-8")
+    if original_decls:
+        body = _ensure_namespace_declarations(body, original_decls)
+    return b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + body
 
 
 # ---------------------------------------------------------------------------
@@ -106,12 +195,37 @@ def _serialize_xml(root: Any) -> bytes:
 
 _RELATIONSHIP_ATTR_LOCALS = ("id", "embed")
 
+# markup-compatibility namespace: mc:Ignorable lists PREFIXES (not URIs) of
+# extension namespaces a non-supporting consumer may ignore. PR #3 review
+# found this was the visible symptom of the namespace-declaration bug
+# above — a part could pass every check opc_valid had before this rule and
+# still be a file Word refuses to open, because mc:Ignorable survived
+# naming prefixes nothing declared any more.
+_MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_MC_IGNORABLE_ATTR = f"{{{_MC_NS}}}Ignorable"
+
+
+def _declared_prefixes(xml_bytes: bytes) -> set[str]:
+    """Every namespace prefix actually declared somewhere in *xml_bytes*
+    (via ET.iterparse's "start-ns" event) — the empty string for a bare
+    default ``xmlns="..."``. This is independent of _capture_source_namespaces
+    above: that function's caller wants the (prefix, uri) map to re-inject;
+    this one is opc_valid's own read-only check of what ended up on disk,
+    over the bytes actually written, not the pre-write source."""
+    import io
+
+    return {prefix for _, (prefix, _uri) in ET.iterparse(io.BytesIO(xml_bytes), events=("start-ns",))}
+
 
 def opc_valid(docx_path: Path) -> tuple[bool, list[str]]:
     """Structural OPC validity, per the WP-04 acceptance contract: every
     XML/.rels part well-formed, every r:id/r:embed resolves against its
-    part's own .rels, and [Content_Types].xml covers every part present
-    (a Default by extension, or an Override by part name)."""
+    part's own .rels, [Content_Types].xml covers every part present (a
+    Default by extension, or an Override by part name), and every prefix
+    named in a part's own mc:Ignorable is actually declared somewhere in
+    that same part (PR #3 review: the namespace-declaration bug that made
+    Word refuse a written file passed every earlier rule here, because
+    none of them checked namespace-declaration consistency at all)."""
     problems: list[str] = []
     try:
         with zipfile.ZipFile(docx_path) as zf:
@@ -121,14 +235,29 @@ def opc_valid(docx_path: Path) -> tuple[bool, list[str]]:
             names = set(zf.namelist())
 
             parsed: dict[str, Any] = {}
+            raw_bytes: dict[str, bytes] = {}
             for name in sorted(names):
                 if name.endswith((".xml", ".rels")):
+                    data = zf.read(name)
+                    raw_bytes[name] = data
                     try:
-                        parsed[name] = ET.fromstring(zf.read(name))
+                        parsed[name] = ET.fromstring(data)
                     except ET.ParseError as exc:
                         problems.append(f"{name}: not well-formed XML: {exc}")
             if problems:
                 return False, problems
+
+            for name, root in parsed.items():
+                ignorable = root.get(_MC_IGNORABLE_ATTR)
+                if ignorable:
+                    tokens = ignorable.split()
+                    declared = _declared_prefixes(raw_bytes[name])
+                    missing_prefixes = [t for t in tokens if t not in declared]
+                    if missing_prefixes:
+                        problems.append(
+                            f"{name}: mc:Ignorable names undeclared prefix(es) {missing_prefixes} "
+                            f"(declared: {sorted(declared)})"
+                        )
 
             for name, root in parsed.items():
                 if not name.endswith(".xml") or name == "[Content_Types].xml":
@@ -370,6 +499,41 @@ def _check_hazards_or_raise(hazards: dict[str, Any], force: bool) -> list[str]:
     return hazards["comment_ids"] if force else []
 
 
+def _strip_comment_anchors_by_id(elements: list[Any], ids: set[str]) -> None:
+    """Remove every w:commentRangeStart/End/commentReference whose id is
+    in *ids*, wherever it occurs inside *elements* (searched recursively —
+    a comment anchor can sit nested inside a table cell, not just directly
+    under a paragraph).
+
+    PR #3 review, should-fix #2 ("half-anchor pairs"): when
+    replace_range_markdown removes a comment anchor from inside the
+    target range under force=True, that same comment's OTHER half (the
+    matching commentRangeStart/End, or the commentReference) can live
+    OUTSIDE the range — a comment whose span crosses the section
+    boundary. Reporting the id in orphaned_comment_ids is not enough on
+    its own if the other half is left behind: that half would then be an
+    unpaired anchor in the surviving document, which is exactly what this
+    removes. Called on the SURVIVING elements (never on the ones already
+    being replaced) with the ids already known to be orphaned; a no-op
+    when a given id's anchors were already fully inside the removed range
+    (nothing in the surviving elements will match)."""
+    if not ids:
+        return
+    for root_el in elements:
+        _strip_comment_anchors_recursive(root_el, ids)
+
+
+def _strip_comment_anchors_recursive(parent: Any, ids: set[str]) -> None:
+    for child in list(parent):
+        tag = projection._ln(child)
+        if tag in _COMMENT_ANCHOR_TAGS:
+            cid = projection._attr(child, "id")
+            if cid in ids:
+                parent.remove(child)
+                continue
+        _strip_comment_anchors_recursive(child, ids)
+
+
 # ---------------------------------------------------------------------------
 # Body/section access helpers
 # ---------------------------------------------------------------------------
@@ -478,8 +642,8 @@ def _build_overrides(
 ) -> dict[str, bytes]:
     overrides: dict[str, bytes] = {}
 
-    _register_source_namespaces(document_xml_bytes)
-    overrides[DEFAULT_PART] = _serialize_xml(document_root)
+    document_decls = _capture_source_namespaces(document_xml_bytes)
+    overrides[DEFAULT_PART] = _serialize_xml(document_root, document_decls)
 
     with zipfile.ZipFile(resolved) as zf:
         names = set(zf.namelist())
@@ -489,8 +653,9 @@ def _build_overrides(
 
     numbering_created = False
     if ctx.new_abstract_nums or ctx.new_nums:
+        numbering_decls: dict[str, str] = {}
         if numbering_bytes is not None:
-            _register_source_namespaces(numbering_bytes)
+            numbering_decls = _capture_source_namespaces(numbering_bytes)
             numbering_root = ET.fromstring(numbering_bytes)
         else:
             numbering_created = True
@@ -508,11 +673,12 @@ def _build_overrides(
             numbering_root.insert(first_num_idx + offset, el)
         for el in ctx.new_nums:
             numbering_root.append(el)
-        overrides["word/numbering.xml"] = _serialize_xml(numbering_root)
+        overrides["word/numbering.xml"] = _serialize_xml(numbering_root, numbering_decls)
 
     if ctx.new_relationships or numbering_created:
+        rels_decls: dict[str, str] = {}
         if rels_bytes is not None:
-            _register_source_namespaces(rels_bytes)
+            rels_decls = _capture_source_namespaces(rels_bytes)
             rels_root = ET.fromstring(rels_bytes)
         else:
             rels_root = ET.Element("Relationships", {"xmlns": "http://schemas.openxmlformats.org/package/2006/relationships"})
@@ -520,10 +686,10 @@ def _build_overrides(
             ET.SubElement(rels_root, "Relationship", {"Id": rid, "Type": rel_type, "Target": target, "TargetMode": "External"})
         if numbering_created:
             ET.SubElement(rels_root, "Relationship", {"Id": f"rId{_max_rid_in(rels_root) + 1}", "Type": _NUMBERING_REL_TYPE, "Target": "numbering.xml"})
-        overrides[projection._rels_path_for(DEFAULT_PART)] = _serialize_xml(rels_root)
+        overrides[projection._rels_path_for(DEFAULT_PART)] = _serialize_xml(rels_root, rels_decls)
 
     if numbering_created:
-        _register_source_namespaces(content_types_bytes)
+        content_types_decls = _capture_source_namespaces(content_types_bytes)
         ct_root = ET.fromstring(content_types_bytes)
         already_covered = any(
             child.get("PartName") == "/word/numbering.xml"
@@ -532,7 +698,7 @@ def _build_overrides(
         )
         if not already_covered:
             ET.SubElement(ct_root, "Override", {"PartName": "/word/numbering.xml", "ContentType": _NUMBERING_CONTENT_TYPE})
-        overrides["[Content_Types].xml"] = _serialize_xml(ct_root)
+        overrides["[Content_Types].xml"] = _serialize_xml(ct_root, content_types_decls)
 
     return overrides
 
@@ -554,7 +720,11 @@ def _max_rid_in(rels_root: Any) -> int:
 def _load_document(resolved: Path) -> tuple[Any, bytes]:
     with zipfile.ZipFile(resolved) as zf:
         raw = zf.read(DEFAULT_PART)
-    _register_source_namespaces(raw)
+    # Registers prefixes now so any NEW element built against this parse
+    # (W_NS/R_NS) picks up the source's own prefix spelling; the returned
+    # map itself is recomputed (redundantly, but cheaply) by
+    # _build_overrides from the same bytes when it actually serializes.
+    _capture_source_namespaces(raw)
     return ET.fromstring(raw), raw
 
 
@@ -680,6 +850,31 @@ def execute_replace_range_markdown(
     path: str, section_key: str, markdown: str, *, revision_before: str | None = None, force: bool = False
 ) -> dict[str, Any]:
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    # find_sections (WP-03's PR #2 fix) now lists text-box sub-scopes
+    # alongside heading sections, both keyed by section_key, so a caller
+    # could hand this tool a "textbox-<n>" key straight from that listing.
+    # locate_section_range below only ever recomputes HEADING positions
+    # over body_children — it does not walk into w:txbxContent — so a
+    # genuine textbox-<n> key would almost always miss and raise
+    # SECTION_NOT_FOUND on its own. But a heading whose own text slugifies
+    # to "textbox-<n>" (e.g. a heading literally titled "Textbox") would
+    # collide with that reserved form, and locate_section_range has no way
+    # to tell the two apart. Rather than depend on that near-miss, refuse
+    # explicitly: replacing a text box's content through a section-RANGE
+    # write is not what this tool means (a text box is not part of the
+    # body's top-level flow read_document(format=markdown) or
+    # find_sections' heading ranges address) — read_document(section_key=
+    # ...) is the (read-only, for now) tool that scopes to a text box.
+    textbox_keys = {t["section_key"] for t in projection.iter_textbox_scopes(resolved, DEFAULT_PART)}
+    if section_key in textbox_keys:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"section_key {section_key!r} names a text box, not a heading-delimited body "
+            "section. replace_range_markdown only rewrites body ranges found by "
+            "find_sections' heading scan; a text box's content is out of scope for this "
+            "tool (there is no write path for it yet).",
+            {"section_key": section_key, "available_textbox_keys": sorted(textbox_keys)},
+        )
     pre_revision = _guard_before_write(resolved, revision_before)
 
     document_root, raw_xml = _load_document(resolved)
@@ -698,6 +893,15 @@ def execute_replace_range_markdown(
 
     hazards = _scan_range_hazards(target_elements)
     orphaned_comment_ids = _check_hazards_or_raise(hazards, force)
+    # PR #3 review, should-fix #2: a comment whose span CROSSES the section
+    # boundary has one half inside target_elements (already accounted for
+    # in orphaned_comment_ids and about to be removed below) and the other
+    # half in the surviving document — left alone, that would be an
+    # unpaired commentRangeStart/End/commentReference. Strip both halves
+    # of every orphaned id from the surviving elements too; a no-op for
+    # any id that was already fully inside the removed range.
+    surviving_elements = body_children[:start] + body_children[end:]
+    _strip_comment_anchors_by_id(surviving_elements, set(orphaned_comment_ids))
 
     ctx = markdown_to_ooxml.StyleContext.build(resolved)
     new_elements = markdown_to_ooxml.render_blocks(markdown, ctx)

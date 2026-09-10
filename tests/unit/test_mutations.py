@@ -22,12 +22,14 @@ from __future__ import annotations
 import glob
 import hashlib
 import os
+import re
 import shutil
 import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from typing import Any
 from xml.etree import ElementTree as ET
 
 REPO = Path(__file__).resolve().parents[2]
@@ -280,6 +282,31 @@ class ReplaceRangeMarkdownTests(_TempFixtureCase):
         self.assertEqual(cm.exception.envelope.error_code, ErrorCode.SECTION_NOT_FOUND)
 
 
+class ReplaceRangeMarkdownTextboxKeyTests(_TempFixtureCase):
+    """find_sections (PR #2) lists text-box sub-scopes alongside heading
+    sections, both keyed by section_key. A textbox-<n> key must never
+    silently fall through to a body-range write — this tool has no write
+    path for text-box content, so it must refuse explicitly rather than
+    let locate_section_range's heading-only scan near-miss its way to an
+    ambiguous result."""
+
+    fixture_name = "textbox.docx"
+
+    def test_textbox_section_key_is_refused_not_silently_written(self):
+        sections = projection.find_sections_impl(self.target)
+        self.assertEqual([s["section_key"] for s in sections], ["textbox-1"])
+
+        before_markdown, _ = projection.read_document_markdown(self.target)
+        with self.assertRaises(VerifyError) as cm:
+            mutations.execute_replace_range_markdown(str(self.target), "textbox-1", "Replacement.\n")
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        self.assertIn("text box", cm.exception.envelope.message)
+
+        # Refused before any write: the document is untouched.
+        after_markdown, _ = projection.read_document_markdown(self.target)
+        self.assertEqual(before_markdown, after_markdown)
+
+
 # ---------------------------------------------------------------------------
 # append_markdown
 # ---------------------------------------------------------------------------
@@ -315,7 +342,7 @@ class MissingNumberingPartTests(_TempFixtureCase):
         del items["word/numbering.xml"]
 
         rels_bytes = items[projection._rels_path_for(projection.DEFAULT_PART)]
-        mutations._register_source_namespaces(rels_bytes)
+        mutations._capture_source_namespaces(rels_bytes)
         rels_root = ET.fromstring(rels_bytes)
         for rel in list(rels_root):
             if rel.get("Target") == "numbering.xml":
@@ -323,7 +350,7 @@ class MissingNumberingPartTests(_TempFixtureCase):
         items[projection._rels_path_for(projection.DEFAULT_PART)] = ET.tostring(rels_root, encoding="utf-8")
 
         ct_bytes = items["[Content_Types].xml"]
-        mutations._register_source_namespaces(ct_bytes)
+        mutations._capture_source_namespaces(ct_bytes)
         ct_root = ET.fromstring(ct_bytes)
         for child in list(ct_root):
             if child.get("PartName") == "/word/numbering.xml":
@@ -355,6 +382,326 @@ class MissingNumberingPartTests(_TempFixtureCase):
 
         valid, problems = mutations.opc_valid(self.target)
         self.assertTrue(valid, problems)
+
+
+# ---------------------------------------------------------------------------
+# PR #3 review, BLOCKING fix: namespace declarations must survive a write.
+#
+# Word 16 refused a written file: mc:Ignorable survived on the root naming
+# prefixes (w14, w15, w16se, ...) that ElementTree's serializer no longer
+# declared anywhere, because nothing in the WRITTEN tree happened to still
+# use those namespaces. Reproduced here against the same two real,
+# Word-authored fixtures the review used (tracked.docx, sections.docx),
+# through the real tools, with explicit before/after declaration counts —
+# plus a dedicated opc_valid test proving the new rule actually rejects a
+# deliberately broken file (a check that cannot fail is not a check).
+# ---------------------------------------------------------------------------
+
+_MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+
+def _root_namespace_decl_count(xml_bytes: bytes) -> int:
+    # Skip the "<?xml ...?>" declaration first — it contains its own ">"
+    # (the one closing "?>"), which would otherwise be mistaken for the
+    # end of the ROOT element's opening tag.
+    after_prolog = xml_bytes.split(b"?>", 1)[-1] if xml_bytes.startswith(b"<?xml") else xml_bytes
+    end = after_prolog.find(b">")
+    open_tag = after_prolog[: end + 1] if end != -1 else after_prolog
+    return len(re.findall(rb'xmlns(?::[A-Za-z0-9]+)?="[^"]*"', open_tag))
+
+
+def _mc_ignorable_undeclared(xml_bytes: bytes) -> list[str]:
+    root = ET.fromstring(xml_bytes)
+    ignorable = root.get(f"{{{_MC_NS}}}Ignorable")
+    if not ignorable:
+        return []
+    declared = mutations._declared_prefixes(xml_bytes)
+    return [tok for tok in ignorable.split() if tok not in declared]
+
+
+class NamespaceDeclarationPreservationTests(_TempFixtureCase):
+    fixture_name = "revision/tracked.docx"
+
+    def _read_document_xml(self) -> bytes:
+        with zipfile.ZipFile(self.target) as zf:
+            return zf.read(projection.DEFAULT_PART)
+
+    def test_replace_body_markdown_keeps_every_mc_ignorable_prefix_declared(self):
+        before_bytes = self._read_document_xml()
+        before_count = _root_namespace_decl_count(before_bytes)
+        self.assertGreater(before_count, 20, "sanity: the real fixture's root should carry many xmlns decls")
+        self.assertEqual(_mc_ignorable_undeclared(before_bytes), [])
+
+        mutations.execute_replace_body_markdown(str(self.target), "Replacement text.\n", force=True)
+
+        after_bytes = self._read_document_xml()
+        after_count = _root_namespace_decl_count(after_bytes)
+        undeclared = _mc_ignorable_undeclared(after_bytes)
+        self.assertEqual(
+            undeclared, [], f"mc:Ignorable names undeclared prefixes after the write: {undeclared} "
+            f"(decl count {before_count} -> {after_count})"
+        )
+        # opc_valid itself must now catch this class of bug (the second half
+        # of this fix, per the review: the missing CHECK, not just the fix).
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
+
+
+class NamespaceDeclarationPreservationSectionsTests(_TempFixtureCase):
+    fixture_name = "sections.docx"
+
+    def _read_document_xml(self) -> bytes:
+        with zipfile.ZipFile(self.target) as zf:
+            return zf.read(projection.DEFAULT_PART)
+
+    def test_replace_range_markdown_keeps_every_mc_ignorable_prefix_declared(self):
+        before_bytes = self._read_document_xml()
+        before_count = _root_namespace_decl_count(before_bytes)
+        self.assertGreater(before_count, 20)
+        self.assertEqual(_mc_ignorable_undeclared(before_bytes), [])
+
+        mutations.execute_replace_range_markdown(
+            str(self.target), "background-1", "## Background\n\nUpdated.\n"
+        )
+
+        after_bytes = self._read_document_xml()
+        after_count = _root_namespace_decl_count(after_bytes)
+        undeclared = _mc_ignorable_undeclared(after_bytes)
+        self.assertEqual(
+            undeclared, [], f"mc:Ignorable names undeclared prefixes after the write: {undeclared} "
+            f"(decl count {before_count} -> {after_count})"
+        )
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
+
+    def test_append_markdown_keeps_every_mc_ignorable_prefix_declared(self):
+        before_bytes = self._read_document_xml()
+        before_count = _root_namespace_decl_count(before_bytes)
+
+        mutations.execute_append_markdown(str(self.target), "## Appendix\n\nMore.\n")
+
+        after_bytes = self._read_document_xml()
+        after_count = _root_namespace_decl_count(after_bytes)
+        undeclared = _mc_ignorable_undeclared(after_bytes)
+        self.assertEqual(
+            undeclared, [], f"mc:Ignorable names undeclared prefixes after the write: {undeclared} "
+            f"(decl count {before_count} -> {after_count})"
+        )
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
+
+    def test_the_r_namespace_specifically_survives_a_write(self):
+        # The review's second-order finding: "r" (relationships) was in
+        # the lost set independent of mc:Ignorable — every hyperlink/image
+        # r:id depends on it being declared, whether or not anything in
+        # THIS particular write happens to use one.
+        before_bytes = self._read_document_xml()
+        before_decls = mutations._declared_prefixes(before_bytes)
+        self.assertIn("r", before_decls)
+
+        mutations.execute_replace_range_markdown(
+            str(self.target), "background-1", "## Background\n\nUpdated, no hyperlink here.\n"
+        )
+
+        after_bytes = self._read_document_xml()
+        after_decls = mutations._declared_prefixes(after_bytes)
+        self.assertIn("r", after_decls, "the relationships namespace prefix must survive even when unused by this write")
+
+
+class OpcValidCatchesUndeclaredMcIgnorablePrefixesTests(_TempFixtureCase):
+    fixture_name = "revision/tracked.docx"
+
+    def test_opc_valid_fails_on_a_deliberately_broken_namespace_declaration(self):
+        with zipfile.ZipFile(self.target) as zf:
+            raw = zf.read(projection.DEFAULT_PART)
+        # Reproduce the ORIGINAL bug shape directly: serialize via bare
+        # ET.tostring with NO namespace preservation, so mc:Ignorable
+        # survives while most of its prefixes lose their declaration —
+        # exactly what _ensure_namespace_declarations now prevents in the
+        # real write path. This proves opc_valid's new rule actually
+        # fires on a file it did not check before this PR (a check that
+        # cannot fail is not a check).
+        root = ET.fromstring(raw)
+        broken = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + ET.tostring(root, encoding="utf-8")
+        undeclared_in_broken = _mc_ignorable_undeclared(broken)
+        self.assertTrue(undeclared_in_broken, "the naive re-serialization must reproduce the original bug")
+
+        with zipfile.ZipFile(self.target) as zin:
+            items = {i.filename: zin.read(i) for i in zin.infolist()}
+        items[projection.DEFAULT_PART] = broken
+        broken_path = self.target.with_name("broken.docx")
+        with zipfile.ZipFile(broken_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for name, data in items.items():
+                zout.writestr(name, data)
+
+        valid, problems = mutations.opc_valid(broken_path)
+        self.assertFalse(valid)
+        self.assertTrue(
+            any("mc:Ignorable" in p and "undeclared" in p for p in problems), problems
+        )
+
+    def test_opc_valid_passes_when_declarations_are_intact(self):
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
+
+
+# ---------------------------------------------------------------------------
+# PR #3 review, should-fix #2: half-anchor pairs when a comment's span
+# crosses the target range's boundary.
+# ---------------------------------------------------------------------------
+
+
+class HalfAnchorCrossingTests(unittest.TestCase):
+    """No real Word-authored fixture combines a heading-delimited section
+    with a comment whose span crosses it (deliberately not fabricated —
+    same reasoning as tests/fixtures/README.md's "not produced this WP"
+    note: hand-assembling that combination would be exactly the
+    hand-built-OOXML anti-pattern this repo's fixtures avoid). Instead,
+    this takes the REAL commentRangeStart/commentRangeEnd/commentReference
+    elements from commented.docx — genuine Word output, moved intact, not
+    retyped — and splits them across two separate paragraph elements to
+    reproduce the topology a real multi-paragraph comment span crossing a
+    section boundary would have. Only the paragraph ARRANGEMENT is a test
+    construction; every anchor element's own shape is real."""
+
+    def _load_real_comment_children(self) -> list[Any]:
+        with zipfile.ZipFile(FIXTURES / "revision" / "commented.docx") as zf:
+            raw = zf.read(projection.DEFAULT_PART)
+        doc_root = ET.fromstring(raw)
+        body = next(c for c in doc_root if projection._ln(c) == "body")
+        paragraph = next(c for c in body if projection._ln(c) == "p")
+        children = list(paragraph)
+        # Sanity: the known real shape (commentRangeStart, "This" run,
+        # commentRangeEnd, the commentReference run, the trailing text
+        # run) — five children. If commented.docx's own shape ever
+        # changes this fixture-derived test should fail loudly here
+        # rather than silently testing something else.
+        self.assertEqual(len(children), 5)
+        return children
+
+    def _build_two_paragraphs(self) -> tuple[Any, Any]:
+        children = self._load_real_comment_children()
+        w_p = f"{{{projection.W_NS}}}p"
+        target_para = ET.Element(w_p)  # simulates: inside the section being replaced
+        surviving_para = ET.Element(w_p)  # simulates: a paragraph elsewhere, left alone
+        for child in children[:2]:  # commentRangeStart, "This"
+            target_para.append(child)
+        for child in children[2:]:  # commentRangeEnd, the commentReference run, trailing text
+            surviving_para.append(child)
+        return target_para, surviving_para
+
+    def test_hazard_scan_finds_the_id_from_only_the_start_half(self):
+        target_para, _surviving_para = self._build_two_paragraphs()
+        hazards = mutations._scan_range_hazards([target_para])
+        self.assertEqual(hazards["comment_ids"], ["0"])
+
+    def test_strip_removes_the_other_half_from_the_surviving_range(self):
+        target_para, surviving_para = self._build_two_paragraphs()
+        hazards = mutations._scan_range_hazards([target_para])
+
+        before_tags = {
+            projection._ln(n) for n in surviving_para.iter() if projection._ln(n) in mutations._COMMENT_ANCHOR_TAGS
+        }
+        self.assertEqual(before_tags, {"commentRangeEnd", "commentReference"})
+
+        mutations._strip_comment_anchors_by_id([surviving_para], set(hazards["comment_ids"]))
+
+        after_tags = {
+            projection._ln(n) for n in surviving_para.iter() if projection._ln(n) in mutations._COMMENT_ANCHOR_TAGS
+        }
+        self.assertEqual(after_tags, set(), "no unpaired anchor may remain in the surviving range")
+        # The trailing text run (not part of the comment anchor at all)
+        # must survive untouched.
+        self.assertTrue(any((t.text or "").strip() for t in surviving_para.iter(f"{{{projection.W_NS}}}t")))
+
+    def test_strip_is_a_no_op_when_the_id_does_not_appear(self):
+        _target_para, surviving_para = self._build_two_paragraphs()
+        before = ET.tostring(surviving_para)
+        mutations._strip_comment_anchors_by_id([surviving_para], {"does-not-exist"})
+        after = ET.tostring(surviving_para)
+        self.assertEqual(before, after)
+
+
+class HalfAnchorCrossingIntegrationTests(_TempFixtureCase):
+    """Same fix, exercised end-to-end through execute_replace_range_markdown
+    against a real, headed document (sections.docx) with the real comment
+    anchors from commented.docx spliced in — one half inside the
+    "background-1" section, the other half in "Next Steps" (outside it) —
+    so the section boundary genuinely crosses the comment's span."""
+
+    fixture_name = "sections.docx"
+
+    def setUp(self):
+        super().setUp()
+        with zipfile.ZipFile(FIXTURES / "revision" / "commented.docx") as zf:
+            comment_raw = zf.read(projection.DEFAULT_PART)
+        comment_root = ET.fromstring(comment_raw)
+        comment_body = next(c for c in comment_root if projection._ln(c) == "body")
+        comment_paragraph = next(c for c in comment_body if projection._ln(c) == "p")
+        comment_children = list(comment_paragraph)
+        self.assertEqual(len(comment_children), 5)
+
+        w_p = f"{{{projection.W_NS}}}p"
+        start_para = ET.Element(w_p)
+        for child in comment_children[:2]:
+            start_para.append(child)
+        end_para = ET.Element(w_p)
+        for child in comment_children[2:]:
+            end_para.append(child)
+
+        with zipfile.ZipFile(self.target) as zf:
+            names = {i.filename: i for i in zf.infolist()}
+            doc_bytes = zf.read(projection.DEFAULT_PART)
+            other_parts = {n: zf.read(n) for n in names if n != projection.DEFAULT_PART}
+        doc_decls = mutations._capture_source_namespaces(doc_bytes)
+        doc_root = ET.fromstring(doc_bytes)
+        body = next(c for c in doc_root if projection._ln(c) == "body")
+        body_children = list(body)
+        # sections.docx: [Overview(h1), Overview text, Background(h1... h2),
+        # Background text, Next Steps(h1), Next steps text, sectPr].
+        background_text_idx = next(
+            i for i, c in enumerate(body_children)
+            if projection._ln(c) == "p" and "Background text." in "".join(t.text or "" for t in c.iter(f"{{{projection.W_NS}}}t"))
+        )
+        next_steps_text_idx = next(
+            i for i, c in enumerate(body_children)
+            if projection._ln(c) == "p" and "Next steps text." in "".join(t.text or "" for t in c.iter(f"{{{projection.W_NS}}}t"))
+        )
+        # start_para goes INSIDE the background-1 range (right after its
+        # own text paragraph); end_para goes AFTER "Next steps text.",
+        # i.e. outside background-1's range entirely.
+        body.insert(background_text_idx + 1, start_para)
+        body_children = list(body)  # indices shifted by the insert above
+        next_steps_text_idx = next(
+            i for i, c in enumerate(body_children)
+            if projection._ln(c) == "p" and "Next steps text." in "".join(t.text or "" for t in c.iter(f"{{{projection.W_NS}}}t"))
+        )
+        body.insert(next_steps_text_idx + 1, end_para)
+
+        new_doc_bytes = mutations._serialize_xml(doc_root, doc_decls)
+        with zipfile.ZipFile(self.target, "w", zipfile.ZIP_DEFLATED) as zout:
+            for name, data in names.items():
+                zout.writestr(data, new_doc_bytes if name == projection.DEFAULT_PART else other_parts[name])
+
+    def test_force_removes_both_halves_and_reports_the_id(self):
+        sections_before = projection.find_sections_impl(self.target)
+        self.assertIn("background-1", {s["section_key"] for s in sections_before})
+
+        with self.assertRaises(VerifyError) as cm:
+            mutations.execute_replace_range_markdown(str(self.target), "background-1", "## Background\n\nUpdated.\n")
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.COMMENT_ANCHORS_IN_RANGE)
+
+        evidence = mutations.execute_replace_range_markdown(
+            str(self.target), "background-1", "## Background\n\nUpdated.\n", force=True
+        )
+        self.assertEqual(evidence["orphaned_comment_ids"], ["0"])
+
+        with zipfile.ZipFile(self.target) as zf:
+            final_doc = ET.fromstring(zf.read(projection.DEFAULT_PART))
+        remaining = [
+            projection._ln(n) for n in final_doc.iter() if projection._ln(n) in mutations._COMMENT_ANCHOR_TAGS
+        ]
+        self.assertEqual(remaining, [], "no unpaired (or paired) anchor may remain for the removed comment")
 
 
 if __name__ == "__main__":

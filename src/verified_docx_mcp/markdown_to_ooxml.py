@@ -239,6 +239,7 @@ class RunSpec:
     bold: bool
     italic: bool
     link: str | None
+    hard_break: bool = False
 
 
 def _inline_runs(inline_tok: Any | None, ctx: StyleContext) -> list[RunSpec]:
@@ -268,8 +269,18 @@ def _inline_runs(inline_tok: Any | None, ctx: StyleContext) -> list[RunSpec]:
         elif t == "link_close":
             if link_stack:
                 link_stack.pop()
-        elif t in ("softbreak", "hardbreak"):
-            runs.append(RunSpec(text="\n", bold=bold > 0, italic=italic > 0, link=current_link))
+        elif t == "hardbreak":
+            # An explicit hard line break (trailing two spaces, or a
+            # backslash, before the newline) -> a real w:br.
+            runs.append(RunSpec(text="", bold=bold > 0, italic=italic > 0, link=current_link, hard_break=True))
+        elif t == "softbreak":
+            # A bare single newline inside a paragraph is a CommonMark/GFM
+            # softbreak, NOT a hard line break: it renders as a single
+            # space (PR #3 review, should-fix #3 — emitting w:br here
+            # turned every wrapped markdown line into a hard break in
+            # Word, so a re-read gave back different text than the
+            # author wrote).
+            runs.append(RunSpec(text=" ", bold=bold > 0, italic=italic > 0, link=current_link))
         # images, raw html_inline, entities beyond markdown-it's own decoding:
         # silently dropped — out of the supported subset (module docstring).
     return runs
@@ -285,7 +296,7 @@ def _append_run_element(parent: Any, run: RunSpec, ctx: StyleContext, *, is_hype
             ET.SubElement(rpr, _w("b"))
         if run.italic:
             ET.SubElement(rpr, _w("i"))
-    if run.text == "\n":
+    if run.hard_break:
         ET.SubElement(r, _w("br"))
         return
     t = ET.SubElement(r, _w("t"))

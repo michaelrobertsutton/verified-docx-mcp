@@ -138,6 +138,28 @@ class RenderBlocksTests(unittest.TestCase):
         self.assertIn("blockquote_flattened", self.ctx.warnings)
         self.assertIn("code_block_as_plain_paragraph", self.ctx.warnings)
 
+    def test_softbreak_becomes_a_space_not_a_hard_line_break(self):
+        # PR #3 review, should-fix #3: a bare single newline inside a
+        # markdown paragraph is a CommonMark/GFM softbreak and renders as
+        # a space, not a hard line break — emitting w:br here turned every
+        # wrapped markdown line into a hard break in Word.
+        md = "Line one\nline two continues the same paragraph.\n"
+        elements = markdown_to_ooxml.render_blocks(md, self.ctx)
+        self.assertEqual(len(elements), 1)
+        p = elements[0]
+        self.assertIsNone(p.find(f"{_w('r')}/{_w('br')}"), "a softbreak must not become w:br")
+        joined = "".join(t.text or "" for t in p.iter(_w("t")))
+        self.assertEqual(joined, "Line one line two continues the same paragraph.")
+
+    def test_hardbreak_still_becomes_a_real_line_break(self):
+        # An explicit hard break (trailing two spaces before the newline)
+        # is unaffected by the softbreak fix above.
+        md = "Line one  \nLine two (hard break above).\n"
+        elements = markdown_to_ooxml.render_blocks(md, self.ctx)
+        p = elements[0]
+        brs = p.findall(f"{_w('r')}/{_w('br')}")
+        self.assertEqual(len(brs), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
