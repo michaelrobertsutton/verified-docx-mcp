@@ -19,12 +19,13 @@
 # runtime error codes (the authoritative source for their names and
 # meaning) plus the render-path codes documented in the vendored
 # render.py's own module docstring. Not every member is raised by a WP-02
-# tool yet: SYNC_IN_FLIGHT and CONFLICT_COPY_DETECTED are write-path
-# codes that first get raised by the write guard landing in WP-04/WP-10;
-# they are declared here now so the enum is the single, stable
-# vocabulary every later WP extends rather than redefines. Extend this
-# enum in the same commit that first raises a new member — same
-# discipline as MUTATING_TOOLS in middleware.py.
+# tool yet: CONFLICT_COPY_DETECTED is a write-path code that first gets
+# raised by the lock guard landing in WP-10 (layers 3-4); it is declared
+# here now so the enum is the single, stable vocabulary every later WP
+# extends rather than redefines. SYNC_IN_FLIGHT was reserved the same way
+# in WP-02 and is now actually raised, by WP-04's write guard (see
+# mutations.py). Extend this enum in the same commit that first raises a
+# new member — same discipline as MUTATING_TOOLS in middleware.py.
 
 from __future__ import annotations
 
@@ -55,6 +56,19 @@ class ErrorCode(Enum):
     WORD_SANDBOX_UNAVAILABLE = "WORD_SANDBOX_UNAVAILABLE"
     RENDER_FAILED = "RENDER_FAILED"
     RENDER_ENGINE_UNAVAILABLE = "RENDER_ENGINE_UNAVAILABLE"
+
+    # Markdown mutations (mutations.py, markdown_to_ooxml.py; WP-04)
+    REVISION_CONFLICT = "REVISION_CONFLICT"  # a passed revision_before no longer matches the file on disk
+    COMMENT_ANCHORS_IN_RANGE = "COMMENT_ANCHORS_IN_RANGE"  # w:commentRangeStart/End/commentReference inside the target range; needs force=true
+    TRACKED_CHANGES_PRESENT = "TRACKED_CHANGES_PRESENT"  # w:ins/w:del inside the target range; needs force=true
+    STYLE_NOT_FOUND = "STYLE_NOT_FOUND"  # a markdown heading level has no matching style in list_styles
+    SECTION_NOT_FOUND = "SECTION_NOT_FOUND"  # replace_range_markdown's section_key does not match find_sections' output.
+    # Not named in the issue #28 plan text for WP-04 (which lists STYLE_NOT_FOUND
+    # but not this one); added because replace_range_markdown needs SOME code
+    # for "the section_key does not exist" and reusing STYLE_NOT_FOUND for that
+    # would conflate two different failures. Flagged in this WP's PR notes.
+    OPC_INVALID = "OPC_INVALID"  # the rendered .docx failed OPC validation before the atomic write (original untouched)
+    VERIFICATION_FAILED = "VERIFICATION_FAILED"  # the post-write re-read/re-project did not confirm the write; restored from .jsbak
 
 
 # Which codes signal a transient condition worth a single retry by the

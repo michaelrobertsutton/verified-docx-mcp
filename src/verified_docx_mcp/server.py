@@ -18,9 +18,12 @@ Entry point dispatch
 Tools registered here (WP-02): ``export_pdf``, ``lock_status``. WP-03 adds
 five more READ tools — ``list_parts``, ``read_document``, ``find_sections``,
 ``list_page_sections``, ``list_styles`` — built on ``projection.py``. None
-of the seven is a mutating tool (export_pdf writes a PDF, never the source
-.docx; every other tool here only reads), so MUTATING_TOOLS (middleware.py)
-stays empty until WP-04's markdown writers land.
+of those seven is a mutating tool (export_pdf writes a PDF, never the
+source .docx; every other one only reads). WP-04 adds the first three
+mutating tools — ``replace_body_markdown``, ``replace_range_markdown``,
+``append_markdown`` (built on ``mutations.py`` + ``markdown_to_ooxml.py``)
+— each gated by a write guard (lock/sync/revision) that runs BEFORE any
+temp file is written, and each is in MUTATING_TOOLS (middleware.py).
 
 Every WP-03 read tool honors core/document-backend-protocol.md §4's "reads
 never refuse" rule via ``_read_local_copy`` below: when Word's owner file is
@@ -43,7 +46,7 @@ from typing import Any, NoReturn
 
 from fastmcp import FastMCP
 
-from . import paths, projection
+from . import mutations, paths, projection
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .middleware import EvidenceEnforcementMiddleware
@@ -510,8 +513,10 @@ def execute_read_document(
             elif format == "runs":
                 result["runs"] = projection.runs_from_projection(scoped)
             else:  # markdown
-                markdown, _ = projection.markdown_from_projection(local_path, scoped)
+                markdown, _, lossy_elements = projection.markdown_from_projection(local_path, scoped)
                 result["markdown"] = markdown
+                if lossy_elements:
+                    result["lossy_elements"] = lossy_elements
             result["warnings"] = scoped.warnings
             return result
 
@@ -522,9 +527,14 @@ def execute_read_document(
             result["runs"] = projection.read_document_runs(local_path, part)
             result["warnings"] = projection.project_part(local_path, part).warnings
         else:  # markdown
-            markdown, warnings = projection.read_document_markdown(local_path, part)
+            markdown, warnings, lossy_elements = projection.read_document_markdown(local_path, part)
             result["markdown"] = markdown
             result["warnings"] = warnings
+            # Same response shape as GoogleDocs-MCP's read_document (issue
+            # #28 WP-03b-a): a lossy_elements key, present only when the
+            # rendering actually lost something (a merged/nested table).
+            if lossy_elements:
+                result["lossy_elements"] = lossy_elements
         return result
     finally:
         if is_temp:
@@ -564,10 +574,15 @@ def read_document(
     structural records: {"type":"table_start"|"table_end", table_id},
     {"type":"drawing", blip_rid, media_part, extent_in, para_ref} for every
     w:drawing/a:blip, and {"type":"field", instr, result_text}.
-    format="markdown" (default) renders headings/bold/italic and stable
-    placeholder tokens ([TABLE], [GRAPHIC], [field:instr]) for constructs
-    markdown cannot represent — WP-04's inverse (markdown -> OOXML) is not
-    implemented here.
+    format="markdown" (default) renders headings, bold/italic, bulleted/
+    numbered lists (nested by indent), and GFM pipe tables — matching
+    GoogleDocs-MCP's markdown.py conventions exactly (issue #28 WP-03b-a)
+    — plus stable placeholder tokens ("[image:rId]", "[field:instr]") for
+    a drawing / a field with no result. WP-04's inverse (markdown ->
+    OOXML) is not implemented here. A merged table cell (w:gridSpan/
+    w:vMerge) or a nested w:tbl has no pipe-table representation and is
+    reported in lossy_elements ({"kind": "table_merge"|"nested_table",
+    "table_id"}) instead of silently reproduced as an ordinary grid cell.
 
     A deleted span (w:del/w:delText) and a field's own instruction text
     (w:instrText) are excluded from every format; a field's RESULT text
@@ -579,7 +594,8 @@ def read_document(
     Returns path, part, format, section_key (echoed back, None unless
     passed), revision (the "<doc8>:<cmt8>" token), revision_detail (the
     full {document_sha256, comments_sha256, size, mtime_ns} tuple),
-    warnings, plus text|runs|markdown per format.
+    warnings, lossy_elements (format="markdown" only, present only when
+    non-empty), plus text|runs|markdown per format.
 
     Not gated by DOCX_LOCKED — see list_parts' docstring.
 
@@ -727,6 +743,163 @@ def list_styles(path: str) -> dict[str, Any]:
     """
     try:
         return execute_list_styles(path)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Markdown mutations (WP-04): replace_body_markdown, replace_range_markdown,
+# append_markdown. All three are in middleware.MUTATING_TOOLS (added in the
+# same commit) and are gated by mutations._guard_before_write BEFORE any
+# temp file is written — DOCX_LOCKED / SYNC_IN_FLIGHT / REVISION_CONFLICT —
+# unlike every WP-03 read tool above, which never refuses for a lock
+# (core/document-backend-protocol.md §4: "reads never refuse"; the
+# reads-vs-writes asymmetry is the point of this WP, not a regression of
+# it — see mutations.py's module docstring).
+#
+# Guard layers 3-4 (Microsoft Graph checkout/checkin, or a stronger local
+# layer 0 per core/document-backend-protocol.md §9) are NOT implemented
+# yet — they land in WP-10. Until then, the residual risk is exactly what
+# §9 states: a write that lands while another client has the file open is
+# only detected after the fact (the next call's lock_status / conflict
+# sweep), never prevented outright. WP-10 is also where a
+# CONFLICT_COPY_DETECTED sweep runs after a successful write; this WP does
+# not add one (layers 3-4, not 1-2).
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def replace_body_markdown(
+    path: str, markdown: str, revision_before: str | None = None, force: bool = False
+) -> dict[str, Any]:
+    """Replace an entire document body's content with markdown, atomically.
+
+    Rung 4 (last resort) of core/document-backend-protocol.md's backend-
+    neutral edit ladder — the whole-document rewrite. Prefer
+    replace_range_markdown when find_sections can locate the target
+    section.
+
+    Markdown is rendered against THIS document's own styles: headings
+    resolve through list_styles (STYLE_NOT_FOUND if a level has no
+    matching style — never a hardcoded "Heading2"), tables pick up the
+    document's own table style if one exists, and every bulleted/ordered
+    list gets a freshly allocated numbering definition. Supports
+    bold/italic/***both***, links, lists (nested), and pipe tables; a
+    thematic break, blockquote, or code fence degrades gracefully (see
+    markdown_to_ooxml's module docstring) rather than failing the call.
+
+    Guard order (this WP's whole point — Codex defect: an earlier draft
+    let writes ship before the guard): lock_status runs FIRST, before any
+    temp file exists. An owner file present -> DOCX_LOCKED (report the
+    owner, no retry). Not sync-quiesced -> one bounded wait (<=10s total)
+    then SYNC_IN_FLIGHT. A revision_before that no longer matches the
+    file's current revision -> REVISION_CONFLICT. If the CURRENT body
+    contains comment anchors or tracked changes, the call refuses
+    (COMMENT_ANCHORS_IN_RANGE / TRACKED_CHANGES_PRESENT) unless
+    force=True; with force, they are removed and their comment ids are
+    reported as orphaned_comment_ids (nothing disappears silently ahead
+    of WP-08's comment tools).
+
+    The write itself is atomic: a temp file is built and OPC-validated
+    (XML well-formed, every r:id resolves, [Content_Types].xml covers
+    every part) BEFORE the original is ever touched (a failure here ->
+    OPC_INVALID, original untouched); the original is then swapped in via
+    os.replace() with a .jsbak kept until a post-write re-read/re-project
+    confirms the change (a failure here restores from .jsbak and raises
+    VERIFICATION_FAILED).
+
+    Residual risk (layers 3-4 land in WP-10, not here): a write that
+    lands while another client has the file open is not prevented by
+    anything above, only detected after the fact by the next call.
+
+    Returns the eight evidence keys: applied, match_count (always 1),
+    rung (4), before, after, revision_before, revision_after,
+    audit_logged; plus orphaned_comment_ids when force removed anchors.
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard (see above)
+      REVISION_CONFLICT                 - revision_before is stale
+      COMMENT_ANCHORS_IN_RANGE          - comment anchors present, no force
+      TRACKED_CHANGES_PRESENT           - w:ins/w:del present, no force
+      STYLE_NOT_FOUND                   - a heading level has no style
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return mutations.execute_replace_body_markdown(path, markdown, revision_before=revision_before, force=force)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def replace_range_markdown(
+    path: str, section_key: str, markdown: str, revision_before: str | None = None, force: bool = False
+) -> dict[str, Any]:
+    """Replace one heading-delimited section (by section_key, from
+    find_sections) with markdown, atomically.
+
+    Rung 3 of core/document-backend-protocol.md's edit ladder: use this
+    when find_sections can locate the target section, ahead of
+    replace_body_markdown's whole-document rewrite. section_key is keyed
+    by heading slug rather than a revision-stamped range — STALE_RANGE is
+    a gdoc-only hazard (the protocol doc's footnote on this rung).
+
+    Same guard, hazard scan, atomic-write, and markdown rendering rules as
+    replace_body_markdown — see that tool's docstring for the full guard
+    order, hazard-refusal/force semantics, and atomic-write mechanics; the
+    only difference is the target range (one section's top-level body
+    children, from its own heading up to but not including the next
+    top-level heading of any level, or the end of the document) instead
+    of the whole body.
+
+    Returns the eight evidence keys (rung is always 3 here), plus
+    orphaned_comment_ids when force removed anchors.
+
+    Errors: as replace_body_markdown, plus:
+      SECTION_NOT_FOUND - section_key does not match any current section
+                           (call find_sections to see the current ones;
+                           not named in the issue #28 plan text for this
+                           WP, added because replace_range_markdown needs
+                           some code for this case)
+    """
+    try:
+        return mutations.execute_replace_range_markdown(
+            path, section_key, markdown, revision_before=revision_before, force=force
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def append_markdown(path: str, markdown: str, revision_before: str | None = None, force: bool = False) -> dict[str, Any]:
+    """Append markdown to the end of a document body (before its trailing
+    w:sectPr, if any), atomically.
+
+    Nothing existing is removed, so there is no comment-anchor/tracked-
+    change hazard to scan and force has no effect here — it is accepted
+    only so a caller's generic retry code can pass it uniformly across
+    all three mutating tools. Same guard order (lock_status first, then
+    revision_before) and atomic-write mechanics as replace_body_markdown
+    — see that tool's docstring.
+
+    Returns the eight evidence keys: before/after are the whole body's
+    markdown immediately before/after the append; rung is reported as 4
+    (append_markdown is not itself a rung on
+    core/document-backend-protocol.md's 4-rung table, which only names
+    replace_body_markdown at rung 4 — grouped with it here as the other
+    whole-document-scoped write).
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
+      REVISION_CONFLICT                 - revision_before is stale
+      STYLE_NOT_FOUND                   - a heading level has no style
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return mutations.execute_append_markdown(path, markdown, revision_before=revision_before, force=force)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

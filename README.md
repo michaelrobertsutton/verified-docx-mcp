@@ -10,9 +10,9 @@ instead of a Google Doc.
 
 ## Status
 
-Early scaffold (issue #28 WP-02 of the build plan). Reading and writing a
-`.docx` package needs no Word installation at all — this server manipulates
-OOXML directly. Word is required only for `export_pdf` (rendering a page-
+Issue #28 WP-04 of the build plan. Reading and writing a `.docx` package
+needs no Word installation at all — this server manipulates OOXML
+directly. Word is required only for `export_pdf` (rendering a page-
 accurate PDF), and that additionally needs a macOS Automation grant for the
 app hosting this server's process.
 
@@ -22,9 +22,22 @@ Tools implemented so far:
   Microsoft Word automation and report its page count.
 - **`lock_status(path)`** — report Word/LibreOffice owner-file presence
   and sync-quiesce state, as data only. Never refuses.
+- **`list_parts(path)`**, **`read_document(path, format, part)`**,
+  **`find_sections(path, part)`**, **`list_page_sections(path, part)`**,
+  **`list_styles(path)`** — read a `.docx` part as markdown/text/runs,
+  and enumerate its heading-delimited sections, page-layout sections, and
+  styles. Never refuse on a locked file (a validated snapshot is read
+  instead).
+- **`replace_body_markdown(path, markdown, ...)`**,
+  **`replace_range_markdown(path, section_key, markdown, ...)`**,
+  **`append_markdown(path, markdown, ...)`** — the first mutating tools:
+  markdown -> OOXML writes, guarded by a lock/sync/revision check that
+  runs before any temp file is written, an atomic write with OPC
+  validation and a rollback on a failed post-write verification, and a
+  full before/after/revision evidence envelope on every call.
 
-More tools (document reads, markdown-based writes, tables, comments,
-tracked changes) land in later work packages of the same plan.
+More tools (tables/comments/tracked-change read-write, stronger lock
+guard layers) land in later work packages of the same plan.
 
 ## Install
 

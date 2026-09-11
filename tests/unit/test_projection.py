@@ -247,7 +247,7 @@ class TextboxSubScopeTests(unittest.TestCase):
         proj = projection.project_textbox_scope(FIXTURES / "textbox.docx", projection.DEFAULT_PART, "textbox-1")
         runs = projection.runs_from_projection(proj)
         self.assertTrue(any(r.get("text") == "Text inside the text box." for r in runs))
-        markdown, _ = projection.markdown_from_projection(FIXTURES / "textbox.docx", proj)
+        markdown, _, _ = projection.markdown_from_projection(FIXTURES / "textbox.docx", proj)
         self.assertIn("Text inside the text box.", markdown)
 
 
@@ -346,20 +346,64 @@ class PartNotFoundTests(unittest.TestCase):
 
 class MarkdownRenderTests(unittest.TestCase):
     def test_headings_rendered_as_markdown_headers(self):
-        markdown, warnings = projection.read_document_markdown(FIXTURES / "sections.docx")
+        markdown, warnings, lossy = projection.read_document_markdown(FIXTURES / "sections.docx")
         self.assertIn("# Overview", markdown)
         self.assertIn("## Background", markdown)
         self.assertEqual(warnings, [])
+        self.assertEqual(lossy, [])
 
     def test_bold_run_rendered(self):
-        markdown, _ = projection.read_document_markdown(FIXTURES / "frag.docx")
+        markdown, _, _ = projection.read_document_markdown(FIXTURES / "frag.docx")
         self.assertIn("**brown**", markdown)
 
-    def test_table_and_graphic_placeholders(self):
-        table_md, _ = projection.read_document_markdown(FIXTURES / "tables.docx")
-        self.assertIn("[TABLE]", table_md)
-        graphic_md, _ = projection.read_document_markdown(FIXTURES / "textbox.docx")
-        self.assertIn("[GRAPHIC]", graphic_md)
+    def test_table_renders_as_gfm_pipe_table_not_a_placeholder(self):
+        """issue #28 WP-03b-a: tables.docx's 2x2 table (R1C1..R2C2, no
+        merges) renders as a real pipe table — first row header, "---"
+        separator, no [TABLE] placeholder anywhere — matching
+        GoogleDocs-MCP markdown.py's _table/_pipe_row conventions. No
+        merge/nesting in this fixture, so lossy_elements is empty."""
+        table_md, _, lossy = projection.read_document_markdown(FIXTURES / "tables.docx")
+        self.assertNotIn("[TABLE]", table_md)
+        self.assertIn("| R1C1 | R1C2 |", table_md)
+        self.assertIn("| --- | --- |", table_md)
+        self.assertIn("| R2C1 | R2C2 |", table_md)
+        self.assertIn("Before the table.", table_md)
+        self.assertIn("After the table.", table_md)
+        self.assertEqual(lossy, [])
+
+    def test_merged_and_nested_table_reports_lossy_elements(self):
+        """tables-merged.docx (derived from the Word-authored tables.docx —
+        see fixtures/README.md) exercises the three OOXML table constructs
+        a GFM pipe table cannot represent: a w:vMerge pair (a "restart"
+        cell keeps its real text, its "continue" cell renders empty), a
+        w:gridSpan cell (its text once, then an empty filler cell), and a
+        nested w:tbl (flattened to inline text). Each is recorded in
+        lossy_elements rather than silently reproduced as an ordinary grid
+        cell."""
+        md, _, lossy = projection.read_document_markdown(FIXTURES / "tables-merged.docx")
+        self.assertNotIn("[TABLE]", md)
+        self.assertIn("| H1 | H2 |", md)
+        self.assertIn("| Merged down | B2 |", md)
+        # vMerge continuation cell: empty, not a copy of "Merged down".
+        self.assertIn("|  | B3 Nested A Nested B |", md)
+        # Nested table flattened inline, not a placeholder or silent drop.
+        self.assertIn("Nested A", md)
+        self.assertIn("Nested B", md)
+        # gridSpan=2 cell: its text once, filled out with an empty cell.
+        self.assertIn("| Spanned row |  |", md)
+
+        kinds = [entry["kind"] for entry in lossy]
+        self.assertEqual(kinds.count("table_merge"), 3)  # vMerge restart + continue + gridSpan
+        self.assertEqual(kinds.count("nested_table"), 1)
+        self.assertTrue(all(entry["table_id"] == 1 for entry in lossy))
+
+    def test_drawing_renders_as_image_placeholder_not_graphic(self):
+        """textbox.docx's shape (not a picture) carries no blip_rid, so
+        the placeholder falls back to "[image:unknown]" — still an
+        [image:...] token, never the old [GRAPHIC]."""
+        graphic_md, _, _ = projection.read_document_markdown(FIXTURES / "textbox.docx")
+        self.assertNotIn("[GRAPHIC]", graphic_md)
+        self.assertIn("[image:", graphic_md)
 
     def test_field_result_not_doubled_and_instr_not_leaked(self):
         """fields.docx has both a complex PAGE field and a simple REF
@@ -367,7 +411,7 @@ class MarkdownRenderTests(unittest.TestCase):
         markdown as ordinary runs) must appear exactly once each, and
         neither field's instruction code may leak into the rendering —
         in any casing."""
-        markdown, _ = projection.read_document_markdown(FIXTURES / "fields.docx")
+        markdown, _, lossy = projection.read_document_markdown(FIXTURES / "fields.docx")
         self.assertNotIn("[FIELD:", markdown)
         self.assertNotIn("[field:", markdown)
         self.assertNotIn("MERGEFORMAT", markdown)
@@ -376,8 +420,13 @@ class MarkdownRenderTests(unittest.TestCase):
         # the ordinary run stream AND a re-appended FieldEvent.
         self.assertEqual(markdown.count("1 of the document"), 1)
         self.assertEqual(markdown.count("Target paragraph"), 2)  # heading + resolved ref, not 3
-        # Matches the flat text/read_document(format="text") exactly.
-        self.assertEqual(markdown, projection.read_document_text(FIXTURES / "fields.docx"))
+        # Same paragraph text as read_document(format="text") modulo the
+        # blank-line block separation WP-03b-a added to match
+        # GoogleDocs-MCP's tight-list/loose-block convention (fields.docx
+        # has no lists/tables, so only that separator differs).
+        flat_text = projection.read_document_text(FIXTURES / "fields.docx")
+        self.assertEqual(markdown.replace("\n\n", "\n"), flat_text)
+        self.assertEqual(lossy, [])
 
     def test_field_with_no_result_gets_lowercase_placeholder(self):
         """A field with an instr but a genuinely empty result_text (never
@@ -400,9 +449,10 @@ class MarkdownRenderTests(unittest.TestCase):
             deleted_spans=[],
             warnings=[],
         )
-        markdown, warnings = projection.markdown_from_projection(FIXTURES / "frag.docx", synthetic)
+        markdown, warnings, lossy = projection.markdown_from_projection(FIXTURES / "frag.docx", synthetic)
         self.assertEqual(markdown, "Author: [field:AUTHOR]")
         self.assertEqual(warnings, [])
+        self.assertEqual(lossy, [])
 
 
 if __name__ == "__main__":

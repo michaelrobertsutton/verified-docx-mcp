@@ -34,12 +34,19 @@ from fastmcp.tools.base import ToolResult
 # §6: "every new docx mutating tool is added to this middleware's
 # MUTATING_TOOLS set in the same commit that adds the tool").
 #
-# Empty as of WP-02: export_pdf writes a local PDF file only and never
+# Empty through WP-03: export_pdf writes a local PDF file only and never
 # modifies the .docx (mirrors the Google server's own docstring note that
-# export_pdf is the one non-mutating exception); lock_status is read-only
-# data. The first entries arrive with WP-04's replace_body_markdown,
-# replace_range_markdown, and append_markdown.
-MUTATING_TOOLS: frozenset[str] = frozenset()
+# export_pdf is the one non-mutating exception); lock_status and every
+# WP-03 read tool are read-only data. WP-04 adds the first three mutating
+# tools below, added in the same commit that adds each tool
+# (core/document-backend-protocol.md §6).
+MUTATING_TOOLS: frozenset[str] = frozenset(
+    {
+        "replace_body_markdown",
+        "replace_range_markdown",
+        "append_markdown",
+    }
+)
 
 _EVIDENCE_KEYS = frozenset({"applied", "error_code"})
 
