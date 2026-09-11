@@ -10,7 +10,7 @@ instead of a Google Doc.
 
 ## Status
 
-Issue #28 of the build plan, through WP-11a. Reading and writing a `.docx`
+Issue #28 of the build plan, through WP-14. Reading and writing a `.docx`
 package needs no Word installation at all — this server manipulates
 OOXML directly. Word is required only for `export_pdf` (rendering a
 page-accurate PDF), and that additionally needs a macOS Automation grant
@@ -78,8 +78,31 @@ Tools implemented so far:
   tool's own docstring for the docx-specific reasons why, including a
   trailing newline on the file side alone surfacing as a spurious
   one-line difference).
+- **`list_tables(path, part)`**, **`get_table(path, table_id, part)`** —
+  enumerate every `w:tbl` (including one nested inside a cell, which gets
+  its own `table_id`) and report one table's full row/cell detail,
+  including `w:gridSpan`/`w:vMerge` per cell. Never refuse on a locked
+  file.
+- **`replace_table_row(path, table_id, row_index, cells, ...)`** —
+  replace one row's cells wholesale, one markdown string per cell.
+  Refuses (`MERGED_OR_NESTED_TABLE`) for the WHOLE table the moment any
+  cell in it is merged (`w:gridSpan`/`w:vMerge`) or a `w:tbl` is nested
+  inside a cell, mirroring GoogleDocs-MCP's own merged-cell refusal.
+- **`replace_cell_markdown(path, table_id, row_index, cell_index,
+  markdown, ...)`** — replace one cell's content, leaving its own
+  `w:tcPr` byte-identical — the only write path safe on a merged cell,
+  and the intended path for an Appendix-A style band-and-border table.
+  Supports multi-level bulleted/numbered markdown inside the cell, one
+  `numId`/`abstractNum` tree shared across nesting levels via increasing
+  `w:ilvl`, the same machinery `replace_body_markdown`/`append_markdown`
+  already use.
+- **`insert_table(path, rows, style_id, ...)`** — append a new table at
+  the end of the body, one markdown string per cell. `style_id` is
+  REQUIRED and must name an existing `w:type="table"` style in the
+  document; column widths split evenly across the text-column width
+  `list_page_sections` reports.
 
-More tools (tables, images) land in later work packages of the same plan.
+More tools (images) land in a later work package of the same plan.
 
 ## Interoperability
 

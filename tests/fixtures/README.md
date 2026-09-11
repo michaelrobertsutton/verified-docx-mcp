@@ -55,6 +55,24 @@ existing fixtures; unchanged here.
 |---|---|---|
 | `tables-merged.docx` | Three OOXML table constructs a GFM pipe table cannot represent, each a genuine lossy_elements case: a `w:vMerge` pair (a "restart" cell's real text, a "continue" cell with none), a `w:gridSpan="2"` cell, and a nested `w:tbl` inside a cell. | Derived from the Word-authored `tables.docx` via `xml.etree.ElementTree` (same technique as `word/empty-shell.docx` above — original namespace prefixes preserved, every other part byte-for-byte unchanged): `word/document.xml`'s one `w:tbl` was replaced with a hand-built one exercising `w:vMerge`/`w:gridSpan`/nested `w:tbl`. Not Word-authored itself and does not need to be — these three constructs are standard, unambiguous OOXML markup (not a Word-output nuance this repo could get wrong by guessing), and this environment has no way to drive Word into producing merged/nested table cells via AppleScript the way the other fixtures above were made. |
 
+**Regenerated for issue #28 WP-14** (same body content, byte-for-byte —
+verified by diffing `word/document.xml`'s `<w:body>` before/after): the
+original file (built before any tool in this repo ever WROTE to a
+merged-cell table) captured only the 3 namespace prefixes ElementTree's
+serializer judged "in use" (`mc`/`w`/`w14`) on `word/document.xml`'s root,
+not the full ~34-prefix set `tables.docx`'s own root declares — the exact
+namespace-declaration bug this module's own `mutations.py` docstring
+describes at length (a namespace `mc:Ignorable` still NAMES but nothing
+declares). Never caught before because nothing had ever run `opc_valid`
+against this fixture (only read tools used it) until WP-14's mutating
+tools (`replace_table_row`/`replace_cell_markdown`) did. Rebuilt with the
+same hand-built `w:tbl` content, this time serialized through
+`mutations._capture_source_namespaces`/`_serialize_xml` (the real
+namespace-preservation fix) against `tables.docx`'s full source
+declarations, so it round-trips through a real write correctly. Confirmed
+`opc_valid(tests/fixtures/tables-merged.docx) == (True, [])`, which it was
+not before.
+
 **Not produced this WP, and named rather than substituted:** a fixture
 combining a heading-delimited section (for `replace_range_markdown`) WITH
 a real comment anchor inside that section was not made — synthesizing one

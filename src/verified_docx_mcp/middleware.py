@@ -56,6 +56,10 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         # issue #28 WP-09:
         "reply_to_comment",
         "resolve_comment",
+        # issue #28 WP-14 (list_tables/get_table are read-only, not listed here):
+        "replace_table_row",
+        "replace_cell_markdown",
+        "insert_table",
     }
 )
 

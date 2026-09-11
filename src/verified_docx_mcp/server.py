@@ -47,7 +47,7 @@ from typing import Any, NoReturn
 
 from fastmcp import FastMCP
 
-from . import comments, mutations, paths, projection, text_edit, tracked_changes
+from . import comments, mutations, paths, projection, tables, text_edit, tracked_changes
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .middleware import EvidenceEnforcementMiddleware
@@ -1418,6 +1418,219 @@ def resolve_comment(path: str, comment_id: str) -> dict[str, Any]:
     """
     try:
         return comments.execute_resolve_comment(path, comment_id)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tables (issue #28 WP-14): list_tables, get_table (read-only), and
+# replace_table_row / replace_cell_markdown / insert_table (mutating, in
+# MUTATING_TOOLS). table_id/row_index/cell_index are 1-based and match
+# read_document(format="runs")'s own container_chain addressing.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_tables(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+    """Enumerate every w:tbl in a .docx part, including tables nested
+    inside a cell (each gets its own table_id, in document order).
+
+    Returns path, part, tables (list of {table_id, row_count, col_count,
+    has_merged_cells, has_nested_table, nested_in_table_id}). table_id is
+    1-based, document order, the same numbering read_document(format=
+    "runs")'s table_start/table_end records and container_chain use.
+
+    Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
+    Word's owner file is present (core/document-backend-protocol.md §4).
+
+    Errors:
+      INVALID_INPUT  - path does not exist or is outside the allowed roots
+      PART_NOT_FOUND - part names a package part absent from this .docx
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return tables.execute_list_tables(path, part)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def get_table(path: str, table_id: int, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+    """Full row/cell detail for one table, addressed by the table_id
+    list_tables reports.
+
+    Returns path, part, table_id, row_count, col_count, has_merged_cells,
+    has_nested_table, rows (list of list of {row_index, cell_index,
+    grid_span, v_merge, text}). grid_span is w:tcPr/w:gridSpan (1 when
+    absent); v_merge is "none"/"restart"/"continue" from w:tcPr/w:vMerge
+    (a continuation cell's own text is always ""). text is the same
+    per-cell markdown rendering read_document(format="markdown") uses for
+    a pipe-table cell (a nested w:tbl inside a cell flattens to inline
+    text, same as there).
+
+    Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
+    Word's owner file is present.
+
+    Errors:
+      INVALID_INPUT   - path does not exist or is outside the allowed roots
+      PART_NOT_FOUND  - part names a package part absent from this .docx
+      TABLE_NOT_FOUND - table_id does not match any table (call list_tables)
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return tables.execute_get_table(path, table_id, part)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def replace_table_row(
+    path: str,
+    table_id: int,
+    row_index: int,
+    cells: list[str],
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    """Replace one table row's cell content wholesale, one markdown string
+    per cell (cells must have exactly as many entries as the row has
+    cells).
+
+    Refuses -- for the WHOLE table, not just this row -- the moment
+    table_id names a table containing a merged cell (w:gridSpan != 1 or a
+    w:vMerge) or a nested w:tbl anywhere in it, mirroring
+    GoogleDocs-MCP's own replace_table_row refusal on a merged cell.
+    replace_cell_markdown is the escape hatch for that case: a cell-scoped
+    write that never touches w:tcPr.
+
+    Same guard (lock/sync/revision, before any temp file), comment-anchor/
+    tracked-change hazard scan (force=True to proceed; COMMENT_ANCHORS_IN_RANGE
+    / TRACKED_CHANGES_PRESENT otherwise), atomic write with OPC validation
+    and a .jsbak rollback, and audit log as every other mutating tool.
+
+    track_changes=True wraps the row's OLD cell content in w:del and the
+    NEW content in w:ins (per cell), under the configured author, rather
+    than rewriting directly.
+
+    Returns the eight evidence keys (before/after are the row's cells
+    tab-joined), plus (track_changes=True only) revision_ids/track_changes,
+    and conflict_copy_detected (+ conflict_copies/sibling_files_changed
+    when non-empty).
+
+    Errors:
+      INVALID_INPUT          - a bad path, or cells' length != the row's own cell count
+      DOCX_LOCKED, SYNC_IN_FLIGHT - the write guard
+      REVISION_CONFLICT      - revision_before is stale
+      TABLE_NOT_FOUND         - table_id does not match any table
+      TABLE_ROW_NOT_FOUND     - row_index out of range for this table
+      MERGED_OR_NESTED_TABLE  - this table has a merged/nested-table cell; use replace_cell_markdown
+      COMMENT_ANCHORS_IN_RANGE / TRACKED_CHANGES_PRESENT - a hazard in the row; force=True to proceed
+      OPC_INVALID             - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED     - post-write verification failed; rolled back
+    """
+    try:
+        return tables.execute_replace_table_row(
+            path, table_id, row_index, cells, revision_before=revision_before, force=force, track_changes=track_changes
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def replace_cell_markdown(
+    path: str,
+    table_id: int,
+    row_index: int,
+    cell_index: int,
+    markdown: str,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    """Replace one table cell's content with rendered markdown, leaving
+    its own w:tcPr byte-identical -- the only write path safe on a merged
+    (w:gridSpan/w:vMerge) cell, and the intended path for an Appendix-A
+    style band-and-border table's own cell content.
+
+    Supports multi-level bulleted/numbered markdown inside the cell
+    (issue #28 WP-16a): rendered through the SAME markdown_to_ooxml
+    machinery replace_body_markdown/append_markdown use, one numId/
+    abstractNum tree per top-level list shared across nesting levels via
+    increasing w:ilvl.
+
+    Same guard/hazard-scan/atomic-write/audit machinery as
+    replace_table_row. track_changes=True wraps the OLD cell content in
+    w:del and the NEW content in w:ins, under the configured author.
+
+    Returns the eight evidence keys (before/after are the cell's own
+    markdown), plus (track_changes=True only) revision_ids/track_changes,
+    and conflict_copy_detected (+ conflict_copies/sibling_files_changed
+    when non-empty).
+
+    Errors:
+      INVALID_INPUT           - a bad path
+      DOCX_LOCKED, SYNC_IN_FLIGHT - the write guard
+      REVISION_CONFLICT       - revision_before is stale
+      TABLE_NOT_FOUND          - table_id does not match any table
+      TABLE_ROW_NOT_FOUND      - row_index out of range for this table
+      TABLE_CELL_NOT_FOUND     - cell_index out of range for this row
+      COMMENT_ANCHORS_IN_RANGE / TRACKED_CHANGES_PRESENT - a hazard in the cell; force=True to proceed
+      OPC_INVALID              - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED      - post-write verification failed (including w:tcPr drift); rolled back
+    """
+    try:
+        return tables.execute_replace_cell_markdown(
+            path, table_id, row_index, cell_index, markdown,
+            revision_before=revision_before, force=force, track_changes=track_changes,
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def insert_table(
+    path: str,
+    rows: list[list[str]],
+    style_id: str,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    """Append a new table at the end of the document body, one markdown
+    string per cell (rows is a list of rows, each a list of cell markdown;
+    short rows are padded with empty cells up to the widest row).
+
+    style_id is REQUIRED and must name an existing w:type="table" style in
+    this document's styles.xml (list_styles reports style type) -- unlike
+    GoogleDocs-MCP's insert_table, which relies on the Docs API's own
+    default table style, raw OOXML has no sensible default to fall back
+    to. Column widths are dxa, split evenly across the text-column width
+    list_page_sections reports for this document's first page section.
+
+    Same guard/atomic-write/audit machinery as append_markdown.
+    track_changes=True wraps the new table's own runs in w:ins (nothing
+    existing is removed by an insertion, so there is no w:del side).
+
+    Returns the eight evidence keys (before="", after is the new table's
+    rows tab/newline-joined), plus table_id (the new table's own id, for a
+    follow-up get_table/replace_table_row/replace_cell_markdown call),
+    (track_changes=True only) revision_ids/track_changes, and
+    conflict_copy_detected (+ conflict_copies/sibling_files_changed when
+    non-empty).
+
+    Errors:
+      INVALID_INPUT      - a bad path, or rows is empty or contains an empty row
+      DOCX_LOCKED, SYNC_IN_FLIGHT - the write guard
+      REVISION_CONFLICT  - revision_before is stale
+      STYLE_NOT_FOUND    - style_id does not name a table style in this document
+      OPC_INVALID        - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED - post-write verification failed; rolled back
+    """
+    try:
+        return tables.execute_insert_table(
+            path, rows, style_id, revision_before=revision_before, force=force, track_changes=track_changes
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
