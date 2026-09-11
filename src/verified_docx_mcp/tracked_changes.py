@@ -269,6 +269,238 @@ def _collect_ins_del(root: Any) -> list[tuple[Any, Any, str, str]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Write-side helpers shared with text_edit.py/mutations.py (WP-07b-a): w:id
+# allocation, w:ins/w:del wrapping, w:rPrChange, and the author-aware
+# "foreign revision" check the TRACKED_CHANGES_PRESENT guard needs.
+# ---------------------------------------------------------------------------
+
+
+class RevisionIdAllocator:
+    """Hands out w:id values for new w:ins/w:del/w:rPrChange elements,
+    each guaranteed above every id already in *document_root* (issue #28
+    plan WP-07b-a: "w:id values allocated above the package maximum") and
+    never repeated within one guarded call, without re-scanning the tree
+    per id."""
+
+    def __init__(self, document_root: Any) -> None:
+        body = mutations._find_body(document_root)
+        self._next = 1
+        for _parent, _elem, _kind, rid in _collect_ins_del(body):
+            if rid.isdigit():
+                self._next = max(self._next, int(rid) + 1)
+
+    def allocate(self) -> str:
+        rid = str(self._next)
+        self._next += 1
+        return rid
+
+
+def current_revision_date() -> str:
+    """UTC timestamp in the w:date attribute's own format (the same shape
+    every fixture's real Word-authored w:ins/w:del already carries, e.g.
+    tracked.docx's "2026-09-10T17:17:00Z")."""
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class TrackContext:
+    """Bundles what a track_changes=True call needs -- author, date, an
+    id allocator, and the ids created so far -- so every call site in
+    text_edit.py/mutations.py takes one optional argument instead of
+    four. Shared here (rather than defined separately in each) so both
+    modules use the identical author/date/id-allocation logic; each
+    imports this module directly (mutations.py only inside a function
+    body, the same deferred-import pattern _guard_before_write already
+    uses for server.py, since this module itself imports mutations.py at
+    the top level -- importing back would cycle)."""
+
+    def __init__(self, document_root: Any, *, author: str | None = None) -> None:
+        # *author* SHOULD always be passed explicitly by the caller (the
+        # same value it already resolved for the TRACKED_CHANGES_PRESENT
+        # guard's own-author exclusion, e.g. text_edit.py's own_author) --
+        # resolving it independently here would risk the two diverging
+        # (a config file changing between the two calls; a test patching
+        # only one of the two import sites) and stamping a DIFFERENT
+        # author on the write than the guard just excluded. Falling back
+        # to a fresh resolve_author_name() call only covers a caller that
+        # does not have one on hand yet.
+        if author is None:
+            from .author import resolve_author_name
+
+            author = resolve_author_name()
+        self.author = author
+        self.date = current_revision_date()
+        self.allocator = RevisionIdAllocator(document_root)
+        self.revision_ids: list[str] = []
+
+    def __bool__(self) -> bool:
+        # A TrackContext is only ever constructed when track_changes=True;
+        # always truthy -- exists so `if track:` reads naturally at call
+        # sites without a separate track_changes bool threaded everywhere.
+        return True
+
+    def next_id(self) -> str:
+        """Allocate one new w:id AND record it in self.revision_ids in the
+        same call -- the only entry point call sites should use (never
+        self.allocator.allocate() directly), so an id can never be
+        allocated without also landing in the evidence's revision_ids."""
+        rid = self.allocator.allocate()
+        self.revision_ids.append(rid)
+        return rid
+
+
+def wrap_insertion(r_elem: Any, *, rid: str, author: str, date: str) -> Any:
+    """Wrap *r_elem* in a new <w:ins id author date> element and return it
+    -- the caller is responsible for putting the returned element where
+    r_elem used to live."""
+    ins_elem = ET.Element(_w("ins"), {_w("id"): rid, _w("author"): author, _w("date"): date})
+    ins_elem.append(r_elem)
+    return ins_elem
+
+
+def wrap_deletion(r_elem: Any, *, rid: str, author: str, date: str) -> Any:
+    """Like wrap_insertion, but for w:del -- *r_elem* must already have had
+    convert_t_to_deltext applied (OOXML requires deleted text to live in
+    w:delText, never w:t, inside a w:del)."""
+    del_elem = ET.Element(_w("del"), {_w("id"): rid, _w("author"): author, _w("date"): date})
+    del_elem.append(r_elem)
+    return del_elem
+
+
+def convert_t_to_deltext(r_elem: Any) -> None:
+    """Rename every w:t inside *r_elem* to w:delText, in place -- the
+    inverse of reject_tracked_changes' own delText->t rename (_reject_one
+    above)."""
+    for node in r_elem.iter():
+        if projection._ln(node) == "t":
+            node.tag = _w("delText")
+
+
+def apply_rpr_change(rpr_elem: Any, *, old_rpr_elem: Any | None, rid: str, author: str, date: str) -> None:
+    """Append <w:rPrChange id author date><w:rPr>...</w:rPr></w:rPrChange>
+    to *rpr_elem*, recording the run's PRE-change formatting (issue #28
+    plan WP-07b-a: "formatting changes use w:rPrChange"). *old_rpr_elem*
+    must be a snapshot the caller took BEFORE applying the new style (a
+    deep copy, or None if the run previously had no w:rPr at all, in which
+    case the previous state was "no explicit properties" and an empty
+    <w:rPr/> is recorded) -- this function does not itself snapshot
+    anything; it only records what it is given.
+    """
+    change = ET.SubElement(rpr_elem, _w("rPrChange"), {_w("id"): rid, _w("author"): author, _w("date"): date})
+    if old_rpr_elem is not None:
+        import copy
+
+        change.append(copy.deepcopy(old_rpr_elem))
+    else:
+        ET.SubElement(change, _w("rPr"))
+
+
+def foreign_crosses_revision(proj: projection.Projection, start: int, end: int, own_author: str) -> bool:
+    """True if [start, end) overlaps a w:ins authored by anyone OTHER than
+    *own_author* -- the TRACKED_CHANGES_PRESENT guard's own-author
+    exclusion (issue #28 plan WP-07b-a: "refusals must exclude revisions
+    the server itself authored under the configured author, or a second
+    proposed edit deadlocks on the first one's tracked change"). A w:del's
+    own content never reaches here at all (excluded from the projection
+    entirely -- see projection.py's module docstring), so this only ever
+    concerns a live w:ins the match's span overlaps.
+    """
+    run_events = [e for e in proj.events if isinstance(e, projection.RunEvent)]
+    for event, (s, e, _pr, _rr) in zip(run_events, proj.offset_map):
+        if s < end and e > start and event.in_revision and event.revision_author != own_author:
+            return True
+    return False
+
+
+def wrap_all_runs(elements: list[Any], wrap_fn) -> None:
+    """For every <w:r> found anywhere inside *elements* (any nesting depth
+    -- a table cell's own paragraphs included), replace it in its own
+    immediate parent with wrap_fn(r_elem), in place. Used by mutations.py's
+    markdown-mutation tools (WP-07b-a) to block-track a whole-body/section
+    replace or an append: wrap_fn is wrap_deletion (after
+    convert_t_to_deltext) for OLD content being marked deleted, or
+    wrap_insertion for NEW content being marked inserted.
+
+    Does NOT descend into an existing w:ins/w:del -- content already
+    tracked (or a force=True-accepted pre-existing hazard) is left exactly
+    as it is, never double-wrapped.
+    """
+
+    def walk(parent: Any) -> None:
+        for child in list(parent):
+            tag = projection._ln(child)
+            if tag == "r":
+                idx = None
+                for i, c in enumerate(parent):
+                    if c is child:
+                        idx = i
+                        break
+                if idx is None:
+                    continue
+                parent.remove(child)
+                parent.insert(idx, wrap_fn(child))
+            elif tag in ("ins", "del"):
+                continue
+            else:
+                walk(child)
+
+    for el in elements:
+        walk(el)
+
+
+def mark_elements_deleted(elements: list[Any], track: Any) -> None:
+    """Mark every LIVE run inside *elements* as deleted for a tracked
+    write, handling a run that is ALREADY inside a pending w:ins or w:del
+    correctly rather than via wrap_all_runs' generic "leave existing
+    tracking alone" rule:
+
+    - A run already inside a w:del is already gone from the live
+      projection; left exactly as it is (re-deleting an already-deleted
+      run is a no-op, not a new revision).
+    - A run already inside a w:ins (a still-pending insertion nobody has
+      accepted yet -- possibly from an EARLIER track_changes=True call
+      this same server made) is REMOVED OUTRIGHT along with its w:ins
+      wrapper, not wrapped in a second, redundant w:del: cancelling an
+      insertion that was never accepted needs no deletion record (this is
+      exactly what reject_tracked_changes already does to a w:ins, for
+      the identical reason). Skipping this case (as a naive "never touch
+      existing ins/del" rule would) leaves the earlier insertion visible
+      in the live projection forever, silently accumulating alongside
+      each new write -- found via this WP's own
+      test_second_tracked_write_over_own_prior_tracked_change_does_not_deadlock,
+      not merely theorized.
+    - Every other run (ordinary, untracked live content) is wrapped in a
+      NEW w:del, exactly like wrap_all_runs' own del path.
+    """
+
+    def walk(parent: Any) -> None:
+        for child in list(parent):
+            tag = projection._ln(child)
+            if tag == "del":
+                continue
+            if tag == "ins":
+                _remove_if_present(parent, child)
+                continue
+            if tag == "r":
+                idx = None
+                for i, c in enumerate(parent):
+                    if c is child:
+                        idx = i
+                        break
+                if idx is None:
+                    continue
+                parent.remove(child)
+                convert_t_to_deltext(child)
+                parent.insert(idx, wrap_deletion(child, rid=track.next_id(), author=track.author, date=track.date))
+            else:
+                walk(child)
+
+    for el in elements:
+        walk(el)
+
+
 def _resolve_targets(
     document_root: Any, revision_ids: list[str] | None
 ) -> list[tuple[Any, Any, str, str]]:

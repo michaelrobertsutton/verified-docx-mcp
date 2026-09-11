@@ -186,6 +186,13 @@ class RunEvent:
     # RunEvent to compare by value) so carrying a live Element reference
     # here is safe.
     in_revision: bool = False
+    # New for issue #28 WP-07b-a: the w:author of the (innermost) w:ins this
+    # run sits inside, or None when in_revision is False. Lets a caller
+    # (text_edit.py's TRACKED_CHANGES_PRESENT guard) exclude the server's
+    # OWN previously-authored revisions from a refusal check — see that
+    # module's own comment for why ("a second proposed edit deadlocks on
+    # the first one's tracked change" otherwise).
+    revision_author: str | None = None
     comment_ids: frozenset[str] = dataclasses.field(default_factory=frozenset)
     r_elem: Any = None
     text_elem: Any = None
@@ -309,15 +316,17 @@ class _PartWalker:
         self.deleted_spans: list[DeletedSpan] = []
         self.warnings: list[str] = []
         self._first_para = True
-        # New for issue #28 WP-06: shared walker state (not threaded as
-        # parameters — every recursive _walk_runs call already shares one
-        # walker instance) backing RunEvent.in_revision/comment_ids. A
-        # w:commentRangeStart/End pair can nest (overlapping comments), so
-        # this is a running set, not a single id; w:ins can nest too
-        # (rare, but the schema allows an w:ins inside another), so this
-        # is a depth counter, not a bool.
+        # New for issue #28 WP-06/WP-07b-a: shared walker state (not
+        # threaded as parameters — every recursive _walk_runs call already
+        # shares one walker instance) backing RunEvent.in_revision/
+        # comment_ids/revision_author. A w:commentRangeStart/End pair can
+        # nest (overlapping comments), so this is a running set, not a
+        # single id; w:ins can nest too (rare, but the schema allows an
+        # w:ins inside another), so this is a STACK of each nested
+        # w:ins's own w:author (its innermost entry is the one a run
+        # currently inside reports), not a depth counter.
         self._open_comment_ids: set[str] = set()
-        self._revision_depth = 0
+        self._revision_author_stack: list[str | None] = []
 
     # -- block level -----------------------------------------------------
 
@@ -447,7 +456,8 @@ class _PartWalker:
                 para_ref,
                 run_ref,
                 field_result=in_result,
-                in_revision=bool(self._revision_depth),
+                in_revision=bool(self._revision_author_stack),
+                revision_author=self._revision_author_stack[-1] if self._revision_author_stack else None,
                 comment_ids=frozenset(self._open_comment_ids),
                 r_elem=r_elem,
                 text_elem=text_elem,
@@ -469,18 +479,22 @@ class _PartWalker:
             if tag == "r":
                 self._walk_run(child, para_ref, counter, field_stack, container)
             elif tag == "ins":
-                # New for issue #28 WP-06: track live w:ins nesting depth so
-                # every RunEvent emitted while inside one is flagged
-                # in_revision=True (locate()'s "crosses_revision" warning).
-                # Content is otherwise walked exactly like hyperlink/smartTag
-                # below — an insertion's text is LIVE text (not yet
-                # accepted), so it belongs in the projection like any other
-                # run.
-                self._revision_depth += 1
+                # New for issue #28 WP-06: track live w:ins nesting (a
+                # stack, not a bool/counter, so a nested w:ins reports its
+                # own, innermost author) so every RunEvent emitted while
+                # inside one is flagged in_revision=True (locate()'s
+                # "crosses_revision" warning) and carries revision_author
+                # (WP-07b-a: the TRACKED_CHANGES_PRESENT guard's own-
+                # author exclusion needs to know WHOSE revision this is,
+                # not just that one exists). Content is otherwise walked
+                # exactly like hyperlink/smartTag below — an insertion's
+                # text is LIVE text (not yet accepted), so it belongs in
+                # the projection like any other run.
+                self._revision_author_stack.append(_attr(child, "author"))
                 try:
                     self._walk_runs(child, para_ref, counter, field_stack)
                 finally:
-                    self._revision_depth -= 1
+                    self._revision_author_stack.pop()
             elif tag in ("hyperlink", "smartTag"):
                 self._walk_runs(child, para_ref, counter, field_stack)
             elif tag == "commentRangeStart":

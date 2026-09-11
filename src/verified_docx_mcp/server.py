@@ -770,7 +770,7 @@ def list_styles(path: str) -> dict[str, Any]:
 
 @mcp.tool()
 def replace_body_markdown(
-    path: str, markdown: str, revision_before: str | None = None, force: bool = False
+    path: str, markdown: str, revision_before: str | None = None, force: bool = False, track_changes: bool = False
 ) -> dict[str, Any]:
     """Replace an entire document body's content with markdown, atomically.
 
@@ -812,9 +812,22 @@ def replace_body_markdown(
     lands while another client has the file open is not prevented by
     anything above, only detected after the fact by the next call.
 
+    track_changes=True (issue #28 WP-07b-a): the OLD body content is kept
+    (not removed) with its runs wrapped in w:del/w:delText, and the NEW
+    content is wrapped in w:ins -- both carrying w:author (author.
+    resolve_author_name())/w:date/an above-package-maximum w:id. Reading
+    the projection is unaffected either way, so after_text still reads as
+    the new content alone. Scope limit: this wraps RUNS, not whole table/
+    list structures -- untested against a target range containing a
+    table. The comment/tracked-change hazard scan's TRACKED_CHANGES_PRESENT
+    excludes a revision authored by the configured author (the server's
+    own prior tracked write), so a second track_changes call never
+    deadlocks on the first one's own tracked change.
+
     Returns the eight evidence keys: applied, match_count (always 1),
     rung (4), before, after, revision_before, revision_after,
-    audit_logged; plus orphaned_comment_ids when force removed anchors.
+    audit_logged; plus orphaned_comment_ids when force removed anchors,
+    and (track_changes=True only) revision_ids/track_changes.
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
@@ -827,14 +840,21 @@ def replace_body_markdown(
       VERIFICATION_FAILED               - post-write verification failed; rolled back
     """
     try:
-        return mutations.execute_replace_body_markdown(path, markdown, revision_before=revision_before, force=force)
+        return mutations.execute_replace_body_markdown(
+            path, markdown, revision_before=revision_before, force=force, track_changes=track_changes
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
 @mcp.tool()
 def replace_range_markdown(
-    path: str, section_key: str, markdown: str, revision_before: str | None = None, force: bool = False
+    path: str,
+    section_key: str,
+    markdown: str,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
 ) -> dict[str, Any]:
     """Replace one heading-delimited section (by section_key, from
     find_sections) with markdown, atomically.
@@ -853,8 +873,13 @@ def replace_range_markdown(
     top-level heading of any level, or the end of the document) instead
     of the whole body.
 
+    track_changes=True: same as replace_body_markdown (WP-07b-a) -- the
+    section's OLD content is kept (w:del-wrapped), the NEW content is
+    wrapped in w:ins and inserted right after it.
+
     Returns the eight evidence keys (rung is always 3 here), plus
-    orphaned_comment_ids when force removed anchors.
+    orphaned_comment_ids when force removed anchors, and (track_changes=
+    True only) revision_ids/track_changes.
 
     Errors: as replace_body_markdown, plus:
       SECTION_NOT_FOUND - section_key does not match any current section
@@ -865,14 +890,16 @@ def replace_range_markdown(
     """
     try:
         return mutations.execute_replace_range_markdown(
-            path, section_key, markdown, revision_before=revision_before, force=force
+            path, section_key, markdown, revision_before=revision_before, force=force, track_changes=track_changes
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
 @mcp.tool()
-def append_markdown(path: str, markdown: str, revision_before: str | None = None, force: bool = False) -> dict[str, Any]:
+def append_markdown(
+    path: str, markdown: str, revision_before: str | None = None, force: bool = False, track_changes: bool = False
+) -> dict[str, Any]:
     """Append markdown to the end of a document body (before its trailing
     w:sectPr, if any), atomically.
 
@@ -883,12 +910,18 @@ def append_markdown(path: str, markdown: str, revision_before: str | None = None
     revision_before) and atomic-write mechanics as replace_body_markdown
     — see that tool's docstring.
 
+    track_changes=True (WP-07b-a): nothing existing is removed by an
+    append, so there is no w:del side here -- only the newly appended
+    content is wrapped in w:ins (w:author/w:date/w:id, same source as
+    replace_text's).
+
     Returns the eight evidence keys: before/after are the whole body's
     markdown immediately before/after the append; rung is reported as 4
     (append_markdown is not itself a rung on
     core/document-backend-protocol.md's 4-rung table, which only names
     replace_body_markdown at rung 4 — grouped with it here as the other
-    whole-document-scoped write).
+    whole-document-scoped write). Plus (track_changes=True only)
+    revision_ids/track_changes.
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
@@ -899,7 +932,9 @@ def append_markdown(path: str, markdown: str, revision_before: str | None = None
       VERIFICATION_FAILED               - post-write verification failed; rolled back
     """
     try:
-        return mutations.execute_append_markdown(path, markdown, revision_before=revision_before, force=force)
+        return mutations.execute_append_markdown(
+            path, markdown, revision_before=revision_before, force=force, track_changes=track_changes
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -924,16 +959,23 @@ def append_markdown(path: str, markdown: str, revision_before: str | None = None
 
 @mcp.tool()
 def replace_text(
-    path: str, find: str, replace: str, expected_matches: int, revision_before: str | None = None, force: bool = False
+    path: str,
+    find: str,
+    replace: str,
+    expected_matches: int,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
 
-    Locates `find` via a 5-rung normalization ladder (exact -> curly/
+    Locates `find` via a 4-rung normalization ladder (exact -> curly/
     straight quote equivalence -> NBSP/whitespace-run collapse -> soft-
-    hyphen strip -> field placeholder -- the last lets `find` match a
-    "[FIELD:instr]" token as read_document(format="markdown") renders one,
-    even though the live text underneath is the field's actual result),
-    stopping at the first rung with at least one match.
+    hyphen strip), stopping at the first rung with at least one match. A
+    match overlapping a RESULT-bearing field's cached text surfaces
+    "touches_field_result" in the evidence's `warnings` (see locate.py's
+    own header comment for why this is a warning, not a match rung, on
+    the corrected field-markdown projection).
 
     expected_matches is REQUIRED (no default, D4): the call refuses with
     MATCH_COUNT_MISMATCH if the actual count differs, listing every span
@@ -947,11 +989,19 @@ def replace_text(
     inside the match is removed outright. A match crossing a w:p/w:tbl/
     w:tc boundary refuses with STRUCTURAL_BOUNDARY instead.
 
-    `force` is accepted for signature symmetry with the markdown-mutation
-    tools but has no effect here yet (WP-06 does not refuse on a
-    crosses_comment_range/crosses_revision warning -- see the evidence's
-    `warnings` key; WP-07 adds the actual refusal for a revision-crossing
-    write).
+    track_changes=True (issue #28 WP-07b-a): the deleted text is wrapped
+    in w:del/w:delText and the replacement in w:ins, each carrying
+    w:author (author.resolve_author_name() -- ~/.jennystack/config.json's
+    author_name, falling back to the macOS full name) and w:date, with
+    w:id values allocated above the package maximum. Reading the
+    projection is unaffected (w:del text stays excluded, w:ins text stays
+    included), so the write is visible to the next read as current text
+    either way. The evidence then also carries revision_ids (the ids just
+    created) and track_changes: true. A match crossing a tracked change
+    authored by someone OTHER than the configured author refuses with
+    TRACKED_CHANGES_PRESENT unless force=True; a match crossing the
+    server's OWN prior tracked change never refuses (accept/reject it via
+    tracked_changes.py, or just keep editing under track_changes).
 
     Same atomic-write mechanics as replace_body_markdown (temp file, OPC-
     validated before the original is touched, .jsbak-backed post-write
@@ -960,7 +1010,8 @@ def replace_text(
     Returns the eight evidence keys (before/after are ±200-character
     excerpts around the first match, not the whole document), plus
     runs_before/runs_after (each match's overlapping run(s), clipped to the
-    span, before and after) and, when non-empty, `warnings`.
+    span, before and after), `warnings` when non-empty, and (track_changes=
+    True only) revision_ids/track_changes.
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or an empty find
@@ -969,12 +1020,13 @@ def replace_text(
       ZERO_MATCH                        - find not located after the full ladder
       MATCH_COUNT_MISMATCH              - the located count != expected_matches
       STRUCTURAL_BOUNDARY               - a match crosses a w:p/w:tbl/w:tc boundary
+      TRACKED_CHANGES_PRESENT           - a match crosses a FOREIGN-authored tracked change; no force
       OPC_INVALID                       - the rendered .docx failed OPC validation
       VERIFICATION_FAILED               - post-write verification failed; rolled back
     """
     try:
         return text_edit.execute_replace_text(
-            path, find, replace, expected_matches, revision_before=revision_before, force=force
+            path, find, replace, expected_matches, revision_before=revision_before, force=force, track_changes=track_changes
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -982,7 +1034,13 @@ def replace_text(
 
 @mcp.tool()
 def format_text(
-    path: str, find: str, style: dict[str, bool], expected_matches: int, revision_before: str | None = None, force: bool = False
+    path: str,
+    find: str,
+    style: dict[str, bool],
+    expected_matches: int,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
 ) -> dict[str, Any]:
     """Apply character styling (bold/italic/underline/strike) to a matched
     text span, without touching its content.
@@ -996,7 +1054,8 @@ def format_text(
     Idempotent: if every located run already carries every requested
     field's value, the call skips the write entirely (revision_before ==
     revision_after in the returned evidence) rather than creating a new,
-    no-op revision.
+    no-op revision -- with track_changes=True too: nothing to record in a
+    w:rPrChange when no style is actually changing.
 
     Same run-splitting rule as replace_text for a boundary run (up to
     three pieces; unmatched prefix/suffix keep the ORIGINAL w:rPr cloned
@@ -1004,9 +1063,16 @@ def format_text(
     carrying the requested style) rather than being deleted -- this tool
     never changes character counts.
 
+    track_changes=True (issue #28 WP-07b-a): the changed run's w:rPr gains
+    a w:rPrChange recording its PRE-change formatting (w:author/w:date/
+    w:id, same source and allocation as replace_text's track_changes).
+    Same own-author-vs-foreign-author TRACKED_CHANGES_PRESENT refusal
+    rule as replace_text.
+
     Returns the eight evidence keys, plus runs_before/runs_after (each
-    match's overlapping run(s) and their style flags, before and after)
-    and, when non-empty, `warnings`.
+    match's overlapping run(s) and their style flags, before and after),
+    `warnings` when non-empty, and (track_changes=True only) revision_ids/
+    track_changes.
 
     Errors: as replace_text, plus:
       INVALID_INPUT - style is empty, not an object, names an unknown key,
@@ -1014,7 +1080,7 @@ def format_text(
     """
     try:
         return text_edit.execute_format_text(
-            path, find, style, expected_matches, revision_before=revision_before, force=force
+            path, find, style, expected_matches, revision_before=revision_before, force=force, track_changes=track_changes
         )
     except VerifyError as exc:
         _raise_tool_error(exc)

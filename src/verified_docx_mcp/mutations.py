@@ -464,7 +464,7 @@ _TRACKED_CHANGE_TAGS = frozenset({"ins", "del"})
 
 def _scan_range_hazards(elements: list[Any]) -> dict[str, Any]:
     comment_ids: set[str] = set()
-    has_tracked_changes = False
+    tracked_change_authors: set[str | None] = set()
     for element in elements:
         for node in element.iter():
             tag = projection._ln(node)
@@ -473,28 +473,38 @@ def _scan_range_hazards(elements: list[Any]) -> dict[str, Any]:
                 if cid is not None:
                     comment_ids.add(cid)
             elif tag in _TRACKED_CHANGE_TAGS:
-                has_tracked_changes = True
+                tracked_change_authors.add(projection._attr(node, "author"))
     return {
         "comment_ids": sorted(comment_ids, key=lambda v: (len(v), v)),
-        "has_tracked_changes": has_tracked_changes,
+        "tracked_change_authors": tracked_change_authors,
     }
 
 
-def _check_hazards_or_raise(hazards: dict[str, Any], force: bool) -> list[str]:
+def _check_hazards_or_raise(hazards: dict[str, Any], force: bool, own_author: str) -> list[str]:
     """Returns orphaned_comment_ids (empty unless force=True and comment
     anchors were present). Raises COMMENT_ANCHORS_IN_RANGE /
-    TRACKED_CHANGES_PRESENT when hazards are present and force is False."""
+    TRACKED_CHANGES_PRESENT when hazards are present and force is False.
+
+    Issue #28 plan WP-07b-a own-author exclusion (load-bearing, per that
+    WP's own notes): a w:ins/w:del authored by *own_author* (this
+    server's own configured identity, author.resolve_author_name()) does
+    NOT trigger TRACKED_CHANGES_PRESENT, or a second track_changes=True
+    write over the server's own prior tracked edit would deadlock. A
+    tracked change authored by anyone else still refuses normally.
+    """
     if hazards["comment_ids"] and not force:
         raise _make_error(
             ErrorCode.COMMENT_ANCHORS_IN_RANGE,
             "The target range contains comment anchors; pass force=True to proceed (the anchors will be removed and their ids reported as orphaned_comment_ids).",
             {"comment_ids": hazards["comment_ids"]},
         )
-    if hazards["has_tracked_changes"] and not force:
+    foreign_authors = {a for a in hazards["tracked_change_authors"] if a != own_author}
+    if foreign_authors and not force:
         raise _make_error(
             ErrorCode.TRACKED_CHANGES_PRESENT,
-            "The target range contains tracked changes (w:ins/w:del); pass force=True to proceed.",
-            {},
+            f"The target range contains tracked changes (w:ins/w:del) authored by someone other than {own_author!r}; "
+            "pass force=True to proceed.",
+            {"foreign_authors": sorted(a for a in foreign_authors if a is not None)},
         )
     return hazards["comment_ids"] if force else []
 
@@ -759,6 +769,7 @@ def _evidence(
     revision_after: str,
     audit_logged: bool,
     orphaned_comment_ids: list[str],
+    track: Any | None = None,
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {
         "applied": applied,
@@ -772,6 +783,11 @@ def _evidence(
     }
     if orphaned_comment_ids:
         evidence["orphaned_comment_ids"] = orphaned_comment_ids
+    if track is not None:
+        # issue #28 plan WP-07b-a: "The evidence envelope gains
+        # revision_ids (the ids created) and track_changes: true."
+        evidence["track_changes"] = True
+        evidence["revision_ids"] = track.revision_ids
     return evidence
 
 
@@ -781,8 +797,11 @@ def _evidence(
 
 
 def execute_replace_body_markdown(
-    path: str, markdown: str, *, revision_before: str | None = None, force: bool = False
+    path: str, markdown: str, *, revision_before: str | None = None, force: bool = False, track_changes: bool = False
 ) -> dict[str, Any]:
+    from . import tracked_changes
+    from .author import resolve_author_name
+
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = _guard_before_write(resolved, revision_before)
 
@@ -795,8 +814,9 @@ def execute_replace_body_markdown(
     numbering_index = projection.load_numbering_index(resolved)
     before_text = projection.markdown_from_elements(target_elements, styles_by_id, numbering_index)
 
+    own_author = resolve_author_name()
     hazards = _scan_range_hazards(target_elements)
-    orphaned_comment_ids = _check_hazards_or_raise(hazards, force)
+    orphaned_comment_ids = _check_hazards_or_raise(hazards, force, own_author)
 
     ctx = markdown_to_ooxml.StyleContext.build(resolved)
     new_elements = markdown_to_ooxml.render_blocks(markdown, ctx)
@@ -815,12 +835,43 @@ def execute_replace_body_markdown(
     new_numbering_index = projection.numbering_index_from_elements(ctx.new_abstract_nums, ctx.new_nums)
     intended_preview = projection.markdown_from_elements(new_elements, styles_by_id, new_numbering_index)
 
-    for child in list(body):
-        body.remove(child)
-    for el in new_elements:
-        body.append(el)
-    if sect_pr is not None:
-        body.append(sect_pr)
+    track = tracked_changes.TrackContext(document_root, author=own_author) if track_changes else None
+    if track:
+        # issue #28 plan WP-07b-a: track_changes=True marks the OLD content
+        # deleted (w:del, its w:t renamed to w:delText) rather than
+        # removing it, and the NEW content inserted (w:ins) rather than a
+        # bare rewrite -- reading the projection continues to exclude
+        # w:del text and include w:ins text (unchanged since WP-03/06), so
+        # after_text below already reads as the new content alone, same
+        # as the non-tracked path. Scope limit, named rather than
+        # silently risked: this wraps RUNS, not whole table/list
+        # structures -- a target range or replacement containing a table
+        # is untested here (real Word's own table-level tracked-deletion
+        # modeling is a much larger, separate problem; every fixture this
+        # WP tests against is plain paragraph prose).
+        def _ins_wrap(r: Any) -> Any:
+            return tracked_changes.wrap_insertion(r, rid=track.next_id(), author=track.author, date=track.date)
+
+        # mark_elements_deleted (not the generic wrap_all_runs): a run
+        # already inside a PENDING w:ins (e.g. from an earlier
+        # track_changes=True call over the same document) is removed
+        # outright rather than wrapped in a second, redundant w:del --
+        # see that function's own docstring for why.
+        tracked_changes.mark_elements_deleted(target_elements, track)
+        tracked_changes.wrap_all_runs(new_elements, _ins_wrap)
+        insert_at = len(target_elements)
+        for offset, el in enumerate(new_elements):
+            body.insert(insert_at + offset, el)
+        # target_elements (now del-wrapped) are left exactly where they
+        # already were -- body's own children were never touched, so
+        # sect_pr (still body's last child) needs no re-append.
+    else:
+        for child in list(body):
+            body.remove(child)
+        for el in new_elements:
+            body.append(el)
+        if sect_pr is not None:
+            body.append(sect_pr)
 
     def _post_verify(written_path: Path) -> None:
         markdown_after, _, _ = projection.read_document_markdown(written_path)
@@ -842,6 +893,7 @@ def execute_replace_body_markdown(
         revision_after=post_revision["token"],
         audit_logged=False,
         orphaned_comment_ids=orphaned_comment_ids,
+        track=track,
     )
     logged, _ = audit.append_audit(path=str(resolved), tool="replace_body_markdown", evidence=evidence)
     evidence["audit_logged"] = logged
@@ -854,8 +906,17 @@ def execute_replace_body_markdown(
 
 
 def execute_replace_range_markdown(
-    path: str, section_key: str, markdown: str, *, revision_before: str | None = None, force: bool = False
+    path: str,
+    section_key: str,
+    markdown: str,
+    *,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
 ) -> dict[str, Any]:
+    from . import tracked_changes
+    from .author import resolve_author_name
+
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     # find_sections (WP-03's PR #2 fix) now lists text-box sub-scopes
     # alongside heading sections, both keyed by section_key, so a caller
@@ -899,8 +960,9 @@ def execute_replace_range_markdown(
     target_elements = body_children[start:end]
     before_text = projection.markdown_from_elements(target_elements, styles_by_id, numbering_index)
 
+    own_author = resolve_author_name()
     hazards = _scan_range_hazards(target_elements)
-    orphaned_comment_ids = _check_hazards_or_raise(hazards, force)
+    orphaned_comment_ids = _check_hazards_or_raise(hazards, force, own_author)
     # PR #3 review, should-fix #2: a comment whose span CROSSES the section
     # boundary has one half inside target_elements (already accounted for
     # in orphaned_comment_ids and about to be removed below) and the other
@@ -921,11 +983,27 @@ def execute_replace_range_markdown(
     new_numbering_index = projection.numbering_index_from_elements(ctx.new_abstract_nums, ctx.new_nums)
     intended_preview = projection.markdown_from_elements(new_elements, styles_by_id, new_numbering_index)
 
-    for el in target_elements:
-        body.remove(el)
-    insert_at = start
-    for offset, el in enumerate(new_elements):
-        body.insert(insert_at + offset, el)
+    track = tracked_changes.TrackContext(document_root, author=own_author) if track_changes else None
+    if track:
+        # issue #28 plan WP-07b-a: mark the section's OLD content deleted
+        # (kept in place, runs wrapped in w:del) instead of removing it,
+        # and insert the NEW content (wrapped in w:ins) right after it --
+        # see execute_replace_body_markdown's identical comment for the
+        # table/list scope limit this also carries.
+        def _ins_wrap(r: Any) -> Any:
+            return tracked_changes.wrap_insertion(r, rid=track.next_id(), author=track.author, date=track.date)
+
+        tracked_changes.mark_elements_deleted(target_elements, track)
+        tracked_changes.wrap_all_runs(new_elements, _ins_wrap)
+        insert_at = end  # new content lands AFTER the kept, del-wrapped old range
+        for offset, el in enumerate(new_elements):
+            body.insert(insert_at + offset, el)
+    else:
+        for el in target_elements:
+            body.remove(el)
+        insert_at = start
+        for offset, el in enumerate(new_elements):
+            body.insert(insert_at + offset, el)
 
     def _post_verify(written_path: Path) -> None:
         new_document_root, _ = _load_document(written_path)
@@ -965,6 +1043,7 @@ def execute_replace_range_markdown(
         revision_after=post_revision["token"],
         audit_logged=False,
         orphaned_comment_ids=orphaned_comment_ids,
+        track=track,
     )
     logged, _ = audit.append_audit(path=str(resolved), tool="replace_range_markdown", evidence=evidence)
     evidence["audit_logged"] = logged
@@ -976,11 +1055,17 @@ def execute_replace_range_markdown(
 # ---------------------------------------------------------------------------
 
 
-def execute_append_markdown(path: str, markdown: str, *, revision_before: str | None = None, force: bool = False) -> dict[str, Any]:
+def execute_append_markdown(
+    path: str, markdown: str, *, revision_before: str | None = None, force: bool = False, track_changes: bool = False
+) -> dict[str, Any]:
     # force/hazard-scanning is a no-op for append (nothing existing is
     # removed) but the parameter is kept for signature symmetry with the
     # other two mutating tools and so a caller's generic retry code can
     # pass force uniformly.
+    from . import tracked_changes
+    from .author import resolve_author_name
+
+    own_author = resolve_author_name()
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = _guard_before_write(resolved, revision_before)
 
@@ -1002,6 +1087,16 @@ def execute_append_markdown(path: str, markdown: str, *, revision_before: str | 
     # numbering.xml on disk.
     new_numbering_index = projection.numbering_index_from_elements(ctx.new_abstract_nums, ctx.new_nums)
     intended_preview = projection.markdown_from_elements(new_elements, styles_by_id, new_numbering_index)
+
+    track = tracked_changes.TrackContext(document_root, author=own_author) if track_changes else None
+    if track:
+        # issue #28 plan WP-07b-a: nothing existing is removed by an
+        # append, so there is no w:del side here -- only the newly
+        # appended content is wrapped in w:ins.
+        def _ins_wrap(r: Any) -> Any:
+            return tracked_changes.wrap_insertion(r, rid=track.next_id(), author=track.author, date=track.date)
+
+        tracked_changes.wrap_all_runs(new_elements, _ins_wrap)
 
     insert_at = len(body_children)
     for offset, el in enumerate(new_elements):
@@ -1040,6 +1135,7 @@ def execute_append_markdown(path: str, markdown: str, *, revision_before: str | 
         revision_after=post_revision["token"],
         audit_logged=False,
         orphaned_comment_ids=[],
+        track=track,
     )
     logged, _ = audit.append_audit(path=str(resolved), tool="append_markdown", evidence=evidence)
     evidence["audit_logged"] = logged

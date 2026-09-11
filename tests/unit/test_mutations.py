@@ -30,6 +30,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from typing import Any
+from unittest import mock
 from xml.etree import ElementTree as ET
 
 REPO = Path(__file__).resolve().parents[2]
@@ -201,7 +202,26 @@ class CommentAnchorHazardTests(_TempFixtureCase):
 
 
 class TrackedChangeHazardTests(_TempFixtureCase):
+    """Patches author.resolve_author_name to a name DIFFERENT from
+    tracked.docx's real Word-authored author ("Michael Sutton") -- WP-07b-a's
+    own-author exclusion (_check_hazards_or_raise) would otherwise treat
+    this fixture's revisions as the server's own prior work whenever this
+    suite happens to run on Michael Sutton's own machine, silently
+    defeating the refusal these tests exist to prove — see
+    test_tracked_changes.py's OverlappingWriteRefusalTests for the
+    identical rationale."""
+
     fixture_name = "revision/tracked.docx"
+
+    def setUp(self):
+        super().setUp()
+        # mutations.py imports resolve_author_name lazily (a deferred,
+        # function-local import — see execute_replace_body_markdown), so
+        # patching the SOURCE (author.resolve_author_name) is what every
+        # such deferred import actually resolves at call time.
+        patcher = mock.patch("verified_docx_mcp.author.resolve_author_name", return_value="A Different Reviewer")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_refuses_without_force(self):
         with self.assertRaises(VerifyError) as cm:
@@ -707,6 +727,110 @@ class HalfAnchorCrossingIntegrationTests(_TempFixtureCase):
             projection._ln(n) for n in final_doc.iter() if projection._ln(n) in mutations._COMMENT_ANCHOR_TAGS
         ]
         self.assertEqual(remaining, [], "no unpaired (or paired) anchor may remain for the removed comment")
+
+
+# ---------------------------------------------------------------------------
+# track_changes=True (issue #28 WP-07b-a) on the three markdown-mutation
+# tools: old content marked deleted (kept, wrapped in w:del) rather than
+# removed, new content wrapped in w:ins, evidence gains track_changes/
+# revision_ids.
+# ---------------------------------------------------------------------------
+
+
+class MarkdownTrackChangesTests(_TempFixtureCase):
+    fixture_name = "word/empty-shell.docx"
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("verified_docx_mcp.author.resolve_author_name", return_value="Jane Reviewer")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _document_xml(self) -> str:
+        with zipfile.ZipFile(self.target) as zf:
+            return zf.read(projection.DEFAULT_PART).decode("utf-8")
+
+    def test_replace_body_markdown_tracked_wraps_new_content_in_ins(self):
+        evidence = mutations.execute_replace_body_markdown(str(self.target), "Hello world.\n", track_changes=True)
+        self.assertTrue(evidence["track_changes"])
+        self.assertEqual(len(evidence["revision_ids"]), 1)
+        doc = self._document_xml()
+        self.assertIn('<w:ins w:id="', doc)
+        self.assertIn('w:author="Jane Reviewer"', doc)
+        self.assertNotIn("<w:del", doc, "an empty shell has no prior content to mark deleted")
+        after_md, _, _ = projection.read_document_markdown(self.target)
+        self.assertEqual(after_md.strip(), "Hello world.")
+
+    def test_replace_body_markdown_tracked_marks_old_content_deleted_and_keeps_it(self):
+        mutations.execute_replace_body_markdown(str(self.target), "First version.\n")
+        evidence = mutations.execute_replace_body_markdown(str(self.target), "Second version.\n", track_changes=True)
+        self.assertTrue(evidence["applied"])
+        doc = self._document_xml()
+        self.assertIn("<w:delText>First version.</w:delText>", doc, "old content stays, marked deleted")
+        self.assertIn("<w:t>Second version.</w:t>", doc)
+        # Reading back as CURRENT text shows only the new content -- w:del
+        # excluded, w:ins included, unchanged read-side contract.
+        after_md, _, _ = projection.read_document_markdown(self.target)
+        self.assertEqual(after_md.strip(), "Second version.")
+
+    def test_append_markdown_tracked_wraps_only_new_content(self):
+        mutations.execute_replace_body_markdown(str(self.target), "Existing paragraph.\n")
+        evidence = mutations.execute_append_markdown(str(self.target), "Appended paragraph.\n", track_changes=True)
+        self.assertTrue(evidence["track_changes"])
+        doc = self._document_xml()
+        self.assertIn("<w:t>Existing paragraph.</w:t>", doc, "pre-existing content is untouched by an append")
+        self.assertNotIn("<w:del", doc)
+        self.assertIn('<w:ins w:id="', doc)
+        after_md, _, _ = projection.read_document_markdown(self.target)
+        self.assertIn("Appended paragraph.", after_md)
+        self.assertIn("Existing paragraph.", after_md)
+
+    def test_replace_range_markdown_tracked_marks_section_deleted_and_inserts_after(self):
+        section_md = (FIXTURES / "markdown" / "section.md").read_text(encoding="utf-8")
+        mutations.execute_replace_body_markdown(str(self.target), section_md)
+        sections = projection.find_sections_impl(self.target)
+        key = next(s["section_key"] for s in sections if s["heading_text"] == "Overview")
+
+        evidence = mutations.execute_replace_range_markdown(
+            str(self.target), key, "## Overview\n\nRewritten overview.\n", track_changes=True
+        )
+        self.assertTrue(evidence["track_changes"])
+        self.assertGreater(len(evidence["revision_ids"]), 0)
+        doc = self._document_xml()
+        self.assertIn("<w:del", doc)
+        self.assertIn("<w:ins", doc)
+        after_md, _, _ = projection.read_document_markdown(self.target)
+        self.assertIn("Rewritten overview.", after_md)
+        # The other, untouched sections survive unaffected.
+        self.assertIn("Background", after_md)
+        self.assertIn("Next Steps", after_md)
+
+    def test_untracked_writes_have_no_track_changes_key(self):
+        evidence = mutations.execute_replace_body_markdown(str(self.target), "Plain write.\n")
+        self.assertNotIn("track_changes", evidence)
+        self.assertNotIn("revision_ids", evidence)
+
+
+class TrackedChangeOwnAuthorExclusionTests(_TempFixtureCase):
+    """WP-07b-a load-bearing note: a hazard scan must exclude the
+    server's own previously-authored tracked change, or a second
+    track_changes=True write over the first one's own content deadlocks."""
+
+    fixture_name = "word/empty-shell.docx"
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("verified_docx_mcp.author.resolve_author_name", return_value="Jane Reviewer")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_second_tracked_write_over_own_prior_tracked_change_does_not_deadlock(self):
+        mutations.execute_replace_body_markdown(str(self.target), "First draft.\n", track_changes=True)
+        # A second track_changes write over the document (which now
+        # contains this server's own w:ins/w:del, all authored "Jane
+        # Reviewer") must not refuse.
+        evidence = mutations.execute_replace_body_markdown(str(self.target), "Second draft.\n", track_changes=True)
+        self.assertTrue(evidence["applied"])
 
 
 if __name__ == "__main__":

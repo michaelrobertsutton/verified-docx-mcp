@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
@@ -114,7 +115,25 @@ class ListOpenItemsCommentsTests(_TempFixtureCase):
 
 class OverlappingWriteRefusalTests(_TempFixtureCase):
     """Acceptance: overlapping replace_text refuses; accept clears it and
-    the write then proceeds."""
+    the write then proceeds.
+
+    Patches text_edit.resolve_author_name to a name DIFFERENT from
+    tracked.docx's real Word-authored author ("Michael Sutton") for the
+    whole class: WP-07b-a's own-author exclusion (text_edit.py's
+    _check_tracked_changes_guard) would otherwise treat tracked.docx's
+    revisions as this server's own prior work whenever this suite happens
+    to run on Michael Sutton's own machine (resolve_author_name's own
+    fallback path -- see test_author.py), silently defeating exactly the
+    refusal these tests exist to prove. Pinning a fixed, different name
+    makes the "foreign author" case deterministic regardless of whose
+    machine runs the suite.
+    """
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("verified_docx_mcp.text_edit.resolve_author_name", return_value="A Different Reviewer")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_replace_text_over_an_insertion_refuses_then_succeeds_after_accept(self):
         before_bytes = self.target.read_bytes()

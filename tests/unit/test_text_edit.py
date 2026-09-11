@@ -17,12 +17,14 @@ import shutil
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 
-from verified_docx_mcp import mutations, paths, projection, text_edit
+from verified_docx_mcp import mutations, paths, projection, text_edit, tracked_changes
 from verified_docx_mcp.errors import ErrorCode, VerifyError
 from verified_docx_mcp.middleware import MUTATING_TOOLS
 
@@ -206,6 +208,101 @@ class WarningsSurfaceOnEvidenceTests(_TempFixtureCase):
         evidence = text_edit.execute_replace_text(str(self.target), "This", "That", 1)
         self.assertTrue(evidence["applied"])
         self.assertIn("crosses_comment_range", evidence.get("warnings", []))
+
+
+class TrackChangesTests(_TempFixtureCase):
+    """Issue #28 WP-07b-a: replace_text/format_text's track_changes=True.
+
+    Patches author.resolve_author_name to a fixed name (rather than
+    relying on this machine's own resolved fallback) so w:author
+    assertions are deterministic regardless of whose machine runs the
+    suite -- see test_author.py for the resolution logic itself.
+    """
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("verified_docx_mcp.text_edit.resolve_author_name", return_value="Jane Reviewer")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _document_xml(self) -> str:
+        with zipfile.ZipFile(self.target) as zf:
+            return zf.read("word/document.xml").decode("utf-8")
+
+    def test_replace_text_tracked_evidence_and_xml_shape(self):
+        evidence = text_edit.execute_replace_text(str(self.target), "fox", "wolf", 1, track_changes=True)
+        self.assertTrue(evidence["applied"])
+        self.assertTrue(evidence["track_changes"])
+        self.assertIsInstance(evidence["revision_ids"], list)
+        self.assertEqual(len(evidence["revision_ids"]), 2, "one w:del + one w:ins for a single-run replace")
+
+        # Content read back as current text is the NEW text (w:del
+        # excluded, w:ins included) -- unchanged read-side contract.
+        self.assertEqual(projection.read_document_text(self.target), "The quick brown wolf jumps over the lazy dog.")
+
+        doc = self._document_xml()
+        self.assertIn('<w:del w:id="', doc)
+        self.assertIn("<w:delText>fox</w:delText>", doc)
+        self.assertIn('<w:ins w:id="', doc)
+        self.assertIn("<w:t>wolf</w:t>", doc)
+        self.assertIn('w:author="Jane Reviewer"', doc)
+        for rid in evidence["revision_ids"]:
+            self.assertIn(f'w:id="{rid}"', doc)
+
+    def test_replace_text_untracked_has_no_track_changes_key(self):
+        evidence = text_edit.execute_replace_text(str(self.target), "fox", "wolf", 1)
+        self.assertNotIn("track_changes", evidence)
+        self.assertNotIn("revision_ids", evidence)
+        self.assertNotIn("<w:del", self._document_xml())
+        self.assertNotIn("<w:ins", self._document_xml())
+
+    def test_format_text_tracked_produces_rprchange_with_old_style(self):
+        evidence = text_edit.execute_format_text(str(self.target), "fox", {"bold": True}, 1, track_changes=True)
+        self.assertTrue(evidence["track_changes"])
+        self.assertEqual(len(evidence["revision_ids"]), 1)
+
+        doc = self._document_xml()
+        self.assertIn("<w:rPrChange", doc)
+        self.assertIn('w:author="Jane Reviewer"', doc)
+        # The recorded PRE-change state for "fox" (no rPr at all before)
+        # is an empty <w:rPr /> nested inside rPrChange.
+        rprchange_start = doc.find("<w:rPrChange")
+        rprchange_snippet = doc[rprchange_start : rprchange_start + 200]
+        self.assertIn("<w:rPr", rprchange_snippet)
+
+        # Content is unaffected; only style + rPrChange metadata changed.
+        self.assertEqual(projection.read_document_text(self.target), "The quick brown fox jumps over the lazy dog.")
+        runs = [r for r in projection.read_document_runs(self.target) if "rPr" in r]
+        fox_run = next(r for r in runs if r["text"] == "fox")
+        self.assertTrue(fox_run["rPr"]["bold"])
+
+    def test_reject_tracked_changes_restores_replace_text(self):
+        evidence = text_edit.execute_replace_text(str(self.target), "fox", "wolf", 1, track_changes=True)
+        self.assertEqual(projection.read_document_text(self.target), "The quick brown wolf jumps over the lazy dog.")
+
+        reject_evidence = tracked_changes.execute_reject_tracked_changes(str(self.target), evidence["revision_ids"])
+        self.assertTrue(reject_evidence["applied"])
+        self.assertEqual(projection.read_document_text(self.target), "The quick brown fox jumps over the lazy dog.")
+
+    def test_own_author_tracked_edit_does_not_deadlock_a_second_tracked_edit(self):
+        # First tracked edit creates a w:ins authored by "Jane Reviewer"
+        # (the patched own_author for this test class).
+        text_edit.execute_replace_text(str(self.target), "fox", "wolf", 1, track_changes=True)
+        # A second edit over that SAME (own-authored) insertion must not
+        # refuse -- WP-07b-a's own-author exclusion.
+        second = text_edit.execute_replace_text(str(self.target), "wolf", "coyote", 1, track_changes=True)
+        self.assertTrue(second["applied"])
+        self.assertEqual(projection.read_document_text(self.target), "The quick brown coyote jumps over the lazy dog.")
+
+    def test_foreign_author_tracked_change_still_refuses(self):
+        # tracked.docx's own real Word-authored revisions are authored
+        # "Michael Sutton" -- different from this test's patched own_author
+        # ("Jane Reviewer") -- so this must still refuse.
+        target = Path(self._tmp.name) / "tracked.docx"
+        shutil.copyfile(FIXTURES / "revision" / "tracked.docx", target)
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_replace_text(str(target), "X", "Y", 1)
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.TRACKED_CHANGES_PRESENT)
 
 
 if __name__ == "__main__":
