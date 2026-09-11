@@ -46,7 +46,7 @@ from typing import Any, NoReturn
 
 from fastmcp import FastMCP
 
-from . import mutations, paths, projection, text_edit, tracked_changes
+from . import comments, mutations, paths, projection, text_edit, tracked_changes
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .middleware import EvidenceEnforcementMiddleware
@@ -1187,6 +1187,108 @@ def reject_tracked_changes(
         return tracked_changes.execute_reject_tracked_changes(
             path, revision_ids, revision_before=revision_before, force=force
         )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Comments (WP-08): add_anchored_comment (mutating, in MUTATING_TOOLS),
+# get_comment_thread (read-only). Reply threading and resolve are WP-09,
+# not this WP -- get_comment_thread reads whatever threading a document
+# already carries (e.g. authored in Word desktop); it never creates a
+# reply.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def add_anchored_comment(path: str, quote: str, text: str, expected_matches: int) -> dict[str, Any]:
+    """Add a comment anchored to a quoted passage, atomically.
+
+    Locates `quote` via the same locate()/expected_matches contract as
+    replace_text (normalization ladder, STRUCTURAL_BOUNDARY refusal,
+    MATCH_COUNT_MISMATCH on the wrong count) -- see that tool's docstring.
+    Every matched span gets its own new comment (same `text`, separate
+    w:id/paraId/durableId each) when expected_matches > 1.
+
+    Builds all five comment-related package parts a real Word comment
+    needs (word/comments.xml, commentsExtended.xml, commentsIds.xml,
+    commentsExtensible.xml, people.xml -- created fresh on a document's
+    first-ever comment, otherwise appended to) plus the anchor itself in
+    word/document.xml (w:commentRangeStart/End and a w:commentReference
+    run) and the matching [Content_Types].xml override + word/_rels/
+    document.xml.rels relationship for each newly created part.
+    w:id = one past the highest existing comment id (0 for a document's
+    first comment); paraId/durableId = a random 8-hex-uppercase value
+    below 0x80000000, unique within the package. Author (w:author, and
+    word/people.xml's w:15:person) comes from author.resolve_author_name()
+    (~/.jennystack/config.json's author_name, falling back to the macOS
+    full name).
+
+    A run whose text the quote's boundary falls in the middle of splits
+    the same way replace_text/format_text's boundary runs do (ORIGINAL
+    w:rPr cloned verbatim onto every surviving piece) -- but nothing here
+    wraps content the way w:ins/w:del does: commentRangeStart/End are
+    self-closing position markers, so a boundary run only ever needs
+    splitting to expose a clean insertion point, never any content change.
+
+    After the write, the target file is re-read from disk and the
+    anchored range is confirmed to bracket the requested quote (modulo
+    whitespace) before the call returns -- a mismatch raises
+    VERIFICATION_FAILED via the same .jsbak-backed atomic-write path
+    every other mutating tool in this server uses.
+
+    Returns the eight evidence keys (before/after are unchanged -- a
+    comment never edits document text), plus comment_ids (every durableId
+    created, one per matched span) and comment_id (the singular durableId,
+    only when exactly one span matched).
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or an empty quote
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
+      REVISION_CONFLICT                 - revision_before is stale
+      ZERO_MATCH                        - quote not located after the full ladder
+      MATCH_COUNT_MISMATCH              - the located count != expected_matches
+      STRUCTURAL_BOUNDARY               - a match crosses a w:p/w:tbl/w:tc boundary
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return comments.execute_add_anchored_comment(path, quote, text, expected_matches)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
+    """Read a comment and its direct replies, by durableId (from
+    add_anchored_comment's own evidence, or word/commentsIds.xml's
+    w16cid:durableId directly).
+
+    Returns comment_id, content, author, created_time, resolved
+    (commentsExtended.xml's w15:done), quoted_text (the live text its
+    range currently brackets), reply_count, and replies (each reply in
+    the same shape, one level deep -- a reply-of-reply is not walked
+    further).
+
+    Scope limit: if comment_id itself names a reply (it has its own
+    w15:paraIdParent), this returns that reply alone with replies=[] --
+    it does not walk upward to find and return the whole thread's root.
+    This tool only READS threading structure a document already carries
+    (e.g. one authored in Word desktop, or a reply added by a later WP);
+    add_anchored_comment never creates one itself, and reply
+    creation/resolve are WP-09, not this tool.
+
+    Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
+    Word's owner file is present, like every other read tool.
+
+    Errors:
+      INVALID_INPUT   - path does not exist or is outside the allowed roots,
+                         the document has no comments at all, or comment_id
+                         does not match any commentsIds.xml durableId
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return comments.execute_get_comment_thread(path, comment_id)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

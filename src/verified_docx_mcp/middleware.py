@@ -51,6 +51,8 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         # issue #28 WP-07 (list_open_items is read-only, not listed here):
         "accept_tracked_changes",
         "reject_tracked_changes",
+        # issue #28 WP-08 (get_comment_thread is read-only, not listed here):
+        "add_anchored_comment",
     }
 )
 
