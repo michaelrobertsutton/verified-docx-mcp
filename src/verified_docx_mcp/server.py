@@ -1527,6 +1527,13 @@ def diff_body_vs_file(path: str, file_path: str) -> dict[str, Any]:
     file. It does not join MUTATING_TOOLS and does not return the eight
     evidence keys.
 
+    Both sides are split with splitlines(keepends=True) before diffing --
+    matching GoogleDocs-MCP's diff_tab_vs_file exactly, on purpose, so a
+    file on disk that ends with a trailing newline (the common case) will
+    surface as a one-line difference against the body projection, which
+    does not end with one; a caller comparing against a projection should
+    account for that rather than read it as real drift.
+
     AFFIRMATIVE-ONLY, same as GoogleDocs-MCP's diff_tab_vs_file: a
     returned hunk, or identical=False, is solid evidence a difference
     exists. identical=True is NOT proof no difference exists -- it only

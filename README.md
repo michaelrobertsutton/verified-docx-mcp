@@ -10,7 +10,7 @@ instead of a Google Doc.
 
 ## Status
 
-Issue #28 of the build plan, through WP-10. Reading and writing a `.docx`
+Issue #28 of the build plan, through WP-11a. Reading and writing a `.docx`
 package needs no Word installation at all — this server manipulates
 OOXML directly. Word is required only for `export_pdf` (rendering a
 page-accurate PDF), and that additionally needs a macOS Automation grant
@@ -69,6 +69,15 @@ Tools implemented so far:
   Detection only, not prevention (core/document-backend-protocol.md §9):
   the naming patterns it matches are client- and locale-dependent, so
   their absence is not proof no conflict occurred.
+- **`diff_body_vs_file(path, file_path)`** — export the docx body's
+  markdown projection (the same one `read_document(format="markdown")`
+  uses) and diff it against a local markdown file with `difflib`, the
+  same mechanism GoogleDocs-MCP's `diff_tab_vs_file` uses. Read-only and
+  affirmative-only: `identical: true` means no difference was found by
+  this particular projection, not a guarantee none exists (see the
+  tool's own docstring for the docx-specific reasons why, including a
+  trailing newline on the file side alone surfacing as a spurious
+  one-line difference).
 
 More tools (tables, images) land in later work packages of the same plan.
 
