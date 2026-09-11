@@ -87,6 +87,22 @@ class ErrorCode(Enum):
     # hazard this backend has no analogue of.
     COMMENT_STILL_OPEN = "COMMENT_STILL_OPEN"  # resolve_comment's own post-write re-read did not confirm w15:done="1"
 
+    # Tables (tables.py; issue #28 WP-14)
+    TABLE_NOT_FOUND = "TABLE_NOT_FOUND"  # table_id does not match any table (call list_tables)
+    TABLE_ROW_NOT_FOUND = "TABLE_ROW_NOT_FOUND"  # row_index out of range for the named table
+    TABLE_CELL_NOT_FOUND = "TABLE_CELL_NOT_FOUND"  # cell_index out of range for the named row
+    MERGED_OR_NESTED_TABLE = "MERGED_OR_NESTED_TABLE"  # replace_table_row's refusal: the target table has a w:gridSpan/w:vMerge cell or a nested w:tbl anywhere in it -- use replace_cell_markdown instead
+
+    # Images (images.py; issue #28 WP-15a). GoogleDocs-MCP's 18th code,
+    # IMAGE_SOURCE_UNSUPPORTED (source must be a public URL, not a local
+    # path), is a deliberate omission here -- a local path is exactly what
+    # insert_image reads natively (see errors.py's own header comment).
+    UNSUPPORTED_IMAGE_FORMAT = "UNSUPPORTED_IMAGE_FORMAT"  # insert_image's path is not a .png/.svg, or the file's own bytes do not parse as one
+    SVG_RASTERIZATION_FAILED = "SVG_RASTERIZATION_FAILED"  # insert_image could not produce the PNG fallback part Word requires for an SVG (macOS `sips` failed or is unavailable)
+
+    # Style application (text_edit.py; issue #28 WP-15a)
+    UNSUPPORTED_STYLE_TYPE = "UNSUPPORTED_STYLE_TYPE"  # apply_style's style_id names a style whose w:type is neither "paragraph" nor "character" (e.g. "table"/"numbering")
+
 
 # Which codes signal a transient condition worth a single retry by the
 # caller. Empty for now — WP-02 has no revision-stamped write to race

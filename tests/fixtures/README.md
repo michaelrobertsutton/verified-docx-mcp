@@ -55,6 +55,24 @@ existing fixtures; unchanged here.
 |---|---|---|
 | `tables-merged.docx` | Three OOXML table constructs a GFM pipe table cannot represent, each a genuine lossy_elements case: a `w:vMerge` pair (a "restart" cell's real text, a "continue" cell with none), a `w:gridSpan="2"` cell, and a nested `w:tbl` inside a cell. | Derived from the Word-authored `tables.docx` via `xml.etree.ElementTree` (same technique as `word/empty-shell.docx` above — original namespace prefixes preserved, every other part byte-for-byte unchanged): `word/document.xml`'s one `w:tbl` was replaced with a hand-built one exercising `w:vMerge`/`w:gridSpan`/nested `w:tbl`. Not Word-authored itself and does not need to be — these three constructs are standard, unambiguous OOXML markup (not a Word-output nuance this repo could get wrong by guessing), and this environment has no way to drive Word into producing merged/nested table cells via AppleScript the way the other fixtures above were made. |
 
+**Regenerated for issue #28 WP-14** (same body content, byte-for-byte —
+verified by diffing `word/document.xml`'s `<w:body>` before/after): the
+original file (built before any tool in this repo ever WROTE to a
+merged-cell table) captured only the 3 namespace prefixes ElementTree's
+serializer judged "in use" (`mc`/`w`/`w14`) on `word/document.xml`'s root,
+not the full ~34-prefix set `tables.docx`'s own root declares — the exact
+namespace-declaration bug this module's own `mutations.py` docstring
+describes at length (a namespace `mc:Ignorable` still NAMES but nothing
+declares). Never caught before because nothing had ever run `opc_valid`
+against this fixture (only read tools used it) until WP-14's mutating
+tools (`replace_table_row`/`replace_cell_markdown`) did. Rebuilt with the
+same hand-built `w:tbl` content, this time serialized through
+`mutations._capture_source_namespaces`/`_serialize_xml` (the real
+namespace-preservation fix) against `tables.docx`'s full source
+declarations, so it round-trips through a real write correctly. Confirmed
+`opc_valid(tests/fixtures/tables-merged.docx) == (True, [])`, which it was
+not before.
+
 **Not produced this WP, and named rather than substituted:** a fixture
 combining a heading-delimited section (for `replace_range_markdown`) WITH
 a real comment anchor inside that section was not made — synthesizing one
@@ -67,3 +85,21 @@ the real `commented.docx`/`tracked.docx` fixtures above (the shared hazard
 `replace_range_markdown`'s own section-targeting logic against the real,
 heading-only `sections.docx` fixture (no comments involved). See
 `tests/unit/test_mutations.py` for both.
+
+## Issue #28 WP-15a additions
+
+| File | Purpose | How it was made |
+|---|---|---|
+| `images/sample.png` | A 300x150px solid-color PNG. Tests `insert_image`'s PNG path: intrinsic-size reading (`IHDR`), the default-width-from-`list_page_sections` path, and the EMU round-trip on `wp:extent`. | **Synthetic, not Word-authored — deliberately, not as a shortcut.** `insert_image`'s own `image_path` argument is a LOCAL file this server reads and embeds VERBATIM; the fixture-integrity rule at the top of this file exists to catch a gap between real Word OUTPUT and this repo's assumptions about it, which does not apply here — there is no Word-output nuance to get wrong by guessing, because Word never produced this file in the first place and this server only ever consumes it. Built with pure-Python `struct`/`zlib` (no imaging library is installed in this environment) — a minimal, valid, single-`IDAT` RGB PNG. |
+| `images/sample.svg` | A 200x100 `viewBox` SVG (a rect + text). Tests `insert_image`'s SVG path: `width`/`viewBox`-derived design size, the native Word 2016+ `a:blip`/`a14:svgBlip` extension, and the PNG fallback part `sips` rasterizes from it. | Hand-authored plain SVG/XML text — same rationale as `sample.png` above: a user-supplied asset `insert_image` reads verbatim, not a Word-output nuance. |
+
+Also worth naming here, since it is the second time this exact bug class
+has surfaced: `tables-merged.docx`'s WP-14 regeneration note above (under
+WP-03b-a) fixed the file being invalid OOXML as shipped — its root
+declared 3 namespace prefixes while `mc:Ignorable` named 9 more nothing
+declared, the same namespace-declaration bug PR #3 fixed in the WRITE
+path, this time latent in a FIXTURE because nothing had ever written to
+it (or run `opc_valid` against it) before WP-14's mutating tools did.
+That recurrence is itself the argument for `opc_valid`'s
+`mc:Ignorable`-declared-prefix check staying a real, standing rule — it
+is what caught this one, on a file, not just on a write.
