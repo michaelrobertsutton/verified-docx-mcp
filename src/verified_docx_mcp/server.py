@@ -1273,10 +1273,8 @@ def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
     Scope limit: if comment_id itself names a reply (it has its own
     w15:paraIdParent), this returns that reply alone with replies=[] --
     it does not walk upward to find and return the whole thread's root.
-    This tool only READS threading structure a document already carries
-    (e.g. one authored in Word desktop, or a reply added by a later WP);
-    add_anchored_comment never creates one itself, and reply
-    creation/resolve are WP-09, not this tool.
+    Reply creation and resolve are reply_to_comment/resolve_comment; this
+    tool only ever reads whatever threading state already exists.
 
     Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
     Word's owner file is present, like every other read tool.
@@ -1289,6 +1287,82 @@ def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
     """
     try:
         return comments.execute_get_comment_thread(path, comment_id)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def reply_to_comment(path: str, comment_id: str, text: str) -> dict[str, Any]:
+    """Reply to an existing comment (durableId), atomically -- issue #28
+    WP-09.
+
+    Creates a NEW, independent comment (its own w:comment / w:id / paraId
+    / durableId, and its own full commentRangeStart/End/commentReference
+    anchor triplet in word/document.xml) whose commentsExtended.xml entry
+    carries w15:paraIdParent pointing at the PARENT's own paraId -- this
+    is exactly how a real Word-authored reply is shaped (verified against
+    tests/fixtures/comments/golden-comment.docx's own real reply). The
+    reply's anchor brackets the SAME live text the parent's own anchor
+    currently does; no new text is located or matched.
+
+    Returns the eight evidence keys (before/after are the parent's own
+    quoted text, unchanged -- a reply never edits document text; rung is
+    the fixed label "reply", since no text search is performed), plus
+    comment_id (the new reply's own durableId) and parent_comment_id.
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or
+                         comment_id does not match any existing comment,
+                         or that comment has no live anchor to reply against
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
+      REVISION_CONFLICT                 - revision_before is stale
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return comments.execute_reply_to_comment(path, comment_id, text)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def resolve_comment(path: str, comment_id: str) -> dict[str, Any]:
+    """Resolve a comment thread (durableId), atomically -- issue #28
+    WP-09. Sets w15:done="1" on the comment's own commentsExtended.xml
+    entry; list_open_items excludes it afterward (it is no longer an
+    "open" item), but get_comment_thread still fetches it by id --
+    resolved is not deleted, only marked.
+
+    COMMENT_STILL_OPEN is adapted, not lifted verbatim, from
+    GoogleDocs-MCP's own member of the same name: that server's version
+    guards genuine Drive-API eventual consistency (a resolve action that
+    does not durably stick server-side) by re-querying the comment from
+    the API after the write. This backend's write is a local, synchronous,
+    atomically-verified file replace with no such external-consistency
+    hazard -- so this code can only ever fire here via a bug in this
+    server's own code, not a real runtime race. Kept anyway (re-reading
+    the fresh file from disk and checking w15:done="1" independently of
+    the write's own success) so the error VOCABULARY still matches
+    Google's for this exact failure mode.
+
+    Idempotent: resolving an already-resolved comment succeeds again
+    (not an error).
+
+    Returns the eight evidence keys (before="open", after="resolved";
+    rung is the fixed label "resolve", since no text search is
+    performed), plus comment_id.
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or
+                         comment_id does not match any existing comment
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
+      REVISION_CONFLICT                 - revision_before is stale
+      COMMENT_STILL_OPEN                - the post-write re-read did not confirm w15:done="1" (see this tool's own docstring)
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return comments.execute_resolve_comment(path, comment_id)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

@@ -46,7 +46,7 @@ class ErrorCode(Enum):
     DOCX_LOCKED = "DOCX_LOCKED"  # writes only; reads snapshot instead (WP-02)
     SNAPSHOT_FAILED = "SNAPSHOT_FAILED"  # read-path snapshot validation exhausted its retries (WP-02)
     SYNC_IN_FLIGHT = "SYNC_IN_FLIGHT"  # reserved: write guard, WP-04/WP-10
-    CONFLICT_COPY_DETECTED = "CONFLICT_COPY_DETECTED"  # reserved: post-write sweep, WP-10
+    CONFLICT_COPY_DETECTED = "CONFLICT_COPY_DETECTED"  # WP-10's post-write conflict-copy sweep: an EVIDENCE FLAG (evidence["conflict_copy_detected"]=True + the sibling's name), never raised -- the write itself still succeeded and is reported as applied
 
     # Projection / read tools (projection.py, WP-03)
     PART_NOT_FOUND = "PART_NOT_FOUND"  # read_document(part=...) names a package part that does not exist
@@ -77,6 +77,15 @@ class ErrorCode(Enum):
 
     # Tracked changes (tracked_changes.py; WP-07)
     REVISION_ID_NOT_FOUND = "REVISION_ID_NOT_FOUND"  # accept_tracked_changes/reject_tracked_changes named a w:ins/w:del id not present in the document
+
+    # Comments (comments.py; WP-09). COMMENT_STILL_OPEN is adapted, not
+    # lifted verbatim, from GoogleDocs-MCP's own member of the same name
+    # (verify.py) -- see comments.py's resolve_comment docstring for the
+    # divergence this server's local, synchronous write means it can only
+    # ever reach via a genuine bug in this server's own code, unlike
+    # Google's version, which guards a real Drive-API eventual-consistency
+    # hazard this backend has no analogue of.
+    COMMENT_STILL_OPEN = "COMMENT_STILL_OPEN"  # resolve_comment's own post-write re-read did not confirm w15:done="1"
 
 
 # Which codes signal a transient condition worth a single retry by the

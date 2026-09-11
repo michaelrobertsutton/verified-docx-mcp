@@ -214,7 +214,18 @@ def execute_list_open_items(path: str) -> dict[str, Any]:
         proj = projection.project_part(local_path)
         document_root, _raw = mutations._load_document(local_path)
         suggestions = _find_pending_suggestions(document_root)
-        comments = _parse_comments(local_path, proj)
+        # New for issue #28 WP-09: "list_open_items filters resolved" -- an
+        # "open item" is, by definition, not a resolved one (matching the
+        # shipped GoogleDocs-MCP server's own list_comments, which only
+        # ever returns a comment when `not raw.get("resolved", False)`).
+        # Filtered HERE, not inside _parse_comments itself, so that
+        # function stays the general "every comment in the package" parser
+        # a future caller wanting the full set (resolved included) could
+        # still reuse. A resolved comment is still fully fetchable by its
+        # comment_id via comments.get_comment_thread -- being filtered out
+        # of THIS list does not remove it from the package (verified in
+        # test_comments.py: ResolvedCommentStillFetchableTests).
+        comments = [c for c in _parse_comments(local_path, proj) if not c["resolved"]]
         return {"path": str(resolved), "comments": comments, "pending_suggestions": suggestions}
     finally:
         if is_temp:

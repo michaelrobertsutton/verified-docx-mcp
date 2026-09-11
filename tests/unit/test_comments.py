@@ -39,6 +39,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from verified_docx_mcp import comments, mutations, paths, projection, tracked_changes
 from verified_docx_mcp.errors import ErrorCode, VerifyError
+from verified_docx_mcp.middleware import MUTATING_TOOLS
 
 FIXTURES = REPO / "tests" / "fixtures"
 GOLDEN = FIXTURES / "comments" / "golden-comment.docx"
@@ -118,6 +119,14 @@ class GoldenShaUnchangedTest(unittest.TestCase):
     def test_golden_sha256_unchanged(self):
         actual = __import__("hashlib").sha256(GOLDEN.read_bytes()).hexdigest()
         self.assertEqual(actual, GOLDEN_SHA256, "golden-comment.docx has been modified -- do not touch it")
+
+
+class MutatingToolsRegistrationTests(unittest.TestCase):
+    def test_add_anchored_comment_and_wp09_tools_registered_get_comment_thread_is_not(self):
+        self.assertIn("add_anchored_comment", MUTATING_TOOLS)
+        self.assertIn("reply_to_comment", MUTATING_TOOLS)
+        self.assertIn("resolve_comment", MUTATING_TOOLS)
+        self.assertNotIn("get_comment_thread", MUTATING_TOOLS, "get_comment_thread is read-only")
 
 
 class _TempFixtureCase(unittest.TestCase):
@@ -418,6 +427,153 @@ class PartByPartGoldenComparisonTests(_TempFixtureCase):
         self.assertIsNotNone(mine_rpr)
         self.assertIsNotNone(golden_rpr)
         assert_structurally_equivalent(self, mine_rpr, golden_rpr, "commentReference run's own rPr shape differs")
+
+
+# ---------------------------------------------------------------------------
+# reply_to_comment / resolve_comment -- issue #28 WP-09.
+# ---------------------------------------------------------------------------
+
+
+class ReplyToCommentTests(_TempFixtureCase):
+    def test_reply_links_to_parent_and_shares_its_anchor(self):
+        root = comments.execute_add_anchored_comment(str(self.target), "brown fox", "root comment", 1)
+        reply = comments.execute_reply_to_comment(str(self.target), root["comment_id"], "a reply")
+        self.assertTrue(reply["applied"])
+        self.assertEqual(reply["parent_comment_id"], root["comment_id"])
+        self.assertNotEqual(reply["comment_id"], root["comment_id"])
+        # A reply never changes document text.
+        self.assertEqual(projection.read_document_text(self.target), "The quick brown fox jumps over the lazy dog.")
+
+        thread = comments.execute_get_comment_thread(str(self.target), root["comment_id"])
+        self.assertEqual(thread["reply_count"], 1)
+        self.assertEqual(thread["replies"][0]["comment_id"], reply["comment_id"])
+        self.assertEqual(thread["replies"][0]["content"], "a reply")
+        # The reply brackets the SAME live text as its parent.
+        self.assertEqual(thread["replies"][0]["quoted_text"], "brown fox")
+
+    def test_reply_gets_its_own_full_anchor_triplet_in_document_xml(self):
+        root = comments.execute_add_anchored_comment(str(self.target), "brown fox", "root comment", 1)
+        comments.execute_reply_to_comment(str(self.target), root["comment_id"], "a reply")
+        with zipfile.ZipFile(self.target) as zf:
+            doc = zf.read("word/document.xml").decode("utf-8")
+        self.assertEqual(doc.count("<w:commentRangeStart"), 2)
+        self.assertEqual(doc.count("<w:commentRangeEnd"), 2)
+        self.assertEqual(doc.count("<w:commentReference"), 2)
+
+    def test_unknown_parent_comment_id_raises_invalid_input(self):
+        comments.execute_add_anchored_comment(str(self.target), "brown", "x", 1)
+        with self.assertRaises(VerifyError) as cm:
+            comments.execute_reply_to_comment(str(self.target), "FFFFFFFF", "a reply")
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+
+class ReplyStructuralComparisonAgainstGoldenTests(_TempFixtureCase):
+    """Extends WP-08's part-by-part comparison to a generated REPLY,
+    against the golden fixture's own real reply (paraId=5FA1F0F0,
+    paraIdParent=4F84A13A) -- per this WP's own orchestrator notes."""
+
+    def test_reply_commentex_shape_matches_golden_reply(self):
+        root = comments.execute_add_anchored_comment(str(self.target), "brown fox", "root comment", 1)
+        comments.execute_reply_to_comment(str(self.target), root["comment_id"], "a reply")
+
+        with zipfile.ZipFile(self.target) as zf:
+            mine_ext_root = ET.fromstring(zf.read("word/commentsExtended.xml"))
+        with zipfile.ZipFile(GOLDEN) as zf:
+            golden_ext_root = ET.fromstring(zf.read("word/commentsExtended.xml"))
+
+        mine_reply_ex = next(
+            c for c in mine_ext_root if projection._ln(c) == "commentEx" and projection._attr(c, "paraIdParent")
+        )
+        golden_reply_ex = next(
+            c
+            for c in golden_ext_root
+            if projection._ln(c) == "commentEx" and projection._attr(c, "paraId") == "5FA1F0F0"
+        )
+        assert_structurally_equivalent(
+            self, mine_reply_ex, golden_reply_ex, "a generated reply's <w15:commentEx> shape differs from the golden's real reply"
+        )
+
+
+class ResolveCommentTests(_TempFixtureCase):
+    def test_resolve_sets_done_and_is_reflected_in_thread(self):
+        root = comments.execute_add_anchored_comment(str(self.target), "brown", "x", 1)
+        evidence = comments.execute_resolve_comment(str(self.target), root["comment_id"])
+        self.assertTrue(evidence["applied"])
+        thread = comments.execute_get_comment_thread(str(self.target), root["comment_id"])
+        self.assertTrue(thread["resolved"])
+
+    def test_resolving_an_already_resolved_comment_is_idempotent(self):
+        root = comments.execute_add_anchored_comment(str(self.target), "brown", "x", 1)
+        comments.execute_resolve_comment(str(self.target), root["comment_id"])
+        evidence = comments.execute_resolve_comment(str(self.target), root["comment_id"])
+        self.assertTrue(evidence["applied"])
+
+    def test_unknown_comment_id_raises_invalid_input(self):
+        comments.execute_add_anchored_comment(str(self.target), "brown", "x", 1)
+        with self.assertRaises(VerifyError) as cm:
+            comments.execute_resolve_comment(str(self.target), "FFFFFFFF")
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+
+class ListOpenItemsFilterResolvedTests(_TempFixtureCase):
+    """Orchestrator note C: filtering resolved must not disturb the
+    comment_id/w_id interop fix, and a resolved comment must still be
+    fetchable by id even when filtered out of the open list."""
+
+    def test_resolved_comment_excluded_from_list_open_items(self):
+        root = comments.execute_add_anchored_comment(str(self.target), "brown", "x", 1)
+        comments.execute_add_anchored_comment(str(self.target), "lazy", "y", 1)
+        comments.execute_resolve_comment(str(self.target), root["comment_id"])
+
+        open_items = tracked_changes.execute_list_open_items(str(self.target))
+        open_ids = {c["comment_id"] for c in open_items["comments"]}
+        self.assertNotIn(root["comment_id"], open_ids, "a resolved comment must not appear in list_open_items")
+        self.assertEqual(len(open_items["comments"]), 1)
+
+    def test_resolved_comment_still_fetchable_by_id_even_though_filtered(self):
+        root = comments.execute_add_anchored_comment(str(self.target), "brown", "x", 1)
+        comments.execute_resolve_comment(str(self.target), root["comment_id"])
+
+        open_items = tracked_changes.execute_list_open_items(str(self.target))
+        self.assertEqual(open_items["comments"], [], "the only comment is resolved -- the open list must be empty")
+
+        # Filtered out of the OPEN list does not mean gone from the
+        # package -- get_comment_thread must still resolve it by id.
+        thread = comments.execute_get_comment_thread(str(self.target), root["comment_id"])
+        self.assertEqual(thread["comment_id"], root["comment_id"])
+        self.assertTrue(thread["resolved"])
+
+
+class GoldenGoldenResolvedFilterTests(unittest.TestCase):
+    """The golden fixture's own resolved thread (id=2, done=1) must be
+    filtered from list_open_items but remain fetchable -- read-only,
+    never writes to the golden."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_allowed = os.environ.get(paths._ALLOWED_FILE_ROOTS_ENV)
+        os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = self._tmp.name
+        self.target = Path(self._tmp.name) / "golden.docx"
+        shutil.copyfile(GOLDEN, self.target)
+
+    def tearDown(self):
+        if self._old_allowed is None:
+            os.environ.pop(paths._ALLOWED_FILE_ROOTS_ENV, None)
+        else:
+            os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = self._old_allowed
+        self._tmp.cleanup()
+        actual = __import__("hashlib").sha256(GOLDEN.read_bytes()).hexdigest()
+        assert actual == GOLDEN_SHA256, "golden-comment.docx was modified by a test -- this must never happen"
+
+    def test_resolved_thread_excluded_but_still_fetchable(self):
+        open_items = tracked_changes.execute_list_open_items(str(self.target))
+        open_ids = {c["comment_id"] for c in open_items["comments"]}
+        self.assertNotIn("5CE3201C", open_ids)
+        self.assertIn("654503C0", open_ids)
+
+        thread = comments.execute_get_comment_thread(str(self.target), "5CE3201C")
+        self.assertTrue(thread["resolved"])
+        self.assertEqual(thread["content"], "test and resolve")
 
 
 if __name__ == "__main__":

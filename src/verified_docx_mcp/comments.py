@@ -182,6 +182,74 @@ def _root_or_new(data: bytes | None, tag: str) -> tuple[Any, bool]:
     return root, True
 
 
+class _CommentParts:
+    """The five comment-related parts' (root, created) pairs plus the raw
+    rels/[Content_Types].xml bytes -- loaded once, shared by
+    add_anchored_comment (WP-08) and reply_to_comment/resolve_comment
+    (WP-09), all of which need the same five parts open for editing."""
+
+    def __init__(self, resolved: Path) -> None:
+        with zipfile.ZipFile(resolved) as zf:
+            names = set(zf.namelist())
+            comments_bytes = _read_part_or_none(zf, _COMMENTS_PART)
+            ext_bytes = _read_part_or_none(zf, _COMMENTS_EXT_PART)
+            ids_bytes = _read_part_or_none(zf, _COMMENTS_IDS_PART)
+            cex_bytes = _read_part_or_none(zf, _COMMENTS_CEX_PART)
+            people_bytes = _read_part_or_none(zf, _PEOPLE_PART)
+            rels_path = projection._rels_path_for(DEFAULT_PART)
+            self.rels_bytes = zf.read(rels_path) if rels_path in names else None
+            self.ct_bytes = zf.read("[Content_Types].xml")
+
+        self.comments_root, self.comments_created = _root_or_new(comments_bytes, _w("comments"))
+        self.ext_root, self.ext_created = _root_or_new(ext_bytes, _w15("commentsEx"))
+        self.ids_root, self.ids_created = _root_or_new(ids_bytes, _w16cid("commentsIds"))
+        self.cex_root, self.cex_created = _root_or_new(cex_bytes, _w16cex("commentsExtensible"))
+        self.people_root, self.people_created = _root_or_new(people_bytes, _w15("people"))
+
+    def build_overrides(self, *, document_root: Any, raw_xml: bytes) -> dict[str, bytes]:
+        return _build_overrides(
+            document_root=document_root,
+            raw_xml=raw_xml,
+            comments_root=self.comments_root,
+            comments_created=self.comments_created,
+            ext_root=self.ext_root,
+            ext_created=self.ext_created,
+            ids_root=self.ids_root,
+            ids_created=self.ids_created,
+            cex_root=self.cex_root,
+            cex_created=self.cex_created,
+            people_root=self.people_root,
+            people_created=self.people_created,
+            rels_bytes=self.rels_bytes,
+            ct_bytes=self.ct_bytes,
+        )
+
+    def para_id_for_w_id(self, w_id: str) -> str | None:
+        for c in self.comments_root:
+            if projection._ln(c) != "comment" or projection._attr(c, "id") != w_id:
+                continue
+            for p in c:
+                if projection._ln(p) == "p":
+                    return projection._attr(p, "paraId")
+        return None
+
+    def w_id_for_durable_id(self, durable_id: str) -> str | None:
+        para_id = None
+        for child in self.ids_root:
+            if projection._ln(child) == "commentId" and projection._attr(child, "durableId") == durable_id:
+                para_id = projection._attr(child, "paraId")
+                break
+        if para_id is None:
+            return None
+        for c in self.comments_root:
+            if projection._ln(c) != "comment":
+                continue
+            for p in c:
+                if projection._ln(p) == "p" and projection._attr(p, "paraId") == para_id:
+                    return projection._attr(c, "id")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # add_anchored_comment
 # ---------------------------------------------------------------------------
@@ -206,25 +274,9 @@ def execute_add_anchored_comment(
     author = resolve_author_name()
     date = tracked_changes.current_revision_date()
 
-    with zipfile.ZipFile(resolved) as zf:
-        names = set(zf.namelist())
-        comments_bytes = _read_part_or_none(zf, _COMMENTS_PART)
-        ext_bytes = _read_part_or_none(zf, _COMMENTS_EXT_PART)
-        ids_bytes = _read_part_or_none(zf, _COMMENTS_IDS_PART)
-        cex_bytes = _read_part_or_none(zf, _COMMENTS_CEX_PART)
-        people_bytes = _read_part_or_none(zf, _PEOPLE_PART)
-        rels_path = projection._rels_path_for(DEFAULT_PART)
-        rels_bytes = zf.read(rels_path) if rels_path in names else None
-        ct_bytes = zf.read("[Content_Types].xml")
-
-    comments_root, comments_created = _root_or_new(comments_bytes, _w("comments"))
-    ext_root, ext_created = _root_or_new(ext_bytes, _w15("commentsEx"))
-    ids_root, ids_created = _root_or_new(ids_bytes, _w16cid("commentsIds"))
-    cex_root, cex_created = _root_or_new(cex_bytes, _w16cex("commentsExtensible"))
-    people_root, people_created = _root_or_new(people_bytes, _w15("people"))
-
-    next_comment_id = _next_comment_id(comments_root if not comments_created else None)
-    taken_hex = _existing_hex_ids(ext_root, ids_root)
+    parts = _CommentParts(resolved)
+    next_comment_id = _next_comment_id(parts.comments_root if not parts.comments_created else None)
+    taken_hex = _existing_hex_ids(parts.ext_root, parts.ids_root)
 
     before_excerpt = text_edit._excerpt(proj.text, locate_result.spans[0][0], locate_result.spans[0][1])
 
@@ -237,12 +289,12 @@ def execute_add_anchored_comment(
         comment_ids_created.append(durable_id)
 
         _insert_anchor(proj, start, end, comment_id=cid)
-        _append_comment(comments_root, comment_id=cid, para_id=para_id, author=author, date=date, text=text)
-        _append_comment_ex(ext_root, para_id=para_id)
-        _append_comment_id(ids_root, para_id=para_id, durable_id=durable_id)
-        _append_comment_extensible(cex_root, durable_id=durable_id, date_utc=date)
+        _append_comment(parts.comments_root, comment_id=cid, para_id=para_id, author=author, date=date, text=text)
+        _append_comment_ex(parts.ext_root, para_id=para_id)
+        _append_comment_id(parts.ids_root, para_id=para_id, durable_id=durable_id)
+        _append_comment_extensible(parts.cex_root, durable_id=durable_id, date_utc=date)
 
-    _ensure_person(people_root, author=author)
+    _ensure_person(parts.people_root, author=author)
 
     # Post-write assertion (issue #28 plan WP-08: "Verify after write that
     # the range brackets the quoted span"): re-project the MUTATED live
@@ -257,23 +309,7 @@ def execute_add_anchored_comment(
         post_proj = projection.project_part(written_path)
         _assert_anchors_bracket_quote(post_proj, quote)
 
-    overrides = _build_overrides(
-        resolved,
-        document_root=document_root,
-        raw_xml=raw_xml,
-        comments_root=comments_root,
-        comments_created=comments_created,
-        ext_root=ext_root,
-        ext_created=ext_created,
-        ids_root=ids_root,
-        ids_created=ids_created,
-        cex_root=cex_root,
-        cex_created=cex_created,
-        people_root=people_root,
-        people_created=people_created,
-        rels_bytes=rels_bytes,
-        ct_bytes=ct_bytes,
-    )
+    overrides = parts.build_overrides(document_root=document_root, raw_xml=raw_xml)
     mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
 
     post_revision = projection.compute_revision(resolved)
@@ -412,6 +448,25 @@ def _assert_anchors_bracket_quote(proj: projection.Projection, quote: str) -> No
     )
 
 
+def _anchor_span_for_w_id(proj: projection.Projection, w_id: str) -> tuple[int, int] | None:
+    """The [start, end) span in proj.text the given comment w:id currently
+    brackets (min start, max end across every run RunEvent.comment_ids
+    tags with it) -- used by reply_to_comment (WP-09) to give the reply
+    the SAME anchor range as the parent it replies to, rather than
+    re-locating any text. None if w_id anchors nothing found in the live
+    projection (a malformed/stale id)."""
+    starts: list[int] = []
+    ends: list[int] = []
+    run_events = [e for e in proj.events if isinstance(e, projection.RunEvent)]
+    for event, (s, e, _pr, _rr) in zip(run_events, proj.offset_map):
+        if w_id in event.comment_ids:
+            starts.append(s)
+            ends.append(e)
+    if not starts:
+        return None
+    return min(starts), max(ends)
+
+
 # ---------------------------------------------------------------------------
 # The five comment parts: build fresh content into each root.
 # ---------------------------------------------------------------------------
@@ -450,8 +505,15 @@ def _append_comment(comments_root: Any, *, comment_id: str, para_id: str, author
         t.set(f"{{{_XML_NS}}}space", "preserve")
 
 
-def _append_comment_ex(ext_root: Any, *, para_id: str) -> None:
-    ET.SubElement(ext_root, _w15("commentEx"), {_w15("paraId"): para_id, _w15("done"): "0"})
+def _append_comment_ex(ext_root: Any, *, para_id: str, parent_para_id: str | None = None) -> None:
+    attrs = {_w15("paraId"): para_id, _w15("done"): "0"}
+    if parent_para_id is not None:
+        # issue #28 plan WP-09: a reply's own commentEx carries
+        # w15:paraIdParent pointing at the PARENT's own paraId -- verified
+        # against the golden fixture's real reply (paraId=5FA1F0F0,
+        # paraIdParent=4F84A13A, the root's own paraId).
+        attrs[_w15("paraIdParent")] = parent_para_id
+    ET.SubElement(ext_root, _w15("commentEx"), attrs)
 
 
 def _append_comment_id(ids_root: Any, *, para_id: str, durable_id: str) -> None:
@@ -488,7 +550,6 @@ def _serialize_comment_part(root: Any, namespace_decls: dict[str, str], mc_ignor
 
 
 def _build_overrides(
-    resolved: Path,
     *,
     document_root: Any,
     raw_xml: bytes,
@@ -696,3 +757,211 @@ def execute_get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
     finally:
         if is_temp:
             local_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# reply_to_comment / resolve_comment -- issue #28 WP-09.
+# ---------------------------------------------------------------------------
+
+
+def execute_reply_to_comment(
+    path: str, comment_id: str, text: str, *, revision_before: str | None = None, force: bool = False
+) -> dict[str, Any]:
+    """Reply to an existing comment (a NEW, independent w:comment whose
+    commentEx carries w15:paraIdParent pointing at the parent's own
+    paraId -- see _append_comment_ex's docstring, verified against the
+    golden fixture's own real reply).
+
+    Reuses the PARENT comment's own EXISTING anchor range in
+    word/document.xml (via _anchor_span_for_w_id) rather than locating any
+    text of its own -- a reply comment gets its own full commentRangeStart/
+    End/commentReference triplet (its own w:id), but brackets the SAME
+    live span the parent already does; this matches the golden fixture's
+    own shape exactly (its reply, id=1, has its own anchor triplet
+    alongside the parent's, id=0, both around the same quoted text).
+    """
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    pre_revision = mutations._guard_before_write(resolved, revision_before)
+
+    document_root, raw_xml = mutations._load_document(resolved)
+    proj = projection.project_document_root(document_root)
+
+    parts = _CommentParts(resolved)
+    parent_w_id = parts.w_id_for_durable_id(comment_id)
+    if parent_w_id is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT, f"comment_id {comment_id!r} not found", {"comment_id": comment_id}
+        )
+    parent_para_id = parts.para_id_for_w_id(parent_w_id)
+    if parent_para_id is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"comment_id {comment_id!r} has no paraId in word/comments.xml",
+            {"comment_id": comment_id},
+        )
+
+    span = _anchor_span_for_w_id(proj, parent_w_id)
+    if span is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"comment_id {comment_id!r} has no live anchor in word/document.xml to reply against",
+            {"comment_id": comment_id},
+        )
+    start, end = span
+    quoted_text = proj.text[start:end]
+
+    author = resolve_author_name()
+    date = tracked_changes.current_revision_date()
+
+    next_comment_id = _next_comment_id(parts.comments_root if not parts.comments_created else None)
+    taken_hex = _existing_hex_ids(parts.ext_root, parts.ids_root)
+    new_w_id = str(next_comment_id)
+    new_para_id = _new_hex_id(taken_hex)
+    new_durable_id = _new_hex_id(taken_hex)
+
+    _insert_anchor(proj, start, end, comment_id=new_w_id)
+    _append_comment(parts.comments_root, comment_id=new_w_id, para_id=new_para_id, author=author, date=date, text=text)
+    _append_comment_ex(parts.ext_root, para_id=new_para_id, parent_para_id=parent_para_id)
+    _append_comment_id(parts.ids_root, para_id=new_para_id, durable_id=new_durable_id)
+    _append_comment_extensible(parts.cex_root, durable_id=new_durable_id, date_utc=date)
+    _ensure_person(parts.people_root, author=author)
+
+    def _post_verify(written_path: Path) -> None:
+        with zipfile.ZipFile(written_path) as zf:
+            ids_root = ET.fromstring(zf.read(_COMMENTS_IDS_PART))
+            ext_root = ET.fromstring(zf.read(_COMMENTS_EXT_PART))
+        found_para = None
+        for child in ids_root:
+            if projection._ln(child) == "commentId" and projection._attr(child, "durableId") == new_durable_id:
+                found_para = projection._attr(child, "paraId")
+                break
+        if found_para is None:
+            raise ValueError(f"reply durableId {new_durable_id!r} not found in commentsIds.xml after write")
+        linked = any(
+            projection._ln(child) == "commentEx"
+            and projection._attr(child, "paraId") == found_para
+            and projection._attr(child, "paraIdParent") == parent_para_id
+            for child in ext_root
+        )
+        if not linked:
+            raise ValueError(f"reply {new_durable_id!r} does not link back to parent paraId {parent_para_id!r} after write")
+
+    overrides = parts.build_overrides(document_root=document_root, raw_xml=raw_xml)
+    mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
+
+    post_revision = projection.compute_revision(resolved)
+    evidence: dict[str, Any] = {
+        "applied": True,
+        "match_count": 1,
+        # "rung" has no locate()-ladder meaning here (no text search is
+        # performed -- the reply reuses the parent's own existing anchor);
+        # a fixed descriptive label, matching the same "adapt the shared
+        # evidence shape to what this tool actually does" precedent
+        # mutations.py's markdown tools set for a non-search rung.
+        "rung": "reply",
+        "before": quoted_text,
+        "after": quoted_text,  # a reply never changes document text
+        "revision_before": pre_revision["token"],
+        "revision_after": post_revision["token"],
+        "audit_logged": False,
+        "comment_id": new_durable_id,
+        "parent_comment_id": comment_id,
+    }
+    logged, _ = audit.append_audit(path=str(resolved), tool="reply_to_comment", evidence=evidence)
+    evidence["audit_logged"] = logged
+    return evidence
+
+
+def execute_resolve_comment(
+    path: str, comment_id: str, *, revision_before: str | None = None, force: bool = False
+) -> dict[str, Any]:
+    """Resolve a comment thread (w15:done="1" on its own commentEx entry).
+
+    COMMENT_STILL_OPEN, adapted from GoogleDocs-MCP's own member of the
+    same name (verify.py/comments.py): that server's resolve_comment
+    issues a Drive API call, then RE-QUERIES the comment from the API
+    (server-side, independently of the write) and raises
+    COMMENT_STILL_OPEN if the re-query still shows it open -- guarding
+    against genuine Drive-side eventual consistency (the resolve action
+    not durably sticking server-side). This backend has no analogue of
+    that hazard: word/commentsExtended.xml is a local file this server
+    writes atomically and re-reads synchronously, so "still open after a
+    successful local write" can only happen here via a bug in this
+    server's own code, never an external service's consistency window.
+    The check is kept anyway -- re-reading the FRESH file from disk after
+    the atomic write and raising COMMENT_STILL_OPEN (not the generic
+    VERIFICATION_FAILED) if it does not show resolved -- so the error
+    VOCABULARY still matches Google's for this exact failure mode, giving
+    a caller a more specific signal than VERIFICATION_FAILED would.
+    """
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    pre_revision = mutations._guard_before_write(resolved, revision_before)
+
+    document_root, raw_xml = mutations._load_document(resolved)
+
+    parts = _CommentParts(resolved)
+    w_id = parts.w_id_for_durable_id(comment_id)
+    if w_id is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT, f"comment_id {comment_id!r} not found", {"comment_id": comment_id}
+        )
+    para_id = parts.para_id_for_w_id(w_id)
+    if para_id is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"comment_id {comment_id!r} has no paraId in word/comments.xml",
+            {"comment_id": comment_id},
+        )
+
+    target_ex = None
+    for child in parts.ext_root:
+        if projection._ln(child) == "commentEx" and projection._attr(child, "paraId") == para_id:
+            target_ex = child
+            break
+    if target_ex is None:
+        # Defensive: every comment THIS server creates always gets a
+        # commentEx entry (_append_comment_ex); a comment authored
+        # elsewhere that somehow lacks one gets one created fresh here
+        # rather than failing outright.
+        target_ex = ET.SubElement(parts.ext_root, _w15("commentEx"), {_w15("paraId"): para_id})
+    target_ex.set(_w15("done"), "1")
+
+    def _post_verify(written_path: Path) -> None:
+        with zipfile.ZipFile(written_path) as zf:
+            ET.fromstring(zf.read(_COMMENTS_EXT_PART))  # basic well-formedness re-check
+
+    overrides = parts.build_overrides(document_root=document_root, raw_xml=raw_xml)
+    mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
+
+    # Independent post-write re-read (see this function's own docstring):
+    # COMMENT_STILL_OPEN, not VERIFICATION_FAILED, if the FRESH file does
+    # not show this comment resolved.
+    with zipfile.ZipFile(resolved) as zf:
+        final_ext_root = ET.fromstring(zf.read(_COMMENTS_EXT_PART))
+    still_open = True
+    for child in final_ext_root:
+        if projection._ln(child) == "commentEx" and projection._attr(child, "paraId") == para_id:
+            still_open = projection._attr(child, "done") != "1"
+            break
+    if still_open:
+        raise _make_error(
+            ErrorCode.COMMENT_STILL_OPEN,
+            f"comment_id {comment_id!r} is still open after the resolve attempt",
+            {"comment_id": comment_id},
+        )
+
+    post_revision = projection.compute_revision(resolved)
+    evidence: dict[str, Any] = {
+        "applied": True,
+        "match_count": 1,
+        "rung": "resolve",
+        "before": "open",
+        "after": "resolved",
+        "revision_before": pre_revision["token"],
+        "revision_after": post_revision["token"],
+        "audit_logged": False,
+        "comment_id": comment_id,
+    }
+    logged, _ = audit.append_audit(path=str(resolved), tool="resolve_comment", evidence=evidence)
+    evidence["audit_logged"] = logged
+    return evidence
