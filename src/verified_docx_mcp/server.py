@@ -513,8 +513,10 @@ def execute_read_document(
             elif format == "runs":
                 result["runs"] = projection.runs_from_projection(scoped)
             else:  # markdown
-                markdown, _ = projection.markdown_from_projection(local_path, scoped)
+                markdown, _, lossy_elements = projection.markdown_from_projection(local_path, scoped)
                 result["markdown"] = markdown
+                if lossy_elements:
+                    result["lossy_elements"] = lossy_elements
             result["warnings"] = scoped.warnings
             return result
 
@@ -525,9 +527,14 @@ def execute_read_document(
             result["runs"] = projection.read_document_runs(local_path, part)
             result["warnings"] = projection.project_part(local_path, part).warnings
         else:  # markdown
-            markdown, warnings = projection.read_document_markdown(local_path, part)
+            markdown, warnings, lossy_elements = projection.read_document_markdown(local_path, part)
             result["markdown"] = markdown
             result["warnings"] = warnings
+            # Same response shape as GoogleDocs-MCP's read_document (issue
+            # #28 WP-03b-a): a lossy_elements key, present only when the
+            # rendering actually lost something (a merged/nested table).
+            if lossy_elements:
+                result["lossy_elements"] = lossy_elements
         return result
     finally:
         if is_temp:
@@ -567,10 +574,15 @@ def read_document(
     structural records: {"type":"table_start"|"table_end", table_id},
     {"type":"drawing", blip_rid, media_part, extent_in, para_ref} for every
     w:drawing/a:blip, and {"type":"field", instr, result_text}.
-    format="markdown" (default) renders headings/bold/italic and stable
-    placeholder tokens ([TABLE], [GRAPHIC], [field:instr]) for constructs
-    markdown cannot represent — WP-04's inverse (markdown -> OOXML) is not
-    implemented here.
+    format="markdown" (default) renders headings, bold/italic, bulleted/
+    numbered lists (nested by indent), and GFM pipe tables — matching
+    GoogleDocs-MCP's markdown.py conventions exactly (issue #28 WP-03b-a)
+    — plus stable placeholder tokens ("[image:rId]", "[field:instr]") for
+    a drawing / a field with no result. WP-04's inverse (markdown ->
+    OOXML) is not implemented here. A merged table cell (w:gridSpan/
+    w:vMerge) or a nested w:tbl has no pipe-table representation and is
+    reported in lossy_elements ({"kind": "table_merge"|"nested_table",
+    "table_id"}) instead of silently reproduced as an ordinary grid cell.
 
     A deleted span (w:del/w:delText) and a field's own instruction text
     (w:instrText) are excluded from every format; a field's RESULT text
@@ -582,7 +594,8 @@ def read_document(
     Returns path, part, format, section_key (echoed back, None unless
     passed), revision (the "<doc8>:<cmt8>" token), revision_detail (the
     full {document_sha256, comments_sha256, size, mtime_ns} tuple),
-    warnings, plus text|runs|markdown per format.
+    warnings, lossy_elements (format="markdown" only, present only when
+    non-empty), plus text|runs|markdown per format.
 
     Not gated by DOCX_LOCKED — see list_parts' docstring.
 

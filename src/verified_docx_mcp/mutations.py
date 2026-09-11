@@ -792,7 +792,8 @@ def execute_replace_body_markdown(
 
     styles = projection.list_styles_impl(resolved)
     styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
-    before_text = projection.markdown_from_elements(target_elements, styles_by_id)
+    numbering_index = projection.load_numbering_index(resolved)
+    before_text = projection.markdown_from_elements(target_elements, styles_by_id, numbering_index)
 
     hazards = _scan_range_hazards(target_elements)
     orphaned_comment_ids = _check_hazards_or_raise(hazards, force)
@@ -800,13 +801,19 @@ def execute_replace_body_markdown(
     ctx = markdown_to_ooxml.StyleContext.build(resolved)
     new_elements = markdown_to_ooxml.render_blocks(markdown, ctx)
     # The verification target is what read_document_markdown would render
-    # from THESE elements (run through the identical, deliberately-lossy
-    # rendering rules read_document_markdown itself uses — no bullet/table
-    # markers; see projection.py's module docstring) — NOT the raw
-    # markdown text. Diffing against the raw input would spuriously fail
-    # for any list/table (read_document_markdown cannot reconstruct "- "
-    # or a pipe table from a re-read), even on a perfectly correct write.
-    intended_preview = projection.markdown_from_elements(new_elements, styles_by_id)
+    # from THESE elements (run through the identical rendering rules
+    # read_document_markdown itself uses; see projection.py's module
+    # docstring) — NOT the raw markdown text. Diffing against the raw
+    # input would spuriously fail for any table (GFM column-count
+    # normalisation, cell-paragraph joining) or list whose markdown the
+    # renderer reproduces in a different but equivalent form, even on a
+    # perfectly correct write. new_elements' own paragraphs only ever
+    # reference numIds markdown_to_ooxml just allocated (ctx.new_*), which
+    # is not yet in this document's numbering.xml on disk — the index for
+    # THIS preview comes from those in-memory elements, never
+    # load_numbering_index(resolved).
+    new_numbering_index = projection.numbering_index_from_elements(ctx.new_abstract_nums, ctx.new_nums)
+    intended_preview = projection.markdown_from_elements(new_elements, styles_by_id, new_numbering_index)
 
     for child in list(body):
         body.remove(child)
@@ -816,7 +823,7 @@ def execute_replace_body_markdown(
         body.append(sect_pr)
 
     def _post_verify(written_path: Path) -> None:
-        markdown_after, _ = projection.read_document_markdown(written_path)
+        markdown_after, _, _ = projection.read_document_markdown(written_path)
         diff = _diff_modulo_whitespace(intended_preview, markdown_after)
         if diff:
             raise ValueError(f"re-read body does not match the intended rendering modulo whitespace: {diff}")
@@ -824,7 +831,7 @@ def execute_replace_body_markdown(
     _write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
     post_revision = projection.compute_revision(resolved)
-    after_text, _ = projection.read_document_markdown(resolved)
+    after_text, _, _ = projection.read_document_markdown(resolved)
     evidence = _evidence(
         applied=True,
         match_count=1,
@@ -886,10 +893,11 @@ def execute_replace_range_markdown(
 
     styles = projection.list_styles_impl(resolved)
     styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
+    numbering_index = projection.load_numbering_index(resolved)
 
     start, end = locate_section_range(body_children, section_key, styles_by_id)
     target_elements = body_children[start:end]
-    before_text = projection.markdown_from_elements(target_elements, styles_by_id)
+    before_text = projection.markdown_from_elements(target_elements, styles_by_id, numbering_index)
 
     hazards = _scan_range_hazards(target_elements)
     orphaned_comment_ids = _check_hazards_or_raise(hazards, force)
@@ -906,8 +914,12 @@ def execute_replace_range_markdown(
     ctx = markdown_to_ooxml.StyleContext.build(resolved)
     new_elements = markdown_to_ooxml.render_blocks(markdown, ctx)
     # See replace_body_markdown's identical comment: verify against the
-    # rendered PREVIEW of these elements, not the raw markdown text.
-    intended_preview = projection.markdown_from_elements(new_elements, styles_by_id)
+    # rendered PREVIEW of these elements, not the raw markdown text — and
+    # (also as there) new_elements' own paragraphs only reference numIds
+    # markdown_to_ooxml just allocated, not yet in this document's
+    # numbering.xml on disk.
+    new_numbering_index = projection.numbering_index_from_elements(ctx.new_abstract_nums, ctx.new_nums)
+    intended_preview = projection.markdown_from_elements(new_elements, styles_by_id, new_numbering_index)
 
     for el in target_elements:
         body.remove(el)
@@ -922,7 +934,11 @@ def execute_replace_range_markdown(
         rewritten_range = new_body_children[insert_at : insert_at + len(new_elements)]
         new_styles = projection.list_styles_impl(written_path)
         new_styles_by_id = {s["style_id"]: s for s in new_styles if s["style_id"]}
-        actual = projection.markdown_from_elements(rewritten_range, new_styles_by_id)
+        # written_path is the ALREADY-REPLACED original (atomic_replace_docx_parts'
+        # docstring), so its numbering.xml on disk now includes ctx's new
+        # lists — a fresh disk read resolves them correctly here.
+        written_numbering_index = projection.load_numbering_index(written_path)
+        actual = projection.markdown_from_elements(rewritten_range, new_styles_by_id, written_numbering_index)
         diff = _diff_modulo_whitespace(intended_preview, actual)
         if diff:
             raise ValueError(f"re-read section does not match the intended rendering modulo whitespace: {diff}")
@@ -936,6 +952,7 @@ def execute_replace_range_markdown(
     after_text = projection.markdown_from_elements(
         final_body_children[insert_at : insert_at + len(new_elements)],
         {s["style_id"]: s for s in projection.list_styles_impl(resolved) if s["style_id"]},
+        projection.load_numbering_index(resolved),
     )
 
     evidence = _evidence(
@@ -973,13 +990,18 @@ def execute_append_markdown(path: str, markdown: str, *, revision_before: str | 
 
     styles = projection.list_styles_impl(resolved)
     styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
-    before_text = projection.markdown_from_elements(body_children, styles_by_id)
+    numbering_index = projection.load_numbering_index(resolved)
+    before_text = projection.markdown_from_elements(body_children, styles_by_id, numbering_index)
 
     ctx = markdown_to_ooxml.StyleContext.build(resolved)
     new_elements = markdown_to_ooxml.render_blocks(markdown, ctx)
     # See replace_body_markdown's identical comment: verify against the
-    # rendered PREVIEW of these elements, not the raw markdown text.
-    intended_preview = projection.markdown_from_elements(new_elements, styles_by_id)
+    # rendered PREVIEW of these elements, not the raw markdown text — and
+    # (also as there) new_elements' own paragraphs only reference numIds
+    # markdown_to_ooxml just allocated, not yet in this document's
+    # numbering.xml on disk.
+    new_numbering_index = projection.numbering_index_from_elements(ctx.new_abstract_nums, ctx.new_nums)
+    intended_preview = projection.markdown_from_elements(new_elements, styles_by_id, new_numbering_index)
 
     insert_at = len(body_children)
     for offset, el in enumerate(new_elements):
@@ -995,7 +1017,10 @@ def execute_append_markdown(path: str, markdown: str, *, revision_before: str | 
         appended = new_body_children[insert_at : insert_at + len(new_elements)]
         new_styles = projection.list_styles_impl(written_path)
         new_styles_by_id = {s["style_id"]: s for s in new_styles if s["style_id"]}
-        actual = projection.markdown_from_elements(appended, new_styles_by_id)
+        # written_path is the ALREADY-REPLACED original; its numbering.xml
+        # on disk now includes ctx's new lists.
+        written_numbering_index = projection.load_numbering_index(written_path)
+        actual = projection.markdown_from_elements(appended, new_styles_by_id, written_numbering_index)
         diff = _diff_modulo_whitespace(intended_preview, actual)
         if diff:
             raise ValueError(f"re-read appended range does not match the intended rendering modulo whitespace: {diff}")
@@ -1003,7 +1028,7 @@ def execute_append_markdown(path: str, markdown: str, *, revision_before: str | 
     _write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
     post_revision = projection.compute_revision(resolved)
-    after_text, _ = projection.read_document_markdown(resolved)
+    after_text, _, _ = projection.read_document_markdown(resolved)
 
     evidence = _evidence(
         applied=True,

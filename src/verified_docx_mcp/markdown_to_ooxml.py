@@ -20,9 +20,12 @@ Supported subset (issue #28 plan WP-04): ATX headings (resolved through
 ``StyleContext.heading_style_for_level`` -> ``list_styles``, never a
 hardcoded "Heading2" — ``STYLE_NOT_FOUND`` when a level has no heading
 style in the target document), paragraphs, **bold**/*italic*/***both***
-runs, bulleted and ordered lists (including nesting, each list — top-level
-or nested — gets its own freshly allocated ``w:abstractNum``/``w:num``
-pair; see ``StyleContext.allocate_list``), pipe tables (``w:tbl`` with
+runs, bulleted and ordered lists (including nesting — a top-level list
+gets one freshly allocated ``w:abstractNum``/``w:num`` pair for its WHOLE
+tree, shared by every nested level under it via an increasing ``w:ilvl``,
+the standard OOXML idiom projection.py's markdown reader also relies on to
+detect nesting; see ``StyleContext.allocate_list_root``/
+``ensure_list_level``), pipe tables (``w:tbl`` with
 ``style_id`` from the target document's own table styles when one exists),
 and ``[text](url)`` links (``w:hyperlink`` + a new External relationship,
 ``StyleContext.relationship_for_link``).
@@ -89,6 +92,8 @@ class StyleContext:
     warnings: list[str] = dataclasses.field(default_factory=list)
     _next_rid: int = 1
     _link_rid_cache: dict[str, str] = dataclasses.field(default_factory=dict)
+    _abstract_num_by_num_id: dict[int, Any] = dataclasses.field(default_factory=dict)
+    _defined_levels_by_num_id: dict[int, set[int]] = dataclasses.field(default_factory=dict)
 
     @staticmethod
     def build(resolved: Path) -> StyleContext:
@@ -147,16 +152,40 @@ class StyleContext:
             )
         return style_id
 
-    def allocate_list(self, ordered: bool, depth: int) -> int:
-        """Allocate a fresh abstractNum/num pair for one list (top-level or
-        nested — every list gets its own pair; see module docstring)."""
+    def allocate_list_root(self, ordered: bool, depth: int) -> int:
+        """Allocate a fresh abstractNum/num pair for one TOP-LEVEL list —
+        every level nested under it (see ensure_list_level) shares this
+        SAME num_id, only its w:ilvl changing per depth. This is the
+        standard OOXML idiom (one numId, increasing ilvl per nesting
+        level) — PR #3 review / WP-03b-a's extended round trip: the prior
+        design (a fresh numId *per nesting level*, every paragraph's own
+        w:ilvl left at 0) left the reader with no signal at all to tell a
+        nested item from a new, unrelated top-level list — every markdown
+        list-nesting round trip silently flattened."""
         abstract_id = self.next_abstract_num_id
         num_id = self.next_num_id
         self.next_abstract_num_id += 1
         self.next_num_id += 1
-        self.new_abstract_nums.append(_build_abstract_num(abstract_id, ordered, depth))
+        abstract_num = _build_abstract_num_shell(abstract_id)
+        self.new_abstract_nums.append(abstract_num)
         self.new_nums.append(_build_num(num_id, abstract_id))
+        self._abstract_num_by_num_id[num_id] = abstract_num
+        self._defined_levels_by_num_id[num_id] = set()
+        self.ensure_list_level(num_id, ordered, depth)
         return num_id
+
+    def ensure_list_level(self, num_id: int, ordered: bool, depth: int) -> None:
+        """Add a w:lvl for *depth* to num_id's abstractNum if this num_id
+        has never used that depth before (e.g. the first ordered list
+        nested under a bulleted parent, or a second bulleted item at a
+        depth a sibling branch already defined — a no-op the second
+        time)."""
+        defined = self._defined_levels_by_num_id.setdefault(num_id, set())
+        if depth in defined:
+            return
+        abstract_num = self._abstract_num_by_num_id[num_id]
+        abstract_num.append(_build_lvl(depth, ordered))
+        defined.add(depth)
 
     def relationship_for_link(self, url: str) -> str:
         cached = self._link_rid_cache.get(url)
@@ -205,21 +234,28 @@ def _max_rel_id(root: Any | None) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _build_abstract_num(abstract_id: int, ordered: bool, depth: int) -> Any:
+def _build_abstract_num_shell(abstract_id: int) -> Any:
+    """An abstractNum with no w:lvl children yet -- ensure_list_level
+    adds one per nesting depth actually used, as that depth is first
+    reached (a list may never go past ilvl 0, or may reach several)."""
     abstract_num = ET.Element(_w("abstractNum"), {_wa("abstractNumId"): str(abstract_id)})
-    ET.SubElement(abstract_num, _w("multiLevelType"), {_wa("val"): "singleLevel"})
-    lvl = ET.SubElement(abstract_num, _w("lvl"), {_wa("ilvl"): "0"})
+    ET.SubElement(abstract_num, _w("multiLevelType"), {_wa("val"): "hybridMultilevel"})
+    return abstract_num
+
+
+def _build_lvl(ilvl: int, ordered: bool) -> Any:
+    lvl = ET.Element(_w("lvl"), {_wa("ilvl"): str(ilvl)})
     ET.SubElement(lvl, _w("start"), {_wa("val"): "1"})
     ET.SubElement(lvl, _w("numFmt"), {_wa("val"): "decimal" if ordered else "bullet"})
     ET.SubElement(lvl, _w("lvlText"), {_wa("val"): "%1." if ordered else ""})
     ET.SubElement(lvl, _w("lvlJc"), {_wa("val"): "left"})
     ppr = ET.SubElement(lvl, _w("pPr"))
-    left = 720 * (depth + 1)
+    left = 720 * (ilvl + 1)
     ET.SubElement(ppr, _w("ind"), {_wa("left"): str(left), _wa("hanging"): "360"})
     if not ordered:
         rpr = ET.SubElement(lvl, _w("rPr"))
         ET.SubElement(rpr, _w("rFonts"), {_wa("ascii"): "Symbol", _wa("hAnsi"): "Symbol", _wa("hint"): "default"})
-    return abstract_num
+    return lvl
 
 
 def _build_num(num_id: int, abstract_id: int) -> Any:
@@ -415,21 +451,39 @@ def _walk_list_item(tokens: list[Any], start: int, end: int, ctx: StyleContext, 
         if tok.type == "paragraph_open":
             inline_tok = tokens[j + 1] if j + 1 < end and tokens[j + 1].type == "inline" else None
             runs = _inline_runs(inline_tok, ctx)
-            elements.append(_build_paragraph(ctx, None, runs, num_id=num_id, ilvl=0))
+            # ilvl=depth (never a hardcoded 0) — this paragraph's nesting
+            # level is the ONLY signal a reader (projection.py's
+            # _events_to_markdown) has to tell it apart from a top-level
+            # item; see allocate_list_root's docstring.
+            elements.append(_build_paragraph(ctx, None, runs, num_id=num_id, ilvl=depth))
             j += 3
         elif tok.type in ("bullet_list_open", "ordered_list_open"):
             nested_ordered = tok.type == "ordered_list_open"
             nested_close = "bullet_list_close" if not nested_ordered else "ordered_list_close"
             nested_end = _find_matching_close(tokens, j, nested_close)
-            elements.extend(_walk_list(tokens, j, nested_end, ctx, nested_ordered, depth + 1))
+            # Same num_id as the enclosing list — a nested list is a
+            # deeper LEVEL of the same numbering tree, not an unrelated
+            # list of its own (see allocate_list_root).
+            elements.extend(_walk_list(tokens, j, nested_end, ctx, nested_ordered, depth + 1, num_id=num_id))
             j = nested_end + 1
         else:
             j += 1
     return elements
 
 
-def _walk_list(tokens: list[Any], open_idx: int, close_idx: int, ctx: StyleContext, ordered: bool, depth: int) -> list[Any]:
-    num_id = ctx.allocate_list(ordered, depth)
+def _walk_list(
+    tokens: list[Any], open_idx: int, close_idx: int, ctx: StyleContext, ordered: bool, depth: int, num_id: int | None = None
+) -> list[Any]:
+    """*num_id* is None for a top-level list (allocates a fresh
+    numId/abstractNum tree) and the enclosing list's num_id when this is a
+    nested list — either way, ensure_list_level makes sure this depth's
+    w:lvl (bullet or numbered, whichever THIS level actually uses — a
+    nested list's own marker type is independent of its parent's) is
+    defined on that shared abstractNum."""
+    if num_id is None:
+        num_id = ctx.allocate_list_root(ordered, depth)
+    else:
+        ctx.ensure_list_level(num_id, ordered, depth)
     elements: list[Any] = []
     j = open_idx + 1
     while j < close_idx:

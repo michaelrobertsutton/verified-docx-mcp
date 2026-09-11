@@ -112,9 +112,27 @@ class RenderBlocksTests(unittest.TestCase):
         fmt = self.ctx.new_abstract_nums[-1].find(f"{_w('lvl')}/{_w('numFmt')}")
         self.assertEqual(fmt.get(_w("val")), "decimal")
 
-    def test_nested_list_allocates_a_second_numbering_definition(self):
-        markdown_to_ooxml.render_blocks("- top\n    - nested\n", self.ctx)
-        self.assertEqual(len(self.ctx.new_abstract_nums), 2)
+    def test_nested_list_shares_its_parent_numid_at_a_deeper_ilvl(self):
+        """WP-03b-a: a nested list is a deeper LEVEL of the SAME numbering
+        tree as its parent (one abstractNum/numId for the whole tree, an
+        increasing w:ilvl per level) — not an unrelated list of its own.
+        projection.py's markdown reader has no other signal to tell a
+        nested item from a new top-level list; the prior one-abstractNum-
+        per-nesting-level design left it unable to, and WP-03b-a's
+        extended round trip (a two-level list in section.md) caught it."""
+        elements = markdown_to_ooxml.render_blocks("- top\n    - nested\n", self.ctx)
+        self.assertEqual(len(self.ctx.new_abstract_nums), 1)
+        self.assertEqual(len(self.ctx.new_nums), 1)
+        num_ids = set()
+        ilvls = []
+        for p in elements:
+            num_pr = p.find(f"{_w('pPr')}/{_w('numPr')}")
+            num_ids.add(num_pr.find(_w("numId")).get(_w("val")))
+            ilvls.append(int(num_pr.find(_w("ilvl")).get(_w("val"))))
+        self.assertEqual(len(num_ids), 1)  # same numId, both levels
+        self.assertEqual(ilvls, [0, 1])
+        lvls = self.ctx.new_abstract_nums[0].findall(_w("lvl"))
+        self.assertEqual({lvl.get(_w("ilvl")) for lvl in lvls}, {"0", "1"})
 
     def test_table_becomes_wtbl_with_style_and_grid(self):
         md = "| A | B |\n| --- | --- |\n| 1 | 2 |\n"

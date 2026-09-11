@@ -191,7 +191,7 @@ class CommentAnchorHazardTests(_TempFixtureCase):
         evidence = mutations.execute_replace_body_markdown(str(self.target), "Replacement text.\n", force=True)
         self.assertTrue(evidence["applied"])
         self.assertEqual(evidence["orphaned_comment_ids"], ["0"])
-        markdown_after, _ = projection.read_document_markdown(self.target)
+        markdown_after, _, _ = projection.read_document_markdown(self.target)
         self.assertEqual(markdown_after.strip(), "Replacement text.")
 
 
@@ -231,7 +231,7 @@ class ReplaceBodyMarkdownRoundTripTests(_TempFixtureCase):
         self.assertNotEqual(evidence["revision_before"], evidence["revision_after"])
         self.assertTrue(evidence["audit_logged"])
 
-        markdown_after, _ = projection.read_document_markdown(self.target)
+        markdown_after, _, _ = projection.read_document_markdown(self.target)
         normalize = lambda s: " ".join(s.split())
         self.assertEqual(normalize(markdown_after), normalize(section_md))
         # The evidence's own "after" must match what a fresh read reports.
@@ -270,7 +270,7 @@ class ReplaceRangeMarkdownTests(_TempFixtureCase):
         keys_after = {s["section_key"] for s in sections_after}
         self.assertEqual(keys_after, {"overview-1", "background-1", "next-steps-1"})
 
-        full_markdown, _ = projection.read_document_markdown(self.target)
+        full_markdown, _, _ = projection.read_document_markdown(self.target)
         self.assertIn("Updated background content", full_markdown)
         self.assertNotIn("Background text.", full_markdown)
         self.assertIn("Some overview text.", full_markdown)
@@ -296,14 +296,14 @@ class ReplaceRangeMarkdownTextboxKeyTests(_TempFixtureCase):
         sections = projection.find_sections_impl(self.target)
         self.assertEqual([s["section_key"] for s in sections], ["textbox-1"])
 
-        before_markdown, _ = projection.read_document_markdown(self.target)
+        before_markdown, _, _ = projection.read_document_markdown(self.target)
         with self.assertRaises(VerifyError) as cm:
             mutations.execute_replace_range_markdown(str(self.target), "textbox-1", "Replacement.\n")
         self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
         self.assertIn("text box", cm.exception.envelope.message)
 
         # Refused before any write: the document is untouched.
-        after_markdown, _ = projection.read_document_markdown(self.target)
+        after_markdown, _, _ = projection.read_document_markdown(self.target)
         self.assertEqual(before_markdown, after_markdown)
 
 
@@ -319,7 +319,7 @@ class AppendMarkdownTests(_TempFixtureCase):
         evidence = mutations.execute_append_markdown(str(self.target), "## Appendix\n\nAppended content.\n")
         self.assertTrue(evidence["applied"])
         self.assertEqual(evidence["rung"], 4)
-        full_markdown, _ = projection.read_document_markdown(self.target)
+        full_markdown, _, _ = projection.read_document_markdown(self.target)
         self.assertTrue(full_markdown.strip().endswith("Appended content."))
         self.assertIn("Next steps text.", full_markdown)  # existing content preserved
 

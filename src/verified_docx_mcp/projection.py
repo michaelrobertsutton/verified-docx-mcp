@@ -173,6 +173,13 @@ class RunEvent:
 class TableBoundaryEvent:
     kind: str  # "table_start" | "table_end"
     table_id: int
+    # The raw w:tbl Element, set only on "table_start" (None on
+    # "table_end") — WP-03b-a's markdown renderer needs direct XML access
+    # (w:tcPr/w:gridSpan, w:vMerge, a nested w:tbl) that the flat
+    # paragraph/run event stream below does not carry; runs_from_projection
+    # never includes this field in its dict output, so the "runs" format's
+    # contract is unaffected.
+    element: Any = None
 
 
 @dataclasses.dataclass
@@ -261,6 +268,12 @@ class ParagraphMeta:
     style_id: str | None
     outline_lvl: int | None
     container_chain: list[dict[str, int]]
+    # w:pPr/w:numPr — None/None for a non-list paragraph. WP-03b-a's list
+    # rendering resolves (num_id, ilvl) through _load_numbering_index to
+    # decide bullet vs numbered and to track per-level nesting/indent,
+    # mirroring GoogleDocs-MCP markdown.py's (listId, nestingLevel).
+    num_id: int | None = None
+    ilvl: int | None = None
 
 
 class _PartWalker:
@@ -298,7 +311,7 @@ class _PartWalker:
 
     def _walk_table(self, tbl: Any, chain: list[dict[str, int]]) -> None:
         table_id = self.ids.next_table_id()
-        self.events.append(TableBoundaryEvent("table_start", table_id))
+        self.events.append(TableBoundaryEvent("table_start", table_id, element=tbl))
         row_idx = 0
         for row in tbl:
             if _ln(row) != "tr":
@@ -326,6 +339,8 @@ class _PartWalker:
         ppr = self._find_child(p, "pPr")
         style_id = None
         outline_lvl = None
+        num_id = None
+        ilvl = None
         if ppr is not None:
             pstyle = self._find_child(ppr, "pStyle")
             if pstyle is not None:
@@ -335,7 +350,23 @@ class _PartWalker:
                 raw = _attr(outline, "val")
                 if raw is not None and raw.isdigit():
                     outline_lvl = int(raw)
-        self.paragraphs.append(ParagraphMeta(para_ref, style_id, outline_lvl, chain))
+            num_pr = self._find_child(ppr, "numPr")
+            if num_pr is not None:
+                num_id_el = self._find_child(num_pr, "numId")
+                ilvl_el = self._find_child(num_pr, "ilvl")
+                if num_id_el is not None:
+                    raw_num_id = _attr(num_id_el, "val")
+                    # numId="0" is OOXML's own "no list" convention (used to
+                    # cancel inherited list formatting from a style) — not a
+                    # real list membership, so it is deliberately excluded
+                    # here rather than rendered as list item #0's bullet.
+                    if raw_num_id is not None and raw_num_id.isdigit() and int(raw_num_id) != 0:
+                        num_id = int(raw_num_id)
+                if ilvl_el is not None:
+                    raw_ilvl = _attr(ilvl_el, "val")
+                    if raw_ilvl is not None and raw_ilvl.isdigit():
+                        ilvl = int(raw_ilvl)
+        self.paragraphs.append(ParagraphMeta(para_ref, style_id, outline_lvl, chain, num_id=num_id, ilvl=ilvl))
 
         if not self._first_para:
             self.events.append(RunEvent("\n", {}, para_ref, f"{para_ref}/break"))
@@ -929,6 +960,122 @@ def list_styles_impl(docx_path: Path) -> list[dict[str, Any]]:
         return styles
 
 
+# ---------------------------------------------------------------------------
+# numbering.xml — w:numId -> {ilvl: numFmt}, WP-03b-a's list rendering.
+# ---------------------------------------------------------------------------
+
+
+def numbering_index_from_elements(
+    abstract_num_elements: list[Any], num_elements: list[Any]
+) -> dict[int, dict[int, str]]:
+    """The same ``w:num``/``w:abstractNum`` -> {numId: {ilvl: numFmt}}
+    join load_numbering_index does, but over already-in-memory Elements
+    rather than a part read from a docx on disk — the on-disk numbering.xml
+    doesn't exist yet for a list a write is ABOUT to add (mutations.py's
+    ``intended_preview`` renders new_elements — freshly built by
+    markdown_to_ooxml.render_blocks — before anything is written; those
+    paragraphs' w:numId values only resolve against
+    ``ctx.new_abstract_nums``/``ctx.new_nums``, never an existing numId, so
+    this is the correct — and only available — index for that preview).
+    """
+    abstract_fmt: dict[int, dict[int, str]] = {}
+    for el in abstract_num_elements:
+        raw_aid = _attr(el, "abstractNumId")
+        if raw_aid is None or not raw_aid.isdigit():
+            continue
+        aid = int(raw_aid)
+        fmts: dict[int, str] = {}
+        for lvl in el:
+            if _ln(lvl) != "lvl":
+                continue
+            raw_ilvl = _attr(lvl, "ilvl")
+            if raw_ilvl is None or not raw_ilvl.isdigit():
+                continue
+            for child in lvl:
+                if _ln(child) == "numFmt":
+                    val = _attr(child, "val")
+                    if val is not None:
+                        fmts[int(raw_ilvl)] = val
+        abstract_fmt[aid] = fmts
+
+    num_to_abstract: dict[int, int] = {}
+    overrides: dict[int, dict[int, str]] = {}
+    for el in num_elements:
+        raw_nid = _attr(el, "numId")
+        if raw_nid is None or not raw_nid.isdigit():
+            continue
+        nid = int(raw_nid)
+        for child in el:
+            if _ln(child) == "abstractNumId":
+                val = _attr(child, "val")
+                if val is not None and val.isdigit():
+                    num_to_abstract[nid] = int(val)
+            elif _ln(child) == "lvlOverride":
+                raw_ilvl = _attr(child, "ilvl")
+                if raw_ilvl is None or not raw_ilvl.isdigit():
+                    continue
+                for sub in child:
+                    if _ln(sub) != "lvl":
+                        continue
+                    for grandchild in sub:
+                        if _ln(grandchild) == "numFmt":
+                            val = _attr(grandchild, "val")
+                            if val is not None:
+                                overrides.setdefault(nid, {})[int(raw_ilvl)] = val
+
+    index: dict[int, dict[int, str]] = {}
+    for nid, aid in num_to_abstract.items():
+        fmts = dict(abstract_fmt.get(aid, {}))
+        fmts.update(overrides.get(nid, {}))
+        index[nid] = fmts
+    return index
+
+
+def load_numbering_index(docx_path: Path) -> dict[int, dict[int, str]]:
+    """``word/numbering.xml``'s ``w:num`` (numId -> abstractNumId) joined
+    with ``w:abstractNum`` (abstractNumId -> {ilvl: numFmt}), a per-numId
+    ``w:num/w:lvlOverride/w:lvl/w:numFmt`` taking precedence over the
+    abstractNum's own value at that level when present. Returns {} when the
+    part is absent (no lists anywhere in the document).
+
+    Used by the markdown renderer to tell a bullet list from a numbered one
+    (a "bullet" numFmt renders "- "; anything else this table recognizes as
+    numeric renders sequential "1. " — see _ORDERED_NUM_FMTS) — never
+    inferred from the paragraph's own lvlText/glyph, which OOXML does not
+    guarantee carries that distinction directly on the paragraph itself.
+    """
+    with zipfile.ZipFile(docx_path) as zf:
+        if "word/numbering.xml" not in zf.namelist():
+            return {}
+        root = read_part_xml(zf, "word/numbering.xml")
+    if root is None:
+        return {}
+    abstract_num_elements = [el for el in root if _ln(el) == "abstractNum"]
+    num_elements = [el for el in root if _ln(el) == "num"]
+    return numbering_index_from_elements(abstract_num_elements, num_elements)
+
+
+# numFmt values rendered as a sequential "1. " marker — anything else
+# (most commonly "bullet", but also "none" or an unrecognized future
+# value) renders "- " instead. An explicit allowlist, never a denylist:
+# GoogleDocs-MCP markdown.py's _ORDERED_GLYPH_TYPES makes the identical
+# choice for the same reason (never GUESS a value is numeric).
+_ORDERED_NUM_FMTS = frozenset(
+    {
+        "decimal",
+        "decimalZero",
+        "decimalEnclosedCircle",
+        "decimalEnclosedFullstop",
+        "decimalEnclosedParen",
+        "lowerRoman",
+        "upperRoman",
+        "lowerLetter",
+        "upperLetter",
+        "ordinal",
+    }
+)
+
+
 # Built-in heading style ids Word emits even when styles.xml's own <w:pPr>
 # carries no explicit <w:outlineLvl> (common for a document whose styles
 # part was never customized) — "Heading1".."Heading9" -> outline level 0-8.
@@ -1198,38 +1345,266 @@ def read_document_text(docx_path: Path, part_name: str = DEFAULT_PART) -> str:
     return project_part(docx_path, part_name).text
 
 
+@dataclasses.dataclass
+class _ListFrame:
+    """Sequential-numbering state for one active nesting level while
+    converting a run of list-item paragraphs back to markdown — ported
+    from GoogleDocs-MCP markdown.py's _ListFrame (num_id/ilvl standing in
+    for that module's list_id/nestingLevel; see that module's
+    _advance_list_item docstring for the indent-width rationale)."""
+
+    num_id: int
+    ilvl: int
+    ordered: bool
+    counter: int
+    indent: int  # leading-space count for THIS level's own marker
+
+
+def _advance_list_item(
+    stack: list[_ListFrame], num_id: int, ilvl: int, ordered: bool
+) -> tuple[str, int]:
+    """Advance (or start) the counter for this (num_id, ilvl) and return
+    (leading-space indent, 1-based counter) for the current item —
+    identical algorithm to GoogleDocs-MCP markdown.py's
+    _Converter._advance_list_item; see that module for why indent is the
+    cumulative width of every ancestor's own marker rather than a fixed
+    per-level indent."""
+    while stack and stack[-1].ilvl >= ilvl:
+        if stack[-1].ilvl == ilvl and stack[-1].num_id == num_id:
+            break
+        stack.pop()
+
+    if stack and stack[-1].ilvl == ilvl:
+        frame = stack[-1]
+        frame.counter += 1
+        frame.ordered = ordered
+    else:
+        parent_indent = 0
+        if stack:
+            parent = stack[-1]
+            marker = f"{parent.counter}. " if parent.ordered else "- "
+            parent_indent = parent.indent + len(marker)
+        frame = _ListFrame(num_id=num_id, ilvl=ilvl, ordered=ordered, counter=1, indent=parent_indent)
+        stack.append(frame)
+
+    return " " * frame.indent, frame.counter
+
+
+def _pipe_row(cells: list[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+def _table_cell_markdown(
+    tc: Any, styles_by_id: dict[str, dict], table_id: int, lossy: list[dict[str, Any]]
+) -> str:
+    """One cell's markdown text — GoogleDocs-MCP markdown.py's ``_table``
+    cell handling (:350-359): the cell's own paragraphs rendered through
+    the SAME renderer as ordinary body content (so a bold run, a field, an
+    image inside a cell all still work), multiple paragraphs joined with a
+    single space (never their own newlines — a pipe-table row is one
+    line), any nested w:tbl flattened to inline text and recorded as a
+    "nested_table" lossy element. A literal "|" is escaped so it cannot be
+    mistaken for a column boundary — GoogleDocs-MCP gets this for free by
+    running every text run through _escape_markdown; this backend's
+    run-level renderer does not escape at all (a pre-existing WP-03 gap
+    out of this WP's scope), so it is done narrowly at this cell boundary
+    instead, where an unescaped "|" would otherwise corrupt the row.
+    """
+    paragraphs_only: list[Any] = []
+    nested_texts: list[str] = []
+    for child in tc:
+        tag = _ln(child)
+        if tag == "p":
+            paragraphs_only.append(child)
+        elif tag == "tbl":
+            lossy.append({"kind": "nested_table", "table_id": table_id})
+            nested_texts.append(_flatten_table_to_text(child, styles_by_id, table_id, lossy))
+        elif tag == "sdt":
+            content = None
+            for grandchild in child:
+                if _ln(grandchild) == "sdtContent":
+                    content = grandchild
+                    break
+            if content is not None:
+                for c in content:
+                    if _ln(c) == "p":
+                        paragraphs_only.append(c)
+                    elif _ln(c) == "tbl":
+                        lossy.append({"kind": "nested_table", "table_id": table_id})
+                        nested_texts.append(_flatten_table_to_text(c, styles_by_id, table_id, lossy))
+        # tcPr and anything else: not block content, skipped.
+
+    text = markdown_from_elements(paragraphs_only, styles_by_id) if paragraphs_only else ""
+    text = text.replace("\n", " ")
+    if nested_texts:
+        extra = " ".join(t for t in nested_texts if t)
+        text = f"{text} {extra}".strip() if text else extra
+    text = " ".join(text.split())
+    return text.replace("|", "\\|")
+
+
+def _flatten_table_to_text(
+    tbl: Any, styles_by_id: dict[str, dict], table_id: int, lossy: list[dict[str, Any]]
+) -> str:
+    """A nested w:tbl has no pipe-table representation at its host cell's
+    position (GFM does not nest tables inside a cell) — every cell's text
+    is flattened into one inline, space-joined run so the outer cell is
+    not silently emptied. The caller already recorded the "nested_table"
+    lossy element; this only renders the fallback text."""
+    parts: list[str] = []
+    for tr in tbl:
+        if _ln(tr) != "tr":
+            continue
+        for tc in tr:
+            if _ln(tc) != "tc":
+                continue
+            parts.append(_table_cell_markdown(tc, styles_by_id, table_id, lossy))
+    return " ".join(p for p in parts if p)
+
+
+def _table_to_markdown(
+    tbl: Any, table_id: int, styles_by_id: dict[str, dict]
+) -> tuple[str, list[dict[str, Any]]]:
+    """The ``read_document(format="markdown")`` rendering of one w:tbl — a
+    GFM pipe table matching GoogleDocs-MCP markdown.py's ``_table``/
+    ``_pipe_row`` conventions exactly (see that module's :341-381): first
+    row as header, a separator row of "---", column count normalised to
+    the widest row (short rows padded with empty cells).
+
+    Two OOXML-specific structural cases that pipe-table markdown has no
+    room for, both recorded as a lossy_elements entry rather than
+    reproduced (or silently dropped):
+      - w:gridSpan (a horizontally merged cell): its text is emitted once,
+        followed by (span - 1) empty cells to keep the grid rectangular.
+      - w:vMerge (a vertically merged cell): the "restart" cell (the top
+        of the merge) renders its own text normally; every continuation
+        cell (no w:val, or w:val != "restart") renders as an empty cell —
+        it carries no content of its own in the source OOXML either.
+    """
+    lossy: list[dict[str, Any]] = []
+    rows: list[list[str]] = []
+    for tr in tbl:
+        if _ln(tr) != "tr":
+            continue
+        cells: list[str] = []
+        for tc in tr:
+            if _ln(tc) != "tc":
+                continue
+            tc_pr = None
+            for child in tc:
+                if _ln(child) == "tcPr":
+                    tc_pr = child
+                    break
+            grid_span = 1
+            v_merge_present = False
+            v_merge_continue = False
+            if tc_pr is not None:
+                for child in tc_pr:
+                    if _ln(child) == "gridSpan":
+                        val = _attr(child, "val")
+                        if val is not None and val.isdigit():
+                            grid_span = int(val)
+                    elif _ln(child) == "vMerge":
+                        v_merge_present = True
+                        val = _attr(child, "val")
+                        v_merge_continue = (val is None) or (val.strip().lower() != "restart")
+            if v_merge_present or grid_span > 1:
+                lossy.append({"kind": "table_merge", "table_id": table_id})
+            text = "" if v_merge_continue else _table_cell_markdown(tc, styles_by_id, table_id, lossy)
+            cells.append(text)
+            cells.extend([""] * (grid_span - 1))
+        rows.append(cells)
+
+    if not rows:
+        return "", lossy
+
+    col_count = max((len(r) for r in rows), default=1) or 1
+    normalised = [r + [""] * (col_count - len(r)) for r in rows]
+    header, body = normalised[0], normalised[1:]
+    lines = [_pipe_row(header), _pipe_row(["---"] * col_count)]
+    lines.extend(_pipe_row(row) for row in body)
+    return "\n".join(lines), lossy
+
+
 def _events_to_markdown(
     events: list[Event],
     paragraphs: list[ParagraphMeta],
     styles_by_id: dict[str, dict],
-) -> str:
+    numbering_index: dict[int, dict[int, str]] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     """Shared rendering loop behind markdown_from_projection and
-    markdown_from_elements (mutations.py, WP-04) below — factored out so
-    both a whole-part projection and an ad hoc slice of a few w:body
-    children render through the exact same modest markdown rules (see
-    markdown_from_projection's docstring for what those rules are)."""
-    lines: list[str] = []
+    markdown_from_elements below — factored out so both a whole-part
+    projection and an ad hoc slice of a few w:body children render through
+    the exact same rules (see markdown_from_projection's docstring).
+    Returns (markdown_text, lossy_elements) — the latter populated only by
+    table merges/nesting (_table_to_markdown); everything else this
+    renderer supports (headings, bold/italic, lists, fields, images) has a
+    lossless markdown token, per GoogleDocs-MCP markdown.py's own
+    lossy_elements contract (image/chip/footnote there; table_merge/
+    nested_table here — this backend has no chip/footnote concept).
+
+    Block separation matches GoogleDocs-MCP markdown.py's convert(): two
+    consecutive list items join with a single newline (a "tight" list, so
+    CommonMark keeps them one list); any other pair of blocks (a heading,
+    an ordinary paragraph, a table) joins with a blank line, so re-parsing
+    the output never merges two distinct blocks into one.
+    """
+    numbering_index = numbering_index or {}
+    meta_by_ref = {m.para_ref: m for m in paragraphs}
+    blocks: list[tuple[bool, str]] = []  # (is_list_item, block_text)
+    lossy_elements: list[dict[str, Any]] = []
+    list_stack: list[_ListFrame] = []
+
     current_para_ref: str | None = None
     current_parts: list[str] = []
-    meta_by_ref = {m.para_ref: m for m in paragraphs}
 
     def flush() -> None:
+        nonlocal current_para_ref, current_parts
         if current_para_ref is None:
             return
         text = "".join(current_parts)
         meta = meta_by_ref.get(current_para_ref)
         level = _resolve_outline_level(meta.style_id, meta.outline_lvl, styles_by_id) if meta else None
         if level is not None and text.strip():
-            lines.append(f"{'#' * (level + 1)} {text.strip()}")
+            blocks.append((False, f"{'#' * (level + 1)} {text.strip()}"))
+        elif meta is not None and meta.num_id is not None:
+            fmt = numbering_index.get(meta.num_id, {}).get(meta.ilvl or 0)
+            ordered = fmt in _ORDERED_NUM_FMTS
+            indent, counter = _advance_list_item(list_stack, meta.num_id, meta.ilvl or 0, ordered)
+            marker = f"{counter}. " if ordered else "- "
+            blocks.append((True, f"{indent}{marker}{text.strip()}"))
         else:
-            lines.append(text)
+            blocks.append((False, text))
+        current_para_ref = None
+        current_parts = []
 
+    skip_table_depth = 0
     for event in events:
+        if isinstance(event, TableBoundaryEvent):
+            if event.kind == "table_start":
+                if skip_table_depth == 0:
+                    # The OUTERMOST table only: render the whole w:tbl
+                    # structurally from its raw element (row/cell/gridSpan/
+                    # vMerge/nested-tbl), then skip every flat event inside
+                    # it below — those are the same cells' paragraphs
+                    # walked a second time for the "runs"/"text" formats'
+                    # sake, and re-emitting them here would duplicate every
+                    # cell's text as bogus extra body lines (the WP-03
+                    # bug this WP replaces).
+                    flush()
+                    table_md, table_lossy = _table_to_markdown(event.element, event.table_id, styles_by_id)
+                    if table_md:
+                        blocks.append((False, table_md))
+                    lossy_elements.extend(table_lossy)
+                skip_table_depth += 1
+            else:  # table_end
+                skip_table_depth = max(0, skip_table_depth - 1)
+            continue
+        if skip_table_depth > 0:
+            continue
         if isinstance(event, RunEvent):
             if event.run_ref.endswith("/break"):
                 flush()
-                current_para_ref = None
-                current_parts = []
                 continue
             if current_para_ref is None:
                 current_para_ref = event.para_ref
@@ -1241,14 +1616,10 @@ def _events_to_markdown(
             elif event.rpr.get("italic"):
                 piece = f"*{piece}*" if piece.strip() else piece
             current_parts.append(piece)
-        elif isinstance(event, TableBoundaryEvent):
-            if event.kind == "table_start":
-                flush()
-                current_para_ref = None
-                current_parts = []
-                lines.append("[TABLE]")
         elif isinstance(event, DrawingEvent):
-            current_parts.append("[GRAPHIC]")
+            if current_para_ref is None:
+                current_para_ref = event.para_ref
+            current_parts.append(f"[image:{event.blip_rid}]" if event.blip_rid else "[image:unknown]")
         elif isinstance(event, FieldEvent):
             # A field's RESULT runs already flowed into current_parts as
             # ordinary RunEvents (field_result=True) before this FieldEvent
@@ -1259,35 +1630,51 @@ def _events_to_markdown(
             # field with an instr but no resolved result isn't silently
             # invisible in the rendered markdown.
             if not event.result_text and event.instr:
+                if current_para_ref is None:
+                    current_para_ref = event.para_ref
                 current_parts.append(f"[field:{event.instr}]")
 
     flush()
-    return "\n".join(lines)
+
+    if not blocks:
+        return "", lossy_elements
+    out = [blocks[0][1]]
+    for i in range(1, len(blocks)):
+        prev_is_list = blocks[i - 1][0]
+        cur_is_list, chunk = blocks[i]
+        out.append("\n" if (prev_is_list and cur_is_list) else "\n\n")
+        out.append(chunk)
+    return "".join(out), lossy_elements
 
 
-def markdown_from_projection(docx_path: Path, proj: Projection) -> tuple[str, list[str]]:
+def markdown_from_projection(docx_path: Path, proj: Projection) -> tuple[str, list[str], list[dict[str, Any]]]:
     """The ``read_document(format="markdown")`` rendering, built from an
     already-resolved Projection — shared by read_document_markdown (a
     whole package part) and server.py's textbox-scoped read
     (project_textbox_scope). *docx_path* is still needed for
-    list_styles_impl (a heading's outline level resolves through the
-    package's styles.xml, not through anything the Projection itself
+    list_styles_impl/load_numbering_index (a heading's outline level and a
+    list's bullet-vs-numbered form resolve through the package's
+    styles.xml/numbering.xml, not through anything the Projection itself
     carries).
 
-    A deliberately modest markdown rendering: paragraph text, headings
-    (from find_sections' same outline-level resolution) as ``#`` runs,
-    **bold**/*italic* run markers, tables/drawings/fields as stable
-    placeholder tokens ([TABLE], [GRAPHIC], [field:instr]) — WP-04's
-    markdown -> OOXML direction is the inverse of this and is not built
-    here. Returns (markdown_text, warnings).
+    Paragraph text, headings (from find_sections' same outline-level
+    resolution) as ``#`` runs, **bold**/*italic* run markers, bulleted/
+    numbered lists, GFM pipe tables, ``[image:rId]``/``[field:instr]``
+    placeholders for a drawing / a field with no result — see
+    _events_to_markdown and _table_to_markdown for the exact conventions
+    (matched to GoogleDocs-MCP markdown.py's; issue #28 WP-03b-a). Returns
+    (markdown_text, warnings, lossy_elements) — lossy_elements is the
+    table_merge/nested_table record described on _events_to_markdown,
+    empty when the content has neither.
     """
     styles = list_styles_impl(docx_path)
     styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
-    markdown = _events_to_markdown(proj.events, proj.paragraphs, styles_by_id)
-    return markdown, proj.warnings
+    numbering_index = load_numbering_index(docx_path)
+    markdown, lossy_elements = _events_to_markdown(proj.events, proj.paragraphs, styles_by_id, numbering_index)
+    return markdown, proj.warnings, lossy_elements
 
 
-def read_document_markdown(docx_path: Path, part_name: str = DEFAULT_PART) -> tuple[str, list[str]]:
+def read_document_markdown(docx_path: Path, part_name: str = DEFAULT_PART) -> tuple[str, list[str], list[dict[str, Any]]]:
     """``read_document(format="markdown")`` for a whole package part — see
     markdown_from_projection for the rendering rules."""
     return markdown_from_projection(docx_path, project_part(docx_path, part_name))
@@ -1296,19 +1683,24 @@ def read_document_markdown(docx_path: Path, part_name: str = DEFAULT_PART) -> tu
 def markdown_from_elements(
     elements: list[Any],
     styles_by_id: dict[str, dict],
+    numbering_index: dict[int, dict[int, str]] | None = None,
 ) -> str:
     """Render an arbitrary list of block-level elements (e.g. a slice of a
-    w:body's direct children) through the exact same modest markdown rules
-    as read_document_markdown, without requiring them to already be a part
-    read from a docx on disk.
+    w:body's direct children, or one table cell's own paragraphs) through
+    the exact same markdown rules as read_document_markdown, without
+    requiring them to already be a part read from a docx on disk.
 
     Used by mutations.py (WP-04) to compute the ``before``/``after``
-    evidence text for replace_range_markdown and replace_body_markdown: a
+    evidence text for replace_range_markdown and replace_body_markdown (a
     plain Python list of Element objects is a valid "container" for
-    _PartWalker.walk_block_container (it only ever iterates its argument),
-    so the identical walker + rendering pipeline applies to a range that
-    was never itself written to a temp part.
+    _PartWalker.walk_block_container, so the identical walker + rendering
+    pipeline applies to a range that was never itself written to a temp
+    part) and by _table_cell_markdown above for one cell's paragraphs.
+    Discards the lossy_elements half of _events_to_markdown's return — the
+    callers here use this for plain evidence/cell text, not the top-level
+    read_document response.
     """
     walker = _PartWalker()
     walker.walk_block_container(elements, [])
-    return _events_to_markdown(walker.events, walker.paragraphs, styles_by_id)
+    markdown, _lossy = _events_to_markdown(walker.events, walker.paragraphs, styles_by_id, numbering_index)
+    return markdown
