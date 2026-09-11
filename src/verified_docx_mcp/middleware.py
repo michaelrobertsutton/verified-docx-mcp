@@ -45,6 +45,17 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         "replace_body_markdown",
         "replace_range_markdown",
         "append_markdown",
+        # issue #28 WP-06:
+        "replace_text",
+        "format_text",
+        # issue #28 WP-07 (list_open_items is read-only, not listed here):
+        "accept_tracked_changes",
+        "reject_tracked_changes",
+        # issue #28 WP-08 (get_comment_thread is read-only, not listed here):
+        "add_anchored_comment",
+        # issue #28 WP-09:
+        "reply_to_comment",
+        "resolve_comment",
     }
 )
 

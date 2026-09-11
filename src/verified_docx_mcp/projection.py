@@ -35,7 +35,10 @@ recorded separately, ``deleted_spans``); ``w:instrText`` (a field's
 instruction code) is EXCLUDED entirely; a field's RESULT runs (the ones
 between ``w:fldChar fldCharType="separate"`` and ``"end"``, or all of a
 ``w:fldSimple``'s nested runs) ARE included, each tagged
-``field_result=True`` internally for the RUNG_FIELD rung WP-06 adds.
+``field_result=True`` internally for locate.py's WARNING_TOUCHES_FIELD_RESULT
+(WP-06; NOT a fifth match rung — see locate.py's own header comment for why
+a literal "RUNG_FIELD" as the plan text names it turned out to be unsafe to
+build once this file's own field-markdown-rendering fix landed).
 ``w:sym`` is mapped to a character only when ``w:font`` is Symbol,
 Wingdings, or Webdings, via the small table in ``_SYM_TABLE`` below (NOT a
 complete 256-glyph mapping for any of the three — see that table's own
@@ -167,6 +170,33 @@ class RunEvent:
     para_ref: str
     run_ref: str
     field_result: bool = False
+    # New for issue #28 WP-06 (text_edit.py's locate()/replace_text/
+    # format_text). in_revision/comment_ids let locate() report the
+    # "crosses_revision"/"crosses_comment_range" warnings without a second
+    # walk of the live tree: True/non-empty when this run sits inside a
+    # w:ins element, or between a still-open commentRangeStart/End pair,
+    # at the moment this event was emitted. r_elem/text_elem/parent_elem
+    # are the LIVE Element objects this event came from (the owning w:r,
+    # its specific text-bearing child, and that child's own parent
+    # container) — None for a synthetic paragraph-break event, or when the
+    # caller never needed them (every WP-03 read-path caller passes
+    # positional args only and never asks for these, so they stay None
+    # there; text_edit.py's run-splitter is the only WP-06 consumer). Not
+    # used for equality anywhere in this repo (no test constructs a
+    # RunEvent to compare by value) so carrying a live Element reference
+    # here is safe.
+    in_revision: bool = False
+    # New for issue #28 WP-07b-a: the w:author of the (innermost) w:ins this
+    # run sits inside, or None when in_revision is False. Lets a caller
+    # (text_edit.py's TRACKED_CHANGES_PRESENT guard) exclude the server's
+    # OWN previously-authored revisions from a refusal check — see that
+    # module's own comment for why ("a second proposed edit deadlocks on
+    # the first one's tracked change" otherwise).
+    revision_author: str | None = None
+    comment_ids: frozenset[str] = dataclasses.field(default_factory=frozenset)
+    r_elem: Any = None
+    text_elem: Any = None
+    parent_elem: Any = None
 
 
 @dataclasses.dataclass
@@ -241,8 +271,6 @@ _SKIP_TAGS = frozenset(
         "rPr",
         "bookmarkStart",
         "bookmarkEnd",
-        "commentRangeStart",
-        "commentRangeEnd",
         "commentReference",
         "proofErr",
         "lastRenderedPageBreak",
@@ -288,6 +316,17 @@ class _PartWalker:
         self.deleted_spans: list[DeletedSpan] = []
         self.warnings: list[str] = []
         self._first_para = True
+        # New for issue #28 WP-06/WP-07b-a: shared walker state (not
+        # threaded as parameters — every recursive _walk_runs call already
+        # shares one walker instance) backing RunEvent.in_revision/
+        # comment_ids/revision_author. A w:commentRangeStart/End pair can
+        # nest (overlapping comments), so this is a running set, not a
+        # single id; w:ins can nest too (rare, but the schema allows an
+        # w:ins inside another), so this is a STACK of each nested
+        # w:ins's own w:author (its innermost entry is the one a run
+        # currently inside reports), not a depth counter.
+        self._open_comment_ids: set[str] = set()
+        self._revision_author_stack: list[str | None] = []
 
     # -- block level -----------------------------------------------------
 
@@ -401,12 +440,30 @@ class _PartWalker:
         para_ref: str,
         counter: list[int],
         field_stack: list[dict[str, Any]],
+        *,
+        r_elem: Any = None,
+        text_elem: Any = None,
+        parent_elem: Any = None,
     ) -> None:
         if not text:
             return
         in_result = bool(field_stack) and field_stack[-1]["mode"] == "result"
         run_ref = self._next_run_ref(para_ref, counter)
-        self.events.append(RunEvent(text, rpr, para_ref, run_ref, field_result=in_result))
+        self.events.append(
+            RunEvent(
+                text,
+                rpr,
+                para_ref,
+                run_ref,
+                field_result=in_result,
+                in_revision=bool(self._revision_author_stack),
+                revision_author=self._revision_author_stack[-1] if self._revision_author_stack else None,
+                comment_ids=frozenset(self._open_comment_ids),
+                r_elem=r_elem,
+                text_elem=text_elem,
+                parent_elem=parent_elem,
+            )
+        )
         if in_result:
             field_stack[-1]["result_parts"].append(text)
 
@@ -420,9 +477,39 @@ class _PartWalker:
         for child in container:
             tag = _ln(child)
             if tag == "r":
-                self._walk_run(child, para_ref, counter, field_stack)
-            elif tag in ("hyperlink", "smartTag", "ins"):
+                self._walk_run(child, para_ref, counter, field_stack, container)
+            elif tag == "ins":
+                # New for issue #28 WP-06: track live w:ins nesting (a
+                # stack, not a bool/counter, so a nested w:ins reports its
+                # own, innermost author) so every RunEvent emitted while
+                # inside one is flagged in_revision=True (locate()'s
+                # "crosses_revision" warning) and carries revision_author
+                # (WP-07b-a: the TRACKED_CHANGES_PRESENT guard's own-
+                # author exclusion needs to know WHOSE revision this is,
+                # not just that one exists). Content is otherwise walked
+                # exactly like hyperlink/smartTag below — an insertion's
+                # text is LIVE text (not yet accepted), so it belongs in
+                # the projection like any other run.
+                self._revision_author_stack.append(_attr(child, "author"))
+                try:
+                    self._walk_runs(child, para_ref, counter, field_stack)
+                finally:
+                    self._revision_author_stack.pop()
+            elif tag in ("hyperlink", "smartTag"):
                 self._walk_runs(child, para_ref, counter, field_stack)
+            elif tag == "commentRangeStart":
+                # New for issue #28 WP-06: track open comment ids (a set,
+                # not a single id — comment ranges can nest) so every
+                # RunEvent emitted while one is open carries it in
+                # comment_ids (locate()'s "crosses_comment_range" warning).
+                # No text of its own; still excluded from the projection.
+                cid = _attr(child, "id")
+                if cid is not None:
+                    self._open_comment_ids.add(cid)
+            elif tag == "commentRangeEnd":
+                cid = _attr(child, "id")
+                if cid is not None:
+                    self._open_comment_ids.discard(cid)
             elif tag == "sdt":
                 content = self._find_child(child, "sdtContent")
                 if content is not None:
@@ -454,7 +541,7 @@ class _PartWalker:
         nested_field_stack: list[dict[str, Any]] = [{"instr": instr, "mode": "result", "result_parts": result_parts}]
         for child in fld:
             if _ln(child) == "r":
-                self._walk_run(child, para_ref, counter, nested_field_stack)
+                self._walk_run(child, para_ref, counter, nested_field_stack, fld)
             elif _ln(child) not in _SKIP_TAGS:
                 self._walk_runs(child, para_ref, counter, nested_field_stack)
         self.events.append(FieldEvent(instr=instr.strip(), result_text="".join(result_parts), para_ref=para_ref))
@@ -465,6 +552,7 @@ class _PartWalker:
         para_ref: str,
         counter: list[int],
         field_stack: list[dict[str, Any]],
+        parent_elem: Any = None,
     ) -> None:
         rpr_elem = self._find_child(run, "rPr")
         rpr = _run_properties(rpr_elem)
@@ -473,15 +561,30 @@ class _PartWalker:
             if tag == "rPr":
                 continue
             elif tag == "t":
-                self._emit_text(child.text or "", rpr, para_ref, counter, field_stack)
+                self._emit_text(
+                    child.text or "", rpr, para_ref, counter, field_stack,
+                    r_elem=run, text_elem=child, parent_elem=parent_elem,
+                )
             elif tag == "tab":
-                self._emit_text("\t", rpr, para_ref, counter, field_stack)
+                self._emit_text(
+                    "\t", rpr, para_ref, counter, field_stack,
+                    r_elem=run, text_elem=child, parent_elem=parent_elem,
+                )
             elif tag in ("br", "cr"):
-                self._emit_text("\n", rpr, para_ref, counter, field_stack)
+                self._emit_text(
+                    "\n", rpr, para_ref, counter, field_stack,
+                    r_elem=run, text_elem=child, parent_elem=parent_elem,
+                )
             elif tag == "noBreakHyphen":
-                self._emit_text("-", rpr, para_ref, counter, field_stack)
+                self._emit_text(
+                    "-", rpr, para_ref, counter, field_stack,
+                    r_elem=run, text_elem=child, parent_elem=parent_elem,
+                )
             elif tag == "softHyphen":
-                self._emit_text("­", rpr, para_ref, counter, field_stack)
+                self._emit_text(
+                    "­", rpr, para_ref, counter, field_stack,
+                    r_elem=run, text_elem=child, parent_elem=parent_elem,
+                )
             elif tag == "sym":
                 font = _attr(child, "font")
                 code = _attr(child, "char")
@@ -489,7 +592,10 @@ class _PartWalker:
                 if mapped is None:
                     mapped = "�"
                     self.warnings.append("unmapped_symbol")
-                self._emit_text(mapped, rpr, para_ref, counter, field_stack)
+                self._emit_text(
+                    mapped, rpr, para_ref, counter, field_stack,
+                    r_elem=run, text_elem=child, parent_elem=parent_elem,
+                )
             elif tag == "fldChar":
                 fld_type = _attr(child, "fldCharType")
                 if fld_type == "begin":
@@ -688,9 +794,13 @@ def project_part(docx_path: Path, part_name: str = DEFAULT_PART) -> Projection:
 def _finalize_projection(walker: _PartWalker, part_name: str) -> Projection:
     """Build the flat text + offset map (from RunEvents only) and wrap
     *walker*'s accumulated state into a Projection. Shared by project_part
-    (a package part) and project_textbox_scope (a w:txbxContent sub-scope)
-    — the two differ only in WHICH element was walked, not in how the
-    walk's output is assembled.
+    (a package part), project_textbox_scope (a w:txbxContent sub-scope),
+    and project_document_root (issue #28 WP-06: an already-parsed, LIVE
+    document root, reused so text_edit.py's replace_text/format_text can
+    splice the very same Element objects rather than a throwaway
+    re-parse) — the three differ only in WHICH element was walked and
+    whether it came from a fresh parse or a live tree already in memory,
+    not in how the walk's output is assembled.
     """
     text_parts: list[str] = []
     offset_map: list[tuple[int, int, str, str]] = []
@@ -712,6 +822,28 @@ def _finalize_projection(walker: _PartWalker, part_name: str) -> Projection:
         deleted_spans=walker.deleted_spans,
         warnings=walker.warnings,
     )
+
+
+def project_document_root(document_root: Any, part_name: str = DEFAULT_PART) -> Projection:
+    """Like project_part, but walks an already-parsed, LIVE document root
+    (e.g. from mutations._load_document) instead of reading *part_name*
+    fresh from a zip on disk.
+
+    New for issue #28 WP-06: text_edit.py's replace_text/format_text need
+    the actual live Element objects (the owning w:r, its text-bearing
+    child, that child's own parent) to splice, not a throwaway parse — every
+    RunEvent's r_elem/text_elem/parent_elem here are elements from
+    *document_root* itself, so mutating them (or inserting siblings next to
+    them) edits the tree the caller is about to serialize. Scoped to
+    word/document.xml's w:body (this WP's tools only ever target the body);
+    unlike project_part, this never resolves DrawingEvent.media_part (no
+    rels are loaded here — no WP-06 caller needs it).
+    """
+    walker = _PartWalker()
+    body = walker._find_child(document_root, "body")
+    if body is not None:
+        walker.walk_block_container(body, [])
+    return _finalize_projection(walker, part_name)
 
 
 # ---------------------------------------------------------------------------

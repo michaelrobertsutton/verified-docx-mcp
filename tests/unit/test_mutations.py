@@ -30,6 +30,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from typing import Any
+from unittest import mock
 from xml.etree import ElementTree as ET
 
 REPO = Path(__file__).resolve().parents[2]
@@ -72,9 +73,14 @@ class _TempFixtureCase(unittest.TestCase):
 
 class MutatingToolsRegistrationTests(unittest.TestCase):
     def test_all_three_wp04_tools_are_registered(self):
-        self.assertEqual(
-            MUTATING_TOOLS,
+        # WP-06 (issue #28) adds replace_text/format_text to MUTATING_TOOLS
+        # in the same commit that adds those tools -- see
+        # tests/unit/test_text_edit.py's own registration test for that
+        # pair; this test stays scoped to WP-04's three markdown-mutation
+        # tools, which this module owns.
+        self.assertLessEqual(
             frozenset({"replace_body_markdown", "replace_range_markdown", "append_markdown"}),
+            MUTATING_TOOLS,
         )
 
 
@@ -139,6 +145,301 @@ class AtomicWriteTests(_TempFixtureCase):
 
 
 # ---------------------------------------------------------------------------
+# Lock guard layers 0/4 (acquire_lock/release_lock/remote_checkout) and
+# layer 3 (conflict_copy_sweep) — issue #28 WP-10.
+# ---------------------------------------------------------------------------
+
+
+class LockGuardLayersTests(_TempFixtureCase):
+    def _overrides_for_noop_write(self) -> dict[str, bytes]:
+        with zipfile.ZipFile(self.target) as zf:
+            doc_bytes = zf.read(projection.DEFAULT_PART)
+        return {projection.DEFAULT_PART: doc_bytes}
+
+    def test_remote_checkout_is_a_documented_noop(self):
+        # WP-10's own instruction: a seam for a future Microsoft Graph
+        # checkout call, MUST NOT call Graph today. Asserting its return
+        # shape (rather than the absence of a network call, which cannot
+        # be observed from here) locks in that it is inert: a plain dict,
+        # no side effects, no exception.
+        result = mutations.remote_checkout(self.target)
+        self.assertEqual(result, {"remote_checkout": "not_implemented", "path": str(self.target)})
+
+    def test_successful_write_leaves_no_jsclaim_behind(self):
+        claim_path = self.target.parent / (self.target.name + ".jsclaim")
+        mutations.atomic_replace_docx_parts(self.target, self._overrides_for_noop_write(), post_verify=lambda _p: None)
+        self.assertFalse(claim_path.exists())
+
+    def test_jsclaim_released_even_when_post_verify_fails(self):
+        claim_path = self.target.parent / (self.target.name + ".jsclaim")
+
+        def _post_verify_always_fails(_path):
+            raise ValueError("simulated verification failure")
+
+        with self.assertRaises(VerifyError):
+            mutations.atomic_replace_docx_parts(
+                self.target, self._overrides_for_noop_write(), post_verify=_post_verify_always_fails
+            )
+        self.assertFalse(claim_path.exists(), "release_lock must run in a finally regardless of write outcome")
+
+    def test_preexisting_jsclaim_refuses_as_docx_locked_without_touching_original(self):
+        # Simulates a genuine concurrent write (or a stale claim left by a
+        # crashed prior process): acquire_lock must fail atomically via
+        # O_EXCL rather than racing a check-then-create.
+        claim_path = self.target.parent / (self.target.name + ".jsclaim")
+        claim_path.write_text("12345")
+        before_hash = _sha256(self.target)
+        try:
+            with self.assertRaises(VerifyError) as cm:
+                mutations.atomic_replace_docx_parts(
+                    self.target, self._overrides_for_noop_write(), post_verify=lambda _p: None
+                )
+            self.assertEqual(cm.exception.envelope.error_code, ErrorCode.DOCX_LOCKED)
+            self.assertEqual(_sha256(self.target), before_hash, "original must be untouched when the claim is refused")
+        finally:
+            claim_path.unlink(missing_ok=True)
+
+    def test_acquire_lock_calls_remote_checkout_first(self):
+        calls = []
+        with mock.patch("verified_docx_mcp.mutations.remote_checkout", side_effect=calls.append):
+            claim_path = mutations.acquire_lock(self.target)
+        self.assertEqual(calls, [self.target])
+        mutations.release_lock(claim_path)
+
+
+class ConflictCopyPatternTests(unittest.TestCase):
+    """Direct tests of _matches_conflict_copy_pattern against every naming
+    form core/document-backend-protocol.md §4 lists verbatim, plus the
+    "matches none of them" case that must fall through to
+    sibling_files_changed instead.
+
+    machine_names is passed EXPLICITLY (never the real
+    mutations._local_machine_names()) so these tests are deterministic
+    regardless of what machine/CI runs them -- the real resolver has its
+    own dedicated tests below (LocalMachineNamesTests)."""
+
+    stem = "Proposal-Final"
+    machine_names = frozenset({"JMS-MacBook"})
+
+    def test_machine_suffix_form(self):
+        self.assertTrue(
+            mutations._matches_conflict_copy_pattern(self.stem, "Proposal-Final-JMS-MacBook.docx", self.machine_names)
+        )
+
+    def test_machine_suffix_form_is_case_insensitive(self):
+        self.assertTrue(
+            mutations._matches_conflict_copy_pattern(self.stem, "Proposal-Final-jms-macbook.docx", self.machine_names)
+        )
+
+    def test_numbered_paren_form(self):
+        self.assertTrue(mutations._matches_conflict_copy_pattern(self.stem, "Proposal-Final (2).docx", frozenset()))
+
+    def test_dash_copy_form(self):
+        self.assertTrue(mutations._matches_conflict_copy_pattern(self.stem, "Proposal-Final-Copy.docx", frozenset()))
+
+    def test_space_dash_copy_form(self):
+        self.assertTrue(
+            mutations._matches_conflict_copy_pattern(self.stem, "Proposal-Final - Copy.docx", frozenset())
+        )
+
+    def test_conflict_substring_anywhere(self):
+        self.assertTrue(
+            mutations._matches_conflict_copy_pattern(self.stem, "Proposal-Final-Conflict1.docx", frozenset())
+        )
+
+    def test_conflicted_copy_substring(self):
+        self.assertTrue(
+            mutations._matches_conflict_copy_pattern(
+                self.stem, "Proposal-Final's conflicted copy 2026-09-10.docx", frozenset()
+            )
+        )
+
+    def test_dash_suffix_not_matching_any_known_machine_name_does_not_match(self):
+        # issue #28 WP-10 review fix: a plain "-<anything>.docx" sibling
+        # is NOT this pattern any more unless <anything> IS a known
+        # machine name -- "proposal-final.docx" next to "proposal.docx"
+        # is the exact false positive the plan's own text warns about by
+        # name, and must fall through to sibling_files_changed instead.
+        self.assertFalse(
+            mutations._matches_conflict_copy_pattern(self.stem, "Proposal-Final-final.docx", self.machine_names)
+        )
+
+    def test_dash_suffix_matching_a_DIFFERENT_machines_name_does_not_match(self):
+        # Proves this is genuinely gated on THIS machine's own name(s),
+        # not "any token" -- a name that happens to look machine-ish but
+        # is not in machine_names still does not match.
+        self.assertFalse(
+            mutations._matches_conflict_copy_pattern(
+                self.stem, "Proposal-Final-Some-Other-Laptop.docx", self.machine_names
+            )
+        )
+
+    def test_underscore_suffix_does_not_match_any_form(self):
+        self.assertFalse(
+            mutations._matches_conflict_copy_pattern(self.stem, "Proposal-Final_backup.docx", self.machine_names)
+        )
+
+    def test_different_stem_entirely_does_not_match(self):
+        self.assertFalse(
+            mutations._matches_conflict_copy_pattern(self.stem, "Other-Document (2).docx", self.machine_names)
+        )
+
+    def test_own_name_unchanged_does_not_match(self):
+        self.assertFalse(
+            mutations._matches_conflict_copy_pattern(self.stem, "Proposal-Final.docx", self.machine_names)
+        )
+
+
+class NormalizeMachineNameTests(unittest.TestCase):
+    def test_strips_apostrophe_and_collapses_spaces(self):
+        self.assertEqual(mutations._normalize_machine_name("Michael's MacBook Pro"), "Michaels-MacBook-Pro")
+
+    def test_curly_apostrophe_also_stripped(self):
+        self.assertEqual(mutations._normalize_machine_name("Michael’s MacBook Pro"), "Michaels-MacBook-Pro")
+
+    def test_already_hyphenated_hostname_is_unchanged(self):
+        self.assertEqual(mutations._normalize_machine_name("Michaels-MacBook-Pro"), "Michaels-MacBook-Pro")
+
+    def test_underscore_runs_collapse_to_one_dash(self):
+        self.assertEqual(mutations._normalize_machine_name("host__name"), "host-name")
+
+
+class LocalMachineNamesTests(unittest.TestCase):
+    """_local_machine_names() itself is best-effort and platform-specific
+    (macOS's scutil); these tests exercise its own failure-tolerance
+    (never raises) without depending on what this test happens to run
+    on."""
+
+    def test_never_raises_when_scutil_and_hostname_both_fail(self):
+        with (
+            mock.patch("verified_docx_mcp.mutations.subprocess.run", side_effect=OSError("no such command")),
+            mock.patch("verified_docx_mcp.mutations.socket.gethostname", side_effect=OSError("no hostname")),
+        ):
+            self.assertEqual(mutations._local_machine_names(), frozenset())
+
+    def test_uses_scutil_output_when_available(self):
+        def _fake_run(args, **_kwargs):
+            result = mock.Mock()
+            if args[-1] == "ComputerName":
+                result.returncode = 0
+                result.stdout = "Michael's MacBook Pro\n"
+            else:
+                result.returncode = 1
+                result.stdout = ""
+            return result
+
+        with (
+            mock.patch("verified_docx_mcp.mutations.subprocess.run", side_effect=_fake_run),
+            mock.patch("verified_docx_mcp.mutations.socket.gethostname", return_value="unrelated-host"),
+        ):
+            names = mutations._local_machine_names()
+        self.assertIn("Michaels-MacBook-Pro", names)
+        self.assertIn("unrelated-host", names)
+
+    def test_falls_back_to_hostname_when_scutil_is_absent(self):
+        with (
+            mock.patch("verified_docx_mcp.mutations.subprocess.run", side_effect=OSError("no such command")),
+            mock.patch("verified_docx_mcp.mutations.socket.gethostname", return_value="my-host.local"),
+        ):
+            names = mutations._local_machine_names()
+        self.assertEqual(names, frozenset({"my-host"}))
+
+
+class ConflictCopySweepTests(_TempFixtureCase):
+    def test_no_siblings_reports_clean(self):
+        sweep = mutations.conflict_copy_sweep(self.target, since_ns=0)
+        self.assertEqual(sweep, {"conflict_copy_detected": False, "conflict_copies": [], "sibling_files_changed": []})
+
+    def test_matching_sibling_flags_detected_without_raising(self):
+        conflict_sibling = self.target.parent / (self.target.stem + "-Copy.docx")
+        conflict_sibling.write_bytes(b"stub")
+        sweep = mutations.conflict_copy_sweep(self.target, since_ns=0)
+        self.assertTrue(sweep["conflict_copy_detected"])
+        self.assertEqual(sweep["conflict_copies"], [conflict_sibling.name])
+        self.assertEqual(sweep["sibling_files_changed"], [])
+
+    def test_non_matching_newer_sibling_is_info_only(self):
+        info_sibling = self.target.parent / (self.target.stem + "_backup.docx")
+        info_sibling.write_bytes(b"stub")
+        sweep = mutations.conflict_copy_sweep(self.target, since_ns=0)
+        self.assertFalse(sweep["conflict_copy_detected"])
+        self.assertEqual(sweep["conflict_copies"], [])
+        self.assertEqual(sweep["sibling_files_changed"], [info_sibling.name])
+
+    def test_real_machine_name_form_flags_but_a_plain_dash_suffix_does_not(self):
+        # Issue #28 WP-10 review fix, both directions in one test so a
+        # future change cannot pass by only checking one side again:
+        # <stem>-<Machine>.docx flags ONLY when <Machine> is this
+        # (mocked) machine's own name; an ordinary same-stem working file
+        # like "<stem>-final.docx" -- the plan's own named counter-
+        # example -- must land in sibling_files_changed, never
+        # conflict_copies, even though both share the same "-suffix"
+        # shape.
+        with mock.patch("verified_docx_mcp.mutations._local_machine_names", return_value=frozenset({"TESTHOST"})):
+            real_conflict = self.target.parent / (self.target.stem + "-TESTHOST.docx")
+            real_conflict.write_bytes(b"stub")
+            ordinary_sibling = self.target.parent / (self.target.stem + "-final.docx")
+            ordinary_sibling.write_bytes(b"stub")
+
+            sweep = mutations.conflict_copy_sweep(self.target, since_ns=0)
+
+        self.assertTrue(sweep["conflict_copy_detected"])
+        self.assertEqual(sweep["conflict_copies"], [real_conflict.name])
+        self.assertEqual(sweep["sibling_files_changed"], [ordinary_sibling.name])
+
+    def test_sibling_older_than_since_ns_is_ignored(self):
+        # since_ns in the far future -> even a genuine conflict-pattern
+        # sibling sitting there from before this write began is not
+        # attributed to this write.
+        conflict_sibling = self.target.parent / (self.target.stem + "-Copy.docx")
+        conflict_sibling.write_bytes(b"stub")
+        far_future_ns = (int(conflict_sibling.stat().st_mtime) + 3600) * 1_000_000_000
+        sweep = mutations.conflict_copy_sweep(self.target, since_ns=far_future_ns)
+        self.assertFalse(sweep["conflict_copy_detected"])
+        self.assertEqual(sweep["conflict_copies"], [])
+        self.assertEqual(sweep["sibling_files_changed"], [])
+
+    def test_jsbak_jsclaim_and_tmp_siblings_never_flagged(self):
+        (self.target.parent / (self.target.name + ".jsbak")).write_bytes(b"stub")
+        (self.target.parent / (self.target.name + ".jsclaim")).write_bytes(b"stub")
+        (self.target.parent / f"{self.target.stem}.tmp-abc123.docx").write_bytes(b"stub")
+        sweep = mutations.conflict_copy_sweep(self.target, since_ns=0)
+        self.assertEqual(sweep, {"conflict_copy_detected": False, "conflict_copies": [], "sibling_files_changed": []})
+
+    def test_owner_files_never_flagged(self):
+        (self.target.parent / ("~$" + self.target.name[2:])).write_bytes(b"stub")
+        (self.target.parent / f".~lock.{self.target.name}#").write_bytes(b"stub")
+        sweep = mutations.conflict_copy_sweep(self.target, since_ns=0)
+        self.assertEqual(sweep, {"conflict_copy_detected": False, "conflict_copies": [], "sibling_files_changed": []})
+
+    def test_a_real_mutating_tool_call_surfaces_the_flag_and_still_applies(self):
+        # Wires layer 3 all the way through a real mutating tool
+        # (execute_append_markdown) rather than only unit-testing
+        # conflict_copy_sweep in isolation: patches time.time_ns so
+        # since_ns is far in the past, so a sibling already sitting next
+        # to the target (planted before this call, for determinism) is
+        # picked up exactly as a genuinely concurrent conflict copy
+        # appearing mid-write would be. core/document-backend-protocol.md
+        # §4: "the write itself succeeded" — applied must still be True.
+        conflict_sibling = self.target.parent / (self.target.stem + "-Copy.docx")
+        conflict_sibling.write_bytes(b"stub")
+        with mock.patch("verified_docx_mcp.mutations.time.time_ns", return_value=0):
+            evidence = mutations.execute_append_markdown(str(self.target), "New paragraph.\n")
+        self.assertTrue(evidence["applied"])
+        self.assertTrue(evidence["conflict_copy_detected"])
+        self.assertEqual(evidence["conflict_copies"], [conflict_sibling.name])
+
+    def test_a_real_mutating_tool_call_with_no_conflict_reports_flag_false(self):
+        # The common case: conflict_copy_detected is always present (not
+        # just on a hit), so a caller can assert its absence positively.
+        evidence = mutations.execute_append_markdown(str(self.target), "New paragraph.\n")
+        self.assertTrue(evidence["applied"])
+        self.assertFalse(evidence["conflict_copy_detected"])
+        self.assertNotIn("conflict_copies", evidence)
+        self.assertNotIn("sibling_files_changed", evidence)
+
+
+# ---------------------------------------------------------------------------
 # Guard: DOCX_LOCKED and REVISION_CONFLICT (SYNC_IN_FLIGHT is covered by
 # test_server.py's existing lock_status sync-quiesce tests at the
 # lower level; this WP only adds the write-side consumption of that
@@ -196,7 +497,26 @@ class CommentAnchorHazardTests(_TempFixtureCase):
 
 
 class TrackedChangeHazardTests(_TempFixtureCase):
+    """Patches author.resolve_author_name to a name DIFFERENT from
+    tracked.docx's real Word-authored author ("Michael Sutton") -- WP-07b-a's
+    own-author exclusion (_check_hazards_or_raise) would otherwise treat
+    this fixture's revisions as the server's own prior work whenever this
+    suite happens to run on Michael Sutton's own machine, silently
+    defeating the refusal these tests exist to prove — see
+    test_tracked_changes.py's OverlappingWriteRefusalTests for the
+    identical rationale."""
+
     fixture_name = "revision/tracked.docx"
+
+    def setUp(self):
+        super().setUp()
+        # mutations.py imports resolve_author_name lazily (a deferred,
+        # function-local import — see execute_replace_body_markdown), so
+        # patching the SOURCE (author.resolve_author_name) is what every
+        # such deferred import actually resolves at call time.
+        patcher = mock.patch("verified_docx_mcp.author.resolve_author_name", return_value="A Different Reviewer")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_refuses_without_force(self):
         with self.assertRaises(VerifyError) as cm:
@@ -702,6 +1022,110 @@ class HalfAnchorCrossingIntegrationTests(_TempFixtureCase):
             projection._ln(n) for n in final_doc.iter() if projection._ln(n) in mutations._COMMENT_ANCHOR_TAGS
         ]
         self.assertEqual(remaining, [], "no unpaired (or paired) anchor may remain for the removed comment")
+
+
+# ---------------------------------------------------------------------------
+# track_changes=True (issue #28 WP-07b-a) on the three markdown-mutation
+# tools: old content marked deleted (kept, wrapped in w:del) rather than
+# removed, new content wrapped in w:ins, evidence gains track_changes/
+# revision_ids.
+# ---------------------------------------------------------------------------
+
+
+class MarkdownTrackChangesTests(_TempFixtureCase):
+    fixture_name = "word/empty-shell.docx"
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("verified_docx_mcp.author.resolve_author_name", return_value="Jane Reviewer")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _document_xml(self) -> str:
+        with zipfile.ZipFile(self.target) as zf:
+            return zf.read(projection.DEFAULT_PART).decode("utf-8")
+
+    def test_replace_body_markdown_tracked_wraps_new_content_in_ins(self):
+        evidence = mutations.execute_replace_body_markdown(str(self.target), "Hello world.\n", track_changes=True)
+        self.assertTrue(evidence["track_changes"])
+        self.assertEqual(len(evidence["revision_ids"]), 1)
+        doc = self._document_xml()
+        self.assertIn('<w:ins w:id="', doc)
+        self.assertIn('w:author="Jane Reviewer"', doc)
+        self.assertNotIn("<w:del", doc, "an empty shell has no prior content to mark deleted")
+        after_md, _, _ = projection.read_document_markdown(self.target)
+        self.assertEqual(after_md.strip(), "Hello world.")
+
+    def test_replace_body_markdown_tracked_marks_old_content_deleted_and_keeps_it(self):
+        mutations.execute_replace_body_markdown(str(self.target), "First version.\n")
+        evidence = mutations.execute_replace_body_markdown(str(self.target), "Second version.\n", track_changes=True)
+        self.assertTrue(evidence["applied"])
+        doc = self._document_xml()
+        self.assertIn("<w:delText>First version.</w:delText>", doc, "old content stays, marked deleted")
+        self.assertIn("<w:t>Second version.</w:t>", doc)
+        # Reading back as CURRENT text shows only the new content -- w:del
+        # excluded, w:ins included, unchanged read-side contract.
+        after_md, _, _ = projection.read_document_markdown(self.target)
+        self.assertEqual(after_md.strip(), "Second version.")
+
+    def test_append_markdown_tracked_wraps_only_new_content(self):
+        mutations.execute_replace_body_markdown(str(self.target), "Existing paragraph.\n")
+        evidence = mutations.execute_append_markdown(str(self.target), "Appended paragraph.\n", track_changes=True)
+        self.assertTrue(evidence["track_changes"])
+        doc = self._document_xml()
+        self.assertIn("<w:t>Existing paragraph.</w:t>", doc, "pre-existing content is untouched by an append")
+        self.assertNotIn("<w:del", doc)
+        self.assertIn('<w:ins w:id="', doc)
+        after_md, _, _ = projection.read_document_markdown(self.target)
+        self.assertIn("Appended paragraph.", after_md)
+        self.assertIn("Existing paragraph.", after_md)
+
+    def test_replace_range_markdown_tracked_marks_section_deleted_and_inserts_after(self):
+        section_md = (FIXTURES / "markdown" / "section.md").read_text(encoding="utf-8")
+        mutations.execute_replace_body_markdown(str(self.target), section_md)
+        sections = projection.find_sections_impl(self.target)
+        key = next(s["section_key"] for s in sections if s["heading_text"] == "Overview")
+
+        evidence = mutations.execute_replace_range_markdown(
+            str(self.target), key, "## Overview\n\nRewritten overview.\n", track_changes=True
+        )
+        self.assertTrue(evidence["track_changes"])
+        self.assertGreater(len(evidence["revision_ids"]), 0)
+        doc = self._document_xml()
+        self.assertIn("<w:del", doc)
+        self.assertIn("<w:ins", doc)
+        after_md, _, _ = projection.read_document_markdown(self.target)
+        self.assertIn("Rewritten overview.", after_md)
+        # The other, untouched sections survive unaffected.
+        self.assertIn("Background", after_md)
+        self.assertIn("Next Steps", after_md)
+
+    def test_untracked_writes_have_no_track_changes_key(self):
+        evidence = mutations.execute_replace_body_markdown(str(self.target), "Plain write.\n")
+        self.assertNotIn("track_changes", evidence)
+        self.assertNotIn("revision_ids", evidence)
+
+
+class TrackedChangeOwnAuthorExclusionTests(_TempFixtureCase):
+    """WP-07b-a load-bearing note: a hazard scan must exclude the
+    server's own previously-authored tracked change, or a second
+    track_changes=True write over the first one's own content deadlocks."""
+
+    fixture_name = "word/empty-shell.docx"
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("verified_docx_mcp.author.resolve_author_name", return_value="Jane Reviewer")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_second_tracked_write_over_own_prior_tracked_change_does_not_deadlock(self):
+        mutations.execute_replace_body_markdown(str(self.target), "First draft.\n", track_changes=True)
+        # A second track_changes write over the document (which now
+        # contains this server's own w:ins/w:del, all authored "Jane
+        # Reviewer") must not refuse.
+        evidence = mutations.execute_replace_body_markdown(str(self.target), "Second draft.\n", track_changes=True)
+        self.assertTrue(evidence["applied"])
 
 
 if __name__ == "__main__":

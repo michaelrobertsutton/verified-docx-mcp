@@ -46,7 +46,7 @@ from typing import Any, NoReturn
 
 from fastmcp import FastMCP
 
-from . import mutations, paths, projection
+from . import comments, mutations, paths, projection, text_edit, tracked_changes
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .middleware import EvidenceEnforcementMiddleware
@@ -757,20 +757,26 @@ def list_styles(path: str) -> dict[str, Any]:
 # reads-vs-writes asymmetry is the point of this WP, not a regression of
 # it — see mutations.py's module docstring).
 #
-# Guard layers 3-4 (Microsoft Graph checkout/checkin, or a stronger local
-# layer 0 per core/document-backend-protocol.md §9) are NOT implemented
-# yet — they land in WP-10. Until then, the residual risk is exactly what
-# §9 states: a write that lands while another client has the file open is
-# only detected after the fact (the next call's lock_status / conflict
-# sweep), never prevented outright. WP-10 is also where a
-# CONFLICT_COPY_DETECTED sweep runs after a successful write; this WP does
-# not add one (layers 3-4, not 1-2).
+# Guard layers 3-4 (issue #28 WP-10, landed in this same PR):
+# mutations.atomic_replace_docx_parts now wraps every write in
+# acquire_lock/release_lock (layer 0's remote_checkout no-op seam for a
+# future Microsoft Graph checkout, plus layer 4's same-machine ``.jsclaim``
+# O_EXCL mutex) and runs conflict_copy_sweep (layer 3) after a successful
+# write, surfacing conflict_copy_detected/conflict_copies/
+# sibling_files_changed on every mutating tool's own evidence dict (never
+# raised — the write already succeeded). What is still true, and always
+# will be per core/document-backend-protocol.md §9's own framing
+# ("detection-only, not prevention"): a write that lands while another
+# client has the file open is not PREVENTED by anything above, only
+# detected after the fact by the sweep; the naming patterns the sweep
+# matches on are themselves client- and locale-dependent, so their
+# absence is not proof no conflict occurred.
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
 def replace_body_markdown(
-    path: str, markdown: str, revision_before: str | None = None, force: bool = False
+    path: str, markdown: str, revision_before: str | None = None, force: bool = False, track_changes: bool = False
 ) -> dict[str, Any]:
     """Replace an entire document body's content with markdown, atomically.
 
@@ -808,13 +814,34 @@ def replace_body_markdown(
     confirms the change (a failure here restores from .jsbak and raises
     VERIFICATION_FAILED).
 
-    Residual risk (layers 3-4 land in WP-10, not here): a write that
-    lands while another client has the file open is not prevented by
-    anything above, only detected after the fact by the next call.
+    Residual risk (layers 3-4, issue #28 WP-10, wrap the atomic write
+    itself -- see the module-level comment above): a write that lands
+    while another client has the file open is not PREVENTED by anything
+    above, only detected after the fact, by the post-write conflict-copy
+    sweep on THIS SAME call (conflict_copy_detected in the evidence
+    below) or a later one.
+
+    track_changes=True (issue #28 WP-07b-a): the OLD body content is kept
+    (not removed) with its runs wrapped in w:del/w:delText, and the NEW
+    content is wrapped in w:ins -- both carrying w:author (author.
+    resolve_author_name())/w:date/an above-package-maximum w:id. Reading
+    the projection is unaffected either way, so after_text still reads as
+    the new content alone. Scope limit: this wraps RUNS, not whole table/
+    list structures -- untested against a target range containing a
+    table. The comment/tracked-change hazard scan's TRACKED_CHANGES_PRESENT
+    excludes a revision authored by the configured author (the server's
+    own prior tracked write), so a second track_changes call never
+    deadlocks on the first one's own tracked change.
 
     Returns the eight evidence keys: applied, match_count (always 1),
     rung (4), before, after, revision_before, revision_after,
-    audit_logged; plus orphaned_comment_ids when force removed anchors.
+    audit_logged; plus orphaned_comment_ids when force removed anchors,
+    and (track_changes=True only) revision_ids/track_changes.
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
@@ -827,14 +854,21 @@ def replace_body_markdown(
       VERIFICATION_FAILED               - post-write verification failed; rolled back
     """
     try:
-        return mutations.execute_replace_body_markdown(path, markdown, revision_before=revision_before, force=force)
+        return mutations.execute_replace_body_markdown(
+            path, markdown, revision_before=revision_before, force=force, track_changes=track_changes
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
 @mcp.tool()
 def replace_range_markdown(
-    path: str, section_key: str, markdown: str, revision_before: str | None = None, force: bool = False
+    path: str,
+    section_key: str,
+    markdown: str,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
 ) -> dict[str, Any]:
     """Replace one heading-delimited section (by section_key, from
     find_sections) with markdown, atomically.
@@ -853,8 +887,18 @@ def replace_range_markdown(
     top-level heading of any level, or the end of the document) instead
     of the whole body.
 
+    track_changes=True: same as replace_body_markdown (WP-07b-a) -- the
+    section's OLD content is kept (w:del-wrapped), the NEW content is
+    wrapped in w:ins and inserted right after it.
+
     Returns the eight evidence keys (rung is always 3 here), plus
-    orphaned_comment_ids when force removed anchors.
+    orphaned_comment_ids when force removed anchors, and (track_changes=
+    True only) revision_ids/track_changes.
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
 
     Errors: as replace_body_markdown, plus:
       SECTION_NOT_FOUND - section_key does not match any current section
@@ -865,14 +909,16 @@ def replace_range_markdown(
     """
     try:
         return mutations.execute_replace_range_markdown(
-            path, section_key, markdown, revision_before=revision_before, force=force
+            path, section_key, markdown, revision_before=revision_before, force=force, track_changes=track_changes
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
 @mcp.tool()
-def append_markdown(path: str, markdown: str, revision_before: str | None = None, force: bool = False) -> dict[str, Any]:
+def append_markdown(
+    path: str, markdown: str, revision_before: str | None = None, force: bool = False, track_changes: bool = False
+) -> dict[str, Any]:
     """Append markdown to the end of a document body (before its trailing
     w:sectPr, if any), atomically.
 
@@ -883,12 +929,23 @@ def append_markdown(path: str, markdown: str, revision_before: str | None = None
     revision_before) and atomic-write mechanics as replace_body_markdown
     — see that tool's docstring.
 
+    track_changes=True (WP-07b-a): nothing existing is removed by an
+    append, so there is no w:del side here -- only the newly appended
+    content is wrapped in w:ins (w:author/w:date/w:id, same source as
+    replace_text's).
+
     Returns the eight evidence keys: before/after are the whole body's
     markdown immediately before/after the append; rung is reported as 4
     (append_markdown is not itself a rung on
     core/document-backend-protocol.md's 4-rung table, which only names
     replace_body_markdown at rung 4 — grouped with it here as the other
-    whole-document-scoped write).
+    whole-document-scoped write). Plus (track_changes=True only)
+    revision_ids/track_changes.
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
@@ -899,7 +956,467 @@ def append_markdown(path: str, markdown: str, revision_before: str | None = None
       VERIFICATION_FAILED               - post-write verification failed; rolled back
     """
     try:
-        return mutations.execute_append_markdown(path, markdown, revision_before=revision_before, force=force)
+        return mutations.execute_append_markdown(
+            path, markdown, revision_before=revision_before, force=force, track_changes=track_changes
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Targeted text edits (WP-06): replace_text, format_text. Both are in
+# middleware.MUTATING_TOOLS (added in the same commit) and share
+# text_edit.py's guard (mutations._guard_before_write, same as the WP-04
+# tools above) and locate.locate()'s normalization ladder + STRUCTURAL_
+# BOUNDARY refusal. expected_matches is REQUIRED here (no default) --
+# issue #28 plan ruling D4, this server only: the shipped GoogleDocs-MCP
+# server defaults it to 1 (its server.py replace_text/format_text
+# signatures) but this server's contract deliberately does not carry that
+# default across (every caller must say how many matches it expects).
+#
+# WP-06 only WARNS on a match crossing a comment range or a tracked change
+# (the "warnings" evidence key, when non-empty) -- it does not refuse.
+# WP-07 (tracked_changes.py) adds the actual TRACKED_CHANGES_PRESENT
+# refusal on top of this same detection.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def replace_text(
+    path: str,
+    find: str,
+    replace: str,
+    expected_matches: int,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    """Replace every occurrence of `find` with `replace`, atomically.
+
+    Locates `find` via a 4-rung normalization ladder (exact -> curly/
+    straight quote equivalence -> NBSP/whitespace-run collapse -> soft-
+    hyphen strip), stopping at the first rung with at least one match. A
+    match overlapping a RESULT-bearing field's cached text surfaces
+    "touches_field_result" in the evidence's `warnings` (see locate.py's
+    own header comment for why this is a warning, not a match rung, on
+    the corrected field-markdown projection).
+
+    expected_matches is REQUIRED (no default, D4): the call refuses with
+    MATCH_COUNT_MISMATCH if the actual count differs, listing every span
+    found at the matching rung.
+
+    A run whose text a match's boundary falls in the middle of splits into
+    up to three pieces: the unmatched prefix and suffix keep the run's
+    ORIGINAL w:rPr (cloned verbatim onto a fresh sibling run when a suffix
+    survives); exactly one new run is inserted for `replace`, its own
+    w:rPr inherited from the FIRST run the match touched. A run entirely
+    inside the match is removed outright. A match crossing a w:p/w:tbl/
+    w:tc boundary refuses with STRUCTURAL_BOUNDARY instead.
+
+    track_changes=True (issue #28 WP-07b-a): the deleted text is wrapped
+    in w:del/w:delText and the replacement in w:ins, each carrying
+    w:author (author.resolve_author_name() -- ~/.jennystack/config.json's
+    author_name, falling back to the macOS full name) and w:date, with
+    w:id values allocated above the package maximum. Reading the
+    projection is unaffected (w:del text stays excluded, w:ins text stays
+    included), so the write is visible to the next read as current text
+    either way. The evidence then also carries revision_ids (the ids just
+    created) and track_changes: true. A match crossing a tracked change
+    authored by someone OTHER than the configured author refuses with
+    TRACKED_CHANGES_PRESENT unless force=True; a match crossing the
+    server's OWN prior tracked change never refuses (accept/reject it via
+    tracked_changes.py, or just keep editing under track_changes).
+
+    Same atomic-write mechanics as replace_body_markdown (temp file, OPC-
+    validated before the original is touched, .jsbak-backed post-write
+    verification) -- see that tool's docstring.
+
+    Returns the eight evidence keys (before/after are ±200-character
+    excerpts around the first match, not the whole document), plus
+    runs_before/runs_after (each match's overlapping run(s), clipped to the
+    span, before and after), `warnings` when non-empty, and (track_changes=
+    True only) revision_ids/track_changes.
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or an empty find
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
+      REVISION_CONFLICT                 - revision_before is stale
+      ZERO_MATCH                        - find not located after the full ladder
+      MATCH_COUNT_MISMATCH              - the located count != expected_matches
+      STRUCTURAL_BOUNDARY               - a match crosses a w:p/w:tbl/w:tc boundary
+      TRACKED_CHANGES_PRESENT           - a match crosses a FOREIGN-authored tracked change; no force
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return text_edit.execute_replace_text(
+            path, find, replace, expected_matches, revision_before=revision_before, force=force, track_changes=track_changes
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def format_text(
+    path: str,
+    find: str,
+    style: dict[str, bool],
+    expected_matches: int,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    """Apply character styling (bold/italic/underline/strike) to a matched
+    text span, without touching its content.
+
+    style maps any of "bold"/"italic"/"underline"/"strike" to true/false;
+    every requested field's value is applied verbatim (including false, so
+    {"bold": false} actually clears bold). Same locate()/expected_matches
+    contract as replace_text (see that tool's docstring for the
+    normalization ladder and STRUCTURAL_BOUNDARY refusal).
+
+    Idempotent: if every located run already carries every requested
+    field's value, the call skips the write entirely (revision_before ==
+    revision_after in the returned evidence) rather than creating a new,
+    no-op revision -- with track_changes=True too: nothing to record in a
+    w:rPrChange when no style is actually changing.
+
+    Same run-splitting rule as replace_text for a boundary run (up to
+    three pieces; unmatched prefix/suffix keep the ORIGINAL w:rPr cloned
+    verbatim), except the matched middle SURVIVES here (as a new run
+    carrying the requested style) rather than being deleted -- this tool
+    never changes character counts.
+
+    track_changes=True (issue #28 WP-07b-a): the changed run's w:rPr gains
+    a w:rPrChange recording its PRE-change formatting (w:author/w:date/
+    w:id, same source and allocation as replace_text's track_changes).
+    Same own-author-vs-foreign-author TRACKED_CHANGES_PRESENT refusal
+    rule as replace_text.
+
+    Returns the eight evidence keys, plus runs_before/runs_after (each
+    match's overlapping run(s) and their style flags, before and after),
+    `warnings` when non-empty, and (track_changes=True only) revision_ids/
+    track_changes.
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
+
+    Errors: as replace_text, plus:
+      INVALID_INPUT - style is empty, not an object, names an unknown key,
+                       or a value is not a literal true/false boolean
+    """
+    try:
+        return text_edit.execute_format_text(
+            path, find, style, expected_matches, revision_before=revision_before, force=force, track_changes=track_changes
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tracked changes (WP-07): list_open_items (read-only), accept_tracked_
+# changes / reject_tracked_changes (mutating, in MUTATING_TOOLS). Also
+# where replace_text/format_text's own TRACKED_CHANGES_PRESENT refusal
+# (text_edit._check_tracked_changes_guard) is wired in -- see that
+# function and each tool's own updated docstring above.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_open_items(path: str) -> dict[str, Any]:
+    """List every open comment and pending tracked change (w:ins/w:del) in
+    a .docx.
+
+    Returns `comments` (from word/comments.xml + commentsExtended.xml's
+    resolved flag; each with comment_id, content, resolved, reply_count,
+    replies, quoted_text, author, created_time, modified_time, scope --
+    the same shape the GoogleDocs-MCP server returns, "scope": "document"
+    always since a docx comment anchor is not tab-scoped) and
+    `pending_suggestions` (every w:ins/w:del, with suggestion_id, kind
+    ("insertion"|"deletion"), text, author, date, anchor_context -- the
+    owning paragraph's own live text).
+
+    Scope limit: comment REPLY THREADING (commentsExtended's parent/child
+    linking) is not resolved here -- every comment reports reply_count=0/
+    replies=[]. reply_count/replies are still present, structurally, for
+    forward compatibility with a later WP that resolves them.
+
+    Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
+    Word's owner file is present, like every other read tool.
+
+    Errors:
+      INVALID_INPUT   - path does not exist or is outside the allowed roots
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return tracked_changes.execute_list_open_items(path)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def accept_tracked_changes(
+    path: str, revision_ids: list[str] | None = None, revision_before: str | None = None, force: bool = False
+) -> dict[str, Any]:
+    """Accept tracked changes (w:ins/w:del), atomically -- all of them, or
+    only the ids named in revision_ids (from list_open_items'
+    pending_suggestions[].suggestion_id).
+
+    Accepting a w:ins makes its inserted text ordinary, permanent content
+    (the wrapper is removed, the text stays). Accepting a w:del makes the
+    deletion permanent (the w:del element and its w:delText content are
+    removed outright).
+
+    Same guard/atomic-write mechanics as replace_text (lock_status first,
+    then revision_before; a temp file OPC-validated before the original is
+    touched; .jsbak-backed post-write verification).
+
+    Returns the eight evidence keys (before/after are the WHOLE document's
+    plain text, not an excerpt -- there is no single match span here;
+    rung is "all" when revision_ids is omitted, else "by_id"; match_count
+    is the number of w:ins/w:del elements processed), plus revision_ids
+    (the ids actually processed).
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
+      REVISION_CONFLICT                 - revision_before is stale
+      REVISION_ID_NOT_FOUND             - a named id is not present (available ids listed)
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return tracked_changes.execute_accept_tracked_changes(
+            path, revision_ids, revision_before=revision_before, force=force
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def reject_tracked_changes(
+    path: str, revision_ids: list[str] | None = None, revision_before: str | None = None, force: bool = False
+) -> dict[str, Any]:
+    """Reject tracked changes (w:ins/w:del), atomically -- all of them, or
+    only the ids named in revision_ids.
+
+    Rejecting a w:ins undoes the insertion (the element and its content
+    are removed outright). Rejecting a w:del undoes the deletion (every
+    w:delText inside it is renamed back to w:t and the w:del wrapper is
+    removed, so the previously-deleted text becomes live again).
+
+    Same guard/atomic-write mechanics and evidence shape as
+    accept_tracked_changes -- see that tool's docstring.
+
+    Errors: as accept_tracked_changes.
+    """
+    try:
+        return tracked_changes.execute_reject_tracked_changes(
+            path, revision_ids, revision_before=revision_before, force=force
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Comments (WP-08): add_anchored_comment (mutating, in MUTATING_TOOLS),
+# get_comment_thread (read-only). Reply threading and resolve are WP-09,
+# not this WP -- get_comment_thread reads whatever threading a document
+# already carries (e.g. authored in Word desktop); it never creates a
+# reply.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def add_anchored_comment(path: str, quote: str, text: str, expected_matches: int) -> dict[str, Any]:
+    """Add a comment anchored to a quoted passage, atomically.
+
+    Locates `quote` via the same locate()/expected_matches contract as
+    replace_text (normalization ladder, STRUCTURAL_BOUNDARY refusal,
+    MATCH_COUNT_MISMATCH on the wrong count) -- see that tool's docstring.
+    Every matched span gets its own new comment (same `text`, separate
+    w:id/paraId/durableId each) when expected_matches > 1.
+
+    Builds all five comment-related package parts a real Word comment
+    needs (word/comments.xml, commentsExtended.xml, commentsIds.xml,
+    commentsExtensible.xml, people.xml -- created fresh on a document's
+    first-ever comment, otherwise appended to) plus the anchor itself in
+    word/document.xml (w:commentRangeStart/End and a w:commentReference
+    run) and the matching [Content_Types].xml override + word/_rels/
+    document.xml.rels relationship for each newly created part.
+    w:id = one past the highest existing comment id (0 for a document's
+    first comment); paraId/durableId = a random 8-hex-uppercase value
+    below 0x80000000, unique within the package. Author (w:author, and
+    word/people.xml's w:15:person) comes from author.resolve_author_name()
+    (~/.jennystack/config.json's author_name, falling back to the macOS
+    full name).
+
+    A run whose text the quote's boundary falls in the middle of splits
+    the same way replace_text/format_text's boundary runs do (ORIGINAL
+    w:rPr cloned verbatim onto every surviving piece) -- but nothing here
+    wraps content the way w:ins/w:del does: commentRangeStart/End are
+    self-closing position markers, so a boundary run only ever needs
+    splitting to expose a clean insertion point, never any content change.
+
+    After the write, the target file is re-read from disk and the
+    anchored range is confirmed to bracket the requested quote (modulo
+    whitespace) before the call returns -- a mismatch raises
+    VERIFICATION_FAILED via the same .jsbak-backed atomic-write path
+    every other mutating tool in this server uses.
+
+    Returns the eight evidence keys (before/after are unchanged -- a
+    comment never edits document text), plus comment_ids (every durableId
+    created, one per matched span) and comment_id (the singular durableId,
+    only when exactly one span matched).
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or an empty quote
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
+      REVISION_CONFLICT                 - revision_before is stale
+      ZERO_MATCH                        - quote not located after the full ladder
+      MATCH_COUNT_MISMATCH              - the located count != expected_matches
+      STRUCTURAL_BOUNDARY               - a match crosses a w:p/w:tbl/w:tc boundary
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return comments.execute_add_anchored_comment(path, quote, text, expected_matches)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
+    """Read a comment and its direct replies, by durableId (from
+    add_anchored_comment's own evidence, or word/commentsIds.xml's
+    w16cid:durableId directly).
+
+    Returns comment_id, content, author, created_time, resolved
+    (commentsExtended.xml's w15:done), quoted_text (the live text its
+    range currently brackets), reply_count, and replies (each reply in
+    the same shape, one level deep -- a reply-of-reply is not walked
+    further).
+
+    Scope limit: if comment_id itself names a reply (it has its own
+    w15:paraIdParent), this returns that reply alone with replies=[] --
+    it does not walk upward to find and return the whole thread's root.
+    Reply creation and resolve are reply_to_comment/resolve_comment; this
+    tool only ever reads whatever threading state already exists.
+
+    Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
+    Word's owner file is present, like every other read tool.
+
+    Errors:
+      INVALID_INPUT   - path does not exist or is outside the allowed roots,
+                         the document has no comments at all, or comment_id
+                         does not match any commentsIds.xml durableId
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return comments.execute_get_comment_thread(path, comment_id)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def reply_to_comment(path: str, comment_id: str, text: str) -> dict[str, Any]:
+    """Reply to an existing comment (durableId), atomically -- issue #28
+    WP-09.
+
+    Creates a NEW, independent comment (its own w:comment / w:id / paraId
+    / durableId, and its own full commentRangeStart/End/commentReference
+    anchor triplet in word/document.xml) whose commentsExtended.xml entry
+    carries w15:paraIdParent pointing at the PARENT's own paraId -- this
+    is exactly how a real Word-authored reply is shaped (verified against
+    tests/fixtures/comments/golden-comment.docx's own real reply). The
+    reply's anchor brackets the SAME live text the parent's own anchor
+    currently does; no new text is located or matched.
+
+    Returns the eight evidence keys (before/after are the parent's own
+    quoted text, unchanged -- a reply never edits document text; rung is
+    the fixed label "reply", since no text search is performed), plus
+    comment_id (the new reply's own durableId) and parent_comment_id.
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or
+                         comment_id does not match any existing comment,
+                         or that comment has no live anchor to reply against
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
+      REVISION_CONFLICT                 - revision_before is stale
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return comments.execute_reply_to_comment(path, comment_id, text)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def resolve_comment(path: str, comment_id: str) -> dict[str, Any]:
+    """Resolve a comment thread (durableId), atomically -- issue #28
+    WP-09. Sets w15:done="1" on the comment's own commentsExtended.xml
+    entry; list_open_items excludes it afterward (it is no longer an
+    "open" item), but get_comment_thread still fetches it by id --
+    resolved is not deleted, only marked.
+
+    COMMENT_STILL_OPEN is adapted, not lifted verbatim, from
+    GoogleDocs-MCP's own member of the same name: that server's version
+    guards genuine Drive-API eventual consistency (a resolve action that
+    does not durably stick server-side) by re-querying the comment from
+    the API after the write. This backend's write is a local, synchronous,
+    atomically-verified file replace with no such external-consistency
+    hazard -- so this code can only ever fire here via a bug in this
+    server's own code, not a real runtime race. Kept anyway (re-reading
+    the fresh file from disk and checking w15:done="1" independently of
+    the write's own success) so the error VOCABULARY still matches
+    Google's for this exact failure mode.
+
+    Idempotent: resolving an already-resolved comment succeeds again
+    (not an error).
+
+    Returns the eight evidence keys (before="open", after="resolved";
+    rung is the fixed label "resolve", since no text search is
+    performed), plus comment_id.
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or
+                         comment_id does not match any existing comment
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
+      REVISION_CONFLICT                 - revision_before is stale
+      COMMENT_STILL_OPEN                - the post-write re-read did not confirm w15:done="1" (see this tool's own docstring)
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return comments.execute_resolve_comment(path, comment_id)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
