@@ -1,6 +1,6 @@
-"""Unit tests for src/verified_docx_mcp/tables.py (issue #28 WP-14).
-WP-16a's multi-level w:numPr coverage inside replace_cell_markdown is
-added by its own dedicated commit, in this same file.
+"""Unit tests for src/verified_docx_mcp/tables.py (issue #28 WP-14), plus
+WP-16a's multi-level w:numPr coverage inside replace_cell_markdown
+(ReplaceCellMarkdownTests.test_multi_level_bullets_inside_cell_wp16a).
 
 Fixture provenance (see tests/fixtures/README.md):
   - tables.docx: Word-authored 2x2 table (R1C1..R2C2), no merges.
@@ -276,9 +276,163 @@ class ReplaceCellMarkdownTests(_TempFixtureCase):
         self.assertIn("<w:del ", xml)
         self.assertIn("R1C1", xml)
 
-    # Multi-level w:numPr inside a cell (issue #28 WP-16a) is covered in
-    # its own dedicated commit/test (test_multi_level_bullets_inside_cell_wp16a,
-    # WP-16a's own acceptance coverage) rather than here.
+    def test_multi_level_bullets_inside_cell_wp16a(self):
+        """issue #28 WP-16a: multi-level w:numPr inside replace_cell_markdown,
+        sharing one numId/abstractNum tree across nesting levels via
+        increasing w:ilvl (the PR #3 fix markdown_to_ooxml.py's own module
+        docstring documents), reused as-is via render_blocks -- this test
+        proves it end-to-end inside a table cell, not just at body level.
+        """
+        markdown = "- Top Skills\n    - Nested skill one\n    - Nested skill two\n- Second top item\n"
+        evidence = tables.execute_replace_cell_markdown(str(self.target), 1, 1, 1, markdown)
+        self.assertTrue(evidence["applied"])
+
+        with zipfile.ZipFile(self.target) as zf:
+            doc_root = ET.fromstring(zf.read(projection.DEFAULT_PART))
+            numbering_root = ET.fromstring(zf.read("word/numbering.xml"))
+
+        tbl = tables._find_table_element(doc_root, 1)
+        tr = tables._find_row(tbl, 1, table_id=1)
+        tc = tables._find_cell(tr, 1, table_id=1, row_index=1)
+        paragraphs = [c for c in tc if projection._ln(c) == "p"]
+        self.assertEqual(len(paragraphs), 4)
+
+        def _num_pr(p):
+            for child in p:
+                if projection._ln(child) == "pPr":
+                    for gc in child:
+                        if projection._ln(gc) == "numPr":
+                            ilvl = None
+                            num_id = None
+                            for ggc in gc:
+                                if projection._ln(ggc) == "ilvl":
+                                    ilvl = int(projection._attr(ggc, "val"))
+                                elif projection._ln(ggc) == "numId":
+                                    num_id = int(projection._attr(ggc, "val"))
+                            return ilvl, num_id
+            return None
+
+        num_prs = [_num_pr(p) for p in paragraphs]
+        ilvls = [np[0] for np in num_prs]
+        num_ids = {np[1] for np in num_prs}
+        self.assertEqual(ilvls, [0, 1, 1, 0])
+        # One shared numId/abstractNum tree for the whole list, not a
+        # fresh one per nesting level (the exact bug PR #3 fixed).
+        self.assertEqual(len(num_ids), 1)
+        (shared_num_id,) = num_ids
+
+        # word/numbering.xml actually carries two w:lvl entries (ilvl 0
+        # and 1) under that num's abstractNum -- the tree, not just the
+        # paragraph-level ilvl/numId values, is real.
+        abstract_id = None
+        for num in numbering_root:
+            if projection._ln(num) == "num" and projection._attr(num, "numId") == str(shared_num_id):
+                for child in num:
+                    if projection._ln(child) == "abstractNumId":
+                        abstract_id = projection._attr(child, "val")
+        self.assertIsNotNone(abstract_id)
+        lvl_count = 0
+        for abstract in numbering_root:
+            if projection._ln(abstract) == "abstractNum" and projection._attr(abstract, "abstractNumId") == abstract_id:
+                lvl_count = sum(1 for c in abstract if projection._ln(c) == "lvl")
+        self.assertEqual(lvl_count, 2)
+
+        # Round-trip via get_table's own text rendering: still readable,
+        # content preserved (flattened to one line, same as any other
+        # cell paragraph join -- list markers are not part of this
+        # tool's own text contract, only the underlying w:numPr is).
+        result = tables.get_table_impl(self.target, 1)
+        text = result["rows"][0][0]["text"]
+        self.assertIn("Top Skills", text)
+        self.assertIn("Nested skill one", text)
+        self.assertIn("Second top item", text)
+
+    def test_three_level_nesting_wp16a(self):
+        """A third nesting level (ilvl 0/1/2) inside one cell -- the KP
+        resume rendering contract's own accomplishment bullets can nest
+        this deep (issue #28 plan WP-16); one shared numId/abstractNum
+        tree must still cover all three levels, not just two."""
+        markdown = "- A\n    - B\n        - C\n"
+        tables.execute_replace_cell_markdown(str(self.target), 1, 1, 1, markdown)
+
+        with zipfile.ZipFile(self.target) as zf:
+            doc_root = ET.fromstring(zf.read(projection.DEFAULT_PART))
+            numbering_root = ET.fromstring(zf.read("word/numbering.xml"))
+        tbl = tables._find_table_element(doc_root, 1)
+        tr = tables._find_row(tbl, 1, table_id=1)
+        tc = tables._find_cell(tr, 1, table_id=1, row_index=1)
+        paragraphs = [c for c in tc if projection._ln(c) == "p"]
+
+        def _ilvl_numid(p):
+            for child in p:
+                if projection._ln(child) == "pPr":
+                    for gc in child:
+                        if projection._ln(gc) == "numPr":
+                            ilvl = num_id = None
+                            for ggc in gc:
+                                if projection._ln(ggc) == "ilvl":
+                                    ilvl = int(projection._attr(ggc, "val"))
+                                elif projection._ln(ggc) == "numId":
+                                    num_id = int(projection._attr(ggc, "val"))
+                            return ilvl, num_id
+            return None
+
+        pairs = [_ilvl_numid(p) for p in paragraphs]
+        self.assertEqual([p[0] for p in pairs], [0, 1, 2])
+        num_ids = {p[1] for p in pairs}
+        self.assertEqual(len(num_ids), 1, "all three levels share one numId")
+        (num_id,) = num_ids
+
+        abstract_id = next(
+            projection._attr(c, "val")
+            for num in numbering_root
+            if projection._ln(num) == "num" and projection._attr(num, "numId") == str(num_id)
+            for c in num
+            if projection._ln(c) == "abstractNumId"
+        )
+        lvl_count = sum(
+            1
+            for abstract in numbering_root
+            if projection._ln(abstract) == "abstractNum" and projection._attr(abstract, "abstractNumId") == abstract_id
+            for c in abstract
+            if projection._ln(c) == "lvl"
+        )
+        self.assertEqual(lvl_count, 3)
+
+    def test_two_cells_each_get_their_own_numid_wp16a(self):
+        """Two SEPARATE replace_cell_markdown calls, each writing its own
+        nested list into a different cell of the SAME table, must not
+        collide on numId -- each call's StyleContext.build re-reads the
+        document's own numbering.xml fresh, so a second write's ids are
+        allocated above whatever the first write already landed on disk."""
+        tables.execute_replace_cell_markdown(str(self.target), 1, 1, 1, "- X\n    - Y\n")
+        tables.execute_replace_cell_markdown(str(self.target), 1, 1, 2, "- P\n    - Q\n")
+
+        with zipfile.ZipFile(self.target) as zf:
+            doc_root = ET.fromstring(zf.read(projection.DEFAULT_PART))
+        tbl = tables._find_table_element(doc_root, 1)
+        tr = tables._find_row(tbl, 1, table_id=1)
+        tc1 = tables._find_cell(tr, 1, table_id=1, row_index=1)
+        tc2 = tables._find_cell(tr, 2, table_id=1, row_index=1)
+
+        def _num_ids(tc):
+            found = set()
+            for p in tc:
+                if projection._ln(p) != "p":
+                    continue
+                for child in p:
+                    if projection._ln(child) == "pPr":
+                        for gc in child:
+                            if projection._ln(gc) == "numPr":
+                                for ggc in gc:
+                                    if projection._ln(ggc) == "numId":
+                                        found.add(projection._attr(ggc, "val"))
+            return found
+
+        ids1, ids2 = _num_ids(tc1), _num_ids(tc2)
+        self.assertEqual(len(ids1), 1)
+        self.assertEqual(len(ids2), 1)
+        self.assertNotEqual(ids1, ids2, "each cell's own write must get a distinct numId, not reuse the other's")
 
 
 class InsertTableTests(_TempFixtureCase):

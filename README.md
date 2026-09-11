@@ -10,11 +10,13 @@ instead of a Google Doc.
 
 ## Status
 
-Issue #28 of the build plan, through WP-15a. Reading and writing a `.docx`
-package needs no Word installation at all — this server manipulates
-OOXML directly. Word is required only for `export_pdf` (rendering a
-page-accurate PDF), and that additionally needs a macOS Automation grant
-for the app hosting this server's process.
+Issue #28 of the build plan, through WP-16a (server half; WP-16b, the
+JennyStack-side KP resume rendering contract, is a separate PR). Reading
+and writing a `.docx` package needs no Word installation at all — this
+server manipulates OOXML directly. Word is required only for
+`export_pdf` (rendering a page-accurate PDF), and that additionally
+needs a macOS Automation grant for the app hosting this server's
+process.
 
 **Platform note:** this server is macOS-only, and not only for
 `export_pdf`. `insert_image`'s SVG path (issue #28 WP-15a) shells out to
