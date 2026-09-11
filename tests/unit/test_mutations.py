@@ -72,9 +72,14 @@ class _TempFixtureCase(unittest.TestCase):
 
 class MutatingToolsRegistrationTests(unittest.TestCase):
     def test_all_three_wp04_tools_are_registered(self):
-        self.assertEqual(
-            MUTATING_TOOLS,
+        # WP-06 (issue #28) adds replace_text/format_text to MUTATING_TOOLS
+        # in the same commit that adds those tools -- see
+        # tests/unit/test_text_edit.py's own registration test for that
+        # pair; this test stays scoped to WP-04's three markdown-mutation
+        # tools, which this module owns.
+        self.assertLessEqual(
             frozenset({"replace_body_markdown", "replace_range_markdown", "append_markdown"}),
+            MUTATING_TOOLS,
         )
 
 

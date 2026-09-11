@@ -46,7 +46,7 @@ from typing import Any, NoReturn
 
 from fastmcp import FastMCP
 
-from . import mutations, paths, projection
+from . import mutations, paths, projection, text_edit
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .middleware import EvidenceEnforcementMiddleware
@@ -900,6 +900,122 @@ def append_markdown(path: str, markdown: str, revision_before: str | None = None
     """
     try:
         return mutations.execute_append_markdown(path, markdown, revision_before=revision_before, force=force)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Targeted text edits (WP-06): replace_text, format_text. Both are in
+# middleware.MUTATING_TOOLS (added in the same commit) and share
+# text_edit.py's guard (mutations._guard_before_write, same as the WP-04
+# tools above) and locate.locate()'s normalization ladder + STRUCTURAL_
+# BOUNDARY refusal. expected_matches is REQUIRED here (no default) --
+# issue #28 plan ruling D4, this server only: the shipped GoogleDocs-MCP
+# server defaults it to 1 (its server.py replace_text/format_text
+# signatures) but this server's contract deliberately does not carry that
+# default across (every caller must say how many matches it expects).
+#
+# WP-06 only WARNS on a match crossing a comment range or a tracked change
+# (the "warnings" evidence key, when non-empty) -- it does not refuse.
+# WP-07 (tracked_changes.py) adds the actual TRACKED_CHANGES_PRESENT
+# refusal on top of this same detection.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def replace_text(
+    path: str, find: str, replace: str, expected_matches: int, revision_before: str | None = None, force: bool = False
+) -> dict[str, Any]:
+    """Replace every occurrence of `find` with `replace`, atomically.
+
+    Locates `find` via a 5-rung normalization ladder (exact -> curly/
+    straight quote equivalence -> NBSP/whitespace-run collapse -> soft-
+    hyphen strip -> field placeholder -- the last lets `find` match a
+    "[FIELD:instr]" token as read_document(format="markdown") renders one,
+    even though the live text underneath is the field's actual result),
+    stopping at the first rung with at least one match.
+
+    expected_matches is REQUIRED (no default, D4): the call refuses with
+    MATCH_COUNT_MISMATCH if the actual count differs, listing every span
+    found at the matching rung.
+
+    A run whose text a match's boundary falls in the middle of splits into
+    up to three pieces: the unmatched prefix and suffix keep the run's
+    ORIGINAL w:rPr (cloned verbatim onto a fresh sibling run when a suffix
+    survives); exactly one new run is inserted for `replace`, its own
+    w:rPr inherited from the FIRST run the match touched. A run entirely
+    inside the match is removed outright. A match crossing a w:p/w:tbl/
+    w:tc boundary refuses with STRUCTURAL_BOUNDARY instead.
+
+    `force` is accepted for signature symmetry with the markdown-mutation
+    tools but has no effect here yet (WP-06 does not refuse on a
+    crosses_comment_range/crosses_revision warning -- see the evidence's
+    `warnings` key; WP-07 adds the actual refusal for a revision-crossing
+    write).
+
+    Same atomic-write mechanics as replace_body_markdown (temp file, OPC-
+    validated before the original is touched, .jsbak-backed post-write
+    verification) -- see that tool's docstring.
+
+    Returns the eight evidence keys (before/after are ±200-character
+    excerpts around the first match, not the whole document), plus
+    runs_before/runs_after (each match's overlapping run(s), clipped to the
+    span, before and after) and, when non-empty, `warnings`.
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or an empty find
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
+      REVISION_CONFLICT                 - revision_before is stale
+      ZERO_MATCH                        - find not located after the full ladder
+      MATCH_COUNT_MISMATCH              - the located count != expected_matches
+      STRUCTURAL_BOUNDARY               - a match crosses a w:p/w:tbl/w:tc boundary
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return text_edit.execute_replace_text(
+            path, find, replace, expected_matches, revision_before=revision_before, force=force
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def format_text(
+    path: str, find: str, style: dict[str, bool], expected_matches: int, revision_before: str | None = None, force: bool = False
+) -> dict[str, Any]:
+    """Apply character styling (bold/italic/underline/strike) to a matched
+    text span, without touching its content.
+
+    style maps any of "bold"/"italic"/"underline"/"strike" to true/false;
+    every requested field's value is applied verbatim (including false, so
+    {"bold": false} actually clears bold). Same locate()/expected_matches
+    contract as replace_text (see that tool's docstring for the
+    normalization ladder and STRUCTURAL_BOUNDARY refusal).
+
+    Idempotent: if every located run already carries every requested
+    field's value, the call skips the write entirely (revision_before ==
+    revision_after in the returned evidence) rather than creating a new,
+    no-op revision.
+
+    Same run-splitting rule as replace_text for a boundary run (up to
+    three pieces; unmatched prefix/suffix keep the ORIGINAL w:rPr cloned
+    verbatim), except the matched middle SURVIVES here (as a new run
+    carrying the requested style) rather than being deleted -- this tool
+    never changes character counts.
+
+    Returns the eight evidence keys, plus runs_before/runs_after (each
+    match's overlapping run(s) and their style flags, before and after)
+    and, when non-empty, `warnings`.
+
+    Errors: as replace_text, plus:
+      INVALID_INPUT - style is empty, not an object, names an unknown key,
+                       or a value is not a literal true/false boolean
+    """
+    try:
+        return text_edit.execute_format_text(
+            path, find, style, expected_matches, revision_before=revision_before, force=force
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 

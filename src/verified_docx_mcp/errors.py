@@ -70,6 +70,11 @@ class ErrorCode(Enum):
     OPC_INVALID = "OPC_INVALID"  # the rendered .docx failed OPC validation before the atomic write (original untouched)
     VERIFICATION_FAILED = "VERIFICATION_FAILED"  # the post-write re-read/re-project did not confirm the write; restored from .jsbak
 
+    # Text location + targeted edits (locate.py, text_edit.py; WP-06)
+    ZERO_MATCH = "ZERO_MATCH"  # `find` not located after the full normalization ladder; near-miss in diagnostics
+    MATCH_COUNT_MISMATCH = "MATCH_COUNT_MISMATCH"  # match count != expected_matches (D4: expected_matches is required, no default)
+    STRUCTURAL_BOUNDARY = "STRUCTURAL_BOUNDARY"  # a match crosses a w:p/w:tbl/w:tc boundary
+
 
 # Which codes signal a transient condition worth a single retry by the
 # caller. Empty for now — WP-02 has no revision-stamped write to race

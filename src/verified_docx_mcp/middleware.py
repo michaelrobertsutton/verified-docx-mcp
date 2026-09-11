@@ -45,6 +45,9 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         "replace_body_markdown",
         "replace_range_markdown",
         "append_markdown",
+        # issue #28 WP-06:
+        "replace_text",
+        "format_text",
     }
 )
 
