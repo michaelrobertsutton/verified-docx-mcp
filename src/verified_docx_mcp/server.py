@@ -34,6 +34,7 @@ writes only).
 
 from __future__ import annotations
 
+import difflib
 import glob
 import json
 import os
@@ -1417,6 +1418,161 @@ def resolve_comment(path: str, comment_id: str) -> dict[str, Any]:
     """
     try:
         return comments.execute_resolve_comment(path, comment_id)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tool: diff_body_vs_file
+# ---------------------------------------------------------------------------
+
+
+def execute_diff_body_vs_file(path: str, file_path: str) -> dict[str, Any]:
+    """Diff the docx body's markdown projection against a local markdown
+    file -- issue #28 WP-11a, same ``difflib`` mechanism as
+    GoogleDocs-MCP's ``diff_tab_vs_file`` (markdown_mutations.py
+    ``execute_diff_tab_vs_file``).
+
+    This is a READ tool -- no mutation, no audit, no evidence envelope
+    required (mirrors Google's own "no changes to the document or file"
+    framing for that tool).
+    """
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+
+    # Reuses the same allowlist/denylist paths.resolve_allowed_docx_path
+    # already enforces for every docx path this server touches (its own
+    # docstring: "the same shape the Google server uses for
+    # diff_tab_vs_file") -- one allowlist for both sides of the diff,
+    # rather than a second, parallel resolver the way Google's
+    # markdown_mutations.py keeps a diff-specific
+    # _resolve_allowed_diff_file next to its general one.
+    file_resolved = paths.resolve_allowed_docx_path(file_path, must_exist=True)
+    if not file_resolved.is_file():
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"Path is not a regular file: {file_path!r}",
+            {"file_path": file_path, "resolved_path": str(file_resolved)},
+        )
+
+    local_path, is_temp = _read_local_copy(resolved)
+    try:
+        revision = projection.compute_revision(local_path)
+        body_markdown, warnings, lossy_elements = projection.read_document_markdown(
+            local_path, projection.DEFAULT_PART
+        )
+        file_content = file_resolved.read_text(encoding="utf-8")
+
+        body_lines = body_markdown.splitlines(keepends=True)
+        file_lines = file_content.splitlines(keepends=True)
+
+        matcher = difflib.SequenceMatcher(None, body_lines, file_lines)
+        hunks: list[dict[str, Any]] = []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            hunks.append(
+                {
+                    "tag": tag,
+                    "body_lines": body_lines[i1:i2],
+                    "file_lines": file_lines[j1:j2],
+                    "body_range": [i1 + 1, i2],
+                    "file_range": [j1 + 1, j2],
+                }
+            )
+
+        unified = list(
+            difflib.unified_diff(
+                body_lines,
+                file_lines,
+                fromfile=f"docx:{path}#body",
+                tofile=file_path,
+            )
+        )
+
+        result: dict[str, Any] = {
+            "path": str(resolved),
+            "file_path": file_path,
+            "revision": revision["token"],
+            "identical": body_markdown == file_content,
+            "hunks": hunks,
+            "unified_diff": "".join(unified),
+            "warnings": warnings,
+        }
+        # Same convention as read_document: present only when the body's
+        # own markdown rendering actually lost something (a merged/nested
+        # table). A non-empty lossy_elements here is a direct reason an
+        # identical=True verdict below cannot be fully trusted -- see this
+        # tool's own docstring.
+        if lossy_elements:
+            result["lossy_elements"] = lossy_elements
+        return result
+    finally:
+        if is_temp:
+            local_path.unlink(missing_ok=True)
+
+
+@mcp.tool()
+def diff_body_vs_file(path: str, file_path: str) -> dict[str, Any]:
+    """Export the docx body as markdown and diff against a local file.
+
+    Use this tool when you need to compare a .docx's body against a local
+    markdown file -- e.g. to decide whether a push/sync is needed. The
+    docx side is rendered through the exact same projection
+    ``read_document(format="markdown")`` uses (``part`` fixed to the body,
+    ``word/document.xml``), so this compares against the same rendering
+    every other skill and tool sees, never a second, divergent one. The
+    server reads the local file directly (it runs locally); both ``path``
+    and ``file_path`` are resolved through the same allowlist/denylist
+    (VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS; see paths.py).
+
+    This is a read-only tool -- it makes no changes to the document or
+    file. It does not join MUTATING_TOOLS and does not return the eight
+    evidence keys.
+
+    Both sides are split with splitlines(keepends=True) before diffing --
+    matching GoogleDocs-MCP's diff_tab_vs_file exactly, on purpose, so a
+    file on disk that ends with a trailing newline (the common case) will
+    surface as a one-line difference against the body projection, which
+    does not end with one; a caller comparing against a projection should
+    account for that rather than read it as real drift.
+
+    AFFIRMATIVE-ONLY, same as GoogleDocs-MCP's diff_tab_vs_file: a
+    returned hunk, or identical=False, is solid evidence a difference
+    exists. identical=True is NOT proof no difference exists -- it only
+    means this particular markdown rendering of the docx body found none
+    against this particular reading of the file, which can under-report a
+    real difference for docx-specific reasons a plain text diff has no
+    way to see:
+      - The docx side is a PROJECTION, not the OOXML itself. Content the
+        markdown renderer cannot express as GFM (a merged/spanned table
+        cell, a nested table -- see lossy_elements) is dropped from the
+        comparison entirely, so two docx files that differ only in ways
+        the renderer discards compare identical here even though the
+        underlying .docx bytes are not. A non-empty lossy_elements in the
+        result is a direct signal to distrust an identical=True verdict.
+      - Only the BODY is compared. Headers, footers, footnotes/endnotes,
+        and comments are out of scope by design (see diff_body_vs_file's
+        own name) -- a real difference confined to one of those parts
+        never surfaces here.
+      - When Word's owner file is present, this reads a validated
+        snapshot rather than the live file (core/document-backend-
+        protocol.md §4's "reads never refuse" rule) -- the comparison
+        is then only as fresh as the last flush/save the snapshot
+        captured, not necessarily the very latest keystrokes.
+    A skill deciding whether a sync is needed should treat identical=True
+    as "no difference found by this projection," not as a guarantee the
+    two are in sync.
+
+    Returns path, file_path, revision (the "<doc8>:<cmt8>" token),
+    identical (bool), hunks (tagged body_lines/file_lines/body_range/
+    file_range per difflib.SequenceMatcher.get_opcodes()), unified_diff
+    (a unified diff string), warnings, and lossy_elements (present only
+    when non-empty).
+
+    Errors:
+      INVALID_INPUT - a bad path, file_path not found, or file_path is
+                       not a regular file
+    """
+    try:
+        return execute_diff_body_vs_file(path, file_path)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

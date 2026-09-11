@@ -10,7 +10,7 @@ instead of a Google Doc.
 
 ## Status
 
-Issue #28 of the build plan, through WP-10. Reading and writing a `.docx`
+Issue #28 of the build plan, through WP-11a. Reading and writing a `.docx`
 package needs no Word installation at all — this server manipulates
 OOXML directly. Word is required only for `export_pdf` (rendering a
 page-accurate PDF), and that additionally needs a macOS Automation grant
@@ -69,40 +69,115 @@ Tools implemented so far:
   Detection only, not prevention (core/document-backend-protocol.md §9):
   the naming patterns it matches are client- and locale-dependent, so
   their absence is not proof no conflict occurred.
+- **`diff_body_vs_file(path, file_path)`** — export the docx body's
+  markdown projection (the same one `read_document(format="markdown")`
+  uses) and diff it against a local markdown file with `difflib`, the
+  same mechanism GoogleDocs-MCP's `diff_tab_vs_file` uses. Read-only and
+  affirmative-only: `identical: true` means no difference was found by
+  this particular projection, not a guarantee none exists (see the
+  tool's own docstring for the docx-specific reasons why, including a
+  trailing newline on the file side alone surfacing as a spurious
+  one-line difference).
 
 More tools (tables, images) land in later work packages of the same plan.
 
 ## Interoperability
 
 Every read/write path above is exercised by `tests/unit` against
-Word-authored fixtures and, for comments specifically, compared part by
-part against a golden `.docx` produced by the lead in Word desktop. What
-those tests cannot cover is a **live round trip through a real synced
-folder with more than one client editing concurrently** — that requires
-a human at a keyboard, in both Word desktop and Word Online, on a file
-actually going through OneDrive/iCloud sync. Two such checks are
-definition-of-done items for this PR, not agent gates, and their results
-belong here once the lead has run them:
+Word-authored fixtures and, for comments specifically, verified part by
+part against a golden `.docx` produced by the lead in Word desktop
+(`tests/fixtures/comments/golden-comment.docx`; its provenance was
+confirmed by the lead). What those tests cannot cover is behavior that
+only shows up with a live human at a keyboard and a real sync client in
+the loop: how a sync client actually names a conflict file, how Word's
+own Review pane renders a tracked change, how Word Online renders a
+comment this server wrote.
 
-- **Word desktop + Word Online round trip (issue #28 WP-09):** the lead
-  leaves one comment in Word desktop and one in Word Online on a file in
-  a real synced folder. This server's tools then read, reply to, and
-  resolve both comments. The lead reopens the file in both clients and
-  confirms the threading and resolved state show correctly.
+The lead has ruled that a live round trip through Word desktop and Word
+Online is no longer a landing gate for this repo. Instead, each item
+below is recorded as **verify at first real use**: the exact assumption
+this server's code depends on, stated precisely enough that a future
+reader knows exactly what is unproven and what would actually break if
+the assumption turns out to be wrong.
 
-  **Result:** _not yet run — pending the lead's live round trip. This
-  placeholder is intentional: no result is recorded here until the lead
-  has actually performed the check above and reports what they observed
-  in both clients._
+1. **Conflict-copy filename (issue #28 WP-10).**
+   Assumption: OneDrive names a conflict copy `<stem>-<Machine>.docx`
+   using the resolved local machine name -- on this machine
+   `Michaels-MacBook-Pro` (`_local_machine_names()` in `mutations.py`;
+   confirmed against this machine's own `scutil --get ComputerName` /
+   `LocalHostName` output, both of which already normalize to that
+   string). `conflict_copy_sweep`'s `_matches_conflict_copy_pattern`
+   matches that branch only on an exact, case-insensitive match against
+   `_local_machine_names()`.
+   If wrong: a real OneDrive client emitting a different machine-name
+   form (a different normalization, a user-set device label, a non-Mac
+   client) means a genuine conflict lands in `sibling_files_changed`
+   instead of raising the `conflict_copy_detected` evidence flag --
+   still visible to a caller that reads the evidence, just not flagged
+   as unambiguously as the matched branch is.
+   This is a deliberate, already-documented trade-off, not a gap
+   discovered here: `_matches_conflict_copy_pattern`'s own docstring
+   notes that a conflict copy from another, unenumerable machine falls
+   through the same way, consistent with
+   core/document-backend-protocol.md §4's "the absence of a match is not
+   proof no conflict occurred."
 
-- **Forced conflict copy (issue #28 WP-10):** the lead edits the same
-  file in Word Online and locally within the sync window, forcing a real
-  conflict-copy sibling, and records the filename the sync client
-  actually produced alongside whether this server's `conflict_copy_detected`
-  evidence flag fired for it.
+2. **Word Online round trip (issue #28 WP-09).**
+   Assumption: a comment created, replied to, and resolved by this
+   server's tools shows correct threading and resolved state when the
+   file is reopened in Word desktop AND Word Online.
+   What is actually proven: every comment part this server writes
+   (`comments.xml`, `commentsExtended.xml`, `commentsIds.xml`,
+   `commentsExtensible.xml`, `people.xml`) is verified part by part
+   against the golden, Word-desktop-authored fixture above.
+   What is not proven: this server has never had one of its own comments
+   opened in a live Word Online session. If wrong, Word Online's comment
+   renderer disagrees with Word desktop's about some part-level detail
+   the golden-fixture comparison did not catch (the fixture was authored
+   in Word desktop, never in Word Online) -- threading or resolved state
+   could render incorrectly specifically in the browser client this
+   repo's fixtures never exercised.
 
-  **Result:** _not yet run — pending the lead's forced conflict. This
-  placeholder is intentional for the same reason as above._
+3. **Review-pane author (issue #28 WP-07b-a).**
+   Assumption: a tracked `replace_text` shows in Word's Review pane
+   under the configured author name -- resolved by `author.py`'s
+   `resolve_author_name()` from `~/.jennystack/config.json`'s
+   `author_name` key, or, absent that, the current macOS account's full
+   name (`pw_gecos`, falling back to `id -F`) -- currently
+   `Michael Sutton` on this machine.
+   What is actually proven: the OOXML this server writes is well-formed
+   and matches documented Word conventions for a `w:ins`/`w:del`'s
+   `w:author` attribute, and this server's own projection reads that
+   author string back unchanged.
+   What is not proven: nobody has opened one of these files in Word and
+   looked at the Review pane. If wrong, the name Word actually displays
+   could differ from the literal `w:author` string this server wrote
+   (e.g. a Word-side display quirk that resolves a name against a
+   signed-in account) -- the UI rendering is unobserved.
+
+4. **Nested tracked edit (issue #28 WP-07b-a).**
+   Assumption: Word renders `<w:ins><w:del>...</w:del><w:ins>...</w:ins></w:ins>`
+   sensibly when a second `track_changes=True` edit lands on a still-
+   pending own insertion -- the named scope limit in `text_edit.py`'s own
+   module docstring.
+   What is actually proven: read-back correctness holds regardless --
+   `projection.py` excludes `w:del` content unconditionally, so the
+   superseded text is correctly invisible to every read tool either way,
+   directly exercised by
+   `test_text_edit.py::test_own_author_tracked_edit_does_not_deadlock_a_second_tracked_edit`
+   (chained `replace_text(..., track_changes=True)` calls over the same
+   span), not merely assumed.
+   What is not proven: the visual shape of that nesting in Word's own
+   Review pane. If wrong, Word could render the nested insertion/deletion
+   confusingly (e.g. a crossed-out "insertion" that reads as ambiguous or
+   duplicated) even though every read tool in this server still reports
+   the correct final text.
+
+None of the four blocks this server from being used; each is a
+live-Word-rendering question this repo's own test suite, which needs no
+Word installation to read or write a `.docx`, cannot answer by itself.
+The next real use of this server against a live synced folder is the
+first opportunity to confirm or correct any of them.
 
 ## Install
 
