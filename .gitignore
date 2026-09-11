@@ -14,3 +14,8 @@ __pycache__/
 .coverage*
 dist/
 *.egg-info/
+
+# macOS Finder metadata; appears anywhere a Finder window has opened
+# this tree, including inside tests/fixtures/ where fixtures are authored
+# and saved by hand.
+.DS_Store
