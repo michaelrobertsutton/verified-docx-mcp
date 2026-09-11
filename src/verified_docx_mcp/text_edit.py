@@ -750,3 +750,286 @@ def execute_format_text(
     logged, _ = audit.append_audit(path=str(resolved), tool="format_text", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
+
+
+# ---------------------------------------------------------------------------
+# Tool 3: apply_style -- issue #28 WP-15a. Applies a NAMED style (from
+# list_styles) rather than format_text's four boolean toggles. Modeled on
+# format_text's exact pipeline (locate -> _atoms_for_span -> per-atom
+# apply -> _serialize_and_write -> 8-key evidence), which is also why it
+# lives here rather than in a new module: it reuses _atoms_for_span,
+# _own_rpr, _build_run, _index_of, _TrackContext, and
+# _check_tracked_changes_guard directly.
+#
+# Scope limit, documented rather than silently mishandled: a CHARACTER
+# style (w:type="character") applies to the matched run(s) exactly like
+# format_text, including track_changes=True support (w:rPrChange, per
+# WP-07b-a's own contract, which names rPrChange for "formatting
+# changes"). A PARAGRAPH style (w:type="paragraph") applies to every
+# paragraph CONTAINING a matched run (the whole paragraph, not just the
+# matched substring -- w:pStyle has no sub-paragraph granularity) but
+# does NOT support track_changes=True: WP-07b-a's contract defines
+# w:rPrChange only, never a w:pPrChange-style paragraph-formatting
+# tracked-change shape, and inventing one untested is out of this WP's
+# scope -- apply_style(..., track_changes=True) on a paragraph style
+# raises INVALID_INPUT naming this gap explicitly rather than silently
+# applying it untracked or guessing at an unspecified w:pPrChange shape.
+# ---------------------------------------------------------------------------
+
+_SUPPORTED_STYLE_TYPES = frozenset({"paragraph", "character"})
+
+
+def _set_run_style(r_elem: Any, style_id: str, *, track: _TrackContext | None) -> None:
+    """Set/replace <w:rStyle w:val=style_id> on r_elem's own w:rPr
+    (creating one if absent; w:rStyle must be rPr's FIRST child per the
+    OOXML schema's fixed element order). Tracked the same way
+    _apply_style_to_run tracks a boolean toggle: a w:rPrChange recording
+    the PRE-change rPr, snapshotted before anything is mutated."""
+    old_rpr = _own_rpr(r_elem)
+    old_rpr_snapshot = copy.deepcopy(old_rpr) if (track and old_rpr is not None) else None
+    rpr = old_rpr
+    if rpr is None:
+        rpr = ET.Element(_w("rPr"))
+        r_elem.insert(0, rpr)
+    existing = None
+    for child in rpr:
+        if projection._ln(child) == "rStyle":
+            existing = child
+            break
+    if existing is None:
+        rstyle = ET.Element(_w("rStyle"), {_w("val"): style_id})
+        rpr.insert(0, rstyle)
+    else:
+        existing.set(_w("val"), style_id)
+    if track:
+        new_rpr = _own_rpr(r_elem)
+        rid = track.next_id()
+        tracked_changes.apply_rpr_change(new_rpr, old_rpr_elem=old_rpr_snapshot, rid=rid, author=track.author, date=track.date)
+
+
+def _apply_named_style_span(
+    start: int,
+    end: int,
+    style_id: str,
+    atoms: list[tuple[int, int, RunEvent]],
+    *,
+    track: _TrackContext | None = None,
+) -> None:
+    """Same run-splitting rule as _apply_format_span: a boundary run
+    splits, the matched middle survives as a new run carrying the named
+    style, character count never changes."""
+    for s, e, event in atoms:
+        local_start = max(start, s) - s
+        local_end = min(end, e) - s
+        full_text = event.text
+        before_text = full_text[:local_start]
+        after_text = full_text[local_end:]
+
+        if not before_text and not after_text:
+            if event.r_elem is not None:
+                _set_run_style(event.r_elem, style_id, track=track)
+            continue
+
+        if event.r_elem is None or event.parent_elem is None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "matched run has no live element to edit", {"start": start, "end": end})
+
+        original_rpr = _own_rpr(event.r_elem)
+        middle_text = full_text[local_start:local_end]
+        middle_run = _build_run(middle_text, copy.deepcopy(original_rpr) if original_rpr is not None else None)
+        _set_run_style(middle_run, style_id, track=track)
+
+        parent = event.parent_elem
+        idx = list(parent).index(event.r_elem)
+        if before_text and after_text:
+            _set_node_text(event, before_text)
+            after_run = _build_run(after_text, copy.deepcopy(original_rpr) if original_rpr is not None else None)
+            parent.insert(idx + 1, middle_run)
+            parent.insert(idx + 2, after_run)
+        elif before_text:
+            _set_node_text(event, before_text)
+            parent.insert(idx + 1, middle_run)
+        else:
+            after_run = _build_run(after_text, copy.deepcopy(original_rpr) if original_rpr is not None else None)
+            parent.insert(idx, middle_run)
+            parent.insert(idx + 1, after_run)
+            _remove_if_present(parent, event.r_elem)
+
+
+def _build_parent_map(root: Any) -> dict[int, Any]:
+    parent_map: dict[int, Any] = {}
+    for parent in root.iter():
+        for child in parent:
+            parent_map[id(child)] = parent
+    return parent_map
+
+
+def _enclosing_paragraph(parent_map: dict[int, Any], elem: Any | None) -> Any | None:
+    current = elem
+    while current is not None:
+        if projection._ln(current) == "p":
+            return current
+        current = parent_map.get(id(current))
+    return None
+
+
+def _apply_paragraph_style(p_elem: Any, style_id: str) -> None:
+    """Set/replace <w:pStyle w:val=style_id> on p_elem's own w:pPr
+    (creating one if absent; w:pStyle must be pPr's FIRST child). Never
+    tracked -- see this section's own module-level scope-limit comment."""
+    ppr = None
+    for child in p_elem:
+        if projection._ln(child) == "pPr":
+            ppr = child
+            break
+    if ppr is None:
+        ppr = ET.Element(_w("pPr"))
+        p_elem.insert(0, ppr)
+    existing = None
+    for child in ppr:
+        if projection._ln(child) == "pStyle":
+            existing = child
+            break
+    if existing is None:
+        pstyle = ET.Element(_w("pStyle"), {_w("val"): style_id})
+        ppr.insert(0, pstyle)
+    else:
+        existing.set(_w("val"), style_id)
+
+
+def execute_apply_style(
+    path: str,
+    find: str,
+    style_id: str,
+    expected_matches: int,
+    *,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    pre_revision = mutations._guard_before_write(resolved, revision_before)
+
+    style_records = projection.list_styles_impl(resolved)
+    styles_by_style_id = {s["style_id"]: s for s in style_records if s["style_id"]}
+    style_info = styles_by_style_id.get(style_id)
+    if style_info is None:
+        raise _make_error(
+            ErrorCode.STYLE_NOT_FOUND,
+            f"style_id {style_id!r} is not a style in this document's styles.xml.",
+            {"style_id": style_id, "available_style_ids": sorted(styles_by_style_id)},
+        )
+    style_type = style_info.get("type")
+    if style_type not in _SUPPORTED_STYLE_TYPES:
+        raise _make_error(
+            ErrorCode.UNSUPPORTED_STYLE_TYPE,
+            f"style_id {style_id!r} is a {style_type!r} style; apply_style supports paragraph and character "
+            "styles only.",
+            {"style_id": style_id, "type": style_type},
+        )
+    if style_type == "paragraph" and track_changes:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "apply_style(track_changes=True) is not supported for a paragraph style: WP-07b-a's track_changes "
+            "contract defines w:rPrChange for run/character formatting only, not a paragraph-level "
+            "w:pPrChange-style tracked change. Apply the paragraph style directly (track_changes=False), or use "
+            "a character style if a tracked change is required.",
+            {"style_id": style_id, "type": style_type},
+        )
+
+    document_root, raw_xml = mutations._load_document(resolved)
+    proj = projection.project_document_root(document_root)
+
+    locate_result: LocateResult = locate(find, proj, expected_matches)
+    own_author = resolve_author_name()
+    _check_tracked_changes_guard(proj, locate_result, force, own_author)
+
+    before_first = locate_result.spans[0]
+    before_excerpt = _excerpt(proj.text, before_first[0], before_first[1])
+    runs_before = _collect_style_runs(proj, locate_result.spans)
+
+    track = _TrackContext(document_root, author=own_author) if track_changes else None
+
+    if style_type == "character":
+        for start, end in locate_result.spans:
+            atoms = _atoms_for_span(proj, start, end)
+            _apply_named_style_span(start, end, style_id, atoms, track=track)
+    else:
+        parent_map = _build_parent_map(document_root)
+        touched_ids: set[int] = set()
+        touched_paragraphs: list[Any] = []
+        for start, end in locate_result.spans:
+            for _s, _e, event in _atoms_for_span(proj, start, end):
+                p_elem = _enclosing_paragraph(parent_map, event.r_elem)
+                if p_elem is not None and id(p_elem) not in touched_ids:
+                    touched_ids.add(id(p_elem))
+                    touched_paragraphs.append(p_elem)
+        for p_elem in touched_paragraphs:
+            _apply_paragraph_style(p_elem, style_id)
+
+    # format_text never changes character counts, and neither does
+    # apply_style (a style id is metadata, not content) -- spans are
+    # stable across the mutation.
+    mutated_proj = projection.project_document_root(document_root)
+    after_excerpt = _excerpt(mutated_proj.text, before_first[0], before_first[1])
+    runs_after = _collect_style_runs(mutated_proj, locate_result.spans)
+    intended_after_text = mutated_proj.text
+
+    def _post_verify(written_path: Path) -> None:
+        actual_text = projection.read_document_text(written_path)
+        diff = mutations._diff_modulo_whitespace(intended_after_text, actual_text)
+        if diff:
+            raise ValueError(f"re-read document does not match the intended text modulo whitespace: {diff}")
+        new_document_root, _ = mutations._load_document(written_path)
+        new_proj = projection.project_document_root(new_document_root)
+        if style_type == "character":
+            for start, end in locate_result.spans:
+                for _s, _e, event in _atoms_for_span(new_proj, start, end):
+                    if event.r_elem is None:
+                        continue
+                    rpr = _own_rpr(event.r_elem)
+                    rstyle_val = None
+                    if rpr is not None:
+                        for child in rpr:
+                            if projection._ln(child) == "rStyle":
+                                rstyle_val = projection._attr(child, "val")
+                    if rstyle_val != style_id:
+                        raise ValueError(f"re-read run does not carry w:rStyle val={style_id!r} (got {rstyle_val!r})")
+        else:
+            new_parent_map = _build_parent_map(new_document_root)
+            for start, end in locate_result.spans:
+                for _s, _e, event in _atoms_for_span(new_proj, start, end):
+                    p_elem = _enclosing_paragraph(new_parent_map, event.r_elem)
+                    if p_elem is None:
+                        raise ValueError("re-read match has no enclosing paragraph")
+                    pstyle_val = None
+                    for child in p_elem:
+                        if projection._ln(child) == "pPr":
+                            for gc in child:
+                                if projection._ln(gc) == "pStyle":
+                                    pstyle_val = projection._attr(gc, "val")
+                    if pstyle_val != style_id:
+                        raise ValueError(f"re-read paragraph does not carry w:pStyle val={style_id!r} (got {pstyle_val!r})")
+
+    conflict_sweep = _serialize_and_write(resolved, document_root, raw_xml, post_verify=_post_verify)
+
+    post_revision = projection.compute_revision(resolved)
+    evidence = _evidence(
+        applied=True,
+        match_count=locate_result.match_count,
+        rung=locate_result.rung,
+        before=before_excerpt,
+        after=after_excerpt,
+        revision_before=pre_revision["token"],
+        revision_after=post_revision["token"],
+        audit_logged=False,
+        runs_before=runs_before,
+        runs_after=runs_after,
+        warnings=locate_result.warnings,
+        track=track,
+        conflict_sweep=conflict_sweep,
+    )
+    evidence["style_id"] = style_id
+    evidence["style_type"] = style_type
+    logged, _ = audit.append_audit(path=str(resolved), tool="apply_style", evidence=evidence)
+    evidence["audit_logged"] = logged
+    return evidence

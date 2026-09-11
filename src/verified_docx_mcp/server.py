@@ -47,7 +47,7 @@ from typing import Any, NoReturn
 
 from fastmcp import FastMCP
 
-from . import comments, mutations, paths, projection, tables, text_edit, tracked_changes
+from . import comments, images, mutations, paths, projection, tables, text_edit, tracked_changes
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .middleware import EvidenceEnforcementMiddleware
@@ -1631,6 +1631,165 @@ def insert_table(
         return tables.execute_insert_table(
             path, rows, style_id, revision_before=revision_before, force=force, track_changes=track_changes
         )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Images (issue #28 WP-15a): insert_image, apply_style (both mutating, in
+# MUTATING_TOOLS), read_header_footer (read-only).
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def insert_image(
+    path: str,
+    image_path: str,
+    width_in: float | None = None,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    """Append a new inline picture at the end of the document body, from a
+    LOCAL .png or .svg file (image_path is read natively -- no
+    IMAGE_SOURCE_UNSUPPORTED, unlike GoogleDocs-MCP's URL-only tool).
+
+    width_in defaults to the text-column width list_page_sections reports
+    for this document's first page section (its own height follows the
+    image's own aspect ratio). An .svg is embedded natively (Word 2016+'s
+    own a:blip/a:extLst SVG extension) WITH a PNG fallback part Word
+    requires for any older/non-SVG-aware consumer -- rasterized from the
+    SVG's own native pixel size via macOS `sips`.
+
+    Records design_width_in/design_height_in (a PNG's own intrinsic pixel
+    size / 96 DPI; an SVG's own root width/height or viewBox),
+    placed_width_in/placed_height_in (what was actually written to
+    wp:extent), and effective_scale = placed_width_in / design_width_in --
+    a real measured ratio, consumed downstream by JennyStack's own
+    readability gate, not a placeholder.
+
+    Same guard/atomic-write/audit machinery as insert_table.
+    track_changes=True wraps the new run in w:ins (nothing existing is
+    removed by an insertion).
+
+    Returns the eight evidence keys (before="", after="[image:<rId>]"),
+    plus format, design_width_in, design_height_in, placed_width_in,
+    placed_height_in, effective_scale, blip_rid (svg_rid when the source
+    was an .svg), (track_changes=True only) revision_ids/track_changes,
+    and conflict_copy_detected (+ conflict_copies/sibling_files_changed
+    when non-empty).
+
+    Errors:
+      INVALID_INPUT           - a bad path, image_path is not a regular file, or width_in <= 0
+      DOCX_LOCKED, SYNC_IN_FLIGHT - the write guard
+      REVISION_CONFLICT       - revision_before is stale
+      UNSUPPORTED_IMAGE_FORMAT - image_path is not .png/.svg, or its bytes do not parse as one
+      SVG_RASTERIZATION_FAILED - the PNG fallback part could not be produced (macOS `sips` failed/unavailable)
+      OPC_INVALID              - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED      - post-write verification failed; rolled back
+    """
+    try:
+        return images.execute_insert_image(
+            path, image_path, width_in, revision_before=revision_before, force=force, track_changes=track_changes
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def apply_style(
+    path: str,
+    find: str,
+    style_id: str,
+    expected_matches: int,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    """Apply a NAMED style (from list_styles) to text located via find --
+    the named-style counterpart to format_text's four boolean toggles.
+
+    A CHARACTER style (w:type="character") applies to the matched run(s)
+    exactly like format_text (same locate()/normalization-ladder/
+    STRUCTURAL_BOUNDARY contract, same run-splitting rule, same
+    track_changes=True support via w:rPrChange). A PARAGRAPH style
+    (w:type="paragraph") applies w:pStyle to every paragraph CONTAINING a
+    matched run (the whole paragraph, not just the matched substring) --
+    but does NOT support track_changes=True: WP-07b-a's contract defines
+    w:rPrChange for run formatting only, never a paragraph-level tracked
+    change, so a paragraph-style call with track_changes=True raises
+    INVALID_INPUT naming this gap rather than silently applying it
+    untracked or inventing an untested w:pPrChange shape.
+
+    Returns the eight evidence keys, plus runs_before/runs_after (as
+    format_text), style_id, style_type ("paragraph"/"character"),
+    `warnings` when non-empty, and (character style, track_changes=True
+    only) revision_ids/track_changes.
+
+    Errors: as format_text, plus:
+      STYLE_NOT_FOUND        - style_id is not a style in this document's styles.xml
+      UNSUPPORTED_STYLE_TYPE - style_id names neither a paragraph nor a character style
+      INVALID_INPUT          - track_changes=True on a paragraph style (see above)
+    """
+    try:
+        return text_edit.execute_apply_style(
+            path, find, style_id, expected_matches,
+            revision_before=revision_before, force=force, track_changes=track_changes,
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+_HEADER_FOOTER_KINDS = frozenset({"header", "footer"})
+
+
+def execute_read_header_footer(path: str) -> dict[str, Any]:
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    local_path, is_temp = _read_local_copy(resolved)
+    try:
+        results: list[dict[str, Any]] = []
+        for part_info in projection.list_parts_impl(local_path):
+            if part_info["kind"] not in _HEADER_FOOTER_KINDS:
+                continue
+            markdown, warnings, lossy_elements = projection.read_document_markdown(local_path, part_info["part"])
+            results.append(
+                {
+                    "part": part_info["part"],
+                    "kind": part_info["kind"],
+                    "header_footer_type": part_info["header_footer_type"],
+                    "markdown": markdown,
+                    "warnings": warnings,
+                    "lossy_elements": lossy_elements,
+                }
+            )
+        return {"path": str(resolved), "headers_and_footers": results}
+    finally:
+        if is_temp:
+            local_path.unlink(missing_ok=True)
+
+
+@mcp.tool()
+def read_header_footer(path: str) -> dict[str, Any]:
+    """Read every header/footer part's content as markdown, in one call --
+    list_parts already discovers these parts (kind "header"/"footer",
+    header_footer_type "default"/"first"/"even") and read_document(part=
+    ...) already reads any one of them; this is the convenience wrapper
+    that reads all of them without the caller enumerating parts first.
+
+    Returns path, headers_and_footers (list of {part, kind,
+    header_footer_type, markdown, warnings, lossy_elements} -- same shape
+    read_document(format="markdown") returns per part). Empty list for a
+    document with no header/footer parts.
+
+    Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
+    Word's owner file is present.
+
+    Errors:
+      INVALID_INPUT  - path does not exist or is outside the allowed roots
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return execute_read_header_footer(path)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

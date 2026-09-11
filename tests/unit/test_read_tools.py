@@ -233,5 +233,64 @@ class ReadsNeverRefuseTests(ReadToolsTestCase):
         self.assertEqual(before, after)
 
 
+class ReadHeaderFooterToolTests(ReadToolsTestCase):
+    """issue #28 WP-15a: read_header_footer reads every header/footer part
+    as markdown in one call -- headers.docx is Word-authored (see
+    tests/fixtures/README.md), with three headers and three footers, each
+    a distinct header_footer_type ("default"/"first"/"even")."""
+
+    def setUp(self):
+        super().setUp()
+        self.target = Path(self._tmp.name) / "headers.docx"
+        shutil.copyfile(FIXTURES / "headers.docx", self.target)
+
+    def test_reads_every_header_and_footer_part(self):
+        result = server.execute_read_header_footer(str(self.target))
+        entries = result["headers_and_footers"]
+        kinds = {e["kind"] for e in entries}
+        self.assertEqual(kinds, {"header", "footer"})
+        self.assertEqual(len({e["part"] for e in entries}), len(entries))  # each part reported once
+        types_by_kind: dict[str, set] = {"header": set(), "footer": set()}
+        for e in entries:
+            types_by_kind[e["kind"]].add(e["header_footer_type"])
+        self.assertEqual(types_by_kind["header"], {"default", "first", "even"})
+        self.assertEqual(types_by_kind["footer"], {"default", "first", "even"})
+
+    def test_default_header_and_footer_content(self):
+        result = server.execute_read_header_footer(str(self.target))
+        default_header = next(
+            e for e in result["headers_and_footers"] if e["kind"] == "header" and e["header_footer_type"] == "default"
+        )
+        default_footer = next(
+            e for e in result["headers_and_footers"] if e["kind"] == "footer" and e["header_footer_type"] == "default"
+        )
+        self.assertIn("Header text, distinct from the body.", default_header["markdown"])
+        self.assertIn("Footer text, also distinct.", default_footer["markdown"])
+
+    def test_document_with_no_headers_or_footers_returns_empty_list(self):
+        no_hf_target = Path(self._tmp.name) / "frag.docx"
+        shutil.copyfile(FIXTURES / "frag.docx", no_hf_target)
+        result = server.execute_read_header_footer(str(no_hf_target))
+        self.assertEqual(result["headers_and_footers"], [])
+
+    def test_not_gated_by_docx_locked(self):
+        owner_file = self.target.with_name("~$" + self.target.name)
+        owner_file.write_bytes(b"\x00Someone\x00")
+        try:
+            with mock.patch.object(paths, "snapshot_docx_package", wraps=paths.snapshot_docx_package) as spy:
+                result = server.execute_read_header_footer(str(self.target))
+            spy.assert_called_once()
+            self.assertTrue(result["headers_and_footers"])
+        finally:
+            owner_file.unlink(missing_ok=True)
+
+
+class ReadHeaderFooterNotMutatingTests(unittest.TestCase):
+    def test_not_registered(self):
+        from verified_docx_mcp.middleware import MUTATING_TOOLS
+
+        self.assertNotIn("read_header_footer", MUTATING_TOOLS)
+
+
 if __name__ == "__main__":
     unittest.main()

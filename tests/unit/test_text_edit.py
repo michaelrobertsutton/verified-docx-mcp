@@ -308,5 +308,79 @@ class TrackChangesTests(_TempFixtureCase):
         self.assertEqual(cm.exception.envelope.error_code, ErrorCode.TRACKED_CHANGES_PRESENT)
 
 
+class ApplyStyleRegistrationTests(unittest.TestCase):
+    def test_apply_style_is_registered(self):
+        self.assertIn("apply_style", MUTATING_TOOLS)
+
+
+class ApplyStyleCharacterTests(_TempFixtureCase):
+    """issue #28 WP-15a: apply_style on a w:type="character" style --
+    same locate/run-splitting/track_changes machinery as format_text."""
+
+    fixture_name = "frag.docx"
+
+    def test_applies_rstyle_to_matched_run(self):
+        evidence = text_edit.execute_apply_style(str(self.target), "brown", "IntenseEmphasis", 1)
+        self.assertTrue(evidence["applied"])
+        self.assertEqual(evidence["style_id"], "IntenseEmphasis")
+        self.assertEqual(evidence["style_type"], "character")
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        self.assertIn('<w:rStyle w:val="IntenseEmphasis"', xml)
+        # rStyle is rPr's FIRST child per the OOXML schema's fixed element
+        # order, ahead of the run's own pre-existing <w:b/>.
+        self.assertIn('<w:rStyle w:val="IntenseEmphasis" /><w:b', xml)
+
+    def test_unknown_style_id_raises_style_not_found(self):
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_apply_style(str(self.target), "brown", "NoSuchStyle", 1)
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.STYLE_NOT_FOUND)
+
+    def test_table_style_id_rejected_as_unsupported_type(self):
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_apply_style(str(self.target), "brown", "TableNormal", 1)
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.UNSUPPORTED_STYLE_TYPE)
+
+    def test_track_changes_wraps_in_rprchange(self):
+        patcher = mock.patch("verified_docx_mcp.text_edit.resolve_author_name", return_value="Jane Reviewer")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        evidence = text_edit.execute_apply_style(
+            str(self.target), "brown", "IntenseEmphasis", 1, track_changes=True
+        )
+        self.assertTrue(evidence["track_changes"])
+        self.assertTrue(evidence["revision_ids"])
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        self.assertIn("<w:rPrChange ", xml)
+        self.assertIn('w:author="Jane Reviewer"', xml)
+        # Content itself is untouched by a style-only change.
+        self.assertEqual(
+            projection.read_document_text(self.target), "The quick brown fox jumps over the lazy dog."
+        )
+
+
+class ApplyStyleParagraphTests(_TempFixtureCase):
+    fixture_name = "frag.docx"
+
+    def test_applies_pstyle_to_enclosing_paragraph(self):
+        evidence = text_edit.execute_apply_style(str(self.target), "brown", "Heading2", 1)
+        self.assertTrue(evidence["applied"])
+        self.assertEqual(evidence["style_type"], "paragraph")
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        self.assertIn('<w:pStyle w:val="Heading2"', xml)
+        # Whole-paragraph text is unchanged -- pStyle carries no
+        # sub-paragraph granularity.
+        self.assertEqual(
+            projection.read_document_text(self.target), "The quick brown fox jumps over the lazy dog."
+        )
+
+    def test_track_changes_on_paragraph_style_refuses(self):
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_apply_style(str(self.target), "brown", "Heading2", 1, track_changes=True)
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+
 if __name__ == "__main__":
     unittest.main()

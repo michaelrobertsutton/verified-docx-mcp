@@ -85,3 +85,21 @@ the real `commented.docx`/`tracked.docx` fixtures above (the shared hazard
 `replace_range_markdown`'s own section-targeting logic against the real,
 heading-only `sections.docx` fixture (no comments involved). See
 `tests/unit/test_mutations.py` for both.
+
+## Issue #28 WP-15a additions
+
+| File | Purpose | How it was made |
+|---|---|---|
+| `images/sample.png` | A 300x150px solid-color PNG. Tests `insert_image`'s PNG path: intrinsic-size reading (`IHDR`), the default-width-from-`list_page_sections` path, and the EMU round-trip on `wp:extent`. | **Synthetic, not Word-authored — deliberately, not as a shortcut.** `insert_image`'s own `image_path` argument is a LOCAL file this server reads and embeds VERBATIM; the fixture-integrity rule at the top of this file exists to catch a gap between real Word OUTPUT and this repo's assumptions about it, which does not apply here — there is no Word-output nuance to get wrong by guessing, because Word never produced this file in the first place and this server only ever consumes it. Built with pure-Python `struct`/`zlib` (no imaging library is installed in this environment) — a minimal, valid, single-`IDAT` RGB PNG. |
+| `images/sample.svg` | A 200x100 `viewBox` SVG (a rect + text). Tests `insert_image`'s SVG path: `width`/`viewBox`-derived design size, the native Word 2016+ `a:blip`/`a14:svgBlip` extension, and the PNG fallback part `sips` rasterizes from it. | Hand-authored plain SVG/XML text — same rationale as `sample.png` above: a user-supplied asset `insert_image` reads verbatim, not a Word-output nuance. |
+
+Also worth naming here, since it is the second time this exact bug class
+has surfaced: `tables-merged.docx`'s WP-14 regeneration note above (under
+WP-03b-a) fixed the file being invalid OOXML as shipped — its root
+declared 3 namespace prefixes while `mc:Ignorable` named 9 more nothing
+declared, the same namespace-declaration bug PR #3 fixed in the WRITE
+path, this time latent in a FIXTURE because nothing had ever written to
+it (or run `opc_valid` against it) before WP-14's mutating tools did.
+That recurrence is itself the argument for `opc_valid`'s
+`mc:Ignorable`-declared-prefix check staying a real, standing rule — it
+is what caught this one, on a file, not just on a write.

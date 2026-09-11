@@ -97,7 +97,11 @@ class ErrorCode(Enum):
     # IMAGE_SOURCE_UNSUPPORTED (source must be a public URL, not a local
     # path), is a deliberate omission here -- a local path is exactly what
     # insert_image reads natively (see errors.py's own header comment).
-    UNSUPPORTED_IMAGE_FORMAT = "UNSUPPORTED_IMAGE_FORMAT"  # insert_image's path is not a .png/.jpg/.jpeg/.svg
+    UNSUPPORTED_IMAGE_FORMAT = "UNSUPPORTED_IMAGE_FORMAT"  # insert_image's path is not a .png/.svg, or the file's own bytes do not parse as one
+    SVG_RASTERIZATION_FAILED = "SVG_RASTERIZATION_FAILED"  # insert_image could not produce the PNG fallback part Word requires for an SVG (macOS `sips` failed or is unavailable)
+
+    # Style application (text_edit.py; issue #28 WP-15a)
+    UNSUPPORTED_STYLE_TYPE = "UNSUPPORTED_STYLE_TYPE"  # apply_style's style_id names a style whose w:type is neither "paragraph" nor "character" (e.g. "table"/"numbering")
 
 
 # Which codes signal a transient condition worth a single retry by the

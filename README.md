@@ -10,11 +10,20 @@ instead of a Google Doc.
 
 ## Status
 
-Issue #28 of the build plan, through WP-14. Reading and writing a `.docx`
+Issue #28 of the build plan, through WP-15a. Reading and writing a `.docx`
 package needs no Word installation at all — this server manipulates
 OOXML directly. Word is required only for `export_pdf` (rendering a
 page-accurate PDF), and that additionally needs a macOS Automation grant
 for the app hosting this server's process.
+
+**Platform note:** this server is macOS-only, and not only for
+`export_pdf`. `insert_image`'s SVG path (issue #28 WP-15a) shells out to
+macOS's built-in `sips` to rasterize the PNG fallback part Word requires
+for an SVG — no `cairosvg`/`rsvg-convert`/Inkscape dependency is added,
+but `sips` itself is not optional and is not available on Linux/Windows.
+PNG-only `insert_image` calls do not need it. (`mutations.py`'s own
+`scutil`-based conflict-copy detection is the other pre-existing
+macOS-only dependency, for reference.)
 
 Tools implemented so far:
 
@@ -101,8 +110,28 @@ Tools implemented so far:
   REQUIRED and must name an existing `w:type="table"` style in the
   document; column widths split evenly across the text-column width
   `list_page_sections` reports.
+- **`insert_image(path, image_path, width_in, ...)`** — append a new
+  inline picture at the end of the body, from a LOCAL `.png` or `.svg`
+  file (read natively — no `IMAGE_SOURCE_UNSUPPORTED`, unlike
+  GoogleDocs-MCP's URL-only tool). `width_in` defaults to the
+  text-column width `list_page_sections` reports; an `.svg` embeds
+  natively (Word 2016+'s own SVG extension) WITH a PNG fallback part
+  Word requires, rasterized from the SVG's own native pixel size via
+  macOS `sips`. Records `design_width_in`/`design_height_in`,
+  `placed_width_in`/`placed_height_in`, and `effective_scale =
+  placed_width_in / design_width_in` — a real measured ratio.
+- **`apply_style(path, find, style_id, expected_matches, ...)`** — apply
+  a NAMED style (from `list_styles`) to text located via `find`, the
+  named-style counterpart to `format_text`'s boolean toggles. A
+  character style applies to the matched run(s) exactly like
+  `format_text` (including `track_changes=True`); a paragraph style
+  applies `w:pStyle` to every paragraph containing a matched run, but
+  does not support `track_changes=True` (no `w:pPrChange`-style tracked
+  change exists yet — named explicitly rather than silently ignored).
+- **`read_header_footer(path)`** — read every header/footer part's
+  content as markdown in one call. Never refuses on a locked file.
 
-More tools (images) land in a later work package of the same plan.
+More tools land in a later work package of the same plan.
 
 ## Interoperability
 
@@ -196,7 +225,33 @@ the assumption turns out to be wrong.
    duplicated) even though every read tool in this server still reports
    the correct final text.
 
-None of the four blocks this server from being used; each is a
+5. **SVG text extractability through export_pdf (issue #28 WP-15a).**
+   Assumption: text inside an `insert_image`-embedded SVG survives
+   `export_pdf` (Word's own PDF export of a document containing that SVG)
+   as extractable text, not a rasterized/flattened image -- i.e. that
+   Word's PDF exporter renders the native SVG branch (`a:blip`'s
+   `a14:svgBlip` extension this server writes) as real vector text rather
+   than falling back to the PNG fallback part or flattening the SVG to a
+   bitmap. The plan named this a `LEAD:` live check; the lead has since
+   ruled the remaining live checks are no longer a landing gate for this
+   repo (see this section's own opening paragraph), so it is recorded
+   here in the same form as items 1-4 instead of being run.
+   What is actually proven: the OOXML this server writes is well-formed
+   (`opc_valid` passes with both the SVG part and its PNG fallback part
+   present and correctly related -- `tests/unit/test_images.py`), and the
+   SVG's own text content is written byte-for-byte into the `.svg` media
+   part (nothing about this server's own write path could corrupt or
+   strip it).
+   What is not proven: nobody has run `export_pdf` against a document
+   this server inserted an SVG into and inspected the resulting PDF's own
+   text layer. If wrong, Word's PDF exporter treats the SVG extension
+   branch as non-authoritative for export purposes and falls back to
+   rasterizing the PNG fallback part instead -- the PDF would still look
+   correct (the fallback is a real rasterization of the same SVG, via
+   macOS `sips`), but the SVG's own text would not be independently
+   selectable/extractable in the PDF.
+
+None of the five blocks this server from being used; each is a
 live-Word-rendering question this repo's own test suite, which needs no
 Word installation to read or write a `.docx`, cannot answer by itself.
 The next real use of this server against a live synced folder is the
