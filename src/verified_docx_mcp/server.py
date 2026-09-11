@@ -46,7 +46,7 @@ from typing import Any, NoReturn
 
 from fastmcp import FastMCP
 
-from . import mutations, paths, projection, text_edit
+from . import mutations, paths, projection, text_edit, tracked_changes
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .middleware import EvidenceEnforcementMiddleware
@@ -1015,6 +1015,111 @@ def format_text(
     try:
         return text_edit.execute_format_text(
             path, find, style, expected_matches, revision_before=revision_before, force=force
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tracked changes (WP-07): list_open_items (read-only), accept_tracked_
+# changes / reject_tracked_changes (mutating, in MUTATING_TOOLS). Also
+# where replace_text/format_text's own TRACKED_CHANGES_PRESENT refusal
+# (text_edit._check_tracked_changes_guard) is wired in -- see that
+# function and each tool's own updated docstring above.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_open_items(path: str) -> dict[str, Any]:
+    """List every open comment and pending tracked change (w:ins/w:del) in
+    a .docx.
+
+    Returns `comments` (from word/comments.xml + commentsExtended.xml's
+    resolved flag; each with comment_id, content, resolved, reply_count,
+    replies, quoted_text, author, created_time, modified_time, scope --
+    the same shape the GoogleDocs-MCP server returns, "scope": "document"
+    always since a docx comment anchor is not tab-scoped) and
+    `pending_suggestions` (every w:ins/w:del, with suggestion_id, kind
+    ("insertion"|"deletion"), text, author, date, anchor_context -- the
+    owning paragraph's own live text).
+
+    Scope limit: comment REPLY THREADING (commentsExtended's parent/child
+    linking) is not resolved here -- every comment reports reply_count=0/
+    replies=[]. reply_count/replies are still present, structurally, for
+    forward compatibility with a later WP that resolves them.
+
+    Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
+    Word's owner file is present, like every other read tool.
+
+    Errors:
+      INVALID_INPUT   - path does not exist or is outside the allowed roots
+      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+    """
+    try:
+        return tracked_changes.execute_list_open_items(path)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def accept_tracked_changes(
+    path: str, revision_ids: list[str] | None = None, revision_before: str | None = None, force: bool = False
+) -> dict[str, Any]:
+    """Accept tracked changes (w:ins/w:del), atomically -- all of them, or
+    only the ids named in revision_ids (from list_open_items'
+    pending_suggestions[].suggestion_id).
+
+    Accepting a w:ins makes its inserted text ordinary, permanent content
+    (the wrapper is removed, the text stays). Accepting a w:del makes the
+    deletion permanent (the w:del element and its w:delText content are
+    removed outright).
+
+    Same guard/atomic-write mechanics as replace_text (lock_status first,
+    then revision_before; a temp file OPC-validated before the original is
+    touched; .jsbak-backed post-write verification).
+
+    Returns the eight evidence keys (before/after are the WHOLE document's
+    plain text, not an excerpt -- there is no single match span here;
+    rung is "all" when revision_ids is omitted, else "by_id"; match_count
+    is the number of w:ins/w:del elements processed), plus revision_ids
+    (the ids actually processed).
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
+      REVISION_CONFLICT                 - revision_before is stale
+      REVISION_ID_NOT_FOUND             - a named id is not present (available ids listed)
+      OPC_INVALID                       - the rendered .docx failed OPC validation
+      VERIFICATION_FAILED               - post-write verification failed; rolled back
+    """
+    try:
+        return tracked_changes.execute_accept_tracked_changes(
+            path, revision_ids, revision_before=revision_before, force=force
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def reject_tracked_changes(
+    path: str, revision_ids: list[str] | None = None, revision_before: str | None = None, force: bool = False
+) -> dict[str, Any]:
+    """Reject tracked changes (w:ins/w:del), atomically -- all of them, or
+    only the ids named in revision_ids.
+
+    Rejecting a w:ins undoes the insertion (the element and its content
+    are removed outright). Rejecting a w:del undoes the deletion (every
+    w:delText inside it is renamed back to w:t and the w:del wrapper is
+    removed, so the previously-deleted text becomes live again).
+
+    Same guard/atomic-write mechanics and evidence shape as
+    accept_tracked_changes -- see that tool's docstring.
+
+    Errors: as accept_tracked_changes.
+    """
+    try:
+        return tracked_changes.execute_reject_tracked_changes(
+            path, revision_ids, revision_before=revision_before, force=force
         )
     except VerifyError as exc:
         _raise_tool_error(exc)

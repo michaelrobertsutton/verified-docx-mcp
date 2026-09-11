@@ -118,7 +118,7 @@ class ReplaceTextRunSplittingTests(_TempFixtureCase):
         # A match spanning the bold "brown" run and into the trailing
         # unbold run: the ONE new replacement run must carry "brown"'s
         # (the first touched run's) bold rPr, not the trailing run's.
-        evidence = text_edit.execute_replace_text(str(self.target), "brown fox", "wolf", 1)
+        text_edit.execute_replace_text(str(self.target), "brown fox", "wolf", 1)
         self.assertEqual(projection.read_document_text(self.target), "The quick wolf jumps over the lazy dog.")
         runs = [r for r in projection.read_document_runs(self.target) if "rPr" in r]
         wolf_run = next(r for r in runs if r["text"] == "wolf")

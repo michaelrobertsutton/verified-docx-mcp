@@ -48,6 +48,9 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         # issue #28 WP-06:
         "replace_text",
         "format_text",
+        # issue #28 WP-07 (list_open_items is read-only, not listed here):
+        "accept_tracked_changes",
+        "reject_tracked_changes",
     }
 )
 

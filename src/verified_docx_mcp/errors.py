@@ -75,6 +75,9 @@ class ErrorCode(Enum):
     MATCH_COUNT_MISMATCH = "MATCH_COUNT_MISMATCH"  # match count != expected_matches (D4: expected_matches is required, no default)
     STRUCTURAL_BOUNDARY = "STRUCTURAL_BOUNDARY"  # a match crosses a w:p/w:tbl/w:tc boundary
 
+    # Tracked changes (tracked_changes.py; WP-07)
+    REVISION_ID_NOT_FOUND = "REVISION_ID_NOT_FOUND"  # accept_tracked_changes/reject_tracked_changes named a w:ins/w:del id not present in the document
+
 
 # Which codes signal a transient condition worth a single retry by the
 # caller. Empty for now — WP-02 has no revision-stamped write to race

@@ -61,7 +61,7 @@ from xml.etree import ElementTree as ET
 from . import audit, mutations, paths, projection
 from .errors import ErrorCode, _make_error
 from .locate import LocateResult, locate
-from .projection import RunEvent, W_NS
+from .projection import W_NS, RunEvent
 
 _XML_NS = "http://www.w3.org/XML/1998/namespace"
 
@@ -407,6 +407,26 @@ def _evidence(
     return evidence
 
 
+def _check_tracked_changes_guard(locate_result: LocateResult, force: bool) -> None:
+    """New for issue #28 WP-07: a match crossing a tracked change (w:ins/
+    w:del -- locate.py's "crosses_revision" warning) refuses unless
+    force=True. WP-06 only detected and warned; this is the actual
+    refusal, layered on top of that same detection (tracked_changes.py's
+    accept_tracked_changes/reject_tracked_changes clear the way for a
+    subsequent write). crosses_comment_range stays a warning-only signal
+    at this WP -- WP-07's own text scopes the refusal to tracked changes.
+    """
+    if force:
+        return
+    if "crosses_revision" in locate_result.warnings:
+        raise _make_error(
+            ErrorCode.TRACKED_CHANGES_PRESENT,
+            "The matched text overlaps a tracked change (w:ins/w:del); accept or reject it "
+            "(tracked_changes.accept_tracked_changes / reject_tracked_changes) first, or pass force=True.",
+            {"spans": [{"start": s, "end": e} for s, e in locate_result.spans], "warnings": locate_result.warnings},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tool 1: replace_text
 # ---------------------------------------------------------------------------
@@ -428,12 +448,12 @@ def execute_replace_text(
     proj = projection.project_document_root(document_root)
 
     locate_result: LocateResult = locate(find, proj, expected_matches)
+    _check_tracked_changes_guard(locate_result, force)
 
     before_first = locate_result.spans[0]
     before_excerpt = _excerpt(proj.text, before_first[0], before_first[1])
     runs_before = _collect_style_runs(proj, locate_result.spans)
 
-    new_run_t_elems: list[Any] = []
     for start, end in locate_result.spans:
         atoms = _atoms_for_span(proj, start, end)
         _apply_replace_span(start, end, replace, atoms)
@@ -496,6 +516,7 @@ def execute_format_text(
     proj = projection.project_document_root(document_root)
 
     locate_result: LocateResult = locate(find, proj, expected_matches)
+    _check_tracked_changes_guard(locate_result, force)
 
     before_first = locate_result.spans[0]
     before_excerpt = _excerpt(proj.text, before_first[0], before_first[1])
