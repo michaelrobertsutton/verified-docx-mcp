@@ -10,8 +10,7 @@ instead of a Google Doc.
 
 ## Status
 
-Issue #28 of the build plan, through WP-09 (WP-10's lock-guard layers 3-4
-land in the same PR, alongside this). Reading and writing a `.docx`
+Issue #28 of the build plan, through WP-10. Reading and writing a `.docx`
 package needs no Word installation at all — this server manipulates
 OOXML directly. Word is required only for `export_pdf` (rendering a
 page-accurate PDF), and that additionally needs a macOS Automation grant
@@ -60,6 +59,16 @@ Tools implemented so far:
   reply to one, and resolve one. Builds all five interlocking comment
   parts a real Word comment needs; verified part-by-part against a
   Word-authored golden fixture (`tests/fixtures/comments/golden-comment.docx`).
+- **Lock guard layers 0/3/4** — every mutating tool above now runs inside
+  a same-machine `.jsclaim` mutex (`O_EXCL`, released even on failure)
+  alongside a no-op `remote_checkout` seam for a future Microsoft Graph
+  checkout, and reports `conflict_copy_detected` (plus, when non-empty,
+  `conflict_copies`/`sibling_files_changed`) after every successful
+  write — a post-write sweep for sync-conflict sibling files, never
+  raised as an error since the write it describes already succeeded.
+  Detection only, not prevention (core/document-backend-protocol.md §9):
+  the naming patterns it matches are client- and locale-dependent, so
+  their absence is not proof no conflict occurred.
 
 More tools (tables, images) land in later work packages of the same plan.
 

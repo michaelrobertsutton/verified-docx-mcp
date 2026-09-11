@@ -162,7 +162,7 @@ class OverlappingWriteRefusalTests(_TempFixtureCase):
 
 class AcceptTests(_TempFixtureCase):
     def test_accept_all_makes_insertion_permanent_and_deletion_final(self):
-        tracked_changes.execute_accept_tracked_changes(str(self.target))
+        evidence = tracked_changes.execute_accept_tracked_changes(str(self.target))
         text = projection.read_document_text(self.target)
         # "X" (the accepted insertion) is now ordinary live text; "he re"
         # (the accepted deletion) stays gone -- both already true of the
@@ -172,6 +172,10 @@ class AcceptTests(_TempFixtureCase):
         self.assertIn("X", text)
         items = tracked_changes.execute_list_open_items(str(self.target))
         self.assertEqual(items["pending_suggestions"], [])
+        # issue #28 WP-10: layer 3's conflict-copy sweep result, wired
+        # through accept/reject_tracked_changes' own evidence dict too.
+        self.assertIn("conflict_copy_detected", evidence)
+        self.assertFalse(evidence["conflict_copy_detected"])
 
     def test_accept_by_id_leaves_the_other_pending(self):
         evidence = tracked_changes.execute_accept_tracked_changes(str(self.target), revision_ids=["0"])

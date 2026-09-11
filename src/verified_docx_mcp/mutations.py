@@ -32,15 +32,21 @@ before the guard" — the ordering below is the fix, not incidental):
 3. Render the intended markdown via ``markdown_to_ooxml.render_blocks``
    against a ``StyleContext`` built from the TARGET document's own styles/
    numbering/rels (never a hardcoded style).
-4. Atomic write (``atomic_replace_docx_parts``): build the full new zip in
-   a temp file in the same directory, validate it (``opc_valid``) BEFORE
-   ever touching the original, then ``os.replace()``, keeping a ``.jsbak``
-   copy of the pre-write original until a post-write re-read/re-project
-   confirms the change; on any post-check failure, restore from ``.jsbak``
-   and raise ``VERIFICATION_FAILED``.
-5. Assemble the eight evidence keys from a genuine re-read of the file on
-   disk (never from what the tool believes it wrote) and log the call via
-   ``audit.append_audit``.
+4. Atomic write (``atomic_replace_docx_parts``): acquire_lock (issue #28
+   WP-10: layer 0's remote_checkout no-op + layer 4's ``.jsclaim``
+   same-machine mutex), then build the full new zip in a temp file in
+   the same directory, validate it (``opc_valid``) BEFORE ever touching
+   the original, then ``os.replace()``, keeping a ``.jsbak`` copy of the
+   pre-write original until a post-write re-read/re-project confirms the
+   change; on any post-check failure, restore from ``.jsbak`` and raise
+   ``VERIFICATION_FAILED``; release_lock always runs (try/finally)
+   regardless of outcome. On success, runs conflict_copy_sweep (layer 3)
+   and returns its result — every caller merges it into its own evidence
+   via ``_merge_conflict_sweep``.
+5. Assemble the eight evidence keys (plus ``conflict_copy_detected`` and,
+   when non-empty, ``conflict_copies``/``sibling_files_changed``) from a
+   genuine re-read of the file on disk (never from what the tool believes
+   it wrote) and log the call via ``audit.append_audit``.
 """
 
 from __future__ import annotations
@@ -49,6 +55,8 @@ import difflib
 import os
 import re
 import shutil
+import socket
+import subprocess
 import tempfile
 import time
 import zipfile
@@ -333,13 +341,267 @@ def _rebuild_zip(source_path: Path, overrides: dict[str, bytes], temp_path: Path
                 dst.writestr(name, data)
 
 
+# ---------------------------------------------------------------------------
+# Lock guard layers 0/4 (acquire_lock/release_lock) and layer 3
+# (conflict_copy_sweep) — issue #28 WP-10.
+#
+# core/document-backend-protocol.md §9 names three detection points:
+# layer 0 (acquire_lock's owner-file check, ahead of the write — already
+# implemented by _guard_before_write below via server.execute_lock_status/
+# _find_owner_file; that check is UNCHANGED by this WP), a post-write
+# conflict-copy sweep, and a human lead-confirmation step outside this
+# server entirely (docx-side comment-ingest skills, not this code). §9
+# also names a "pluggable layer 0" seam for a FUTURE Microsoft Graph
+# checkout/checkin call — remote_checkout below is that seam, a
+# deliberate no-op today (WP-10 declines building the Graph call itself;
+# it must never make a network call).
+#
+# .jsclaim (layer 4) is new here and has no protocol-doc counterpart: it
+# is a same-machine mutex against two calls into THIS server racing the
+# same file's write window (rebuild-zip -> opc_valid -> os.replace),
+# distinct from Word's own cross-client "~$" owner file. It is acquired
+# and released entirely INSIDE atomic_replace_docx_parts (see below) —
+# every one of this module's and the other write modules' six call sites
+# into that function get layer 4 for free, with no acquire/release
+# mechanics of their own to get wrong or leak on an early abort.
+# ---------------------------------------------------------------------------
+
+_JSCLAIM_SUFFIX = ".jsclaim"
+
+
+def remote_checkout(resolved: Path) -> dict[str, Any]:
+    """No-op layer-0 hook: a seam for a future Microsoft Graph
+    checkout/checkin call (Graph v1.0 supports this for OneDrive for
+    Business and SharePoint, not consumer OneDrive — §9's "pluggable
+    layer 0" paragraph). Deliberately does nothing today; WP-10 declines
+    building the actual Graph call, this hook exists only so acquire_lock
+    has a single place to wire it in later without changing anything that
+    calls acquire_lock. MUST NOT make a network call.
+    """
+    return {"remote_checkout": "not_implemented", "path": str(resolved)}
+
+
+def acquire_lock(resolved: Path) -> Path:
+    """Layer 4: claim a same-machine, same-process-family mutex on
+    *resolved* for the duration of the write window that follows, via an
+    ``O_EXCL`` sidecar file (``<name>.jsclaim``) — this fails atomically
+    if another call already holds it, rather than racing a check-then-
+    create. Also calls remote_checkout (layer 0's no-op hook) first, so a
+    future Graph checkout lands ahead of the claim without changing this
+    function's own call sites.
+
+    Raises DOCX_LOCKED if the claim file already exists — either a
+    genuine concurrent write, or a stale claim left by a prior process
+    that crashed before its own release_lock ran; either way this call is
+    not retried automatically.
+
+    Returns the claim path; the caller (only atomic_replace_docx_parts)
+    passes it to release_lock in a finally block.
+    """
+    remote_checkout(resolved)
+    claim_path = resolved.with_name(resolved.name + _JSCLAIM_SUFFIX)
+    try:
+        fd = os.open(str(claim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise _make_error(
+            ErrorCode.DOCX_LOCKED,
+            (
+                f"{resolved} has an in-progress write claimed by this same server "
+                "(a stale .jsclaim left by a crashed prior write, or a genuine "
+                "concurrent call); not retried."
+            ),
+            {"claim_path": str(claim_path)},
+        ) from exc
+    else:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        os.close(fd)
+    return claim_path
+
+
+def release_lock(claim_path: Path) -> None:
+    """Release the layer-4 mutex acquired by acquire_lock. Idempotent —
+    a missing claim file is not an error (already released, or
+    acquire_lock never reached the point of creating it)."""
+    claim_path.unlink(missing_ok=True)
+
+
+def _normalize_machine_name(raw: str) -> str:
+    """Normalize a raw machine name (macOS's ComputerName, a hostname, ...)
+    into the dash-joined form a sync client's conflict-copy suffix uses:
+    strip apostrophes, collapse whitespace/underscore runs into a single
+    "-". ``"Michael's MacBook Pro"`` -> ``"Michaels-MacBook-Pro"``.
+    """
+    stripped = raw.replace("'", "").replace("’", "")
+    return re.sub(r"[\s_]+", "-", stripped).strip("-")
+
+
+def _local_machine_names() -> frozenset[str]:
+    """Best-effort set of THIS machine's own name(s), in the normalized
+    form a sync client's ``<stem>-<Machine>.docx`` conflict suffix uses —
+    macOS's ``ComputerName`` (e.g. "Michael's MacBook Pro", normalizing to
+    "Michaels-MacBook-Pro") and ``LocalHostName``/``hostname -s`` (already
+    hyphenated). Both sources are collected rather than assumed identical
+    — nothing guarantees a user has not set them differently.
+
+    Every source here is best-effort: a failure (a different OS, a
+    sandboxed environment, ``scutil`` missing) is swallowed silently and
+    simply contributes nothing to the set — the caller already treats an
+    unmatched name as "not proof of absence" (core/document-backend-
+    protocol.md §4), and this function extends that same posture to "we
+    could not even determine this machine's own name."
+    """
+    names: set[str] = set()
+    for args in (["scutil", "--get", "ComputerName"], ["scutil", "--get", "LocalHostName"]):
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=2, check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            raw = result.stdout.strip()
+            if raw:
+                names.add(_normalize_machine_name(raw))
+    try:
+        hostname = socket.gethostname()
+    except OSError:
+        hostname = ""
+    if hostname:
+        short = hostname.split(".")[0]
+        if short:
+            names.add(_normalize_machine_name(short))
+    return frozenset(n for n in names if n)
+
+
+def _matches_conflict_copy_pattern(stem: str, name: str, machine_names: frozenset[str]) -> bool:
+    """True if sibling filename *name* matches one of
+    core/document-backend-protocol.md §4's CONFLICT_COPY_DETECTED naming
+    forms for a document whose own stem is *stem*: ``<stem>-<Machine>.docx``,
+    ``<stem> (n).docx``, ``<stem>-Copy.docx``, ``<stem> - Copy.docx``, or
+    any name containing "Conflict" or "conflicted copy". These forms are
+    client- and locale-dependent (§4/§9, verbatim) — a False return is NOT
+    proof no conflict occurred; see conflict_copy_sweep.
+
+    Tightened (issue #28 WP-10 review fix): ``<stem>-<Machine>.docx`` only
+    matches when the text after the dash is, case-insensitively, one of
+    *machine_names* (this machine's own name(s) — see
+    _local_machine_names). A bare ``<stem>-<anything>.docx`` is
+    deliberately NOT this pattern any more: an entirely ordinary working
+    file like "proposal-final.docx" sitting next to "proposal.docx" is
+    the exact false positive issue #28's own plan text calls out by name
+    ("Codex: false positives") — the unqualified ``-.+`` shape this
+    function used before could not tell that file apart from a real
+    conflict-copy suffix. The four OTHER forms (the two "Copy" spellings,
+    the numbered-paren form, and the "Conflict"/"conflicted copy"
+    substring) carry their own unambiguous signal and are unchanged.
+
+    Trade-off, accepted deliberately and NOT to be loosened back to "any
+    dash suffix" to catch more: a genuine conflict copy created on a
+    DIFFERENT machine (whose name this process cannot enumerate) will not
+    match this branch and falls through to sibling_files_changed instead
+    of conflict_copies. core/document-backend-protocol.md §4 already
+    covers this explicitly: "the absence of a match is not proof no
+    conflict occurred."
+    """
+    lower_name = name.lower()
+    if "conflict" in lower_name:
+        return True
+    if not lower_name.endswith(".docx"):
+        return False
+    base = name[: -len(".docx")]
+    if not base.lower().startswith(stem.lower()):
+        return False
+    remainder = base[len(stem) :]
+    if re.fullmatch(r"-copy", remainder, re.IGNORECASE):  # <stem>-Copy.docx
+        return True
+    if re.fullmatch(r" \(\d+\)", remainder):  # <stem> (n).docx
+        return True
+    if re.fullmatch(r" - copy", remainder, re.IGNORECASE):  # <stem> - Copy.docx
+        return True
+    machine_suffix = re.fullmatch(r"-(.+)", remainder)  # <stem>-<Machine>.docx
+    if machine_suffix and machine_names:
+        lowered_names = {m.lower() for m in machine_names}
+        if machine_suffix.group(1).lower() in lowered_names:
+            return True
+    return False
+
+
+def conflict_copy_sweep(resolved: Path, *, since_ns: int) -> dict[str, Any]:
+    """Layer 3 (§9): after a successful write, look in *resolved*'s own
+    directory for sync-conflict sibling files that appeared or changed no
+    earlier than *since_ns* (a ``time.time_ns()`` timestamp captured
+    BEFORE the write began, so a sibling already sitting there untouched
+    is never flagged as caused by this write).
+
+    Returns a dict, always all three keys:
+      - "conflict_copy_detected": bool — True if any qualifying sibling
+        matched a §4 naming form (_matches_conflict_copy_pattern). NEVER
+        raised as an error here — the write that just happened still
+        succeeded and is reported as applied; this is evidence attached
+        to that success. §4: "require lead reconciliation before the
+        next write to this pointer — do not attempt to merge or pick a
+        winner automatically."
+      - "conflict_copies": matching sibling filenames (sorted; empty if
+        none).
+      - "sibling_files_changed": OTHER same-stem, newer siblings that
+        matched none of the naming patterns — information only, per §4's
+        own last sentence, never this flag.
+
+    These patterns are client- and locale-dependent: the absence of a
+    match is not proof no conflict occurred (§4/§9, verbatim).
+    """
+    stem = resolved.stem
+    directory = resolved.parent
+    machine_names = _local_machine_names()
+    conflict_copies: list[str] = []
+    sibling_files_changed: list[str] = []
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        if entry.name == resolved.name:
+            continue
+        if entry.suffix in (".jsbak", _JSCLAIM_SUFFIX):
+            continue
+        if entry.name.startswith(f"{stem}.tmp-"):
+            continue
+        if entry.name.startswith("~$") or entry.name.startswith(".~lock."):
+            continue  # Word/LibreOffice's own owner files, not a conflict copy
+        try:
+            stat_result = entry.stat()
+        except OSError:
+            continue
+        if stat_result.st_mtime_ns < since_ns:
+            continue
+        if _matches_conflict_copy_pattern(stem, entry.name, machine_names):
+            conflict_copies.append(entry.name)
+        elif entry.name.lower().startswith(stem.lower()):
+            sibling_files_changed.append(entry.name)
+    return {
+        "conflict_copy_detected": bool(conflict_copies),
+        "conflict_copies": sorted(conflict_copies),
+        "sibling_files_changed": sorted(sibling_files_changed),
+    }
+
+
+def _merge_conflict_sweep(evidence: dict[str, Any], sweep: dict[str, Any]) -> None:
+    """Merge a conflict_copy_sweep() result into an evidence dict in
+    place: conflict_copy_detected is always set; the two list keys are
+    added only when non-empty (matching this codebase's existing
+    convention for orphaned_comment_ids/warnings)."""
+    evidence["conflict_copy_detected"] = sweep["conflict_copy_detected"]
+    if sweep["conflict_copies"]:
+        evidence["conflict_copies"] = sweep["conflict_copies"]
+    if sweep["sibling_files_changed"]:
+        evidence["sibling_files_changed"] = sweep["sibling_files_changed"]
+
+
 def atomic_replace_docx_parts(
     original_path: Path,
     overrides: dict[str, bytes],
     *,
     post_verify: Callable[[Path], None],
     _corrupt_temp_for_test: bool = False,
-) -> None:
+) -> dict[str, Any]:
     """Write *overrides* (part name -> new bytes; any name not already in
     the package is added) into a fresh copy of *original_path*, atomically.
 
@@ -352,57 +614,74 @@ def atomic_replace_docx_parts(
     ``.jsbak``; on any exception from *post_verify*, restore the original
     from ``.jsbak`` and raise VERIFICATION_FAILED.
 
+    issue #28 WP-10 wraps the whole thing in acquire_lock/release_lock
+    (layers 0's remote_checkout no-op + 4's ``.jsclaim`` mutex, held only
+    for this function's own duration via try/finally — no caller of this
+    function has any acquire/release mechanics of its own to get wrong),
+    and on a successful write returns conflict_copy_sweep's result (layer
+    3) as this function's own return value — EVERY caller must capture it
+    now (the return type changed from None) and fold it into its own
+    evidence dict via _merge_conflict_sweep, since a raised exception
+    means no write happened and no sweep is meaningful.
+
     ``_corrupt_temp_for_test`` is a test-only seam (never set by a tool):
     it corrupts the temp file's bytes AFTER it is built but BEFORE
     opc_valid runs, so a test can exercise the "corrupted temp write"
     acceptance case deterministically without depending on a real
     filesystem fault.
     """
-    tmp_fd, tmp_name = tempfile.mkstemp(
-        prefix=f"{original_path.stem}.tmp-", suffix=".docx", dir=str(original_path.parent)
-    )
-    os.close(tmp_fd)
-    tmp_path = Path(tmp_name)
-    tmp_consumed = False  # True once os.replace() has moved tmp_path onto original_path
-    jsbak_path = original_path.with_name(original_path.name + ".jsbak")
-    replaced = False
+    since_ns = time.time_ns()
+    claim_path = acquire_lock(original_path)
     try:
-        _rebuild_zip(original_path, overrides, tmp_path)
-
-        if _corrupt_temp_for_test:
-            with open(tmp_path, "r+b") as fh:
-                fh.seek(0)
-                fh.write(b"\x00" * min(64, tmp_path.stat().st_size))
-
-        valid, problems = opc_valid(tmp_path)
-        if not valid:
-            raise _make_error(
-                ErrorCode.OPC_INVALID,
-                "Rendered .docx failed OPC validation; the original file was left untouched.",
-                {"problems": problems},
-            )
-
-        shutil.copyfile(original_path, jsbak_path)
-        os.replace(str(tmp_path), str(original_path))
-        replaced = True
-        tmp_consumed = True
-
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix=f"{original_path.stem}.tmp-", suffix=".docx", dir=str(original_path.parent)
+        )
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_name)
+        tmp_consumed = False  # True once os.replace() has moved tmp_path onto original_path
+        jsbak_path = original_path.with_name(original_path.name + ".jsbak")
+        replaced = False
         try:
-            post_verify(original_path)
-        except Exception as exc:
-            os.replace(str(jsbak_path), str(original_path))
-            raise _make_error(
-                ErrorCode.VERIFICATION_FAILED,
-                f"Post-write verification failed; restored the original from .jsbak. Detail: {exc}",
-                {"detail": str(exc)},
-            ) from exc
-        else:
-            jsbak_path.unlink(missing_ok=True)
+            _rebuild_zip(original_path, overrides, tmp_path)
+
+            if _corrupt_temp_for_test:
+                with open(tmp_path, "r+b") as fh:
+                    fh.seek(0)
+                    fh.write(b"\x00" * min(64, tmp_path.stat().st_size))
+
+            valid, problems = opc_valid(tmp_path)
+            if not valid:
+                raise _make_error(
+                    ErrorCode.OPC_INVALID,
+                    "Rendered .docx failed OPC validation; the original file was left untouched.",
+                    {"problems": problems},
+                )
+
+            shutil.copyfile(original_path, jsbak_path)
+            os.replace(str(tmp_path), str(original_path))
+            replaced = True
+            tmp_consumed = True
+
+            try:
+                post_verify(original_path)
+            except Exception as exc:
+                os.replace(str(jsbak_path), str(original_path))
+                raise _make_error(
+                    ErrorCode.VERIFICATION_FAILED,
+                    f"Post-write verification failed; restored the original from .jsbak. Detail: {exc}",
+                    {"detail": str(exc)},
+                ) from exc
+            else:
+                jsbak_path.unlink(missing_ok=True)
+        finally:
+            if not tmp_consumed and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            if not replaced:
+                jsbak_path.unlink(missing_ok=True)
     finally:
-        if not tmp_consumed and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        if not replaced:
-            jsbak_path.unlink(missing_ok=True)
+        release_lock(claim_path)
+
+    return conflict_copy_sweep(original_path, since_ns=since_ns)
 
 
 # ---------------------------------------------------------------------------
@@ -753,9 +1032,9 @@ def _write_and_verify(
     ctx: markdown_to_ooxml.StyleContext,
     *,
     post_verify: Callable[[Path], None],
-) -> None:
+) -> dict[str, Any]:
     overrides = _build_overrides(resolved, document_root, document_xml_bytes, ctx)
-    atomic_replace_docx_parts(resolved, overrides, post_verify=post_verify)
+    return atomic_replace_docx_parts(resolved, overrides, post_verify=post_verify)
 
 
 def _evidence(
@@ -770,6 +1049,7 @@ def _evidence(
     audit_logged: bool,
     orphaned_comment_ids: list[str],
     track: Any | None = None,
+    conflict_sweep: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {
         "applied": applied,
@@ -788,6 +1068,8 @@ def _evidence(
         # revision_ids (the ids created) and track_changes: true."
         evidence["track_changes"] = True
         evidence["revision_ids"] = track.revision_ids
+    if conflict_sweep is not None:
+        _merge_conflict_sweep(evidence, conflict_sweep)
     return evidence
 
 
@@ -879,7 +1161,7 @@ def execute_replace_body_markdown(
         if diff:
             raise ValueError(f"re-read body does not match the intended rendering modulo whitespace: {diff}")
 
-    _write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
+    conflict_sweep = _write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
     post_revision = projection.compute_revision(resolved)
     after_text, _, _ = projection.read_document_markdown(resolved)
@@ -894,6 +1176,7 @@ def execute_replace_body_markdown(
         audit_logged=False,
         orphaned_comment_ids=orphaned_comment_ids,
         track=track,
+        conflict_sweep=conflict_sweep,
     )
     logged, _ = audit.append_audit(path=str(resolved), tool="replace_body_markdown", evidence=evidence)
     evidence["audit_logged"] = logged
@@ -1021,7 +1304,7 @@ def execute_replace_range_markdown(
         if diff:
             raise ValueError(f"re-read section does not match the intended rendering modulo whitespace: {diff}")
 
-    _write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
+    conflict_sweep = _write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
     post_revision = projection.compute_revision(resolved)
     final_document_root, _ = _load_document(resolved)
@@ -1044,6 +1327,7 @@ def execute_replace_range_markdown(
         audit_logged=False,
         orphaned_comment_ids=orphaned_comment_ids,
         track=track,
+        conflict_sweep=conflict_sweep,
     )
     logged, _ = audit.append_audit(path=str(resolved), tool="replace_range_markdown", evidence=evidence)
     evidence["audit_logged"] = logged
@@ -1120,7 +1404,7 @@ def execute_append_markdown(
         if diff:
             raise ValueError(f"re-read appended range does not match the intended rendering modulo whitespace: {diff}")
 
-    _write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
+    conflict_sweep = _write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
     post_revision = projection.compute_revision(resolved)
     after_text, _, _ = projection.read_document_markdown(resolved)
@@ -1136,6 +1420,7 @@ def execute_append_markdown(
         audit_logged=False,
         orphaned_comment_ids=[],
         track=track,
+        conflict_sweep=conflict_sweep,
     )
     logged, _ = audit.append_audit(path=str(resolved), tool="append_markdown", evidence=evidence)
     evidence["audit_logged"] = logged

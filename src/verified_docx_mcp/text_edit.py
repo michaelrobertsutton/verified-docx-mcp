@@ -488,11 +488,11 @@ def _apply_format_span(
 # ---------------------------------------------------------------------------
 
 
-def _serialize_and_write(resolved: Path, document_root: Any, raw_xml: bytes, *, post_verify) -> None:
+def _serialize_and_write(resolved: Path, document_root: Any, raw_xml: bytes, *, post_verify) -> dict[str, Any]:
     document_decls = mutations._capture_source_namespaces(raw_xml)
     new_xml_bytes = mutations._serialize_xml(document_root, document_decls)
     overrides = {projection.DEFAULT_PART: new_xml_bytes}
-    mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=post_verify)
+    return mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=post_verify)
 
 
 def _evidence(
@@ -509,6 +509,7 @@ def _evidence(
     runs_after: list[list[dict[str, Any]]],
     warnings: list[str],
     track: _TrackContext | None = None,
+    conflict_sweep: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {
         "applied": applied,
@@ -529,6 +530,10 @@ def _evidence(
         # revision_ids (the ids created) and track_changes: true."
         evidence["track_changes"] = True
         evidence["revision_ids"] = track.revision_ids
+    if conflict_sweep is not None:
+        # issue #28 WP-10: layer 3's post-write conflict-copy sweep,
+        # merged the same way mutations.py's own _evidence does.
+        mutations._merge_conflict_sweep(evidence, conflict_sweep)
     return evidence
 
 
@@ -625,7 +630,7 @@ def execute_replace_text(
         if diff:
             raise ValueError(f"re-read document does not match the intended text modulo whitespace: {diff}")
 
-    _serialize_and_write(resolved, document_root, raw_xml, post_verify=_post_verify)
+    conflict_sweep = _serialize_and_write(resolved, document_root, raw_xml, post_verify=_post_verify)
 
     post_revision = projection.compute_revision(resolved)
     evidence = _evidence(
@@ -641,6 +646,7 @@ def execute_replace_text(
         runs_after=runs_after,
         warnings=locate_result.warnings,
         track=track,
+        conflict_sweep=conflict_sweep,
     )
     logged, _ = audit.append_audit(path=str(resolved), tool="replace_text", evidence=evidence)
     evidence["audit_logged"] = logged
@@ -723,7 +729,7 @@ def execute_format_text(
         if not _style_matches(post_runs, style):
             raise ValueError(f"re-read style does not match the requested style: {post_runs}")
 
-    _serialize_and_write(resolved, document_root, raw_xml, post_verify=_post_verify)
+    conflict_sweep = _serialize_and_write(resolved, document_root, raw_xml, post_verify=_post_verify)
 
     post_revision = projection.compute_revision(resolved)
     evidence = _evidence(
@@ -739,6 +745,7 @@ def execute_format_text(
         runs_after=runs_after,
         warnings=locate_result.warnings,
         track=track,
+        conflict_sweep=conflict_sweep,
     )
     logged, _ = audit.append_audit(path=str(resolved), tool="format_text", evidence=evidence)
     evidence["audit_logged"] = logged

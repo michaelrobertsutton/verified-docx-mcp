@@ -757,14 +757,20 @@ def list_styles(path: str) -> dict[str, Any]:
 # reads-vs-writes asymmetry is the point of this WP, not a regression of
 # it — see mutations.py's module docstring).
 #
-# Guard layers 3-4 (Microsoft Graph checkout/checkin, or a stronger local
-# layer 0 per core/document-backend-protocol.md §9) are NOT implemented
-# yet — they land in WP-10. Until then, the residual risk is exactly what
-# §9 states: a write that lands while another client has the file open is
-# only detected after the fact (the next call's lock_status / conflict
-# sweep), never prevented outright. WP-10 is also where a
-# CONFLICT_COPY_DETECTED sweep runs after a successful write; this WP does
-# not add one (layers 3-4, not 1-2).
+# Guard layers 3-4 (issue #28 WP-10, landed in this same PR):
+# mutations.atomic_replace_docx_parts now wraps every write in
+# acquire_lock/release_lock (layer 0's remote_checkout no-op seam for a
+# future Microsoft Graph checkout, plus layer 4's same-machine ``.jsclaim``
+# O_EXCL mutex) and runs conflict_copy_sweep (layer 3) after a successful
+# write, surfacing conflict_copy_detected/conflict_copies/
+# sibling_files_changed on every mutating tool's own evidence dict (never
+# raised — the write already succeeded). What is still true, and always
+# will be per core/document-backend-protocol.md §9's own framing
+# ("detection-only, not prevention"): a write that lands while another
+# client has the file open is not PREVENTED by anything above, only
+# detected after the fact by the sweep; the naming patterns the sweep
+# matches on are themselves client- and locale-dependent, so their
+# absence is not proof no conflict occurred.
 # ---------------------------------------------------------------------------
 
 
@@ -808,9 +814,12 @@ def replace_body_markdown(
     confirms the change (a failure here restores from .jsbak and raises
     VERIFICATION_FAILED).
 
-    Residual risk (layers 3-4 land in WP-10, not here): a write that
-    lands while another client has the file open is not prevented by
-    anything above, only detected after the fact by the next call.
+    Residual risk (layers 3-4, issue #28 WP-10, wrap the atomic write
+    itself -- see the module-level comment above): a write that lands
+    while another client has the file open is not PREVENTED by anything
+    above, only detected after the fact, by the post-write conflict-copy
+    sweep on THIS SAME call (conflict_copy_detected in the evidence
+    below) or a later one.
 
     track_changes=True (issue #28 WP-07b-a): the OLD body content is kept
     (not removed) with its runs wrapped in w:del/w:delText, and the NEW
@@ -828,6 +837,11 @@ def replace_body_markdown(
     rung (4), before, after, revision_before, revision_after,
     audit_logged; plus orphaned_comment_ids when force removed anchors,
     and (track_changes=True only) revision_ids/track_changes.
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
@@ -881,6 +895,11 @@ def replace_range_markdown(
     orphaned_comment_ids when force removed anchors, and (track_changes=
     True only) revision_ids/track_changes.
 
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
+
     Errors: as replace_body_markdown, plus:
       SECTION_NOT_FOUND - section_key does not match any current section
                            (call find_sections to see the current ones;
@@ -922,6 +941,11 @@ def append_markdown(
     replace_body_markdown at rung 4 — grouped with it here as the other
     whole-document-scoped write). Plus (track_changes=True only)
     revision_ids/track_changes.
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
@@ -1013,6 +1037,11 @@ def replace_text(
     span, before and after), `warnings` when non-empty, and (track_changes=
     True only) revision_ids/track_changes.
 
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
+
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or an empty find
       DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
@@ -1073,6 +1102,11 @@ def format_text(
     match's overlapping run(s) and their style flags, before and after),
     `warnings` when non-empty, and (track_changes=True only) revision_ids/
     track_changes.
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
 
     Errors: as replace_text, plus:
       INVALID_INPUT - style is empty, not an object, names an unknown key,
@@ -1149,6 +1183,11 @@ def accept_tracked_changes(
     rung is "all" when revision_ids is omitted, else "by_id"; match_count
     is the number of w:ins/w:del elements processed), plus revision_ids
     (the ids actually processed).
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
@@ -1242,6 +1281,11 @@ def add_anchored_comment(path: str, quote: str, text: str, expected_matches: int
     created, one per matched span) and comment_id (the singular durableId,
     only when exactly one span matched).
 
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
+
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or an empty quote
       DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
@@ -1310,6 +1354,11 @@ def reply_to_comment(path: str, comment_id: str, text: str) -> dict[str, Any]:
     the fixed label "reply", since no text search is performed), plus
     comment_id (the new reply's own durableId) and parent_comment_id.
 
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
+
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or
                          comment_id does not match any existing comment,
@@ -1351,6 +1400,11 @@ def resolve_comment(path: str, comment_id: str) -> dict[str, Any]:
     Returns the eight evidence keys (before="open", after="resolved";
     rung is the fixed label "resolve", since no text search is
     performed), plus comment_id.
+
+    Always also carries conflict_copy_detected (issue #28 WP-10's
+    post-write conflict-copy sweep -- never raised, an evidence flag on
+    an already-successful write); conflict_copies/sibling_files_changed
+    are added only when non-empty.
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or

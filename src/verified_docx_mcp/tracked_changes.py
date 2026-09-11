@@ -580,7 +580,9 @@ def _run_accept_or_reject(
 
     document_decls = mutations._capture_source_namespaces(raw_xml)
     new_xml_bytes = mutations._serialize_xml(document_root, document_decls)
-    mutations.atomic_replace_docx_parts(resolved, {projection.DEFAULT_PART: new_xml_bytes}, post_verify=_post_verify)
+    conflict_sweep = mutations.atomic_replace_docx_parts(
+        resolved, {projection.DEFAULT_PART: new_xml_bytes}, post_verify=_post_verify
+    )
 
     post_revision = projection.compute_revision(resolved)
     evidence: dict[str, Any] = {
@@ -594,6 +596,7 @@ def _run_accept_or_reject(
         "audit_logged": False,
         "revision_ids": processed_ids,
     }
+    mutations._merge_conflict_sweep(evidence, conflict_sweep)  # issue #28 WP-10
     logged, _ = audit.append_audit(path=str(resolved), tool=tool_name, evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence

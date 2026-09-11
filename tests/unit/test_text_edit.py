@@ -41,6 +41,9 @@ _EVIDENCE_KEYS = {
     "revision_before",
     "revision_after",
     "audit_logged",
+    # issue #28 WP-10: layer 3's conflict-copy sweep result, always present
+    # (True/False) on every successful write.
+    "conflict_copy_detected",
 }
 
 

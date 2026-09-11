@@ -310,7 +310,7 @@ def execute_add_anchored_comment(
         _assert_anchors_bracket_quote(post_proj, quote)
 
     overrides = parts.build_overrides(document_root=document_root, raw_xml=raw_xml)
-    mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
+    conflict_sweep = mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
 
     post_revision = projection.compute_revision(resolved)
     after_excerpt = before_excerpt  # a comment never changes document text
@@ -330,6 +330,7 @@ def execute_add_anchored_comment(
         # issue #28 plan WP-08: "expose durableId as comment_id" -- the
         # singular convenience key for the common (single-match) case.
         evidence["comment_id"] = comment_ids_created[0]
+    mutations._merge_conflict_sweep(evidence, conflict_sweep)  # issue #28 WP-10
     logged, _ = audit.append_audit(path=str(resolved), tool="add_anchored_comment", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
@@ -847,7 +848,7 @@ def execute_reply_to_comment(
             raise ValueError(f"reply {new_durable_id!r} does not link back to parent paraId {parent_para_id!r} after write")
 
     overrides = parts.build_overrides(document_root=document_root, raw_xml=raw_xml)
-    mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
+    conflict_sweep = mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
 
     post_revision = projection.compute_revision(resolved)
     evidence: dict[str, Any] = {
@@ -867,6 +868,7 @@ def execute_reply_to_comment(
         "comment_id": new_durable_id,
         "parent_comment_id": comment_id,
     }
+    mutations._merge_conflict_sweep(evidence, conflict_sweep)  # issue #28 WP-10
     logged, _ = audit.append_audit(path=str(resolved), tool="reply_to_comment", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
@@ -931,7 +933,7 @@ def execute_resolve_comment(
             ET.fromstring(zf.read(_COMMENTS_EXT_PART))  # basic well-formedness re-check
 
     overrides = parts.build_overrides(document_root=document_root, raw_xml=raw_xml)
-    mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
+    conflict_sweep = mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
 
     # Independent post-write re-read (see this function's own docstring):
     # COMMENT_STILL_OPEN, not VERIFICATION_FAILED, if the FRESH file does
@@ -962,6 +964,7 @@ def execute_resolve_comment(
         "audit_logged": False,
         "comment_id": comment_id,
     }
+    mutations._merge_conflict_sweep(evidence, conflict_sweep)  # issue #28 WP-10
     logged, _ = audit.append_audit(path=str(resolved), tool="resolve_comment", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence

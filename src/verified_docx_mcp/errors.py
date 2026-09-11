@@ -43,7 +43,7 @@ class ErrorCode(Enum):
     DOCX_ROOT_NOT_FOUND = "DOCX_ROOT_NOT_FOUND"
 
     # Lock / consistency window (core/document-backend-protocol.md §4, §9)
-    DOCX_LOCKED = "DOCX_LOCKED"  # writes only; reads snapshot instead (WP-02)
+    DOCX_LOCKED = "DOCX_LOCKED"  # writes only; reads snapshot instead (WP-02). Also raised by acquire_lock's own layer-4 .jsclaim O_EXCL mutex (WP-10) when this same server has a write to the same file already in flight -- a same-machine case, distinct from (but reported with the same code as) the owner-file (layer 0) case.
     SNAPSHOT_FAILED = "SNAPSHOT_FAILED"  # read-path snapshot validation exhausted its retries (WP-02)
     SYNC_IN_FLIGHT = "SYNC_IN_FLIGHT"  # reserved: write guard, WP-04/WP-10
     CONFLICT_COPY_DETECTED = "CONFLICT_COPY_DETECTED"  # WP-10's post-write conflict-copy sweep: an EVIDENCE FLAG (evidence["conflict_copy_detected"]=True + the sibling's name), never raised -- the write itself still succeeded and is reported as applied

@@ -155,6 +155,10 @@ class AddAnchoredCommentTests(_TempFixtureCase):
         self.assertEqual(evidence["comment_ids"], [evidence["comment_id"]])
         for key in ("applied", "match_count", "rung", "before", "after", "revision_before", "revision_after", "audit_logged"):
             self.assertIn(key, evidence)
+        # issue #28 WP-10: layer 3's conflict-copy sweep result, wired
+        # through add_anchored_comment's own evidence dict too.
+        self.assertIn("conflict_copy_detected", evidence)
+        self.assertFalse(evidence["conflict_copy_detected"])
 
         # "Verify after write that the range brackets the quoted span" --
         # re-read from disk (not the tool's own in-memory belief).
@@ -441,6 +445,10 @@ class ReplyToCommentTests(_TempFixtureCase):
         self.assertTrue(reply["applied"])
         self.assertEqual(reply["parent_comment_id"], root["comment_id"])
         self.assertNotEqual(reply["comment_id"], root["comment_id"])
+        # issue #28 WP-10: layer 3's conflict-copy sweep result, wired
+        # through reply_to_comment's own evidence dict too.
+        self.assertIn("conflict_copy_detected", reply)
+        self.assertFalse(reply["conflict_copy_detected"])
         # A reply never changes document text.
         self.assertEqual(projection.read_document_text(self.target), "The quick brown fox jumps over the lazy dog.")
 
@@ -501,6 +509,10 @@ class ResolveCommentTests(_TempFixtureCase):
         self.assertTrue(evidence["applied"])
         thread = comments.execute_get_comment_thread(str(self.target), root["comment_id"])
         self.assertTrue(thread["resolved"])
+        # issue #28 WP-10: layer 3's conflict-copy sweep result, wired
+        # through resolve_comment's own evidence dict too.
+        self.assertIn("conflict_copy_detected", evidence)
+        self.assertFalse(evidence["conflict_copy_detected"])
 
     def test_resolving_an_already_resolved_comment_is_idempotent(self):
         root = comments.execute_add_anchored_comment(str(self.target), "brown", "x", 1)
