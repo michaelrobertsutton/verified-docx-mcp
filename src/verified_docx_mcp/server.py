@@ -111,14 +111,20 @@ def _resolve_export_output_path(output_path: str) -> Path:
     return resolved
 
 
-def execute_export_pdf(path: str, output_path: str, *, timeout: int = render_module.DEFAULT_TIMEOUT) -> dict[str, Any]:
+def execute_export_pdf(
+    path: str,
+    output_path: str,
+    *,
+    timeout: int = render_module.DEFAULT_TIMEOUT,
+    close_after: bool = True,
+) -> dict[str, Any]:
     """Render *path* (.docx) to *output_path* (.pdf) via Word automation.
 
     Returns {pdf_path, sha256, page_count, page_count_source, engine,
-    left_open_document}. page_count is Word's own count when available
-    (authoritative — see render.py's module docstring), cross-checked
-    against pdfinfo/regex; None (never a guessed 0) when neither source can
-    determine it. Raises VerifyError(RENDER_ENGINE_UNAVAILABLE),
+    left_open_document, closed_after, close_error}. page_count is Word's own
+    count when available (authoritative — see render.py's module docstring),
+    cross-checked against pdfinfo/regex; None (never a guessed 0) when
+    neither source can determine it. Raises VerifyError(RENDER_ENGINE_UNAVAILABLE),
     (AUTOMATION_NOT_GRANTED), (WORD_SANDBOX_UNAVAILABLE), or (RENDER_FAILED)
     — see errors.py and render.py's module docstring for exactly when each
     fires.
@@ -133,7 +139,9 @@ def execute_export_pdf(path: str, output_path: str, *, timeout: int = render_mod
     target = _resolve_export_output_path(output_path)
 
     try:
-        result = render_module.render_word(str(source), str(target), timeout=timeout)
+        result = render_module.render_word(
+            str(source), str(target), timeout=timeout, close_after=close_after
+        )
     except render_module.RenderError as exc:
         # 1:1 name mapping between render.py's RenderError codes and this
         # server's ErrorCode members (errors.py's docstring records why).
@@ -160,11 +168,13 @@ def execute_export_pdf(path: str, output_path: str, *, timeout: int = render_mod
         "page_count": page_count_value,
         "page_count_source": page_count_source,
         "engine": "word",
-        # Extra, informational field beyond the WP-02 return shape: Word's
-        # AppleScript surface has no `close` command (render.py's module
-        # docstring), so every successful render leaves its document open.
-        # Surfaced here rather than silently dropped.
+        # left_open_document is None when the staged copy's window was
+        # closed; otherwise it is that window's title. closed_after and
+        # close_error report whether the close itself (attempted only when
+        # close_after=True) succeeded — see render.py's module docstring.
         "left_open_document": result.get("left_open_document"),
+        "closed_after": result.get("closed_after", False),
+        "close_error": result.get("close_error"),
     }
 
 
@@ -179,7 +189,7 @@ def _sha256_file(path: str) -> str:
 
 
 @mcp.tool()
-def export_pdf(path: str, output_path: str) -> dict[str, Any]:
+def export_pdf(path: str, output_path: str, close_after: bool = True) -> dict[str, Any]:
     """Render a local .docx to PDF via Microsoft Word and report its page count.
 
     output_path must fall inside VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS
@@ -190,12 +200,22 @@ def export_pdf(path: str, output_path: str) -> dict[str, Any]:
     (Word opens a private staged copy — see render.py), so the return value
     has no "applied" key.
 
+    The staged copy Word renders from is a private file this server created
+    inside Word's own sandbox container; it is never the source document and
+    is deleted from disk in a `finally` block regardless of what happens to
+    its Word window. close_after (default True) closes that window's copy
+    after the PDF is written and the page count is read, so nothing is
+    discarded by closing: the PDF is already on disk first. A close failure
+    is reported in close_error rather than failing the render — the PDF and
+    page_count are still returned. Pass close_after=False to leave the
+    window open on purpose (e.g. to inspect it).
+
     Returns pdf_path, sha256, page_count (best-effort; None — never a
     guessed 0 — when it cannot be determined), page_count_source
     ("word"|"pdfinfo"|"regex"|None), engine ("word"; the only engine, D2:
-    no LibreOffice), and left_open_document (the rendered document's
-    window title in Word — see render.py's module docstring for why it is
-    never auto-closed).
+    no LibreOffice), left_open_document (null when the window was closed,
+    else its title), closed_after (bool — whether the close succeeded), and
+    close_error (the close attempt's error text, or null).
 
     Errors:
       INVALID_INPUT             - a bad path or output_path
@@ -210,7 +230,7 @@ def export_pdf(path: str, output_path: str) -> dict[str, Any]:
       RENDER_FAILED             - any other Word automation failure
     """
     try:
-        return execute_export_pdf(path, output_path)
+        return execute_export_pdf(path, output_path, close_after=close_after)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -2108,7 +2128,7 @@ def doctor() -> int:
                 names = [n.strip() for n in proc.stdout.split(",")]
                 leftover = [n for n in names if "jennystack-render-" in n]
                 if leftover:
-                    _doctor_print("NOTE", f"{len(leftover)} leftover \"jennystack-render-*\" document window(s) open in Word (read-only count; never auto-closed — see render.py's module docstring). Safe to close by hand.")
+                    _doctor_print("NOTE", f"{len(leftover)} leftover \"jennystack-render-*\" document window(s) open in Word (read-only count; renders now close their own window by default — leftovers predate that change or had close_error set). Safe to close by hand.")
                 else:
                     _doctor_print("NOTE", 'no leftover "jennystack-render-*" document windows open in Word.')
         except (OSError, subprocess.TimeoutExpired):
