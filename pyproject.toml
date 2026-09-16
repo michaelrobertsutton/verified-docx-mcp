@@ -32,6 +32,23 @@ dependencies = [
     # Direct dependency, not just a fastmcp transitive: middleware.py imports
     # mcp.types for CallToolRequestParams.
     "mcp>=1.27,<2",
+    # issue #106 WP-2: the WSS ops channel between the bridge
+    # (live/bridge.py) and the Word task pane (addin/taskpane.js) --
+    # request/reply op dispatch (search/replace/format/comments/save),
+    # separate from the stdlib http.server used for the static HTTPS
+    # pane + /ping + /report. Already present transitively via
+    # uvicorn[standard]'s "server" extra (fastmcp -> uvicorn), but that
+    # is an implementation detail of an unrelated dependency, not a
+    # promise about which API this repo's own code may call -- hence a
+    # direct pin. Floor >=15.0.1: fastmcp[server]>=3.0 itself requires
+    # websockets>=15.0.1 (verified via `uv sync` resolution failure
+    # against the plan's original `<15` ceiling), so this bridge is
+    # written against the websockets>=15 `websockets.asyncio.server` API
+    # (single-argument connection handler; the request path comes from
+    # `connection.request.path`, not a second handler argument) rather
+    # than the pre-15 legacy `(websocket, path)` signature. Ceiling <16
+    # mirrors this repo's other major-version ceilings (fastmcp, mcp).
+    "websockets>=15.0.1,<16",
 ]
 
 [project.urls]
