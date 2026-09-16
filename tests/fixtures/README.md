@@ -103,3 +103,9 @@ it (or run `opc_valid` against it) before WP-14's mutating tools did.
 That recurrence is itself the argument for `opc_valid`'s
 `mc:Ignorable`-declared-prefix check staying a real, standing rule — it
 is what caught this one, on a file, not just on a write.
+
+## Comment identity fixture (multi-paragraph comment)
+
+| File | Purpose | How it was made |
+|---|---|---|
+| `comments/multipara-comment.docx` | Two comments: `w:id="0"` has two `w:p` paragraphs ("First paragraph of a two-paragraph comment." / "Second paragraph of the same comment."), `w:id="1"` has one ("A single-paragraph comment for contrast."). Word keys `word/commentsIds.xml` (`w16cid:commentId/@w16cid:paraId`) and `word/commentsExtended.xml` (`w15:commentEx/@w15:paraId`) on the **last** `w:p`'s `w14:paraId`, not the first — `w:id="0"`'s two paragraphs carry paraIds `5C83D4AC` (first) and `53D84979` (last), and only `53D84979` appears in either part (durableId `58A3F864`); `w:id="1"`'s single paragraph (`439EAAC1`) is keyed normally (durableId `22F779FB`). Reproduces the gap between comment identity assumed by a first-`w:p` lookup and Word's own last-`w:p` keying, which left three real multi-paragraph comments unresolvable through `resolve_comment`. | Word-authored (Word 16.112.4, same AppleScript automation as every other fixture in this file): a new document (`make new document`), then one two-paragraph comment via `make new Word comment at <range> with properties {comment text:"First paragraph of a two-paragraph comment." & return & "Second paragraph of the same comment."}` and one single-paragraph comment the same way, saved with `save as … file format format document` into Word's sandbox container (`~/Library/Containers/com.microsoft.Word/Data/Documents/`) and copied out with a plain filesystem copy. Synthetic placeholder text only. |
