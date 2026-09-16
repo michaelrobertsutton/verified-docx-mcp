@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # Vendored verbatim from JennyStack scripts/docx_render.py at commit
-# 175c6fe (JennyStack PR #104, "close_after"), source sha256
-# 7120f7a3d9cf4d4a6ef2cc3cb06d15516ac67cd78f1b9f08910141851ce39c19,
-# size 30153 bytes. Copied verbatim per issue #28 WP-02 (D3: a
+# 678aac1 (JennyStack PR #105, "paragraph geometry probe"), source
+# sha256 4496467fe6ebf09d01d587874a198bc65d671c9e78df22cf8e1174c742a10a29,
+# size 40791 bytes. Copied verbatim per issue #28 WP-02 (D3: a
 # standalone, stdlib-only Python module vendored into both repos with
 # a source-hash comment). Do not diverge from the JennyStack copy
 # without also updating it there — see that repo's copy for the
@@ -174,6 +174,34 @@ section below on unique naming, and the safety note in
 `scripts/docx-doctor.sh`).
 
 =====================================================================
+PARAGRAPH GEOMETRY PROBE (issue #102, JennyStack half — a generic,
+stdlib-only probe; the verified-docx-mcp server's section-to-page
+mapping built on top of this is a later, separate change). Verified
+live 2026-09-16 against Word 16.112.4 on a staged 10-page copy:
+
+```applescript
+set r to text object of paragraph N of d
+get range information r information type active end page number      -- integer page
+get range information r information type vertical position relative to page  -- points from page top (real)
+page height of page setup of d                                       -- points (792.0 for US Letter)
+content of r                                                          -- the paragraph text, ends with a CR
+```
+
+`N` is a 1-based ordinal into Word's `paragraphs of document` — the
+main story only (body and table-cell paragraphs in document order;
+text boxes, headers, and footnotes are excluded). The probes run
+inside the SAME `osascript` invocation as the render, after `compute
+statistics` and strictly BEFORE `save as`/close, so the pagination the
+probes observe is identical to the pagination in the saved PDF —
+pagination is not guaranteed stable across a second Word session, so
+measuring it in a later, separate pass would not be trustworthy. Each
+ordinal is probed inside its own `try`; a bad ordinal (out of range,
+or any other per-paragraph failure) emits a `PROBE<TAB>n<TAB>ERR<TAB>
+<message>` line and the render continues rather than failing the
+whole call. `render_word()`'s `page_height_pt` / `paragraph_geometry`
+result keys and the CLI's `--probe-paragraphs` flag are documented on
+`render_word()` itself, below.
+=====================================================================
 WORD'S FILE-ACCESS SANDBOX (found in review, NOT anticipated by the
 original plan or docs/onboarding.md step 11 as merged — that step covers
 only the Automation/Apple-events grant). Word is sandboxed for FILE
@@ -272,30 +300,49 @@ DEFAULT_TIMEOUT = 90
 # required). Written to a temp file inside the SAME staging directory as
 # the copied .docx (both already inside Word's sandbox container), then
 # run via plain `osascript <script> <in.docx> <out.pdf> <in-basename>
-# <close|keep>` (osascript's DEFAULT language is AppleScript; no
-# `-l JavaScript` flag) using `on run argv`. The first three arguments
-# describe the already-staged paths; the script never makes its own
-# sandbox decisions. The fourth argument is "close" (close the staged
-# document after rendering — render_word()'s default) or "keep" (leave
-# it open, close_after=False). Prints "OK <page-count> closed=<0|1>
-# <close-error-text-or-empty>" on success; any failure before that point
-# (including the `-1712`/`-1743` automation-declined case, and the
-# bounded active-document poll below timing out) raises an AppleScript
-# error, which osascript reports on stderr with a non-zero exit — parsed
-# by render_word() below. A close FAILURE (as opposed to a render
-# failure) is never raised as an AppleScript error — it is caught,
-# reported in the "closed="/error-text fields of the OK line, and never
-# fails the render, because the PDF is already on disk by then. The
-# close call itself must reference the window by the EXACT name this
-# script captured via `name of active window` — see the module
-# docstring's CORRECTED FINDING section for why a `whose` filter must
-# NEVER be used here (it can close the wrong window).
+# <close|keep> [ordinal ...]` (osascript's DEFAULT language is
+# AppleScript; no `-l JavaScript` flag) using `on run argv`. The first
+# three arguments describe the already-staged paths; the script never
+# makes its own sandbox decisions. The fourth argument is "close" (close
+# the staged document after rendering — render_word()'s default) or
+# "keep" (leave it open, close_after=False). Any FIFTH argument onward
+# is a 1-based paragraph ordinal to probe (issue #102) — see the module
+# docstring's PARAGRAPH GEOMETRY PROBE section.
+#
+# Output is one or more lines, joined with `linefeed`, in this order:
+#   PROBE<TAB>n<TAB>page<TAB>vpos<TAB>text   -- one per requested ordinal
+#   PROBE<TAB>n<TAB>ERR<TAB>message          -- that ordinal failed
+#   PAGEH<TAB>page-height-in-points          -- only if any ordinals were probed
+#   OK <page-count> closed=<0|1> <close-error-text-or-empty>   -- ALWAYS last
+# render_word() below splits stdout on newlines and treats the last
+# non-empty line as the OK line, unchanged from #103; PROBE/PAGEH lines
+# (if any) are everything before it. No ordinals requested -> no PROBE
+# or PAGEH lines at all, output is the bare OK line exactly as before
+# #102. Any failure before the OK line is produced at all (including the
+# `-1712`/`-1743` automation-declined case, and the bounded
+# active-document poll below timing out) raises an AppleScript error,
+# which osascript reports on stderr with a non-zero exit — parsed by
+# render_word() below. A close FAILURE (as opposed to a render failure)
+# is never raised as an AppleScript error — it is caught, reported in
+# the "closed="/error-text fields of the OK line, and never fails the
+# render, because the PDF is already on disk by then. The close call
+# itself must reference the window by the EXACT name this script
+# captured via `name of active window` — see the module docstring's
+# CORRECTED FINDING section for why a `whose` filter must NEVER be used
+# here (it can close the wrong window).
 _APPLESCRIPT_RENDER = r"""
 on run argv
   set inPath to item 1 of argv
   set outPath to item 2 of argv
   set inName to item 3 of argv
   set closeMode to item 4 of argv
+  set probeOrdinals to {}
+  if (count of argv) > 4 then
+    repeat with i from 5 to (count of argv)
+      set end of probeOrdinals to (item i of argv)
+    end repeat
+  end if
+  set outputLines to {}
   tell application "Microsoft Word"
     set display alerts to alerts none
     open POSIX file inPath
@@ -304,7 +351,7 @@ on run argv
     -- screen or a document-recovery pane can make "active document"
     -- unready, or the wrong document, for well over a second. 80 tries
     -- * 0.5s = 40s, leaving headroom under render_word()'s own timeout
-    -- for the compute-statistics/save-as/close steps that follow.
+    -- for the compute-statistics/probe/save-as/close steps that follow.
     set foundIt to false
     repeat 80 times
       try
@@ -329,6 +376,37 @@ on run argv
       error "active window (" & winName & ") does not belong to the just-opened document (" & inName & ") — refusing to touch a window this render did not create"
     end if
     set pg to compute statistics d statistic statistic pages
+    -- Paragraph geometry probe (issue #102): runs AFTER compute
+    -- statistics and strictly BEFORE save-as/close, so the pagination
+    -- observed here is identical to the pagination in the saved PDF.
+    -- Each ordinal is independent: a bad one emits a PROBE ERR line and
+    -- the loop continues, never aborting the whole render.
+    if (count of probeOrdinals) > 0 then
+      repeat with probeArg in probeOrdinals
+        set nStr to (probeArg as string)
+        try
+          set n to (probeArg as integer)
+          set r to text object of paragraph n of d
+          set pNum to (get range information r information type active end page number)
+          set vPos to (get range information r information type vertical position relative to page)
+          set txt to content of r
+          if (count of txt) > 80 then
+            set txt to text 1 thru 80 of txt
+          end if
+          if (count of txt) > 0 and (character (count of txt) of txt is return or character (count of txt) of txt is linefeed) then
+            set txt to text 1 thru ((count of txt) - 1) of txt
+          end if
+          set txt to my _js102ReplaceChar(txt, tab, " ")
+          set txt to my _js102ReplaceChar(txt, return, " ")
+          set txt to my _js102ReplaceChar(txt, linefeed, " ")
+          set end of outputLines to "PROBE" & tab & nStr & tab & (pNum as string) & tab & (vPos as string) & tab & txt
+        on error errMsg
+          set end of outputLines to "PROBE" & tab & nStr & tab & "ERR" & tab & errMsg
+        end try
+      end repeat
+      set pgh to page height of page setup of d
+      set end of outputLines to "PAGEH" & tab & (pgh as string)
+    end if
     save as d file name outPath file format format PDF
     set closed to "0"
     set closeErr to ""
@@ -344,8 +422,21 @@ on run argv
       end try
     end if
   end tell
-  return "OK " & (pg as string) & " closed=" & closed & " " & closeErr
+  set end of outputLines to "OK " & (pg as string) & " closed=" & closed & " " & closeErr
+  set {tid, AppleScript's text item delimiters} to {AppleScript's text item delimiters, linefeed}
+  set fullOutput to outputLines as text
+  set AppleScript's text item delimiters to tid
+  return fullOutput
 end run
+
+on _js102ReplaceChar(txt, findChar, replChar)
+  set {tid, AppleScript's text item delimiters} to {AppleScript's text item delimiters, findChar}
+  set theItems to text items of txt
+  set AppleScript's text item delimiters to replChar
+  set joined to theItems as text
+  set AppleScript's text item delimiters to tid
+  return joined
+end _js102ReplaceChar
 """
 
 
@@ -381,16 +472,18 @@ def render_word(
     out_path: str,
     timeout: int = DEFAULT_TIMEOUT,
     close_after: bool = True,
+    probe_paragraphs: Optional[list[int]] = None,
 ) -> dict:
     """Render in_path (.docx) to out_path (.pdf) via Word automation.
 
     Returns {"pdf": <out_path str>, "pages": <int|None>,
     "left_open_document": <window title str | None>, "closed_after":
-    <bool>, "close_error": <str | None>} on success. "pages" is Word's
-    OWN page count (from `compute statistics ... statistic pages`) — the
-    authoritative source per the module docstring; a caller should still
-    cross-check against page_count() (pdfinfo/regex) for a second
-    opinion, which the CLI (_main, below) does.
+    <bool>, "close_error": <str | None>, "page_height_pt": <float|None>,
+    "paragraph_geometry": <dict[int, dict]>} on success. "pages" is
+    Word's OWN page count (from `compute statistics ... statistic
+    pages`) — the authoritative source per the module docstring; a
+    caller should still cross-check against page_count() (pdfinfo/regex)
+    for a second opinion, which the CLI (_main, below) does.
 
     close_after (default True, D3): when true, the staged document is
     closed (no save — nothing is discarded, the PDF is already written)
@@ -403,6 +496,27 @@ def render_word(
     module docstring's CORRECTED FINDING section for the verified-working
     close form and why a `whose` window reference must never be used.
 
+    probe_paragraphs (issue #102, default None): an optional list of
+    1-based ordinals into Word's `paragraphs of document` (main story
+    only — see the module docstring's PARAGRAPH GEOMETRY PROBE section).
+    Every ordinal must be a positive int; anything else raises
+    RenderError("RENDER_FAILED", "invalid probe ordinal: ...") BEFORE
+    osascript is ever launched. When None or empty, no extra argv is
+    passed, no probe runs, "page_height_pt" is None, and
+    "paragraph_geometry" is {}. Otherwise the probes run inside the same
+    osascript invocation as the render, before save/close, so the
+    pagination they observe matches the saved PDF exactly.
+    "page_height_pt" is the document's page height in points (from
+    `page height of page setup`). "paragraph_geometry" maps each
+    requested ordinal to either {"page": int, "vpos_pt": float, "text":
+    str} (the paragraph's page number, vertical position in points from
+    the page top, and up to its first 80 characters) or {"error": str}
+    when that one ordinal's probe failed (e.g. out of range) — a
+    per-ordinal failure never aborts the render or the other probes. A
+    missing PAGEH line when probes were requested (the worker and this
+    parser ship together and must never drift apart) is
+    RenderError("RENDER_FAILED", "unexpected form").
+
     Raises RenderError on any failure — never returns a partial/silent
     result, and never leaves a stray PDF in Word's sandbox staging
     directory (cleaned up in `finally` regardless of outcome) nor
@@ -413,6 +527,14 @@ def render_word(
 
     if not in_path.is_file():
         raise RenderError("RENDER_FAILED", f"input file not found: {in_path}")
+
+    probe_paragraphs = list(probe_paragraphs) if probe_paragraphs else []
+    for ordinal in probe_paragraphs:
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
+            raise RenderError(
+                "RENDER_FAILED",
+                f"invalid probe ordinal: {ordinal!r} (must be a positive int)",
+            )
 
     sandbox_root = _word_sandbox_root()
     if not sandbox_root.is_dir():
@@ -442,6 +564,7 @@ def render_word(
         script_path.write_text(_APPLESCRIPT_RENDER, encoding="utf-8")
 
         close_mode = "close" if close_after else "keep"
+        probe_argv = [str(n) for n in probe_paragraphs]
         try:
             proc = subprocess.run(
                 [
@@ -451,6 +574,7 @@ def render_word(
                     str(staged_out),
                     staged_in.name,
                     close_mode,
+                    *probe_argv,
                 ],
                 capture_output=True,
                 text=True,
@@ -482,12 +606,27 @@ def render_word(
                 stderr or stdout or "(no output)",
             )
 
+        # The worker's output is one or more lines (issue #102): any
+        # PROBE/PAGEH lines come first, and the "OK <n> closed=<0|1>
+        # <err>" line is always LAST — split on newlines and treat the
+        # last non-empty line as that OK line, exactly as the worker
+        # promises (see _APPLESCRIPT_RENDER's comment above).
+        out_lines = [ln for ln in stdout.splitlines() if ln.strip() != ""]
+        if not out_lines:
+            raise RenderError(
+                "RENDER_FAILED",
+                "Word did not report success in the expected form.",
+                stdout or "(no output)",
+            )
+        ok_line = out_lines[-1]
+        probe_lines = out_lines[:-1]
+
         # ^OK\s+(\d+)\s+closed=([01])\s*(.*)$ — the "closed=" token was
         # added alongside close_after (D3); the legacy bare "OK <n>" form
         # (no "closed=" token) is now RENDER_FAILED "unexpected form", not
         # silently accepted, because the AppleScript worker and this
         # parser ship together and must never drift apart.
-        m = re.match(r"^OK\s+(\d+)\s+closed=([01])\s*(.*)$", stdout, re.DOTALL)
+        m = re.match(r"^OK\s+(\d+)\s+closed=([01])\s*(.*)$", ok_line, re.DOTALL)
         if not m:
             raise RenderError(
                 "RENDER_FAILED",
@@ -497,6 +636,50 @@ def render_word(
         word_pages = int(m.group(1))
         closed_after = m.group(2) == "1"
         close_error = m.group(3).strip() or None
+
+        # Parse PROBE/PAGEH lines (issue #102). page_height_pt stays
+        # None, and paragraph_geometry stays {}, when no probes were
+        # requested — the worker emits neither line in that case.
+        page_height_pt: Optional[float] = None
+        paragraph_geometry: dict = {}
+        for ln in probe_lines:
+            parts = ln.split("\t")
+            if parts[0] == "PROBE" and len(parts) >= 3:
+                try:
+                    ordinal = int(parts[1])
+                except ValueError:
+                    continue
+                if parts[2] == "ERR":
+                    err_text = "\t".join(parts[3:]) if len(parts) > 3 else ""
+                    paragraph_geometry[ordinal] = {"error": err_text}
+                elif len(parts) >= 5:
+                    try:
+                        page_num = int(parts[2])
+                        vpos_pt = float(parts[3])
+                    except ValueError:
+                        paragraph_geometry[ordinal] = {
+                            "error": f"unparseable PROBE line: {ln!r}"
+                        }
+                        continue
+                    text = "\t".join(parts[4:])
+                    paragraph_geometry[ordinal] = {
+                        "page": page_num,
+                        "vpos_pt": vpos_pt,
+                        "text": text,
+                    }
+            elif parts[0] == "PAGEH" and len(parts) >= 2:
+                try:
+                    page_height_pt = float(parts[1])
+                except ValueError:
+                    pass
+
+        if probe_paragraphs and page_height_pt is None:
+            raise RenderError(
+                "RENDER_FAILED",
+                "Word did not report success in the expected form.",
+                "probes were requested but no PAGEH line was found in: "
+                + (stdout or "(no output)"),
+            )
 
         if not staged_out.is_file():
             raise RenderError(
@@ -525,6 +708,8 @@ def render_word(
             "left_open_document": None if closed_after else staged_in.name,
             "closed_after": closed_after,
             "close_error": close_error,
+            "page_height_pt": page_height_pt,
+            "paragraph_geometry": paragraph_geometry,
         }
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
@@ -609,6 +794,14 @@ def _main(argv: list[str]) -> int:
         "close it — D3). Useful for inspecting the rendered document in "
         "Word by hand.",
     )
+    parser.add_argument(
+        "--probe-paragraphs",
+        default=None,
+        metavar="N,N,...",
+        help="Comma-separated 1-based paragraph ordinals (issue #102) to "
+        "probe for page number, vertical position, and text. Adds "
+        '"page_height_pt" and "paragraph_geometry" to the JSON output line.',
+    )
     args = parser.parse_args(argv)
 
     if args.engine != "word":
@@ -619,12 +812,28 @@ def _main(argv: list[str]) -> int:
         print(json.dumps(err.to_dict()))
         return 1
 
+    probe_paragraphs: Optional[list[int]] = None
+    if args.probe_paragraphs:
+        try:
+            probe_paragraphs = [
+                int(tok) for tok in args.probe_paragraphs.split(",") if tok.strip() != ""
+            ]
+        except ValueError:
+            err = RenderError(
+                "RENDER_FAILED",
+                f"invalid --probe-paragraphs value: {args.probe_paragraphs!r} "
+                "(must be a comma-separated list of positive integers)",
+            )
+            print(json.dumps(err.to_dict()))
+            return 1
+
     try:
         result = render_word(
             args.input,
             args.output,
             timeout=args.timeout,
             close_after=not args.keep_open,
+            probe_paragraphs=probe_paragraphs,
         )
     except RenderError as e:
         print(json.dumps(e.to_dict()))
@@ -667,6 +876,7 @@ def _main(argv: list[str]) -> int:
         note += ". Safe to close by hand; it carries no content beyond the rendered input."
         print(note, file=sys.stderr)
 
+    geometry = result.get("paragraph_geometry") or {}
     line = {
         "engine": "word",
         "pdf": pdf_path,
@@ -676,6 +886,8 @@ def _main(argv: list[str]) -> int:
         "left_open_document": left_open,
         "closed_after": closed_after,
         "close_error": close_error,
+        "page_height_pt": result.get("page_height_pt"),
+        "paragraph_geometry": {str(k): v for k, v in geometry.items()},
     }
     print(json.dumps(line))
     return 0

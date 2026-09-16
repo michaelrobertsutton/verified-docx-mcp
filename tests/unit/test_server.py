@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import stat
 import sys
 import tempfile
@@ -33,6 +34,17 @@ sys.path.insert(0, str(REPO / "src"))
 
 from verified_docx_mcp import paths, server
 from verified_docx_mcp.errors import ErrorCode, VerifyError
+
+FIXTURE_DIR = REPO / "tests" / "fixtures"
+# A real, valid .docx with zero headings (confirmed via find_sections_impl)
+# -- used wherever a test needs execute_export_pdf's *source* path to
+# survive projection.find_sections_impl() (issue #102's section-geometry
+# planning runs before render_word() is ever invoked) without pulling in
+# any actual section probing. Tests exercising rendering-path behavior
+# unrelated to sections (error mapping, close_after) use this rather than
+# a fake byte blob, now that execute_export_pdf reads the source .docx
+# directly (not just stages it for a mocked Word to "open").
+NO_HEADINGS_FIXTURE = FIXTURE_DIR / "frag.docx"
 
 
 def _write_fake_osascript(bin_dir: Path, stderr_text: str, exit_code: int = 1) -> None:
@@ -71,7 +83,12 @@ class ExportPdfErrorMappingTests(unittest.TestCase):
         os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = self._tmp.name
 
         self._in_path = Path(self._tmp.name) / "test-input.docx"
-        self._in_path.write_bytes(b"not a real docx, but osascript never reads it")
+        # A real, headingless .docx (issue #102: execute_export_pdf now
+        # calls projection.find_sections_impl() on the source BEFORE
+        # render_word() is invoked, which needs a real OOXML zip --
+        # osascript itself still never reads this file's bytes, only
+        # Python's own zipfile-based section planning does.
+        shutil.copyfile(NO_HEADINGS_FIXTURE, self._in_path)
         self._out_path = Path(self._tmp.name) / "out" / "test-output.pdf"
         self._out_path.parent.mkdir()
 
@@ -152,7 +169,12 @@ class ExportPdfCloseAfterTests(unittest.TestCase):
         os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = self._tmp.name
 
         self._in_path = Path(self._tmp.name) / "test-input.docx"
-        self._in_path.write_bytes(b"not a real docx, but osascript never reads it")
+        # A real, headingless .docx (issue #102: execute_export_pdf now
+        # calls projection.find_sections_impl() on the source BEFORE
+        # render_word() is invoked, which needs a real OOXML zip --
+        # osascript itself still never reads this file's bytes, only
+        # Python's own zipfile-based section planning does.
+        shutil.copyfile(NO_HEADINGS_FIXTURE, self._in_path)
         self._out_path = Path(self._tmp.name) / "out" / "test-output.pdf"
         self._out_path.parent.mkdir()
 
@@ -196,6 +218,241 @@ class ExportPdfCloseAfterTests(unittest.TestCase):
         # osascript's positional $1 is the .applescript file itself, so
         # this is logged_argv[-1] (the last of the five shell args).
         self.assertEqual(logged_argv[-1], "keep", logged_argv)
+
+
+def _write_fake_osascript_multiline_success(
+    bin_dir: Path, stdout_lines: list[str], args_log: Path | None = None
+) -> None:
+    """Like _write_fake_osascript_success above, but emitting several REAL
+    newline-separated lines of stdout (PROBE/PAGEH lines followed by the
+    OK line — issue #102), the same technique test_render.py's own
+    _write_fake_osascript_multiline uses, rather than the single line
+    _write_fake_osascript_success's `!r`-based echo is limited to."""
+    lines = ["#!/bin/sh", 'printf "%%PDF-1.4 placeholder" > "$3"']
+    if args_log is not None:
+        lines.append(f'echo "$@" > {shlex.quote(str(args_log))}')
+    for out_line in stdout_lines:
+        lines.append(f"echo {shlex.quote(out_line)}")
+    lines.append("exit 0")
+    script = bin_dir / "osascript"
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+class ExportPdfSectionsTests(unittest.TestCase):
+    """execute_export_pdf()'s per-section page-span assembly (issue #102),
+    end to end through a fake `osascript` that prints the PROBE/PAGEH/OK
+    lines the real AppleScript worker now emits when ordinals are
+    requested — no real Word instance needed. Same sandbox-dir guard as
+    ExportPdfErrorMappingTests/ExportPdfCloseAfterTests above."""
+
+    def setUp(self):
+        import verified_docx_mcp.render as render_module
+
+        if not render_module._word_sandbox_root().is_dir():
+            self.skipTest(
+                "Word's sandbox container directory does not exist on this "
+                "machine (Word never launched)."
+            )
+        self._tmp = tempfile.TemporaryDirectory()
+        self._bin_dir = Path(self._tmp.name) / "bin"
+        self._bin_dir.mkdir()
+        self._old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self._bin_dir}{os.pathsep}{self._old_path}"
+
+        self._old_allowed = os.environ.get(paths._ALLOWED_FILE_ROOTS_ENV)
+        os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = self._tmp.name
+
+        self._out_path = Path(self._tmp.name) / "out" / "test-output.pdf"
+        self._out_path.parent.mkdir()
+
+    def tearDown(self):
+        os.environ["PATH"] = self._old_path
+        if self._old_allowed is None:
+            os.environ.pop(paths._ALLOWED_FILE_ROOTS_ENV, None)
+        else:
+            os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = self._old_allowed
+        self._tmp.cleanup()
+
+    def _copy_fixture(self, name: str) -> Path:
+        in_path = Path(self._tmp.name) / name
+        shutil.copyfile(FIXTURE_DIR / name, in_path)
+        return in_path
+
+    def test_three_sections_assembled_with_monotonic_starts(self):
+        # sections.docx's three headings (Overview, Background, Next
+        # Steps) are, in document order, the 1st/3rd/5th <w:p> elements,
+        # with the document's own last paragraph (Next Steps' end) the
+        # 6th -- see test_geometry.py's OrdinalMappingTests for how that
+        # ordinal count is independently verified. probe_paragraphs is
+        # therefore [1, 3, 5, 6] (starts 1/3/5 plus the last section's
+        # own end, 6); this fake ignores the actual argv and just returns
+        # PROBE lines for those same four ordinals.
+        in_path = self._copy_fixture("sections.docx")
+        _write_fake_osascript_multiline_success(
+            self._bin_dir,
+            [
+                "PROBE\t1\t1\t72.0\tOverview",
+                "PROBE\t3\t1\t200.0\tBackground",
+                "PROBE\t5\t1\t400.0\tNext Steps",
+                "PROBE\t6\t1\t600.0\tlast line of Next Steps",
+                "PAGEH\t792.0",
+                "OK 1 closed=1 ",
+            ],
+        )
+        result = server.execute_export_pdf(str(in_path), str(self._out_path))
+        self.assertIsNone(result["sections_error"])
+        self.assertEqual(result["page_height_pt"], 792.0)
+        sections = result["sections"]
+        self.assertEqual(len(sections), 3)
+        self.assertEqual(
+            [s["section_key"] for s in sections],
+            ["overview-1", "background-1", "next-steps-1"],
+        )
+        self.assertEqual(
+            [s["heading_text"] for s in sections], ["Overview", "Background", "Next Steps"]
+        )
+        for section in sections:
+            self.assertTrue(section["text_verified"])
+        starts = [s["start_page"] + s["start_fraction"] for s in sections]
+        self.assertEqual(starts, sorted(starts))
+
+    def test_no_headings_document_gets_empty_sections_and_no_probe_argv(self):
+        in_path = self._copy_fixture("frag.docx")
+        args_log = Path(self._tmp.name) / "argv.log"
+        _write_fake_osascript_success(self._bin_dir, "OK 1 closed=1 ", args_log=args_log)
+        result = server.execute_export_pdf(str(in_path), str(self._out_path))
+        self.assertEqual(result["sections"], [])
+        self.assertIsNone(result["sections_error"])
+        self.assertIsNone(result["page_height_pt"])
+        logged_argv = args_log.read_text().strip().split()
+        # $1 script, $2 staged-in, $3 staged-out, $4 staged-in-name, $5
+        # close_mode -- nothing after it: no headings means no ordinals
+        # were ever requested.
+        self.assertEqual(len(logged_argv), 5, logged_argv)
+
+    def test_unknown_section_key_raises_section_not_found_before_render(self):
+        in_path = self._copy_fixture("sections.docx")
+        with mock.patch.object(server.render_module, "render_word") as fake_render_word:
+            with self.assertRaises(VerifyError) as ctx:
+                server.execute_export_pdf(
+                    str(in_path), str(self._out_path), section_keys=["not-a-real-section"]
+                )
+            fake_render_word.assert_not_called()
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.SECTION_NOT_FOUND)
+
+    def test_explicit_mode_verification_mismatch_raises_geometry_unavailable(self):
+        in_path = self._copy_fixture("sections.docx")
+        # section_keys=["overview-1"] now probes ordinal 1 (its own
+        # start) plus ordinal 3 (Background's start, the FULL document's
+        # next heading -- not overview-1's own end_para_ref, ordinal 2,
+        # since a next heading exists). The deliberately wrong text is on
+        # ordinal 1, overview-1's own start probe.
+        _write_fake_osascript_multiline_success(
+            self._bin_dir,
+            [
+                "PROBE\t1\t1\t72.0\tNot The Right Heading",
+                "PROBE\t3\t1\t200.0\tBackground",
+                "PAGEH\t792.0",
+                "OK 1 closed=1 ",
+            ],
+        )
+        with self.assertRaises(VerifyError) as ctx:
+            server.execute_export_pdf(
+                str(in_path), str(self._out_path), section_keys=["overview-1"]
+            )
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.SECTION_GEOMETRY_UNAVAILABLE)
+
+    def test_single_section_keys_entry_borrows_full_document_next_heading_start(self):
+        # The follow-up behavior (2026-09-16): section_keys=["overview-1"]
+        # alone still gets an EXACT end boundary -- Background's own
+        # start, ordinal 3 -- rather than the +0.03 last-paragraph
+        # approximation, because sections.docx has a real next heading
+        # even though it is not itself part of the request or the
+        # returned "sections" list.
+        in_path = self._copy_fixture("sections.docx")
+        args_log = Path(self._tmp.name) / "argv.log"
+        _write_fake_osascript_multiline_success(
+            self._bin_dir,
+            [
+                "PROBE\t1\t1\t72.0\tOverview",
+                "PROBE\t3\t1\t200.0\tBackground",
+                "PAGEH\t792.0",
+                "OK 1 closed=1 ",
+            ],
+            args_log=args_log,
+        )
+        result = server.execute_export_pdf(
+            str(in_path), str(self._out_path), section_keys=["overview-1"]
+        )
+        self.assertIsNone(result["sections_error"])
+        sections = result["sections"]
+        self.assertEqual(len(sections), 1)
+        entry = sections[0]
+        self.assertEqual(entry["section_key"], "overview-1")
+        self.assertTrue(entry["text_verified"])
+        # end == Background's own probed start, exactly (no +0.03 nudge).
+        self.assertEqual(entry["end_page"], 1)
+        self.assertEqual(entry["end_fraction"], round(200.0 / 792.0, 2))
+        self.assertEqual(
+            entry["pages"],
+            round((entry["end_page"] + entry["end_fraction"]) - (entry["start_page"] + entry["start_fraction"]), 2),
+        )
+        # start_paragraph/end_paragraph stay overview-1's OWN structural
+        # ordinals (1 and 2), never Background's borrowed start (3).
+        self.assertEqual(entry["start_paragraph"], 1)
+        self.assertEqual(entry["end_paragraph"], 2)
+        # Only ordinals 1 and 3 were ever requested -- never 2 (overview-1's
+        # own end_para_ref), since a real next heading made the
+        # approximation unnecessary.
+        logged_argv = args_log.read_text().strip().split()
+        self.assertEqual(logged_argv[-2:], ["1", "3"], logged_argv)
+
+    def test_section_keys_last_heading_still_uses_approximation(self):
+        # The other half of the same follow-up: section_keys=["next-steps-1"]
+        # (the document's own last heading) has no next heading at all,
+        # full document or otherwise -- the +0.03 last-paragraph
+        # approximation still applies, exactly as in default mode.
+        in_path = self._copy_fixture("sections.docx")
+        args_log = Path(self._tmp.name) / "argv.log"
+        _write_fake_osascript_multiline_success(
+            self._bin_dir,
+            [
+                "PROBE\t5\t1\t400.0\tNext Steps",
+                "PROBE\t6\t1\t600.0\tlast line of Next Steps",
+                "PAGEH\t792.0",
+                "OK 1 closed=1 ",
+            ],
+            args_log=args_log,
+        )
+        result = server.execute_export_pdf(
+            str(in_path), str(self._out_path), section_keys=["next-steps-1"]
+        )
+        self.assertIsNone(result["sections_error"])
+        entry = result["sections"][0]
+        self.assertEqual(entry["end_fraction"], round(min(1.0, 600.0 / 792.0 + 0.03), 2))
+        logged_argv = args_log.read_text().strip().split()
+        self.assertEqual(logged_argv[-2:], ["5", "6"], logged_argv)
+
+    def test_default_mode_verification_mismatch_degrades_instead_of_raising(self):
+        in_path = self._copy_fixture("sections.docx")
+        _write_fake_osascript_multiline_success(
+            self._bin_dir,
+            [
+                "PROBE\t1\t1\t72.0\tNot The Right Heading",
+                "PROBE\t3\t1\t200.0\tBackground",
+                "PROBE\t5\t1\t400.0\tNext Steps",
+                "PROBE\t6\t1\t600.0\tlast line of Next Steps",
+                "PAGEH\t792.0",
+                "OK 1 closed=1 ",
+            ],
+        )
+        # No exception in default mode (section_keys=None): the PDF and
+        # page_count are still returned, sections degrades instead.
+        result = server.execute_export_pdf(str(in_path), str(self._out_path))
+        self.assertIsNone(result["sections"])
+        self.assertIsNotNone(result["sections_error"])
+        self.assertIsNotNone(result["page_count"])
 
 
 class ExportPdfPathValidationTests(unittest.TestCase):

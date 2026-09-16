@@ -29,11 +29,16 @@ macOS-only dependency, for reference.)
 
 Tools implemented so far:
 
-- **`export_pdf(path, output_path, close_after=True)`** — render a `.docx`
-  to PDF via Microsoft Word automation and report its page count; the
-  result also reports `closed_after` (whether the staged copy's window was
-  closed), `close_error` (why not, when it wasn't), and
-  `left_open_document` (null once closed).
+- **`export_pdf(path, output_path, close_after=True, section_keys=None)`** —
+  render a `.docx` to PDF via Microsoft Word automation and report its page
+  count; the result also reports `closed_after` (whether the staged copy's
+  window was closed), `close_error` (why not, when it wasn't), and
+  `left_open_document` (null once closed). It also reports per-section page
+  spans: `sections` (each heading section's `start_page`/`start_fraction`,
+  `end_page`/`end_fraction`, and derived `pages`, verified against
+  `find_sections`' `heading_text`) and `page_height_pt`, restrictable to
+  specific sections via `section_keys` — see the tool's own docstring for
+  the default-mode-degrades-vs-explicit-mode-raises verification contract.
 - **`lock_status(path)`** — report Word/LibreOffice owner-file presence
   and sync-quiesce state, as data only. Never refuses.
 - **`list_parts(path)`**, **`read_document(path, format, part)`**,
