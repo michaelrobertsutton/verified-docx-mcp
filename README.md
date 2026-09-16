@@ -73,6 +73,10 @@ Tools implemented so far:
   reply to one, and resolve one. Builds all five interlocking comment
   parts a real Word comment needs; verified part-by-part against a
   Word-authored golden fixture (`tests/fixtures/comments/golden-comment.docx`).
+  A multi-paragraph comment's identity is keyed on its LAST paragraph,
+  matching Word's own commentsIds.xml/commentsExtended.xml convention, and
+  every `comment_id` `list_open_items` reports (durableId or, lacking one,
+  the raw `w:id`) is accepted by the three tools above.
 - **Lock guard layers 0/3/4** — every mutating tool above now runs inside
   a same-machine `.jsclaim` mutex (`O_EXCL`, released even on failure)
   alongside a no-op `remote_checkout` seam for a future Microsoft Graph
