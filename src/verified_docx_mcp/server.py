@@ -65,6 +65,7 @@ from . import (
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .live import bridge as live_bridge
+from .live import comments_live
 from .middleware import EvidenceEnforcementMiddleware
 
 mcp = FastMCP(
@@ -1422,7 +1423,7 @@ def format_text(
 
 
 @mcp.tool()
-def list_open_items(path: str) -> dict[str, Any]:
+def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     """List every open comment and pending tracked change (w:ins/w:del) in
     a .docx.
 
@@ -1436,9 +1437,9 @@ def list_open_items(path: str) -> dict[str, Any]:
     owning paragraph's own live text).
 
     Scope limit: comment REPLY THREADING (commentsExtended's parent/child
-    linking) is not resolved here -- every comment reports reply_count=0/
-    replies=[]. reply_count/replies are still present, structurally, for
-    forward compatibility with a later WP that resolves them.
+    linking) is not resolved in file mode -- every comment reports
+    reply_count=0/replies=[]. reply_count/replies are still present,
+    structurally, for forward compatibility.
 
     Each comment's identity is keyed on its LAST paragraph (Word itself
     keys commentsIds.xml/commentsExtended.xml this way for a
@@ -1448,15 +1449,47 @@ def list_open_items(path: str) -> dict[str, Any]:
     Every comment_id list_open_items emits is accepted by get_comment_thread/
     reply_to_comment/resolve_comment, including that raw w:id fallback.
 
+    source: "auto" (default) | "file" | "live" -- issue #106 WP-4. "file"
+    is today's OOXML read (unchanged), and the response gets an added
+    `source: "file"` key. "live" reads through the connected Word task
+    pane instead (`comments_list`, live/protocol.py), raising
+    LIVE_UNAVAILABLE if no pane session for this document's file name is
+    connected. "auto" picks live whenever such a session exists (a read
+    never refuses, so this is simpler than write_mode's own "auto" rule),
+    else file.
+
+    In live mode: `source: "live"`; each comment's `comment_id` is a live
+    handle `live:<Comment.id>` (Office.js's own id, unrelated to the OOXML
+    durableId/w:id -- docs/live-mode.md's WP-1 finding; it does not
+    survive a Word restart), `w_id` is null, and each comment also carries
+    `anchor_text`/`author`/`created_time`/`resolved`/`replies` read
+    straight from the pane (including real reply threading, since the
+    pane sees it and file mode's own reply_count=0/replies=[] limit above
+    does not apply here). Resolved comments are filtered out the same way
+    file mode does, even though the pane reports them too. The response
+    also carries a top-level `correlation` list: for each listed live
+    comment, the best-matching file-mode comment_id (durableId, or a raw
+    w:id fallback) from this same document's on-disk snapshot, matched by
+    normalized anchor text + normalized content (+ author + creation date
+    within 2 minutes, when both sides have them) -- `confidence` is
+    `"exact"` | `"content-only"` | `"none"`. This is ADVISORY, never
+    authoritative: a caller already holding a `live:<id>` handle should
+    use it directly; correlation only exists so a durableId/w:id (from an
+    earlier file-mode call, or pasted in by the lead) can still be used
+    with `reply_to_comment`/`resolve_comment(write_mode="live")`.
+
     Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
     Word's owner file is present, like every other read tool.
 
     Errors:
-      INVALID_INPUT   - path does not exist or is outside the allowed roots
-      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+      INVALID_INPUT    - path does not exist or is outside the allowed
+                          roots, or source is not "auto"/"file"/"live"
+      SNAPSHOT_FAILED  - the read-path snapshot could not be validated
+      LIVE_UNAVAILABLE - source="live" requested but no connected pane
+                          session for this document
     """
     try:
-        return tracked_changes.execute_list_open_items(path)
+        return comments_live.execute_list_open_items(path, source)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
