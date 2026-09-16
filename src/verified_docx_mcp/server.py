@@ -15,7 +15,11 @@ Entry point dispatch
   verified-docx-mcp            -> start the stdio MCP server
   verified-docx-mcp doctor     -> run the local diagnostic (see doctor())
 
-Tools registered here (WP-02): ``export_pdf``, ``lock_status``. WP-03 adds
+Tools registered here (WP-02): ``export_pdf``, ``lock_status``. WP-2 of
+issue #106 (https://github.com/michaelrobertsutton/JennyStack/issues/106)
+adds ``live_status`` (read-only; starts the local live-mode bridge lazily
+and reports connected Word task-pane sessions -- see ``live/bridge.py``).
+WP-03 adds
 five more READ tools — ``list_parts``, ``read_document``, ``find_sections``,
 ``list_page_sections``, ``list_styles`` — built on ``projection.py``. None
 of those seven is a mutating tool (export_pdf writes a PDF, never the
@@ -60,6 +64,7 @@ from . import (
 )
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
+from .live import bridge as live_bridge
 from .middleware import EvidenceEnforcementMiddleware
 
 mcp = FastMCP(
@@ -71,7 +76,9 @@ mcp = FastMCP(
         "macOS Automation grant for the calling app. export_pdf writes a "
         "local PDF file only and never modifies the source .docx. lock_status "
         "reports Word/LibreOffice owner-file and sync-quiesce state as data "
-        "only — it never refuses a call by itself."
+        "only — it never refuses a call by itself. live_status starts the "
+        "local live-mode bridge lazily and reports connected Word task-pane "
+        "sessions; empty sessions is normal, not an error."
     ),
 )
 
@@ -607,6 +614,88 @@ def lock_status(path: str) -> dict[str, Any]:
     """
     try:
         return execute_lock_status(path)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tool: live_status (issue #106 WP-2:
+# https://github.com/michaelrobertsutton/JennyStack/issues/106)
+# ---------------------------------------------------------------------------
+
+
+def execute_live_status() -> dict[str, Any]:
+    """Start the live bridge lazily (idempotent) and report its state.
+
+    Never raises for "no pane connected yet" -- an empty ``sessions``
+    list is the normal, expected answer before the lead opens the task
+    pane in Word. It DOES raise (``LIVE_UNAVAILABLE``) if the bridge
+    itself could not start -- e.g. no ``openssl`` on PATH to generate a
+    first-run cert, or its HTTPS/WSS ports are already bound by
+    something else. That is a real failure distinct from "nothing has
+    connected to a working bridge yet".
+    """
+    try:
+        registry = live_bridge.start_in_background()
+    except Exception as exc:
+        raise _make_error(
+            ErrorCode.LIVE_UNAVAILABLE,
+            f"live bridge failed to start: {exc}",
+            {"exception_type": type(exc).__name__},
+        ) from exc
+
+    ports = live_bridge.current_ports()
+    port, ops_port = ports if ports is not None else (None, None)
+
+    sessions: list[dict[str, Any]] = []
+    for session in registry.list():
+        sessions.append(
+            {
+                "document_name": session.document_name,
+                "document_url": session.document_url,
+                "connected_since": session.connected_since,
+                "last_heartbeat_age_s": session.heartbeat_age(),
+                "body_sha256": session.last_body_sha256,
+                "requirement_sets": session.hello.requirement_sets,
+            }
+        )
+
+    return {
+        "bridge_running": True,
+        "port": port,
+        "ops_port": ops_port,
+        "sessions": sessions,
+    }
+
+
+@mcp.tool()
+def live_status() -> dict[str, Any]:
+    """Report live-bridge state: whether it is running, its ports, and
+    every currently connected Word task-pane session.
+
+    Starts the bridge lazily (idempotent -- a second call, or any future
+    ``write_mode="live"`` tool call from WP-3/WP-4, reuses the same
+    running bridge) so the lead's pane has something to connect to the
+    first time this is called; does NOT itself require a pane to already
+    be connected -- see ``sessions: []`` below.
+
+    Read-only: never modifies a .docx, so it is not in ``MUTATING_TOOLS``
+    (middleware.py).
+
+    Returns ``bridge_running``, ``port`` (the static HTTPS pane server),
+    ``ops_port`` (the WSS ``/ops`` channel), ``sessions`` (list of
+    ``{document_name, document_url, connected_since,
+    last_heartbeat_age_s, body_sha256, requirement_sets}`` -- one per
+    connected pane, ``[]`` before any pane connects).
+
+    Errors:
+      LIVE_UNAVAILABLE - the bridge itself failed to start (e.g. no
+        `openssl` on PATH for a first-run cert, or its ports are already
+        bound by something else) -- distinct from "no pane connected
+        yet", which is not an error.
+    """
+    try:
+        return execute_live_status()
     except VerifyError as exc:
         _raise_tool_error(exc)
 

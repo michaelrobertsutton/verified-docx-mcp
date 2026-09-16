@@ -1,21 +1,128 @@
-# Live mode: WP-1 spike runbook
+# Live mode
 
-This is the lead's step-by-step for issue #106 WP-1 — a hello-world Word
-task-pane add-in, served over local HTTPS by
-`verified_docx_mcp.live.bridge`, sideloaded once into Word for Mac
-(16.112.4). It proves four things before anything else in the plan
-(`docs/plans/issue-106-word-addin-bridge.md` in the JennyStack repo) gets
-built:
+Live co-editing in Word via an Office Add-in bridge
+([issue #106](https://github.com/michaelrobertsutton/JennyStack/issues/106)):
+a Word task-pane add-in plus a local bridge inside `verified-docx-mcp`
+that lets the MCP server send edit and comment operations to a pane
+running inside the lead's own open document. Design plan:
+`docs/plans/issue-106-word-addin-bridge.md` in the JennyStack repo.
 
-1. the pane loads in Word,
-2. `WordApi 1.4` is supported,
-3. the pane can read the document URL and a body-text hash, and
-4. how Office.js's `Comment.id` relates to the OOXML `durableId`
-   `list_open_items` reports.
+## Architecture
 
-No document is edited at any step below. The agent cannot run Word or
-sideload the manifest — every step here is something only the lead can
-do at the keyboard.
+```
+Claude Code ──stdio──> verified-docx-mcp (FastMCP)
+                          │  existing OOXML tools (unchanged; used when the doc is closed)
+                          │
+                          ├─ live/bridge.py   HTTPS static (53135): serves addin/ + /ping + /report
+                          │                   WSS ops channel (53136): /ops, live/session.py's SessionRegistry
+                          │        ▲ wss://localhost:53136/ops        ▲ https://localhost:53135/taskpane.html
+                          │        │                                  │
+Word for Mac ─── task pane (Office.js, WordApi 1.4) ──────────────────┘
+      │  applies ops in the open document; reads back; reports evidence
+      └─ co-authoring to SharePoint / OneDrive as usual
+```
+
+- **Pane** (`addin/`): classic XML add-in manifest, `taskpane.html`,
+  `taskpane.js`. No framework, no build step. Connects to the bridge's WSS
+  ops channel on load, sends `hello`, heartbeats every 5s, and dispatches
+  every op the MCP server sends (`live/protocol.py`), always reading the
+  document back after a mutation (`pre`/`post` body SHA-256) before
+  replying. Reconnects with backoff (1s → 30s, doubling) if the socket
+  drops. The WP-1 read-only report/ping UI is unchanged and still works.
+- **Bridge** (`src/verified_docx_mcp/live/`):
+  - `bridge.py` — the WP-1 static HTTPS server (`addin/`, `/ping`,
+    `/report`) on port **53135**, plus WP-2's WSS `/ops` channel on a
+    **separate port, 53136** (`DEFAULT_PORT + 1`). Two ports because
+    `http.server.HTTPServer` (synchronous, blocking-accept) and
+    `websockets.asyncio.server` (asyncio) cannot share one listening
+    socket's `accept()` loop cleanly; two independent listener threads,
+    each with its own loop, is the straightforward option and leaves
+    WP-1's static server byte-for-byte as it was. Both listeners bind
+    `127.0.0.1` only. `start_in_background()` is what the MCP process
+    calls lazily (idempotent — a second call while already running just
+    returns the existing `SessionRegistry`) on the first live-aware tool
+    call (`live_status` today; a `write_mode="live"` tool call from
+    WP-3/4 later); `stop()` tears both listeners down. `--serve-only`
+    still works for the lead's manual runbook below, and now also starts
+    the WSS ops channel.
+  - `protocol.py` — typed message schemas for the wire protocol: pane→
+    server `hello`/`heartbeat`/op `reply`, server→pane op `request`
+    (`ping`, `describe`, `search`, `replace`, `format`, `comments_list`,
+    `comment_add`, `comment_reply`, `comment_resolve`, `save`). Each op's
+    docstring names the exact Word JS calls the pane makes to satisfy it.
+  - `session.py` — `LiveSession` (one per connected pane, keyed by the
+    document's file name parsed from `documentUrl`) and `SessionRegistry`
+    (thread-safe; stale eviction after 3 missed heartbeats at 5s each —
+    15s). `request()`/`request_threadsafe()` send an op and await the
+    matching reply, safe to call from any thread/event loop (not just the
+    bridge's own ops-thread loop) — see that module's own comments for
+    why that split exists (a real cross-loop bug caught while building
+    WP-2). Raises `LiveUnavailable` (no session for that document),
+    `LiveDisconnected` (socket closed mid-request, or a reply timeout),
+    `LiveOpFailed` (pane replied `ok:false`, e.g. an `expected_matches`
+    refusal), `LiveStale` (the pane's body hash before the op didn't
+    match a caller-supplied expected hash) — mapped to the matching
+    `ErrorCode` (`errors.py`) once a tool calls through this layer
+    (WP-3/4).
+- **`live_status` tool** (`server.py`, read-only, not in
+  `MUTATING_TOOLS`): starts the bridge lazily and reports
+  `{bridge_running, port, ops_port, sessions: [{document_name,
+  document_url, connected_since, last_heartbeat_age_s, body_sha256,
+  requirement_sets}]}`. An empty `sessions` list is normal before the
+  lead opens the pane, not an error.
+- **Live write mode** (WP-3/WP-4, not yet wired): `replace_text`,
+  `format_text`, `add_anchored_comment`, `reply_to_comment`,
+  `resolve_comment` will gain `write_mode: "auto" | "file" | "live"`.
+  Not implemented by WP-2 — this WP delivers the transport, the protocol,
+  the pane dispatcher, and `live_status` only.
+- **Testing**: `tests/unit/fake_pane.py` is a Python `websockets` client
+  that answers every op deterministically against an in-memory document,
+  mimicking the pane's semantics (including the `expected_matches`
+  refusal and `pre`/`post` hashes) with no Word installation.
+  `tests/unit/test_live_protocol.py` and `tests/unit/test_live_session.py`
+  exercise the schemas and the bridge/session wiring through it, on
+  ephemeral ports.
+
+## WP-1 result (2026-09-16, Word for Mac 16.112.4)
+
+Recorded from the issue's WP-1 comment
+([full text](https://github.com/michaelrobertsutton/JennyStack/issues/106)):
+
+Pane sideloaded from `wef/`, loaded over the local HTTPS bridge
+(self-signed cert trusted in the login keychain), read the fixture, and
+POSTed its report to the bridge. No prompt or error from Word.
+
+- **Requirement sets:** WordApi 1.4 **true**, 1.5 true, 1.6 true.
+  `host: Word`, `platform: Mac`.
+- **Document URL** reported as the local path; `body.text` length and
+  SHA-256 read fine (100 chars for the fixture).
+- **Comment id correlation:** Office.js `Comment.id` values
+  (`1487140964`, `586643963`) are **unrelated** to the OOXML `durableId`
+  (`58A3F864`, `22F779FB`) and to `w:id` (0, 1).
+  `scripts/compare_comment_ids.py` matched both comments by anchor text +
+  content and reported `VERDICT: Comment.id is unrelated to both
+  durableId and w_id`.
+- **Consequence for live comment ops:** the pane's dispatcher
+  (`comment_reply`/`comment_resolve`) looks a comment up by the pane's
+  own `Comment.id`, valid only within one live session — never by
+  `durableId`/`w:id`. Anything that needs to correlate a live comment
+  back to `list_open_items`' output (WP-4) does so by anchor text +
+  content + author + creation date, the same method
+  `scripts/compare_comment_ids.py` uses.
+- Multi-paragraph comment content arrives with `\r` between paragraphs.
+
+WP-1 gate passed. WP-2 (bridge sessions, op protocol, pane dispatcher,
+fake-pane tests) is implemented above.
+
+## WP-1 sideload runbook (still current)
+
+The steps below still apply unchanged for a fresh sideload — cert
+generation, trust, `--serve-only`, and copying the manifest into Word's
+`wef/` folder are all the same regardless of WP. `--serve-only` now also
+starts the WSS `/ops` channel (a startup line prints its port), which the
+pane will connect to automatically once loaded; nothing below requires
+that connection to succeed, since the WP-1 report/ping flow is
+independent of it.
 
 ## 1. Generate the local HTTPS certificate
 

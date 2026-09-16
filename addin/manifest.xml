@@ -3,11 +3,15 @@
   Classic (XML, add-in only) task-pane manifest for the WP-1 spike of
   https://github.com/michaelrobertsutton/JennyStack/issues/106.
 
-  Hello-world only: proves a pane can be sideloaded into Word for Mac,
-  loaded over local HTTPS, and report WordApi 1.4 support plus the
-  document URL / body hash / comment list. Nothing here writes to the
-  document; that is WP-2 onward, on the file path documented in
-  docs/live-mode.md.
+  WP-1 proved a pane can be sideloaded into Word for Mac, loaded over
+  local HTTPS, and report WordApi 1.4 support plus the document URL /
+  body hash / comment list. WP-2 adds the WSS ops channel
+  (taskpane.js connects to wss://localhost:53136/ops; see that
+  file's OPS_PORT constant and live/bridge.py's module docstring for
+  why the ops channel is a separate port from the static one below)
+  and its dispatcher for search/replace/format/comment ops, still with
+  nothing here writing to the document except through that channel,
+  driven by the MCP server (docs/live-mode.md).
 
   Id below is a fresh GUID generated for this manifest only (not reused
   from any other add-in). Sideload steps: docs/live-mode.md.
@@ -24,7 +28,7 @@
   <ProviderName>verified-docx-mcp</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
   <DisplayName DefaultValue="verified-docx-mcp live" />
-  <Description DefaultValue="WP-1 spike pane: confirms WordApi 1.4 support and reads the document URL, body hash, and comment list. No document writes." />
+  <Description DefaultValue="verified-docx-mcp live pane: connects to the local bridge's WSS ops channel and applies search/replace/format/comment operations the MCP server sends, always reading back after a mutation." />
 
   <IconUrl DefaultValue="https://localhost:53135/icon-32.png" />
   <HighResolutionIconUrl DefaultValue="https://localhost:53135/icon-80.png" />
@@ -32,6 +36,10 @@
 
   <AppDomains>
     <AppDomain>https://localhost:53135</AppDomain>
+    <!-- WP-2's WSS ops channel: a separate port from the static pane
+         server above; see the header comment and live/bridge.py's
+         module docstring for why. -->
+    <AppDomain>https://localhost:53136</AppDomain>
   </AppDomains>
 
   <Hosts>
@@ -108,8 +116,8 @@
         <bt:String id="ShowTaskpane.Label" DefaultValue="Live pane" />
       </bt:ShortStrings>
       <bt:LongStrings>
-        <bt:String id="GetStarted.Description" DefaultValue="WP-1 spike: confirms WordApi 1.4 and reads document/comment info. Makes no edits." />
-        <bt:String id="ShowTaskpane.Tooltip" DefaultValue="Open the verified-docx-mcp WP-1 spike pane" />
+        <bt:String id="GetStarted.Description" DefaultValue="Connects to the local live-mode bridge and applies edit/comment operations the MCP server sends." />
+        <bt:String id="ShowTaskpane.Tooltip" DefaultValue="Open the verified-docx-mcp live pane" />
       </bt:LongStrings>
     </Resources>
   </VersionOverrides>

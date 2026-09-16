@@ -317,17 +317,28 @@ files — no Word installation required. `tests/live` needs a real Word
 install and a macOS Automation grant; it is skipped unless `--run-live` is
 passed.
 
-## Live mode (WP-1 spike)
+## Live mode
 
-A hello-world Word task-pane add-in (`addin/`) plus a local HTTPS bridge
-(`python -m verified_docx_mcp.live.bridge --serve-only`) that a lead can
-sideload into Word for Mac to check `WordApi 1.4` support and correlate
-Office.js comment ids against this server's OOXML `durableId`s. This is
-the WP-1 spike for
-[issue #106](https://github.com/michaelrobertsutton/JennyStack/issues/106)'s
-live co-editing bridge — throwaway scaffolding, not yet wired into the
-MCP server itself (importing `verified_docx_mcp.live` never starts
-anything). Full step-by-step: [`docs/live-mode.md`](docs/live-mode.md).
+A Word task-pane add-in (`addin/`) plus a local bridge
+(`src/verified_docx_mcp/live/`) for live co-editing:
+[issue #106](https://github.com/michaelrobertsutton/JennyStack/issues/106).
+The bridge serves the pane over local HTTPS (port 53135) and runs a WSS
+ops channel (port 53136) the pane connects to and applies
+search/replace/format/comment operations from, always reading the
+document back after a mutation. The MCP server starts the bridge lazily
+(idempotent) the first time a live-aware tool is called.
+
+`live_status` (read-only) reports bridge and connected-pane state:
+`{bridge_running, port, ops_port, sessions: [{document_name,
+document_url, connected_since, last_heartbeat_age_s, body_sha256,
+requirement_sets}]}` — an empty `sessions` list is normal before the lead
+opens the pane in Word.
+
+`write_mode="live"` on the existing edit/comment tools is not wired up
+yet (tracked for a later work package) — this only delivers the
+transport, the protocol, the pane dispatcher, and `live_status`.
+Full architecture and the lead's sideload runbook:
+[`docs/live-mode.md`](docs/live-mode.md).
 
 ## Path safety
 
