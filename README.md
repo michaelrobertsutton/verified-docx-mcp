@@ -60,28 +60,33 @@ Tools implemented so far:
   curly/straight quotes -> NBSP/whitespace collapse -> soft-hyphen
   strip), with run splitting that clones a boundary run's original
   `w:rPr` verbatim onto every surviving piece.
-- **`list_open_items(path)`**, **`accept_tracked_changes(path,
+- **`list_open_items(path, source="auto")`**, **`accept_tracked_changes(path,
   revision_ids?, ...)`**, **`reject_tracked_changes(path, revision_ids?,
   ...)`** — list open comments/pending tracked changes (Google's response
   shape), and accept/reject `w:ins`/`w:del` revisions by id or all at
-  once.
+  once. `source="live"` reads through a connected Word task pane instead
+  (issue #106 WP-4 — see "Live mode" below).
 - **`track_changes: bool`** on every mutating tool above — when true,
   the edit is wrapped in `w:ins`/`w:del` (or a `w:rPrChange` for a style
   change) with an author/date/id, rather than applied directly. A
   revision authored by the server's own configured identity never blocks
   a later tracked write; one authored by anyone else does, unless
   `force=True`.
-- **`add_anchored_comment(path, quote, text, expected_matches, ...)`**,
-  **`get_comment_thread(path, comment_id)`**, **`reply_to_comment(path,
-  comment_id, text)`**, **`resolve_comment(path, comment_id)`** — create
-  an anchored comment, read a comment and its replies (by durable id),
-  reply to one, and resolve one. Builds all five interlocking comment
-  parts a real Word comment needs; verified part-by-part against a
-  Word-authored golden fixture (`tests/fixtures/comments/golden-comment.docx`).
+- **`add_anchored_comment(path, quote, text, expected_matches,
+  write_mode="auto", ...)`**, **`get_comment_thread(path, comment_id)`**,
+  **`reply_to_comment(path, comment_id, text, write_mode="auto")`**,
+  **`resolve_comment(path, comment_id, write_mode="auto")`** — create an
+  anchored comment, read a comment and its replies (by durable id), reply
+  to one, and resolve one. Builds all five interlocking comment parts a
+  real Word comment needs; verified part-by-part against a Word-authored
+  golden fixture (`tests/fixtures/comments/golden-comment.docx`).
   A multi-paragraph comment's identity is keyed on its LAST paragraph,
   matching Word's own commentsIds.xml/commentsExtended.xml convention, and
   every `comment_id` `list_open_items` reports (durableId or, lacking one,
   the raw `w:id`) is accepted by the three tools above.
+  `write_mode="live"` sends the same operation through a connected Word
+  task pane instead (issue #106 WP-4 — see "Live mode" below), accepting
+  either a `live:<id>` handle or a correlated durableId/w:id.
 - **Lock guard layers 0/3/4** — every mutating tool above now runs inside
   a same-machine `.jsclaim` mutex (`O_EXCL`, released even on failure)
   alongside a no-op `remote_checkout` seam for a future Microsoft Graph
@@ -334,11 +339,15 @@ document_url, connected_since, last_heartbeat_age_s, body_sha256,
 requirement_sets}]}` — an empty `sessions` list is normal before the lead
 opens the pane in Word.
 
-`write_mode="live"` on the existing edit/comment tools is not wired up
-yet (tracked for a later work package) — this only delivers the
-transport, the protocol, the pane dispatcher, and `live_status`.
-Full architecture and the lead's sideload runbook:
-[`docs/live-mode.md`](docs/live-mode.md).
+`write_mode="live"` (`"auto" | "file" | "live"`) is wired up on
+`add_anchored_comment`/`reply_to_comment`/`resolve_comment`, and a
+parallel `source="live"` on `list_open_items` — going through the
+connected pane instead of the on-disk `.docx` parts, with a `correlation`
+list bridging a live comment's own id back to the durableId/w:id file
+mode reports (Office.js's `Comment.id` is unrelated to either). Live
+`replace_text`/`format_text` is a separate, parallel work package.
+Full architecture, the correlation algorithm, and the lead's sideload
+runbook: [`docs/live-mode.md`](docs/live-mode.md).
 
 ## Path safety
 
