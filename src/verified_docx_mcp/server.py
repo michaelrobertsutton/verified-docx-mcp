@@ -47,7 +47,17 @@ from typing import Any, NoReturn
 
 from fastmcp import FastMCP
 
-from . import comments, geometry, images, mutations, paths, projection, tables, text_edit, tracked_changes
+from . import (
+    comments,
+    geometry,
+    images,
+    mutations,
+    paths,
+    projection,
+    tables,
+    text_edit,
+    tracked_changes,
+)
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .middleware import EvidenceEnforcementMiddleware

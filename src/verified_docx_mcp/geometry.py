@@ -78,9 +78,10 @@ _SOFT_HYPHEN = "­"
 # whitespace-collapse step below instead of being deleted outright, so
 # e.g. "Factor 1<TAB>Overview" still normalizes with a space between the
 # words rather than silently merging them.
-_CONTROL_RE = re.compile(
-    "[" + "".join(chr(c) for c in list(range(0x00, 0x09)) + [0x0B, 0x0C] + list(range(0x0E, 0x20)) + list(range(0x7F, 0xA0))) + "]"
+_CONTROL_CODEPOINTS = (
+    list(range(0x09)) + [0x0B, 0x0C] + list(range(0x0E, 0x20)) + list(range(0x7F, 0xA0))
 )
+_CONTROL_RE = re.compile("[" + "".join(chr(c) for c in _CONTROL_CODEPOINTS) + "]")
 _WS_RE = re.compile(r"\s+")
 
 
