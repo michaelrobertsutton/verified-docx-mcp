@@ -1283,8 +1283,45 @@ def replace_text(
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
+    write_mode: str = "auto",
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
+
+    `write_mode` (issue #106 WP-3, "auto" | "file" | "live", default
+    "auto"): whether this call edits the .docx file directly (today's
+    path, unchanged) or sends the edit to a connected Word task pane over
+    the live bridge instead. "file" always uses the file path. "live"
+    always uses the live pane, raising LIVE_UNAVAILABLE if none is
+    connected for this document. "auto" uses live only when BOTH hold:
+    lock_status reports a desktop Word owner file for `path`, AND a pane
+    session is connected for that file's name -- i.e. the lead has the
+    document open in Word with the Live pane loaded right now. This is
+    why a document being open in Word (`DOCX_LOCKED` today) is now
+    writable instead of refused: the open copy is the very thing "auto"
+    routes the edit into, live, in front of the lead, rather than
+    treating "someone has it open" as a reason to refuse.
+
+    Live-mode evidence differs from file mode in three ways: (1)
+    `revision_before`/`revision_after` are `"live:sha256:<hex>"` of the
+    pane's own `body.text` hash (there is no OOXML revision token until
+    `live_save` writes the file back to disk); (2) `write_mode: "live"`,
+    `verified_via: "word-addin"`, `document_name`, and
+    `track_changes_author: "word-signed-in-user"` are added (the pane
+    cannot set `w:author` -- live track-changes authorship is always
+    whoever is signed into that copy of Word); (3) no
+    `conflict_copy_detected`/`conflict_copies`/`sibling_files_changed` --
+    Word owns the file for the whole live session, so there is no
+    sync-conflict copy for a sweep to find. `force`/`revision_ids` have
+    no live-mode meaning and are not produced in that mode.
+
+    Rungs 3 and 4 (`replace_range_markdown`/`replace_body_markdown`, the
+    structural/whole-document rungs) never go live, in either mode --
+    `write_mode` on THIS tool only ever chooses between file and live for
+    rung 1/2 edits. After a live session, structural verification against
+    the file on disk happens by calling `live_save` first, then the
+    existing read tools (`read_document`/`find_sections`/
+    `diff_body_vs_file`) against the now-saved file, same as any other
+    file-mode read.
 
     Locates `find` via a 4-rung normalization ladder (exact -> curly/
     straight quote equivalence -> NBSP/whitespace-run collapse -> soft-
@@ -1344,11 +1381,25 @@ def replace_text(
       STRUCTURAL_BOUNDARY               - a match crosses a w:p/w:tbl/w:tc boundary
       TRACKED_CHANGES_PRESENT           - a match crosses a FOREIGN-authored tracked change; no force
       OPC_INVALID                       - the rendered .docx failed OPC validation
-      VERIFICATION_FAILED               - post-write verification failed; rolled back
+      VERIFICATION_FAILED               - post-write verification failed; rolled back (file mode);
+                                           or the pane's read-back did not confirm the change, with
+                                           nothing to roll back (live mode -- Word owns the file)
+      LIVE_UNAVAILABLE                  - write_mode="live" (or "auto" routed to live) but no
+                                           connected pane session for this document
+      LIVE_DISCONNECTED                 - the pane's socket closed, or an op timed out, mid-call
+      LIVE_STALE                        - a "live:sha256:..." revision_before no longer matches the
+                                           pane's current body hash
     """
     try:
         return text_edit.execute_replace_text(
-            path, find, replace, expected_matches, revision_before=revision_before, force=force, track_changes=track_changes
+            path,
+            find,
+            replace,
+            expected_matches,
+            revision_before=revision_before,
+            force=force,
+            track_changes=track_changes,
+            write_mode=write_mode,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1363,9 +1414,23 @@ def format_text(
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
+    write_mode: str = "auto",
 ) -> dict[str, Any]:
     """Apply character styling (bold/italic/underline/strike) to a matched
     text span, without touching its content.
+
+    `write_mode` (issue #106 WP-3, "auto" | "file" | "live", default
+    "auto"): identical rule and evidence differences to `replace_text`'s
+    own `write_mode` -- see that tool's docstring. One live-mode
+    difference worth calling out here: a format-only op never changes
+    `body.text`, so the live evidence's `revision_before`/
+    `revision_after` (the pane's body-hash-derived tokens) are typically
+    EQUAL for a live format call -- that is expected, not a sign the
+    style failed to apply (unlike `replace_text`, where an unchanged
+    hash after a live call IS a verification failure). This tool never
+    goes live at rung 3/4 either; see `replace_text`'s docstring for the
+    structural-verification-after-`live_save` note, which applies here
+    identically.
 
     style maps any of "bold"/"italic"/"underline"/"strike" to true/false;
     every requested field's value is applied verbatim (including false, so
@@ -1407,8 +1472,64 @@ def format_text(
     """
     try:
         return text_edit.execute_format_text(
-            path, find, style, expected_matches, revision_before=revision_before, force=force, track_changes=track_changes
+            path,
+            find,
+            style,
+            expected_matches,
+            revision_before=revision_before,
+            force=force,
+            track_changes=track_changes,
+            write_mode=write_mode,
         )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tool: live_save (issue #106 WP-3:
+# https://github.com/michaelrobertsutton/JennyStack/issues/106)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def live_save(path: str) -> dict[str, Any]:
+    """Ask the connected Word task pane to save the live document.
+
+    Word owns the open document for the whole live session -- nothing a
+    live `replace_text`/`format_text` call does writes to the .docx file
+    directly. `live_save` is the one point where a live session's edits
+    become visible on disk again: it sends the pane's `save` op
+    (`document.save()`), then reports both the pane's own live revision
+    token AND a bridge back to the file-mode revision contract, so a
+    caller that wants to keep working against the file after a live
+    session has a `file_revision` to pass as the next file-mode call's
+    `revision_before`.
+
+    Structural verification (tables, whole-section rewrites -- rungs 3
+    and 4, which never go live) against the now-saved file is the
+    caller's own job afterward, via the existing read tools
+    (`read_document`/`find_sections`/`diff_body_vs_file`) -- this tool
+    only confirms the save itself, not the file's contents.
+
+    Mutating (added to MUTATING_TOOLS): the middleware requires an
+    `applied` key, which this tool always returns on success.
+
+    Returns `applied`, `saved` (bool), `document_name`, `revision_after`
+    (`"live:sha256:<hex>"` of the pane's body hash right after the save),
+    `file_revision` (the plain revision TOKEN STRING --
+    `projection.compute_revision(path)["token"]` -- the same shape
+    `replace_text`/`replace_body_markdown`/etc. use as `revision_before`/
+    `revision_after` in file mode, computed from the now-saved file on
+    disk), and `audit_logged`.
+
+    Errors:
+      LIVE_UNAVAILABLE   - no connected pane session for this document
+      LIVE_DISCONNECTED  - the pane's socket closed, or the save timed out
+      LIVE_OP_FAILED     - the pane replied ok=false to 'save'
+      VERIFICATION_FAILED - the pane replied ok=true but did not report saved=true
+    """
+    try:
+        return text_edit.execute_live_save(path)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

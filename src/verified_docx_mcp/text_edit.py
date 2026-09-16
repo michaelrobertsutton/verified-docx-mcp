@@ -79,6 +79,8 @@ from xml.etree import ElementTree as ET
 from . import audit, mutations, paths, projection, tracked_changes
 from .author import resolve_author_name
 from .errors import ErrorCode, _make_error
+from .live import write_mode as live_write_mode
+from .live.session import LiveDisconnected, LiveOpFailed, LiveStale
 from .locate import LocateResult, locate
 from .projection import W_NS, RunEvent
 
@@ -582,6 +584,131 @@ def _check_tracked_changes_guard(
 
 
 # ---------------------------------------------------------------------------
+# Live mode (issue #106 WP-3): replace_text/format_text over the WSS ops
+# channel instead of the OOXML file, when write_mode resolves to "live"
+# (live/write_mode.py's resolve_write_mode -- the shared rule WP-4's
+# comment tools also use). Structural verification against the SAVED
+# file (rungs 3/4 never go live; a re-read via the existing read tools
+# after live_save is the caller's own job -- these two functions never
+# touch the .docx on disk at all).
+# ---------------------------------------------------------------------------
+
+
+def _live_describe(session, path: str, revision_before: str | None) -> str:
+    """describe() first (record the pane's pre-op body hash), then the
+    LIVE_STALE pre-flight check against *revision_before* -- refuses
+    BEFORE any mutating op is sent, per the plan."""
+    describe_result = session.request_threadsafe("describe")
+    pre_hash = describe_result["bodySha256"]
+    live_write_mode.check_not_stale(revision_before, pre_hash)
+    return pre_hash
+
+
+def execute_replace_text_live(
+    path: str,
+    find: str,
+    replace: str,
+    expected_matches: int,
+    *,
+    revision_before: str | None = None,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    """Live-mode ``replace_text`` (issue #106 WP-3): sends a ``replace``
+    op over the pane's WSS ops channel instead of editing the .docx file.
+
+    Flow: ``describe`` (record ``pre`` body hash + ``LIVE_STALE`` check)
+    -> ``replace`` (with ``expected_body_sha256=pre`` so the session layer
+    itself also re-checks staleness against the reply) -> verify
+    (``post`` differs from ``pre``, and every match's ``after`` equals
+    *replace* exactly) -> build the live evidence envelope
+    (``live/write_mode.py``'s ``live_evidence``).
+
+    ``force`` has no live-mode analogue (there is no tracked-change/
+    comment-anchor override to force here -- Word owns the document, not
+    this server) and is not accepted; a caller that wants a forced
+    override uses ``write_mode="file"`` with the file's own ``force``
+    instead.
+
+    Raises ``LIVE_UNAVAILABLE``/``LIVE_DISCONNECTED``/``LIVE_STALE`` (see
+    ``live/session.py``'s exceptions of the same names), ``ZERO_MATCH``/
+    ``MATCH_COUNT_MISMATCH``/``LIVE_OP_FAILED`` (the pane refused the
+    ``expected_matches`` gate -- see ``live/write_mode.py``'s
+    ``classify_op_failed``), or ``VERIFICATION_FAILED`` (the pane's own
+    read-back after the op did not confirm the intended change -- nothing
+    to roll back in live mode, since Word, not this server, owns the
+    file; the diagnostics say so explicitly).
+    """
+    if not find:
+        raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty")
+
+    session = live_write_mode.live_session_for(path)
+    document_name = session.document_name
+
+    try:
+        pre_hash = _live_describe(session, path, revision_before)
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+
+    payload = {
+        "find": find,
+        "expected_matches": expected_matches,
+        "replace": replace,
+        "track_changes": track_changes,
+    }
+    try:
+        result = session.request_threadsafe("replace", payload, expected_body_sha256=pre_hash)
+    except LiveStale as exc:
+        raise _make_error(
+            ErrorCode.LIVE_STALE, str(exc), {"expected": exc.expected, "actual": exc.actual}
+        ) from exc
+    except LiveOpFailed as exc:
+        raise _make_error(
+            live_write_mode.classify_op_failed(exc), exc.message, {"pane_code": exc.code}
+        ) from exc
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+
+    matches = result.get("matches") or []
+    match_count = result.get("match_count", len(matches))
+    post_hash = result.get("post")
+
+    if not result.get("applied") or post_hash == pre_hash:
+        raise _make_error(
+            ErrorCode.VERIFICATION_FAILED,
+            "live replace did not verify: the pane's post-op body hash did not change from its "
+            "pre-op hash (or the pane did not report applied=true). Nothing to roll back in live "
+            "mode -- Word, not this server, owns the document; re-read via describe/read_document "
+            "and retry.",
+            {"pre": pre_hash, "post": post_hash, "applied": result.get("applied")},
+        )
+    for m in matches:
+        if m.get("after") != replace:
+            raise _make_error(
+                ErrorCode.VERIFICATION_FAILED,
+                f"live replace did not verify: a matched range's after-text {m.get('after')!r} "
+                f"does not equal the requested replacement {replace!r}. Nothing to roll back in "
+                "live mode -- Word, not this server, owns the document.",
+                {"matches": matches},
+            )
+
+    before_text = "\n".join(m.get("before", "") for m in matches)
+    after_text = "\n".join(m.get("after", "") for m in matches)
+
+    return live_write_mode.live_evidence(
+        applied=True,
+        match_count=match_count,
+        rung=2,
+        before=before_text,
+        after=after_text,
+        pre_body_sha256=pre_hash,
+        post_body_sha256=post_hash,
+        document_name=document_name,
+        tool="replace_text",
+        path=path,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool 1: replace_text
 # ---------------------------------------------------------------------------
 
@@ -595,7 +722,19 @@ def execute_replace_text(
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
+    write_mode: str = "auto",
 ) -> dict[str, Any]:
+    mode = live_write_mode.resolve_write_mode(path, write_mode)
+    if mode == "live":
+        return execute_replace_text_live(
+            path,
+            find,
+            replace,
+            expected_matches,
+            revision_before=revision_before,
+            track_changes=track_changes,
+        )
+
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(resolved, revision_before)
 
@@ -653,6 +792,104 @@ def execute_replace_text(
     return evidence
 
 
+def execute_format_text_live(
+    path: str,
+    find: str,
+    style: dict[str, bool],
+    expected_matches: int,
+    *,
+    revision_before: str | None = None,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    """Live-mode ``format_text`` (issue #106 WP-3): sends a ``format`` op
+    over the pane's WSS ops channel instead of editing the .docx file.
+
+    Same describe -> op -> verify shape as ``execute_replace_text_live``,
+    with a verification predicate suited to what ``format`` actually
+    changes: unlike ``replace``, a format-only op never changes
+    ``body.text`` (per ``live/protocol.py``'s own documented
+    ``FormatResult`` shape and ``tests/unit/fake_pane.py``'s
+    ``FakeDocument.format`` -- both report ``pre == post`` for a format
+    op even when the style genuinely changed), so a ``post != pre``
+    check would be wrong here -- it is REQUIRED to differ for replace,
+    and EXPECTED to be equal for format. What IS checked: the pane
+    reported ``applied: true``, and every matched range's ``after`` text
+    still equals its own ``before`` text (format changes styling, never
+    content -- a match whose text changed anyway is a real verification
+    failure, not a false alarm).
+    """
+    style = _validate_style(style)
+    if not find:
+        raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty")
+
+    session = live_write_mode.live_session_for(path)
+    document_name = session.document_name
+
+    try:
+        pre_hash = _live_describe(session, path, revision_before)
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+
+    payload = {
+        "find": find,
+        "expected_matches": expected_matches,
+        "bold": style.get("bold"),
+        "italic": style.get("italic"),
+        "underline": style.get("underline"),
+        "track_changes": track_changes,
+    }
+    try:
+        result = session.request_threadsafe("format", payload, expected_body_sha256=pre_hash)
+    except LiveStale as exc:
+        raise _make_error(
+            ErrorCode.LIVE_STALE, str(exc), {"expected": exc.expected, "actual": exc.actual}
+        ) from exc
+    except LiveOpFailed as exc:
+        raise _make_error(
+            live_write_mode.classify_op_failed(exc), exc.message, {"pane_code": exc.code}
+        ) from exc
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+
+    matches = result.get("matches") or []
+    match_count = result.get("match_count", len(matches))
+    post_hash = result.get("post")
+
+    if not result.get("applied"):
+        raise _make_error(
+            ErrorCode.VERIFICATION_FAILED,
+            "live format did not verify: the pane did not report applied=true. Nothing to roll "
+            "back in live mode -- Word, not this server, owns the document; re-read via describe/"
+            "read_document and retry.",
+            {"pre": pre_hash, "post": post_hash, "applied": result.get("applied")},
+        )
+    for m in matches:
+        if m.get("after") != m.get("before"):
+            raise _make_error(
+                ErrorCode.VERIFICATION_FAILED,
+                "live format did not verify: a matched range's text changed, but format_text must "
+                f"never change content ({m.get('before')!r} -> {m.get('after')!r}). Nothing to "
+                "roll back in live mode -- Word, not this server, owns the document.",
+                {"matches": matches},
+            )
+
+    before_text = "\n".join(m.get("before", "") for m in matches)
+    after_text = "\n".join(m.get("after", "") for m in matches)
+
+    return live_write_mode.live_evidence(
+        applied=True,
+        match_count=match_count,
+        rung=1,
+        before=before_text,
+        after=after_text,
+        pre_body_sha256=pre_hash,
+        post_body_sha256=post_hash,
+        document_name=document_name,
+        tool="format_text",
+        path=path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tool 2: format_text
 # ---------------------------------------------------------------------------
@@ -667,8 +904,20 @@ def execute_format_text(
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
+    write_mode: str = "auto",
 ) -> dict[str, Any]:
     style = _validate_style(style)
+    mode = live_write_mode.resolve_write_mode(path, write_mode)
+    if mode == "live":
+        return execute_format_text_live(
+            path,
+            find,
+            style,
+            expected_matches,
+            revision_before=revision_before,
+            track_changes=track_changes,
+        )
+
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(resolved, revision_before)
 
@@ -1031,5 +1280,77 @@ def execute_apply_style(
     evidence["style_id"] = style_id
     evidence["style_type"] = style_type
     logged, _ = audit.append_audit(path=str(resolved), tool="apply_style", evidence=evidence)
+    evidence["audit_logged"] = logged
+    return evidence
+
+
+# ---------------------------------------------------------------------------
+# Tool: live_save (issue #106 WP-3: https://github.com/michaelrobertsutton/JennyStack/issues/106)
+# ---------------------------------------------------------------------------
+
+
+def execute_live_save(path: str) -> dict[str, Any]:
+    """Ask the connected pane to save the live document (``document.save()``
+    via the ``save`` op), then bridge back to a file-mode revision token.
+
+    Word owns the file for the whole live session -- nothing this server
+    writes directly -- so ``live_save`` is the one point where a live
+    edit becomes visible on disk again. After the pane confirms
+    ``saved: true``, this re-describes the pane (for its own
+    ``"live:sha256:..."`` ``revision_after``) and separately computes
+    ``projection.compute_revision(path)["token"]`` (the SAME token
+    ``replace_body_markdown``/``replace_text``/etc. use in file mode) as
+    ``file_revision``, so a caller that wants to keep working against the
+    file-mode revision contract after a live session has one to pass as
+    the next file-mode call's ``revision_before``.
+
+    Structural verification (tables, whole-section rewrites -- rungs 3/4,
+    which never go live per the plan) against the now-saved file is the
+    caller's own job afterward, via the existing read tools
+    (``read_document``/``find_sections``/``diff_body_vs_file``/etc.) --
+    this tool only confirms the save itself, not the file's contents.
+
+    Errors:
+      LIVE_UNAVAILABLE   - no connected pane session for this document
+      LIVE_DISCONNECTED  - the pane's socket closed, or the save timed out
+      LIVE_OP_FAILED     - the pane replied ok=false to 'save'
+      VERIFICATION_FAILED - the pane replied ok=true but did not report saved=true
+    """
+    session = live_write_mode.live_session_for(path)
+    document_name = session.document_name
+
+    try:
+        result = session.request_threadsafe("save")
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+    except LiveOpFailed as exc:
+        raise _make_error(
+            live_write_mode.classify_op_failed(exc), exc.message, {"pane_code": exc.code}
+        ) from exc
+
+    if not result.get("saved"):
+        raise _make_error(
+            ErrorCode.VERIFICATION_FAILED,
+            "live_save did not verify: the pane replied without saved=true.",
+            {"result": result},
+        )
+
+    try:
+        describe_result = session.request_threadsafe("describe")
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+    post_hash = describe_result["bodySha256"]
+
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    file_revision = projection.compute_revision(resolved)["token"]
+
+    evidence: dict[str, Any] = {
+        "applied": True,
+        "saved": True,
+        "document_name": document_name,
+        "revision_after": f"live:sha256:{post_hash}",
+        "file_revision": file_revision,
+    }
+    logged, _ = audit.append_audit(path=str(resolved), tool="live_save", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence

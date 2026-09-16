@@ -59,7 +59,15 @@ Tools implemented so far:
   targeted text edits located via a normalization ladder (exact ->
   curly/straight quotes -> NBSP/whitespace collapse -> soft-hyphen
   strip), with run splitting that clones a boundary run's original
-  `w:rPr` verbatim onto every surviving piece.
+  `w:rPr` verbatim onto every surviving piece. Both take a `write_mode:
+  "auto" | "file" | "live"` parameter (default `"auto"`): `"auto"` edits
+  through a connected Word task pane instead of the file when the
+  document is open in Word with the Live pane loaded, otherwise the file
+  path unchanged — see [Live mode](#live-mode) below.
+- **`live_save(path)`** — ask the connected pane to save the live
+  document, then report both the pane's own live revision token and a
+  bridge back to the file-mode revision contract (`file_revision`) for a
+  caller that wants to keep working against the file afterward.
 - **`list_open_items(path, source="auto")`**, **`accept_tracked_changes(path,
   revision_ids?, ...)`**, **`reject_tracked_changes(path, revision_ids?,
   ...)`** — list open comments/pending tracked changes (Google's response
@@ -339,15 +347,17 @@ document_url, connected_since, last_heartbeat_age_s, body_sha256,
 requirement_sets}]}` — an empty `sessions` list is normal before the lead
 opens the pane in Word.
 
-`write_mode="live"` (`"auto" | "file" | "live"`) is wired up on
-`add_anchored_comment`/`reply_to_comment`/`resolve_comment`, and a
-parallel `source="live"` on `list_open_items` — going through the
-connected pane instead of the on-disk `.docx` parts, with a `correlation`
-list bridging a live comment's own id back to the durableId/w:id file
-mode reports (Office.js's `Comment.id` is unrelated to either). Live
-`replace_text`/`format_text` is a separate, parallel work package.
-Full architecture, the correlation algorithm, and the lead's sideload
-runbook: [`docs/live-mode.md`](docs/live-mode.md).
+`write_mode: "auto" | "file" | "live"` (default `"auto"`) is wired up on
+`replace_text`/`format_text` (WP-3) and on
+`add_anchored_comment`/`reply_to_comment`/`resolve_comment` (WP-4), with a
+parallel `source="live"` on `list_open_items` — each goes through the connected
+pane instead of the on-disk `.docx` parts when the document is open in Word with
+the Live pane loaded, otherwise the file path unchanged. `live_save(path)` asks the
+pane to save. `list_open_items(source="live")` carries a `correlation` list bridging
+a live comment's own id back to the durableId/w:id file mode reports (Office.js's
+`Comment.id` is unrelated to either). Full architecture, the `write_mode` rule and
+live evidence shape, the correlation algorithm, and the lead's sideload runbook:
+[`docs/live-mode.md`](docs/live-mode.md).
 
 ## Path safety
 

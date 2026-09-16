@@ -83,14 +83,8 @@ _LIVE_HANDLE_PREFIX = "live:"
 # ---------------------------------------------------------------------------
 # Write-mode / source resolution and session lookup.
 #
-# TODO(WP-3 merge): WP-3 is building a shared live/write_mode.py
-# (resolve_write_mode(path, requested), live_session_for(path),
-# live_evidence(...)) with the SAME semantics as the two helpers just
-# below. That module may not exist yet on this branch (WP-3 runs in
-# parallel off the same WP-2 base), so this file defines its own private
-# copies rather than depending on it -- replace both call sites with
-# live.write_mode.* once WP-3 lands and dedupe.
-# ---------------------------------------------------------------------------
+# The write-mode resolver and session lookup live in live/write_mode.py (WP-3);
+# the thin wrappers below keep the comment tools on that single rule.
 
 
 def _document_name_and_path(path: str) -> tuple[Any, str]:
@@ -100,8 +94,19 @@ def _document_name_and_path(path: str) -> tuple[Any, str]:
     return resolved, resolved.name
 
 
+class _NoSessions:
+    """Stand-in registry when the bridge is not running: every lookup misses."""
+
+    def get(self, _document_name: str):
+        return None
+
+
 def _registry():
-    return live_bridge.start_in_background()
+    # Never start_in_background() here: an ordinary file-mode call must not
+    # bind the bridge's real ports as a side effect (same rule as
+    # live/write_mode.py). Only live_status, or an already-connected pane,
+    # brings the bridge up.
+    return live_bridge.current_registry() or _NoSessions()
 
 
 def _make_error(code, message: str, diagnostics: dict[str, Any]):
@@ -110,50 +115,15 @@ def _make_error(code, message: str, diagnostics: dict[str, Any]):
     return _make(code, message, diagnostics)
 
 
-# TODO(WP-3 merge): replace with live.write_mode.resolve_write_mode
 def _resolve_write_mode(path: str, requested: str) -> str:
-    """"auto" | "file" | "live" -> "file" | "live". See this module's
-    docstring and docs/live-mode.md for the exact "auto" rule."""
-    from ..errors import ErrorCode
+    """Delegates to the shared resolver (live/write_mode.py, WP-3) so the
+    comment tools and the text tools apply one identical "auto" rule."""
+    from . import write_mode as _wm
 
-    if requested not in VALID_WRITE_MODES:
-        raise _make_error(
-            ErrorCode.INVALID_INPUT,
-            f"write_mode must be one of {VALID_WRITE_MODES}, got {requested!r}",
-            {"write_mode": requested},
-        )
-    if requested == "file":
-        return "file"
-
-    _resolved, document_name = _document_name_and_path(path)
-    if requested == "live":
-        if _registry().get(document_name) is None:
-            raise _make_error(
-                ErrorCode.LIVE_UNAVAILABLE,
-                f"write_mode='live' requested but no connected pane session for document {document_name!r}",
-                {"document_name": document_name},
-            )
-        return "live"
-
-    # "auto": live only when a desktop Word owner file is present for
-    # this exact path AND a pane session for the same document name is
-    # already connected -- both conditions, not either (docs/live-
-    # mode.md's design section, mirrored from the plan text). Reuses
-    # mutations._QUIESCE_INTERVAL_SECONDS (module-level, test-shrinkable
-    # the same way _guard_before_write's own lock_status call is) rather
-    # than lock_status's own 1.5s default, so a test suite exercising
-    # "auto" doesn't eat that wait on every single resolution.
-    from .. import mutations
-    from .. import server as _server
-
-    status = _server.execute_lock_status(str(_resolved), quiesce_interval=mutations._QUIESCE_INTERVAL_SECONDS)
-    owner = status["owner_file"]
-    if owner["present"] and owner["format"] == "word" and _registry().get(document_name) is not None:
-        return "live"
-    return "file"
+    return _wm.resolve_write_mode(path, requested)
 
 
-# TODO(WP-3 merge): replace with live.write_mode.resolve_source
+# list_open_items' own read rule (live whenever a pane session exists; reads never refuse).
 def _resolve_source(path: str, requested: str) -> str:
     from ..errors import ErrorCode
 
@@ -182,19 +152,11 @@ def _resolve_source(path: str, requested: str) -> str:
     return "live" if _registry().get(document_name) is not None else "file"
 
 
-# TODO(WP-3 merge): replace with live.write_mode.live_session_for
 def _session_for(path: str) -> LiveSession:
-    from ..errors import ErrorCode
+    """Delegates to live.write_mode.live_session_for (WP-3)."""
+    from . import write_mode as _wm
 
-    _resolved, document_name = _document_name_and_path(path)
-    session = _registry().get(document_name)
-    if session is None:
-        raise _make_error(
-            ErrorCode.LIVE_UNAVAILABLE,
-            f"no connected pane session for document {document_name!r}",
-            {"document_name": document_name},
-        )
-    return session
+    return _wm.live_session_for(path)
 
 
 def _raise_from_live_error(exc: BaseException) -> None:
