@@ -144,6 +144,96 @@ class AllowedFileRootsTests(unittest.TestCase):
             self.assertIn("credential", ctx.exception.envelope.message)
 
 
+class DefaultAllowedRootsTests(unittest.TestCase):
+    """issue #101: the default allowed roots (env unset) widen to include
+    paths._claude_code_scratch_root() when it exists. An explicit
+    VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS is used verbatim — never widened
+    with, or narrowed to, the scratch root."""
+
+    def setUp(self):
+        self._old_env = os.environ.get(paths._ALLOWED_FILE_ROOTS_ENV)
+        os.environ.pop(paths._ALLOWED_FILE_ROOTS_ENV, None)
+        self._home_tmp = tempfile.TemporaryDirectory()
+        self.fake_home = Path(self._home_tmp.name) / "home"
+        self.fake_home.mkdir()
+        self._scratch_tmp = tempfile.TemporaryDirectory()
+        self.fake_scratch = Path(self._scratch_tmp.name) / "scratch"
+        self.fake_scratch.mkdir()
+        self._explicit_tmp = tempfile.TemporaryDirectory()
+        self.explicit_root = Path(self._explicit_tmp.name) / "explicit"
+        self.explicit_root.mkdir()
+
+    def tearDown(self):
+        if self._old_env is None:
+            os.environ.pop(paths._ALLOWED_FILE_ROOTS_ENV, None)
+        else:
+            os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = self._old_env
+        self._home_tmp.cleanup()
+        self._scratch_tmp.cleanup()
+        self._explicit_tmp.cleanup()
+
+    def test_env_unset_scratch_present_widens_default(self):
+        home_file = self.fake_home / "doc.docx"
+        home_file.write_bytes(b"stub")
+        scratch_file = self.fake_scratch / "doc.docx"
+        scratch_file.write_bytes(b"stub")
+        with mock.patch.object(Path, "home", return_value=self.fake_home), mock.patch.object(
+            paths, "_claude_code_scratch_root", return_value=self.fake_scratch
+        ):
+            self.assertEqual(paths.resolve_allowed_docx_path(str(home_file)), home_file.resolve())
+            self.assertEqual(paths.resolve_allowed_docx_path(str(scratch_file)), scratch_file.resolve())
+
+    def test_env_unset_scratch_absent_home_only(self):
+        home_file = self.fake_home / "doc.docx"
+        home_file.write_bytes(b"stub")
+        would_be_scratch_file = self.fake_scratch / "doc.docx"
+        would_be_scratch_file.write_bytes(b"stub")
+        with mock.patch.object(Path, "home", return_value=self.fake_home), mock.patch.object(
+            paths, "_claude_code_scratch_root", return_value=None
+        ):
+            self.assertEqual(paths._allowed_file_roots(), [self.fake_home.resolve()])
+            self.assertEqual(paths.resolve_allowed_docx_path(str(home_file)), home_file.resolve())
+            with self.assertRaises(VerifyError) as ctx:
+                paths.resolve_allowed_docx_path(str(would_be_scratch_file))
+            self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    def test_env_set_explicit_allowlist_excludes_scratch_root(self):
+        os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = str(self.explicit_root)
+        scratch_file = self.fake_scratch / "doc.docx"
+        scratch_file.write_bytes(b"stub")
+        with mock.patch.object(paths, "_claude_code_scratch_root", return_value=self.fake_scratch):
+            self.assertEqual(paths._allowed_file_roots(), [self.explicit_root.resolve()])
+            with self.assertRaises(VerifyError) as ctx:
+                paths.resolve_allowed_docx_path(str(scratch_file))
+            self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    def test_denylist_applies_inside_home_with_widened_default(self):
+        with mock.patch.object(Path, "home", return_value=self.fake_home), mock.patch.object(
+            paths, "_claude_code_scratch_root", return_value=self.fake_scratch
+        ):
+            ssh_dir = self.fake_home / ".ssh"
+            ssh_dir.mkdir()
+            key = ssh_dir / "id_rsa"
+            key.write_bytes(b"stub")
+            with self.assertRaises(VerifyError) as ctx:
+                paths.resolve_allowed_docx_path(str(key))
+            self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+            self.assertIn("credential", ctx.exception.envelope.message)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS /tmp -> /private/tmp alias only")
+    def test_tmp_spelling_of_scratch_path_resolves_via_private_tmp_alias(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as real_scratch_dir:
+            real_scratch = Path(real_scratch_dir)
+            target = real_scratch / "doc.docx"
+            target.write_bytes(b"stub")
+            tmp_spelling = Path("/tmp") / real_scratch.relative_to("/private/tmp") / "doc.docx"
+            with mock.patch.object(Path, "home", return_value=self.fake_home), mock.patch.object(
+                paths, "_claude_code_scratch_root", return_value=real_scratch
+            ):
+                resolved = paths.resolve_allowed_docx_path(str(tmp_spelling))
+            self.assertEqual(resolved, target.resolve())
+
+
 class SnapshotDocxPackageTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

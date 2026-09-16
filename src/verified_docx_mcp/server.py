@@ -183,11 +183,12 @@ def export_pdf(path: str, output_path: str) -> dict[str, Any]:
     """Render a local .docx to PDF via Microsoft Word and report its page count.
 
     output_path must fall inside VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS
-    (defaults to the user's home directory), must not resolve to a
-    credential path, and its parent directory must already exist. This is
-    a read/render tool: the source .docx is never modified (Word opens a
-    private staged copy — see render.py), so the return value has no
-    "applied" key.
+    (defaults to the user's home directory plus the Claude Code scratch
+    root, /private/tmp/claude-<uid>, when that directory exists), must not
+    resolve to a credential path, and its parent directory must already
+    exist. This is a read/render tool: the source .docx is never modified
+    (Word opens a private staged copy — see render.py), so the return value
+    has no "applied" key.
 
     Returns pdf_path, sha256, page_count (best-effort; None — never a
     guessed 0 — when it cannot be determined), page_count_source
@@ -2007,6 +2008,9 @@ def doctor() -> int:
     issue #30 WP-04 — "the #30 doctor checks"; pandoc/uv presence are
     intentionally NOT carried over, since this server has no runtime
     dependency on either — see this WP's PR notes for the correction):
+      0. NOTE (read-only, never fails): the effective allowed file roots and
+         whether they came from VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS or the
+         default (issue #101)
       1. Microsoft Word present
       2. Word's sandbox container directory exists
       3. pdfinfo present (ADVISORY — page counts fall back to a regex)
@@ -2031,6 +2035,14 @@ def doctor() -> int:
         )
 
     print("== verified-docx-mcp doctor: Word PDF render path ==\n")
+
+    # 0. Effective allowed file roots (read-only; issue #101)
+    allowed_roots_source = "env" if os.environ.get(paths._ALLOWED_FILE_ROOTS_ENV) is not None else "default"
+    effective_roots = ", ".join(str(root) for root in paths._allowed_file_roots())
+    _doctor_print(
+        "NOTE",
+        f"allowed file roots ({allowed_roots_source}): {effective_roots}",
+    )
 
     # 1. Microsoft Word present
     word_present = Path(_WORD_APP_PATH).is_dir()
