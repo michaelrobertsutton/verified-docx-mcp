@@ -63,6 +63,8 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         # issue #28 WP-15a (read_header_footer is read-only, not listed here):
         "insert_image",
         "apply_style",
+        # issue #106 WP-3 (live_status is read-only, not listed here):
+        "live_save",
     }
 )
 

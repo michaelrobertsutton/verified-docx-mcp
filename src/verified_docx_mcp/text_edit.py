@@ -1282,3 +1282,75 @@ def execute_apply_style(
     logged, _ = audit.append_audit(path=str(resolved), tool="apply_style", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
+
+
+# ---------------------------------------------------------------------------
+# Tool: live_save (issue #106 WP-3: https://github.com/michaelrobertsutton/JennyStack/issues/106)
+# ---------------------------------------------------------------------------
+
+
+def execute_live_save(path: str) -> dict[str, Any]:
+    """Ask the connected pane to save the live document (``document.save()``
+    via the ``save`` op), then bridge back to a file-mode revision token.
+
+    Word owns the file for the whole live session -- nothing this server
+    writes directly -- so ``live_save`` is the one point where a live
+    edit becomes visible on disk again. After the pane confirms
+    ``saved: true``, this re-describes the pane (for its own
+    ``"live:sha256:..."`` ``revision_after``) and separately computes
+    ``projection.compute_revision(path)["token"]`` (the SAME token
+    ``replace_body_markdown``/``replace_text``/etc. use in file mode) as
+    ``file_revision``, so a caller that wants to keep working against the
+    file-mode revision contract after a live session has one to pass as
+    the next file-mode call's ``revision_before``.
+
+    Structural verification (tables, whole-section rewrites -- rungs 3/4,
+    which never go live per the plan) against the now-saved file is the
+    caller's own job afterward, via the existing read tools
+    (``read_document``/``find_sections``/``diff_body_vs_file``/etc.) --
+    this tool only confirms the save itself, not the file's contents.
+
+    Errors:
+      LIVE_UNAVAILABLE   - no connected pane session for this document
+      LIVE_DISCONNECTED  - the pane's socket closed, or the save timed out
+      LIVE_OP_FAILED     - the pane replied ok=false to 'save'
+      VERIFICATION_FAILED - the pane replied ok=true but did not report saved=true
+    """
+    session = live_write_mode.live_session_for(path)
+    document_name = session.document_name
+
+    try:
+        result = session.request_threadsafe("save")
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+    except LiveOpFailed as exc:
+        raise _make_error(
+            live_write_mode.classify_op_failed(exc), exc.message, {"pane_code": exc.code}
+        ) from exc
+
+    if not result.get("saved"):
+        raise _make_error(
+            ErrorCode.VERIFICATION_FAILED,
+            "live_save did not verify: the pane replied without saved=true.",
+            {"result": result},
+        )
+
+    try:
+        describe_result = session.request_threadsafe("describe")
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+    post_hash = describe_result["bodySha256"]
+
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    file_revision = projection.compute_revision(resolved)["token"]
+
+    evidence: dict[str, Any] = {
+        "applied": True,
+        "saved": True,
+        "document_name": document_name,
+        "revision_after": f"live:sha256:{post_hash}",
+        "file_revision": file_revision,
+    }
+    logged, _ = audit.append_audit(path=str(resolved), tool="live_save", evidence=evidence)
+    evidence["audit_logged"] = logged
+    return evidence

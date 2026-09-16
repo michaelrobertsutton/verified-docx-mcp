@@ -1485,6 +1485,55 @@ def format_text(
 
 
 # ---------------------------------------------------------------------------
+# Tool: live_save (issue #106 WP-3:
+# https://github.com/michaelrobertsutton/JennyStack/issues/106)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def live_save(path: str) -> dict[str, Any]:
+    """Ask the connected Word task pane to save the live document.
+
+    Word owns the open document for the whole live session -- nothing a
+    live `replace_text`/`format_text` call does writes to the .docx file
+    directly. `live_save` is the one point where a live session's edits
+    become visible on disk again: it sends the pane's `save` op
+    (`document.save()`), then reports both the pane's own live revision
+    token AND a bridge back to the file-mode revision contract, so a
+    caller that wants to keep working against the file after a live
+    session has a `file_revision` to pass as the next file-mode call's
+    `revision_before`.
+
+    Structural verification (tables, whole-section rewrites -- rungs 3
+    and 4, which never go live) against the now-saved file is the
+    caller's own job afterward, via the existing read tools
+    (`read_document`/`find_sections`/`diff_body_vs_file`) -- this tool
+    only confirms the save itself, not the file's contents.
+
+    Mutating (added to MUTATING_TOOLS): the middleware requires an
+    `applied` key, which this tool always returns on success.
+
+    Returns `applied`, `saved` (bool), `document_name`, `revision_after`
+    (`"live:sha256:<hex>"` of the pane's body hash right after the save),
+    `file_revision` (the plain revision TOKEN STRING --
+    `projection.compute_revision(path)["token"]` -- the same shape
+    `replace_text`/`replace_body_markdown`/etc. use as `revision_before`/
+    `revision_after` in file mode, computed from the now-saved file on
+    disk), and `audit_logged`.
+
+    Errors:
+      LIVE_UNAVAILABLE   - no connected pane session for this document
+      LIVE_DISCONNECTED  - the pane's socket closed, or the save timed out
+      LIVE_OP_FAILED     - the pane replied ok=false to 'save'
+      VERIFICATION_FAILED - the pane replied ok=true but did not report saved=true
+    """
+    try:
+        return text_edit.execute_live_save(path)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
 # Tracked changes (WP-07): list_open_items (read-only), accept_tracked_
 # changes / reject_tracked_changes (mutating, in MUTATING_TOOLS). Also
 # where replace_text/format_text's own TRACKED_CHANGES_PRESENT refusal
