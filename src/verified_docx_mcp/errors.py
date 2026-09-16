@@ -104,6 +104,22 @@ class ErrorCode(Enum):
     # Style application (text_edit.py; issue #28 WP-15a)
     UNSUPPORTED_STYLE_TYPE = "UNSUPPORTED_STYLE_TYPE"  # apply_style's style_id names a style whose w:type is neither "paragraph" nor "character" (e.g. "table"/"numbering")
 
+    # Live mode (live/session.py, live/bridge.py; issue #106 WP-2). Every
+    # member here maps 1:1 to a live/session.py exception of the same
+    # shape (LiveUnavailable/LiveDisconnected/LiveStale/LiveOpFailed);
+    # server.py's WP-3/WP-4 live write path is what actually catches
+    # those and raises these. Declared now, in the same commit as the
+    # session-layer exceptions they mirror, per this file's own header
+    # comment's rule ("extend this enum in the same commit that first
+    # raises a new member") -- not yet raised by any tool in this WP
+    # (write_mode="live" lands in WP-3/WP-4), same status as
+    # CONFLICT_COPY_DETECTED/SYNC_IN_FLIGHT above when THEY were first
+    # declared.
+    LIVE_UNAVAILABLE = "LIVE_UNAVAILABLE"  # no connected pane session for the target document (live/session.py LiveUnavailable)
+    LIVE_DISCONNECTED = "LIVE_DISCONNECTED"  # the pane's WebSocket closed mid-request, or a reply never arrived within the op timeout (live/session.py LiveDisconnected)
+    LIVE_STALE = "LIVE_STALE"  # the pane's body hash before the op (result["pre"]) did not match a caller-supplied expected_body_sha256 (live/session.py LiveStale)
+    LIVE_OP_FAILED = "LIVE_OP_FAILED"  # the pane replied ok=false (e.g. an expected_matches count mismatch it refused to act on) (live/session.py LiveOpFailed)
+
 
 # Which codes signal a transient condition worth a single retry by the
 # caller. Empty for now — WP-02 has no revision-stamped write to race
