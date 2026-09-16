@@ -489,7 +489,34 @@ def execute_list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
 def execute_add_anchored_comment_live(
     path: str, quote: str, text: str, expected_matches: int
 ) -> dict[str, Any]:
+    """``write_mode="live"`` path for ``add_anchored_comment``: sends
+    ``comment_add`` (``find=quote``, ``expected_matches``) to the
+    connected pane and returns the same evidence shape file mode's own
+    ``comments.execute_add_anchored_comment`` does.
+
+    ``rung`` is ``locate.RUNG_EXACT`` (``"exact"``) -- the same value
+    file mode's own ``add_anchored_comment`` reports for an ordinary
+    single-pass match (``comments.execute_add_anchored_comment``'s
+    ``locate_result.rung``, from ``locate.py``'s normalization ladder;
+    NOT the unrelated numeric edit-ladder ``rung`` `replace_text`/
+    `format_text`'s live evidence reports -- see ``live/write_mode.py``
+    and ``docs/live-mode.md``'s own note on that overload). The pane's
+    own ``body.search`` has no multi-rung normalization ladder of its
+    own to fall back through the way file mode's ``locate()`` does, so
+    every successful live match is reported at this top rung.
+
+    Known limitation (issue #106 WP-6, unchanged by this fix -- inherited
+    from WP-2's already-built pane dispatcher, not something this PR's
+    plan touches): the pane's ``comment_add`` op inserts a comment on the
+    FIRST match only, even when ``expected_matches > 1`` -- unlike file
+    mode, which comments every match. The count is still verified before
+    anything is inserted (a count mismatch still raises
+    ``MATCH_COUNT_MISMATCH``/``ZERO_MATCH``), so this only affects WHERE
+    the comment lands when ``expected_matches > 1``, not whether the call
+    refuses on a bad count.
+    """
     from .. import audit
+    from ..locate import RUNG_EXACT
 
     resolved, document_name = _document_name_and_path(path)
     session = _session_for(path)
@@ -504,7 +531,7 @@ def execute_add_anchored_comment_live(
     evidence: dict[str, Any] = {
         "applied": True,
         "match_count": expected_matches,
-        "rung": "live",
+        "rung": RUNG_EXACT,
         "before": quote,
         "after": quote,  # a comment never edits document text, live or otherwise
         "revision_before": f"live:sha256:{pre}" if pre else None,
@@ -529,10 +556,24 @@ def execute_add_anchored_comment_live(
 
 
 def execute_reply_to_comment_live(path: str, comment_id: str, text: str) -> dict[str, Any]:
+    """``write_mode="live"`` path for ``reply_to_comment``.
+
+    ``revision_before``/``revision_after`` are ``"live:sha256:<hex>"`` of
+    a ``describe`` call's ``bodySha256`` taken immediately before and
+    after the ``comment_reply`` op -- the same ``live:sha256:`` token
+    shape ``live/write_mode.live_evidence`` uses for ``replace_text``/
+    ``format_text``, so a reply's evidence is never the bare ``None`` a
+    caller might mistake for "not computed". A comment reply never edits
+    document body text, so the two will typically read identical (mirrors
+    ``format_text``'s own ``revision_before == revision_after`` case) --
+    that is expected, not a sign the op did nothing.
+    """
     from .. import audit
 
     resolved, document_name = _document_name_and_path(path)
     session = _session_for(path)
+
+    pre_body_sha256 = _request(session, "describe").get("bodySha256")
 
     raw_comments, correlation = _live_state(path, session)
     live_handle, resolved_via = _resolve_comment_handle(comment_id, correlation)
@@ -557,14 +598,16 @@ def execute_reply_to_comment_live(path: str, comment_id: str, text: str) -> dict
             {"comment_id": comment_id, "live_handle": f"{_LIVE_HANDLE_PREFIX}{live_handle}"},
         )
 
+    post_body_sha256 = _request(session, "describe").get("bodySha256")
+
     evidence: dict[str, Any] = {
         "applied": True,
         "match_count": 1,
         "rung": "reply",
         "before": parent_anchor,
         "after": parent_anchor,  # a reply never edits document text
-        "revision_before": None,
-        "revision_after": None,
+        "revision_before": f"live:sha256:{pre_body_sha256}" if pre_body_sha256 else None,
+        "revision_after": f"live:sha256:{post_body_sha256}" if post_body_sha256 else None,
         "audit_logged": False,
         "comment_id": f"{_LIVE_HANDLE_PREFIX}{live_handle}",
         "parent_comment_id": comment_id,
@@ -580,11 +623,18 @@ def execute_reply_to_comment_live(path: str, comment_id: str, text: str) -> dict
 
 
 def execute_resolve_comment_live(path: str, comment_id: str) -> dict[str, Any]:
+    """``write_mode="live"`` path for ``resolve_comment``. See
+    ``execute_reply_to_comment_live``'s own docstring for why
+    ``revision_before``/``revision_after`` are ``describe``-sourced
+    ``live:sha256:`` tokens rather than ``None`` -- the same reasoning
+    applies here (a resolve never edits body text either)."""
     from .. import audit
     from ..errors import ErrorCode, _make_error
 
     resolved, document_name = _document_name_and_path(path)
     session = _session_for(path)
+
+    pre_body_sha256 = _request(session, "describe").get("bodySha256")
 
     _raw_comments, correlation = _live_state(path, session)
     live_handle, resolved_via = _resolve_comment_handle(comment_id, correlation)
@@ -602,14 +652,16 @@ def execute_resolve_comment_live(path: str, comment_id: str) -> dict[str, Any]:
             {"comment_id": comment_id, "live_handle": f"{_LIVE_HANDLE_PREFIX}{live_handle}"},
         )
 
+    post_body_sha256 = _request(session, "describe").get("bodySha256")
+
     evidence: dict[str, Any] = {
         "applied": True,
         "match_count": 1,
         "rung": "resolve",
         "before": "open",
         "after": "resolved",
-        "revision_before": None,
-        "revision_after": None,
+        "revision_before": f"live:sha256:{pre_body_sha256}" if pre_body_sha256 else None,
+        "revision_after": f"live:sha256:{post_body_sha256}" if post_body_sha256 else None,
         "audit_logged": False,
         "comment_id": f"{_LIVE_HANDLE_PREFIX}{live_handle}",
         "comment_id_resolved_via": resolved_via,

@@ -1770,7 +1770,11 @@ def add_anchored_comment(
     are added only when non-empty. Not present in live mode (no conflict-
     copy fields there); live evidence instead carries write_mode
     ("live"), verified_via ("word-addin"), document_name, author
-    ("word-signed-in-user"), and orphaned_comment_ids ([]).
+    ("word-signed-in-user"), and orphaned_comment_ids ([]). In live mode,
+    `rung` is `locate.RUNG_EXACT` ("exact") -- the same value file mode's
+    own `add_anchored_comment` reports for an ordinary single-pass match
+    (not the string "live", and not the unrelated numeric edit-ladder
+    `rung` replace_text/format_text's live evidence reports).
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or an empty quote
@@ -1883,7 +1887,12 @@ def reply_to_comment(path: str, comment_id: str, text: str, write_mode: str = "a
     an already-successful write); conflict_copies/sibling_files_changed
     are added only when non-empty. Not present in live mode; live
     evidence instead carries write_mode ("live"), verified_via
-    ("word-addin"), document_name, and author ("word-signed-in-user").
+    ("word-addin"), document_name, and author ("word-signed-in-user"). In
+    live mode, revision_before/revision_after are `"live:sha256:<hex>"`
+    of a `describe` call's body hash taken immediately before/after the
+    op (same token shape replace_text/format_text/add_anchored_comment's
+    live evidence uses) -- typically equal, since a reply never edits
+    body text, mirroring format_text's own before==after case.
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or
@@ -1966,7 +1975,12 @@ def resolve_comment(path: str, comment_id: str, write_mode: str = "auto") -> dic
     an already-successful write); conflict_copies/sibling_files_changed
     are added only when non-empty. Not present in live mode; live
     evidence instead carries write_mode ("live"), verified_via
-    ("word-addin"), document_name, and author ("word-signed-in-user").
+    ("word-addin"), document_name, and author ("word-signed-in-user"). In
+    live mode, revision_before/revision_after are `"live:sha256:<hex>"`
+    of a `describe` call's body hash taken immediately before/after the
+    op (same token shape replace_text/format_text/add_anchored_comment's
+    live evidence uses) -- typically equal, since a resolve never edits
+    body text.
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or

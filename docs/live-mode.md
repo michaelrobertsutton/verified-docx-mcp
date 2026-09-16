@@ -473,17 +473,21 @@ own).
 names WP-3 adds for `replace_text`/`format_text`, so the two branches'
 additions to `protocol.py` merge without conflict) map onto `ZERO_MATCH`/
 `MATCH_COUNT_MISMATCH`. Known limitation, inherited from WP-2's already-
-built pane dispatcher: the pane's `comment_add` op inserts on the FIRST
-match only, even when `expected_matches > 1` — unlike file mode's one-
-comment-per-match behavior — though the count is still verified before
-anything is inserted. Evidence carries the usual eight keys (`before`/
-`after` are the quote, unchanged) plus `comment_id`/`comment_ids` (the
-`live:<id>` handle), `revision_before`/`revision_after` as
-`"live:sha256:<pre/post>"`, `write_mode: "live"`, `verified_via:
-"word-addin"`, `document_name`, `author: "word-signed-in-user"` (Word's
-signed-in user; the pane cannot be told to claim a different one), and
-`orphaned_comment_ids: []`. No conflict-copy fields — those are a file-
-mode-only concept.
+built pane dispatcher (unchanged by WP-6): the pane's `comment_add` op
+inserts on the FIRST match only, even when `expected_matches > 1` —
+unlike file mode's one-comment-per-match behavior — though the count is
+still verified before anything is inserted. Evidence carries the usual
+eight keys (`before`/`after` are the quote, unchanged; `rung` is
+`locate.RUNG_EXACT`, `"exact"` — the same value file mode's own
+`add_anchored_comment` reports for an ordinary single-pass match, fixed
+from an earlier `"live"` placeholder — not the unrelated numeric
+edit-ladder `rung` `replace_text`/`format_text`'s live evidence reports)
+plus `comment_id`/`comment_ids` (the `live:<id>` handle),
+`revision_before`/`revision_after` as `"live:sha256:<pre/post>"`,
+`write_mode: "live"`, `verified_via: "word-addin"`, `document_name`,
+`author: "word-signed-in-user"` (Word's signed-in user; the pane cannot
+be told to claim a different one), and `orphaned_comment_ids: []`. No
+conflict-copy fields — those are a file-mode-only concept.
 
 **`reply_to_comment`/`resolve_comment(write_mode="live")`.** Resolve the
 handle as described above (`comment_id_resolved_via`: `"live-handle"` |
@@ -493,7 +497,13 @@ the pane's own `ok:true` alone, the same discipline file mode's own
 `resolve_comment` already applies to its post-write re-read. Reply
 verification looks for a reply whose content equals the text sent;
 resolve verification raises the existing `COMMENT_STILL_OPEN` if the
-re-list does not show `resolved: true`.
+re-list does not show `resolved: true`. `revision_before`/`revision_after`
+are now (WP-6 fix) `"live:sha256:<hex>"` of a `describe` call's body hash
+taken immediately before and after the op — fixed from an earlier `null`
+placeholder — the same token shape `replace_text`/`format_text`/
+`add_anchored_comment`'s live evidence already used; the two typically
+read equal, since neither a reply nor a resolve edits body text
+(mirrors `format_text`'s own `revision_before == revision_after` case).
 
 ## What could block this, and the fix
 
