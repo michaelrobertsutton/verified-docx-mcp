@@ -1,15 +1,15 @@
 <!DOCTYPE html>
 <!--
-  WP-1 spike pane (https://github.com/michaelrobertsutton/JennyStack/issues/106).
+  Live pane (https://github.com/michaelrobertsutton/JennyStack/issues/106).
   Plain HTML, no framework, no build step. Loaded by Word over local HTTPS
-  from src/verified_docx_mcp/live/bridge.py --serve-only. See
-  docs/live-mode.md for the sideload runbook.
+  from src/verified_docx_mcp/live/bridge.py. See docs/live-mode.md for the
+  sideload runbook and architecture.
 -->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
-  <title>verified-docx-mcp live (WP-1 spike)</title>
+  <title>verified-docx-mcp live</title>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js" type="text/javascript"></script>
   <style>
     body {
@@ -23,6 +23,10 @@
       font-size: 15px;
       margin: 0 0 8px 0;
     }
+    h2 {
+      font-size: 13px;
+      margin: 14px 0 4px 0;
+    }
     button {
       margin: 4px 8px 4px 0;
       padding: 6px 10px;
@@ -33,11 +37,17 @@
       font-weight: 600;
       margin-bottom: 8px;
     }
-    pre#output {
+    #ws-status {
+      white-space: pre-wrap;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: #2a5d34;
+    }
+    pre#output, pre#op-log {
       background: #f3f3f3;
       border: 1px solid #ccc;
       padding: 8px;
-      max-height: 420px;
+      max-height: 240px;
       overflow: auto;
       white-space: pre-wrap;
       word-break: break-word;
@@ -49,8 +59,9 @@
   </style>
 </head>
 <body>
-  <h1>verified-docx-mcp live (WP-1 spike)</h1>
+  <h1>verified-docx-mcp live</h1>
   <div id="status">Loading Office.js…</div>
+  <div id="ws-status">Ops channel: not started</div>
 
   <div>
     <button id="copy-json" disabled>Copy JSON</button>
@@ -59,7 +70,11 @@
 
   <div id="ping-result"></div>
 
+  <h2>WP-1 report</h2>
   <pre id="output">(waiting for Office.onReady)</pre>
+
+  <h2>Op log (last 20)</h2>
+  <pre id="op-log">(no ops received yet)</pre>
 
   <script src="taskpane.js" type="text/javascript"></script>
 </body>
