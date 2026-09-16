@@ -137,7 +137,19 @@ def _plan_section_probes(
     geometry, computed BEFORE any render happens.
 
     headings is projection.find_sections_impl(source)'s "heading"-kind
-    entries, in document order, filtered to *section_keys* when given. An
+    entries, in document order, each augmented with a
+    "next_start_para_ref" key (start_para_ref of the FULL document's next
+    heading, or None when this heading is the document's last one),
+    filtered to *section_keys* when given. That augmentation happens
+    BEFORE filtering, deliberately: the skills' primary call is
+    export_pdf(section_keys=[<one section>]) for a page-budget check, and
+    that section's true end is the FULL document's next heading's start
+    when one exists — even though that next heading is not itself part
+    of the filtered/requested set and never appears in the returned
+    "sections" list. Only a heading with no next one AT ALL (the
+    document's last heading) falls back to the +0.03 last-paragraph
+    approximation in geometry.assemble_sections, regardless of whether
+    section_keys narrowed the request down to just that one heading. An
     unknown key in *section_keys* raises SECTION_NOT_FOUND here — before
     render_word() ever runs — since the caller asked for that section by
     name (mirrors mutations.locate_section_range's SECTION_NOT_FOUND).
@@ -150,7 +162,17 @@ def _plan_section_probes(
     section_keys view of one) with nothing to probe.
     """
     all_sections = projection.find_sections_impl(source)
-    headings = [s for s in all_sections if s["kind"] == "heading"]
+    all_headings = [s for s in all_sections if s["kind"] == "heading"]
+
+    headings = [
+        {
+            **heading,
+            "next_start_para_ref": (
+                all_headings[idx + 1]["start_para_ref"] if idx + 1 < len(all_headings) else None
+            ),
+        }
+        for idx, heading in enumerate(all_headings)
+    ]
 
     if section_keys is not None:
         known = {s["section_key"] for s in headings}
@@ -329,13 +351,19 @@ def export_pdf(
     section's own 1-based Word paragraph ordinals, from
     projection.find_sections_impl's start_para_ref/end_para_ref — see
     geometry.ordinal_of), and text_verified (always true on an entry that
-    made it into this list — see below). A section's end is approximated
-    as the NEXT section's own start (they are contiguous, so the small
-    gap between one section's last line and the next section's heading is
-    assumed negligible); only the LAST section, which has no next
-    section's start to borrow, uses its own last paragraph's probe, with
-    end_fraction nudged by +0.03 of a page (capped at 1.0) to approximate
-    that last line's own height.
+    made it into this list — see below). A section's end is the FULL
+    DOCUMENT's next heading's own start — not merely the next entry in
+    this call's own "sections" list — whenever the document has one, even
+    when section_keys narrowed the request down to just that one section
+    and its true next heading is not itself part of the returned list (so
+    a single-section, page-budget-style section_keys=[...] call still
+    gets an exact boundary, not an approximation, whenever a following
+    heading exists). Only a section with no next heading AT ALL — the
+    document's own last heading — uses its own last paragraph's probe,
+    with end_fraction nudged by +0.03 of a page (capped at 1.0) to
+    approximate that last line's own height. The borrowed next heading's
+    probed text is never verified against anything — only the start
+    position it supplies is used, purely as boundary geometry.
 
     Every probed section's start paragraph must verify: its probed text,
     after geometry.normalize_probe_text(), must equal that section's

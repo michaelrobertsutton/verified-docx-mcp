@@ -11,20 +11,31 @@ See server.py's execute_export_pdf for how this is wired to
 projection.find_sections_impl / projection.project_part and
 render.render_word(..., probe_paragraphs=...).
 
-Design (issue #102's spec, "Server layer"):
+Design (issue #102's spec, "Server layer"; end-geometry source amended
+2026-09-16 per a follow-up from the issue's lead):
   - Ordinal mapping: ordinal(para_ref) = index of that para_ref in
     [m.para_ref for m in proj.paragraphs] + 1 — the same main-story
     paragraph order find_sections_impl indexes as its own all_para_refs,
     so start_para_ref/end_para_ref map directly (ordinal_of below).
-  - Probing is minimized: only the start ordinal of every section, plus
-    the end ordinal of the LAST section, are ever probed
-    (build_probe_ordinals). An interior section's end is approximated as
-    the NEXT section's start (they are contiguous — the content between
-    the last line of one section and the next section's heading is
-    assumed negligible); only the true last section, which has no next
-    heading to borrow from, uses its own last paragraph's probe, nudged
-    by +0.03 of a page to approximate that line's own height
-    (assemble_sections below).
+  - Probing is minimized: the start ordinal of every section, plus one
+    more ordinal per section for its END geometry (build_probe_ordinals).
+    A section's end is the FULL DOCUMENT's next heading's start — NOT
+    just "the next entry in the *sections* list passed in" — whenever
+    the document has one (each section dict carries its own
+    "next_start_para_ref", precomputed by the caller from the unfiltered
+    heading list; see server.py's _plan_section_probes). This matters
+    specifically for an explicit, single-section section_keys=[...] call
+    (the skills' primary use: a page-budget check for one section): even
+    though only that one section is requested and returned, its end
+    still borrows the real next heading's start when the document has
+    one, rather than falling back to an approximation just because nothing
+    else was requested. ONLY a section with no next heading AT ALL — the
+    true last heading in the whole document — uses its own end_para_ref
+    probe, nudged by +0.03 of a page (capped at 1.0) to approximate that
+    last line's own height (assemble_sections below). The borrowed next
+    heading's own text is never verified against anything (only a
+    section's OWN start-probe text is checked against its heading_text);
+    it exists purely as a page/vertical-position boundary.
   - Verification is not optional: a probed start paragraph's text must
     equal find_sections_impl's heading_text for that section (both run
     through normalize_probe_text), and every probed ordinal this module
@@ -123,16 +134,26 @@ def build_probe_ordinals(sections: list[dict[str, Any]], all_para_refs: list[str
     """Distinct 1-based ordinals export_pdf must pass to render_word() as
     probe_paragraphs for *sections* (a document-order list of
     find_sections_impl "heading" entries, already filtered to any
-    requested section_keys): the start ordinal of every section, plus the
-    end ordinal of the LAST one — interior section ends are approximated
-    from the next section's start, so they need no probe of their own
-    (see assemble_sections). Returns [] for an empty *sections* list (no
-    probes needed — the caller should then pass probe_paragraphs=None so
+    requested section_keys, each carrying its own "next_start_para_ref"
+    -- see server.py's _plan_section_probes): the start ordinal of every
+    section, plus ONE more ordinal per section for its end geometry --
+    the FULL document's next heading's start ordinal
+    (ordinal_of(section["next_start_para_ref"], ...)) when that section
+    has one, or its own end_para_ref ordinal (the last-paragraph
+    approximation case) when it does not, i.e. when it is the document's
+    own last heading. Returns [] for an empty *sections* list (no probes
+    needed — the caller should then pass probe_paragraphs=None so
     render_word() adds no PROBE/PAGEH overhead at all)."""
     if not sections:
         return []
-    ordinals = {ordinal_of(s["start_para_ref"], all_para_refs) for s in sections}
-    ordinals.add(ordinal_of(sections[-1]["end_para_ref"], all_para_refs))
+    ordinals: set[int] = set()
+    for section in sections:
+        ordinals.add(ordinal_of(section["start_para_ref"], all_para_refs))
+        next_start_para_ref = section["next_start_para_ref"]
+        if next_start_para_ref is not None:
+            ordinals.add(ordinal_of(next_start_para_ref, all_para_refs))
+        else:
+            ordinals.add(ordinal_of(section["end_para_ref"], all_para_refs))
     return sorted(ordinals)
 
 
@@ -150,14 +171,19 @@ def assemble_sections(
     """Turn a render_word() probe result into export_pdf's "sections" list.
 
     *sections* is find_sections_impl's "heading"-kind entries, in document
-    order, already filtered to any requested section_keys. *paragraph_geometry*
-    and *page_height_pt* are render_word()'s own probe results (render.py,
-    issue #102's paragraph geometry probe). Returns (sections_result, None)
-    on success, or (None, "<detail>") when verification fails — the caller
-    (server.py's execute_export_pdf) decides whether that means degrading
-    to sections: null (default mode, section_keys is None) or raising
-    SECTION_GEOMETRY_UNAVAILABLE (explicit mode); this function never
-    raises.
+    order, already filtered to any requested section_keys, each carrying
+    its own "next_start_para_ref" (the FULL document's next heading's
+    start_para_ref, or None when the section is the document's own last
+    heading — see server.py's _plan_section_probes; NOT relative to the
+    filtered *sections* list itself, which may omit that next heading
+    entirely on an explicit, single-section section_keys=[...] call).
+    *paragraph_geometry* and *page_height_pt* are render_word()'s own
+    probe results (render.py, issue #102's paragraph geometry probe).
+    Returns (sections_result, None) on success, or (None, "<detail>")
+    when verification fails — the caller (server.py's execute_export_pdf)
+    decides whether that means degrading to sections: null (default mode,
+    section_keys is None) or raising SECTION_GEOMETRY_UNAVAILABLE
+    (explicit mode); this function never raises.
 
     An empty *sections* list (no headings, or none requested) returns
     ([], None) immediately without inspecting paragraph_geometry /
@@ -170,21 +196,31 @@ def assemble_sections(
          RENDER_FAILED when probes were requested but no PAGEH line came
          back, so this should not normally be reachable — checked here
          too, defensively, rather than assumed).
-      2. any ordinal this function needs (every section's start, the last
-         section's end, or an interior section's borrowed "next start")
-         is missing from paragraph_geometry, or its entry is a probe
-         error ({"error": ...}).
+      2. any ordinal this function needs (every section's start, and per
+         section either the full document's next heading's start or —
+         only for the document's own last heading — that section's own
+         end_para_ref) is missing from paragraph_geometry, or its entry
+         is a probe error ({"error": ...}).
       3. a section's start-probe text, after normalize_probe_text(), does
-         not equal its find_sections_impl heading_text, also normalized.
+         not equal its find_sections_impl heading_text, also normalized
+         (the borrowed next-heading probe used for END geometry is never
+         text-verified against anything — it is a boundary, not a claim
+         about what that next section is).
 
-    Geometry per section (start_page/start_fraction always from the
-    section's own start probe; end_page/end_fraction from the next
-    section's start probe, or — for the last section — its own
-    end_para_ref probe with end_fraction nudged by +0.03, capped at 1.0,
-    to approximate that last line's own height): start_fraction/
-    end_fraction are vpos_pt / page_height_pt, and
-    pages = (end_page + end_fraction) - (start_page + start_fraction).
-    Fractions and pages are all rounded to 2 places."""
+    Geometry per section: start_page/start_fraction always come from the
+    section's own start probe. end_page/end_fraction come from the FULL
+    document's next heading's start probe when "next_start_para_ref" is
+    not None — regardless of whether that next heading is itself part of
+    *sections* — or, only when it IS None (this section is the document's
+    last heading), from that section's own end_para_ref probe with
+    end_fraction nudged by +0.03, capped at 1.0, to approximate that last
+    line's own height. start_fraction/end_fraction are vpos_pt /
+    page_height_pt, and pages = (end_page + end_fraction) - (start_page +
+    start_fraction). Fractions and pages are all rounded to 2 places.
+    start_paragraph/end_paragraph are always the section's OWN structural
+    ordinals (start_para_ref/end_para_ref), never the borrowed next
+    heading's — they describe this section's own extent in the document,
+    independent of which probe supplied its end geometry."""
     if not sections:
         return [], None
 
@@ -192,10 +228,22 @@ def assemble_sections(
         return None, "page_height_pt was not returned by the render (no PAGEH line)"
 
     starts = [ordinal_of(s["start_para_ref"], all_para_refs) for s in sections]
-    last_end = ordinal_of(sections[-1]["end_para_ref"], all_para_refs)
 
-    needed_ordinals = set(starts)
-    needed_ordinals.add(last_end)
+    # Per section, the ordinal that supplies its END geometry, and
+    # whether that ordinal is the last-heading approximation (True) or a
+    # borrowed next-heading start (False, never text-verified).
+    end_ordinals: list[int] = []
+    end_is_approximation: list[bool] = []
+    for section in sections:
+        next_start_para_ref = section["next_start_para_ref"]
+        if next_start_para_ref is not None:
+            end_ordinals.append(ordinal_of(next_start_para_ref, all_para_refs))
+            end_is_approximation.append(False)
+        else:
+            end_ordinals.append(ordinal_of(section["end_para_ref"], all_para_refs))
+            end_is_approximation.append(True)
+
+    needed_ordinals = set(starts) | set(end_ordinals)
     for ordinal in sorted(needed_ordinals):
         entry = paragraph_geometry.get(ordinal)
         if entry is None:
@@ -219,14 +267,12 @@ def assemble_sections(
         start_page = start_probe["page"]
         start_fraction = round(start_probe["vpos_pt"] / page_height_pt, 2)
 
-        if idx + 1 < len(sections):
-            next_probe = paragraph_geometry[starts[idx + 1]]
-            end_page = next_probe["page"]
-            end_fraction = round(next_probe["vpos_pt"] / page_height_pt, 2)
-        else:
-            end_probe = paragraph_geometry[last_end]
-            end_page = end_probe["page"]
+        end_probe = paragraph_geometry[end_ordinals[idx]]
+        end_page = end_probe["page"]
+        if end_is_approximation[idx]:
             end_fraction = round(min(1.0, end_probe["vpos_pt"] / page_height_pt + 0.03), 2)
+        else:
+            end_fraction = round(end_probe["vpos_pt"] / page_height_pt, 2)
 
         pages = round((end_page + end_fraction) - (start_page + start_fraction), 2)
 

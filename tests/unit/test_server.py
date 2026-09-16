@@ -343,13 +343,16 @@ class ExportPdfSectionsTests(unittest.TestCase):
 
     def test_explicit_mode_verification_mismatch_raises_geometry_unavailable(self):
         in_path = self._copy_fixture("sections.docx")
+        # section_keys=["overview-1"] now probes ordinal 1 (its own
+        # start) plus ordinal 3 (Background's start, the FULL document's
+        # next heading -- not overview-1's own end_para_ref, ordinal 2,
+        # since a next heading exists). The deliberately wrong text is on
+        # ordinal 1, overview-1's own start probe.
         _write_fake_osascript_multiline_success(
             self._bin_dir,
             [
-                # Deliberately wrong probed text for the requested
-                # section's own start ordinal (1).
                 "PROBE\t1\t1\t72.0\tNot The Right Heading",
-                "PROBE\t2\t1\t100.0\tlast line of Overview",
+                "PROBE\t3\t1\t200.0\tBackground",
                 "PAGEH\t792.0",
                 "OK 1 closed=1 ",
             ],
@@ -359,6 +362,77 @@ class ExportPdfSectionsTests(unittest.TestCase):
                 str(in_path), str(self._out_path), section_keys=["overview-1"]
             )
         self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.SECTION_GEOMETRY_UNAVAILABLE)
+
+    def test_single_section_keys_entry_borrows_full_document_next_heading_start(self):
+        # The follow-up behavior (2026-09-16): section_keys=["overview-1"]
+        # alone still gets an EXACT end boundary -- Background's own
+        # start, ordinal 3 -- rather than the +0.03 last-paragraph
+        # approximation, because sections.docx has a real next heading
+        # even though it is not itself part of the request or the
+        # returned "sections" list.
+        in_path = self._copy_fixture("sections.docx")
+        args_log = Path(self._tmp.name) / "argv.log"
+        _write_fake_osascript_multiline_success(
+            self._bin_dir,
+            [
+                "PROBE\t1\t1\t72.0\tOverview",
+                "PROBE\t3\t1\t200.0\tBackground",
+                "PAGEH\t792.0",
+                "OK 1 closed=1 ",
+            ],
+            args_log=args_log,
+        )
+        result = server.execute_export_pdf(
+            str(in_path), str(self._out_path), section_keys=["overview-1"]
+        )
+        self.assertIsNone(result["sections_error"])
+        sections = result["sections"]
+        self.assertEqual(len(sections), 1)
+        entry = sections[0]
+        self.assertEqual(entry["section_key"], "overview-1")
+        self.assertTrue(entry["text_verified"])
+        # end == Background's own probed start, exactly (no +0.03 nudge).
+        self.assertEqual(entry["end_page"], 1)
+        self.assertEqual(entry["end_fraction"], round(200.0 / 792.0, 2))
+        self.assertEqual(
+            entry["pages"],
+            round((entry["end_page"] + entry["end_fraction"]) - (entry["start_page"] + entry["start_fraction"]), 2),
+        )
+        # start_paragraph/end_paragraph stay overview-1's OWN structural
+        # ordinals (1 and 2), never Background's borrowed start (3).
+        self.assertEqual(entry["start_paragraph"], 1)
+        self.assertEqual(entry["end_paragraph"], 2)
+        # Only ordinals 1 and 3 were ever requested -- never 2 (overview-1's
+        # own end_para_ref), since a real next heading made the
+        # approximation unnecessary.
+        logged_argv = args_log.read_text().strip().split()
+        self.assertEqual(logged_argv[-2:], ["1", "3"], logged_argv)
+
+    def test_section_keys_last_heading_still_uses_approximation(self):
+        # The other half of the same follow-up: section_keys=["next-steps-1"]
+        # (the document's own last heading) has no next heading at all,
+        # full document or otherwise -- the +0.03 last-paragraph
+        # approximation still applies, exactly as in default mode.
+        in_path = self._copy_fixture("sections.docx")
+        args_log = Path(self._tmp.name) / "argv.log"
+        _write_fake_osascript_multiline_success(
+            self._bin_dir,
+            [
+                "PROBE\t5\t1\t400.0\tNext Steps",
+                "PROBE\t6\t1\t600.0\tlast line of Next Steps",
+                "PAGEH\t792.0",
+                "OK 1 closed=1 ",
+            ],
+            args_log=args_log,
+        )
+        result = server.execute_export_pdf(
+            str(in_path), str(self._out_path), section_keys=["next-steps-1"]
+        )
+        self.assertIsNone(result["sections_error"])
+        entry = result["sections"][0]
+        self.assertEqual(entry["end_fraction"], round(min(1.0, 600.0 / 792.0 + 0.03), 2))
+        logged_argv = args_log.read_text().strip().split()
+        self.assertEqual(logged_argv[-2:], ["5", "6"], logged_argv)
 
     def test_default_mode_verification_mismatch_degrades_instead_of_raising(self):
         in_path = self._copy_fixture("sections.docx")

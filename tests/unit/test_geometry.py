@@ -107,14 +107,27 @@ class BuildProbeOrdinalsTests(unittest.TestCase):
 
     def test_distinct_starts_plus_last_end_only(self):
         sections = [
-            {"start_para_ref": "p0", "end_para_ref": "p1"},
-            {"start_para_ref": "p2", "end_para_ref": "p4"},
+            {"start_para_ref": "p0", "end_para_ref": "p1", "next_start_para_ref": "p2"},
+            {"start_para_ref": "p2", "end_para_ref": "p4", "next_start_para_ref": None},
         ]
         all_para_refs = ["p0", "p1", "p2", "p3", "p4"]
-        # Starts: ordinal_of(p0)=1, ordinal_of(p2)=3. Last section's own
-        # end (p4)=5. p1/p3 (interior/first-section ends) are never
-        # probed -- they are approximated from the next section's start.
+        # Starts: ordinal_of(p0)=1, ordinal_of(p2)=3. First section's end
+        # borrows the second's start (already ordinal 3, no extra probe).
+        # The second section has no next_start_para_ref (it IS the
+        # document's last heading), so its own end (p4)=5 is probed
+        # instead. p1/p3 are never probed at all.
         self.assertEqual(geometry.build_probe_ordinals(sections, all_para_refs), [1, 3, 5])
+
+    def test_next_start_para_ref_probed_even_when_not_in_filtered_list(self):
+        # A single, explicitly-filtered section (section_keys=[...]) whose
+        # next_start_para_ref points at a heading that is NOT itself
+        # present in *sections* at all -- the follow-up behavior (issue
+        # #102, 2026-09-16): the borrowed next heading's start ordinal
+        # must still be probed even though only one section was passed
+        # in and it never appears in the output.
+        sections = [{"start_para_ref": "p0", "end_para_ref": "p1", "next_start_para_ref": "p2"}]
+        all_para_refs = ["p0", "p1", "p2", "p3"]
+        self.assertEqual(geometry.build_probe_ordinals(sections, all_para_refs), [1, 3])
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +144,7 @@ class AssembleSectionsGeometryTests(unittest.TestCase):
                 "heading_text": "Intro",
                 "start_para_ref": "p0",
                 "end_para_ref": "p1",
+                "next_start_para_ref": "p2",
             },
             {
                 "section_key": "body-1",
@@ -138,6 +152,7 @@ class AssembleSectionsGeometryTests(unittest.TestCase):
                 "heading_text": "Body",
                 "start_para_ref": "p2",
                 "end_para_ref": "p3",
+                "next_start_para_ref": None,
             },
         ]
         all_para_refs = ["p0", "p1", "p2", "p3"]
@@ -181,6 +196,7 @@ class AssembleSectionsGeometryTests(unittest.TestCase):
                 "heading_text": "A",
                 "start_para_ref": "p0",
                 "end_para_ref": "p1",
+                "next_start_para_ref": "p2",
             },
             {
                 "section_key": "b-1",
@@ -188,6 +204,7 @@ class AssembleSectionsGeometryTests(unittest.TestCase):
                 "heading_text": "B",
                 "start_para_ref": "p2",
                 "end_para_ref": "p3",
+                "next_start_para_ref": None,
             },
         ]
         all_para_refs = ["p0", "p1", "p2", "p3"]
@@ -216,6 +233,7 @@ class AssembleSectionsGeometryTests(unittest.TestCase):
                 "heading_text": "Factor 1",
                 "start_para_ref": "p0",
                 "end_para_ref": "p1",
+                "next_start_para_ref": None,
             }
         ]
         all_para_refs = ["p0", "p1"]
@@ -241,6 +259,7 @@ class AssembleSectionsGeometryTests(unittest.TestCase):
                 "heading_text": "Tail",
                 "start_para_ref": "p0",
                 "end_para_ref": "p1",
+                "next_start_para_ref": None,
             }
         ]
         all_para_refs = ["p0", "p1"]
@@ -259,6 +278,74 @@ class AssembleSectionsGeometryTests(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertIsNone(error)
 
+    def test_single_filtered_section_borrows_full_document_next_heading_start(self):
+        # Follow-up (issue #102, 2026-09-16): an explicit, single-section
+        # section_keys=[...] call still borrows the FULL document's next
+        # heading's start for its end geometry, even though that next
+        # heading is not itself part of *sections* and never appears in
+        # the returned list -- this is the skills' primary page-budget
+        # call shape. "Background" (ordinal 3, on page 2) is the next
+        # heading; it supplies end_page/end_fraction directly, with NO
+        # +0.03 approximation and NO text verification against it.
+        sections = [
+            {
+                "section_key": "overview-1",
+                "kind": "heading",
+                "heading_text": "Overview",
+                "start_para_ref": "p0",
+                "end_para_ref": "p1",
+                "next_start_para_ref": "p2",
+            }
+        ]
+        all_para_refs = ["p0", "p1", "p2", "p3"]
+        paragraph_geometry = {
+            1: {"page": 1, "vpos_pt": 72.0, "text": "Overview"},
+            3: {"page": 2, "vpos_pt": 100.0, "text": "Background"},
+        }
+        result, error = geometry.assemble_sections(sections, all_para_refs, paragraph_geometry, 792.0)
+        self.assertIsNone(error)
+        self.assertEqual(len(result), 1)
+        entry = result[0]
+        self.assertEqual(entry["section_key"], "overview-1")
+        self.assertEqual(entry["start_page"], 1)
+        self.assertEqual(entry["start_fraction"], 0.09)
+        # end == the next heading's own start, exactly -- no +0.03 nudge.
+        self.assertEqual(entry["end_page"], 2)
+        self.assertEqual(entry["end_fraction"], round(100.0 / 792.0, 2))
+        self.assertEqual(entry["end_fraction"], 0.13)
+        self.assertEqual(entry["pages"], round((2 + 0.13) - (1 + 0.09), 2))
+        # start_paragraph/end_paragraph stay the section's OWN structural
+        # ordinals (ordinal_of(p1)=2), never the borrowed heading's (3).
+        self.assertEqual(entry["start_paragraph"], 1)
+        self.assertEqual(entry["end_paragraph"], 2)
+
+    def test_single_filtered_last_heading_still_uses_approximation(self):
+        # The other half of the same follow-up: when the ONE requested
+        # section IS the document's own last heading (next_start_para_ref
+        # is None even though it came from an explicit, single-section
+        # section_keys=[...] filter), the +0.03 last-paragraph
+        # approximation still applies -- there is no next heading to
+        # borrow from, full document or otherwise.
+        sections = [
+            {
+                "section_key": "next-steps-1",
+                "kind": "heading",
+                "heading_text": "Next Steps",
+                "start_para_ref": "p4",
+                "end_para_ref": "p5",
+                "next_start_para_ref": None,
+            }
+        ]
+        all_para_refs = ["p0", "p1", "p2", "p3", "p4", "p5"]
+        paragraph_geometry = {
+            5: {"page": 1, "vpos_pt": 400.0, "text": "Next Steps"},
+            6: {"page": 1, "vpos_pt": 600.0, "text": "last line of Next Steps"},
+        }
+        result, error = geometry.assemble_sections(sections, all_para_refs, paragraph_geometry, 792.0)
+        self.assertIsNone(error)
+        entry = result[0]
+        self.assertEqual(entry["end_fraction"], round(min(1.0, 600.0 / 792.0 + 0.03), 2))
+
 
 # ---------------------------------------------------------------------------
 # Verification / probe-error failure contract (spec test 3)
@@ -274,6 +361,7 @@ class AssembleSectionsFailureTests(unittest.TestCase):
                 "heading_text": "Background",
                 "start_para_ref": "p0",
                 "end_para_ref": "p1",
+                "next_start_para_ref": None,
             }
         ], ["p0", "p1"]
 
