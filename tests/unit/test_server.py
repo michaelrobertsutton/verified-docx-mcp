@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
@@ -125,6 +126,18 @@ class ExportPdfPathValidationTests(unittest.TestCase):
         with self.assertRaises(VerifyError) as ctx:
             server.execute_export_pdf(str(Path(self._tmp.name) / "nope.docx"), str(out))
         self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    def test_output_path_under_scratch_root_accepted(self):
+        # issue #101: with VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS unset, an
+        # output_path under the (patched) Claude Code scratch root resolves
+        # rather than being rejected as outside the allowed roots.
+        os.environ.pop(paths._ALLOWED_FILE_ROOTS_ENV, None)
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            scratch_root = Path(scratch_dir)
+            out = scratch_root / "out.pdf"
+            with mock.patch.object(paths, "_claude_code_scratch_root", return_value=scratch_root):
+                resolved = server._resolve_export_output_path(str(out))
+            self.assertEqual(resolved, out.resolve())
 
 
 class WordOwnerFileMatchTests(unittest.TestCase):

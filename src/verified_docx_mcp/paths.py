@@ -111,6 +111,22 @@ def resolve_docx_pointer(relative_path: str, docs_root: str) -> Path:
 
 _ALLOWED_FILE_ROOTS_ENV = "VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS"
 
+# The Claude Code per-user scratch root (issue #101): a proposal build staged
+# in the harness-mandated scratchpad (a subdirectory of this) could not be
+# read back or rendered without copying it into a pursuit repo first, which
+# is exactly the round trip the verify-before-copy workflow
+# (core/document-backend-protocol.md) exists to avoid. Folded into the
+# DEFAULT allowed roots only (below); an explicit
+# VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS is used verbatim and is not widened.
+_CLAUDE_SCRATCH_ROOT_TEMPLATE = "/private/tmp/claude-{uid}"
+
+
+def _claude_code_scratch_root() -> Path | None:
+    """The Claude Code per-user scratch root, or None when it does not exist."""
+    candidate = Path(_CLAUDE_SCRATCH_ROOT_TEMPLATE.format(uid=os.getuid()))
+    return candidate if candidate.is_dir() else None
+
+
 # Well-known credential/secrets locations, relative to the user's home
 # directory. Denylisted unconditionally — regardless of the configured
 # allowed roots — because the risk this guards against is a document's own
@@ -136,14 +152,24 @@ def _allowed_file_roots() -> list[Path]:
 
     Defaults to the user's home directory (covers iCloud Drive / OneDrive
     sync roots under it without extra configuration), not the server
-    process's working directory. Home still excludes system paths and
-    other users' home directories, and _is_denylisted_sensitive_path below
-    unconditionally blocks well-known credential locations under it — set
-    VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS explicitly to narrow (or further
-    widen) the allowed roots themselves.
+    process's working directory, PLUS the Claude Code scratch root
+    (/private/tmp/claude-<uid>) when that directory exists (issue #101) — a
+    scratch build can be read back and rendered without first being copied
+    into a synced repo. Home still excludes system paths and other users'
+    home directories, and _is_denylisted_sensitive_path below unconditionally
+    blocks well-known credential locations under it. Set
+    VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS explicitly to use that list verbatim
+    instead — an explicit setting is never silently widened with the scratch
+    root or narrowed to it.
     """
     raw = os.environ.get(_ALLOWED_FILE_ROOTS_ENV)
-    root_values = [p for p in raw.split(os.pathsep) if p] if raw is not None else [str(Path.home())]
+    if raw is not None:
+        root_values = [p for p in raw.split(os.pathsep) if p]
+    else:
+        root_values = [str(Path.home())]
+        scratch_root = _claude_code_scratch_root()
+        if scratch_root is not None:
+            root_values.append(str(scratch_root))
     return [Path(value).expanduser().resolve(strict=False) for value in root_values]
 
 
@@ -198,7 +224,9 @@ def resolve_allowed_docx_path(file_path: str, *, must_exist: bool = True) -> Pat
             ErrorCode.INVALID_INPUT,
             (
                 "File path is outside the allowed roots for this server. "
-                "By default this is the user's home directory — set "
+                "By default this is the user's home directory plus the "
+                "Claude Code scratch root (/private/tmp/claude-<uid>) when "
+                "that directory exists — set "
                 f"{_ALLOWED_FILE_ROOTS_ENV} on the server process to a "
                 f"{os.pathsep!r}-separated list of directories to widen it, "
                 "then restart the server."
