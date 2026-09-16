@@ -588,5 +588,202 @@ class GoldenGoldenResolvedFilterTests(unittest.TestCase):
         self.assertEqual(thread["content"], "test and resolve")
 
 
+# ---------------------------------------------------------------------------
+# Issue #108: a multi-paragraph comment's identity is its LAST w:p's paraId
+# (what Word itself keys commentsIds.xml/commentsExtended.xml on), not its
+# first -- and every comment_id list_open_items can emit (durableId, or a
+# raw w:id fallback) is accepted by get_comment_thread/reply_to_comment/
+# resolve_comment.
+# ---------------------------------------------------------------------------
+
+MULTIPARA = FIXTURES / "comments" / "multipara-comment.docx"
+MULTIPARA_SHA256 = "d3ad193433969b995895c1b407ed4ffb94baa720419a551220adb4cb68edfcf2"
+
+
+class MultiparaFixtureShaUnchangedTest(unittest.TestCase):
+    """Guards against ever accidentally re-saving/rewriting the
+    multi-paragraph comment fixture -- see tests/fixtures/README.md's own
+    provenance row for it."""
+
+    def test_multipara_sha256_unchanged(self):
+        actual = __import__("hashlib").sha256(MULTIPARA.read_bytes()).hexdigest()
+        self.assertEqual(actual, MULTIPARA_SHA256, "multipara-comment.docx has been modified -- do not touch it")
+
+
+class MultiParagraphCommentIdentityTests(_TempFixtureCase):
+    """tests/fixtures/comments/multipara-comment.docx (Word 16.112.4, see
+    tests/fixtures/README.md's provenance row): w:id="0" has two
+    paragraphs (paraIds 5C83D4AC then 53D84979 -- Word keyed
+    commentsIds.xml/commentsExtended.xml on 53D84979 only, the LAST one);
+    w:id="1" has one paragraph (paraId 439EAAC1), keyed normally.
+    """
+
+    fixture_name = "comments/multipara-comment.docx"
+
+    ROOT_DURABLE_ID = "58A3F864"  # w:id="0" -- keyed on its LAST paraId, 53D84979
+    ROOT_LAST_PARA_ID = "53D84979"
+    SINGLE_DURABLE_ID = "22F779FB"  # w:id="1"
+    ROOT_CONTENT = "First paragraph of a two-paragraph comment.Second paragraph of the same comment."
+
+    def test_list_open_items_reports_durable_ids_with_joined_content_and_unresolved(self):
+        # Spec test 1: two comments, both comment_ids are 8-hex durableIds
+        # (no raw-w:id fallback firing on a Word-authored multi-paragraph
+        # comment), the root's content joins both paragraphs, both open.
+        open_items = tracked_changes.execute_list_open_items(str(self.target))
+        ids = {c["comment_id"] for c in open_items["comments"]}
+        self.assertEqual(ids, {self.ROOT_DURABLE_ID, self.SINGLE_DURABLE_ID})
+        for cid in ids:
+            self.assertEqual(len(cid), 8)
+            int(cid, 16)  # every char is hex -- confirms this is a durableId, not a raw w:id like "0"/"1"
+
+        root = next(c for c in open_items["comments"] if c["comment_id"] == self.ROOT_DURABLE_ID)
+        self.assertEqual(root["content"], self.ROOT_CONTENT)
+        self.assertFalse(root["resolved"])
+        single = next(c for c in open_items["comments"] if c["comment_id"] == self.SINGLE_DURABLE_ID)
+        self.assertFalse(single["resolved"])
+
+    def test_get_comment_thread_returns_both_paragraphs_and_no_replies(self):
+        # Spec test 2.
+        thread = comments.execute_get_comment_thread(str(self.target), self.ROOT_DURABLE_ID)
+        self.assertEqual(thread["content"], self.ROOT_CONTENT)
+        self.assertEqual(thread["replies"], [])
+        self.assertEqual(thread["comment_id_resolved_via"], "durableId")
+
+    def test_resolve_marks_the_last_paragraphs_commentex_and_creates_no_new_one(self):
+        # Spec test 3.
+        with zipfile.ZipFile(self.target) as zf:
+            before_entries = [
+                c for c in ET.fromstring(zf.read("word/commentsExtended.xml")) if projection._ln(c) == "commentEx"
+            ]
+        before_count = len(before_entries)
+
+        evidence = comments.execute_resolve_comment(str(self.target), self.ROOT_DURABLE_ID)
+        self.assertTrue(evidence["applied"])
+        self.assertEqual(evidence["comment_id_resolved_via"], "durableId")
+
+        with zipfile.ZipFile(self.target) as zf:
+            after_entries = [
+                c for c in ET.fromstring(zf.read("word/commentsExtended.xml")) if projection._ln(c) == "commentEx"
+            ]
+        self.assertEqual(len(after_entries), before_count, "resolve must not create a new commentEx entry")
+        target_ex = next(c for c in after_entries if projection._attr(c, "paraId") == self.ROOT_LAST_PARA_ID)
+        self.assertEqual(projection._attr(target_ex, "done"), "1")
+        # Never touches the FIRST paragraph's paraId -- it has no commentEx
+        # of its own (Word never wrote one for it either).
+        self.assertIsNone(next((c for c in after_entries if projection._attr(c, "paraId") == "5C83D4AC"), None))
+
+        open_items = tracked_changes.execute_list_open_items(str(self.target))
+        self.assertNotIn(self.ROOT_DURABLE_ID, {c["comment_id"] for c in open_items["comments"]})
+        thread = comments.execute_get_comment_thread(str(self.target), self.ROOT_DURABLE_ID)
+        self.assertTrue(thread["resolved"])
+
+    def test_reply_links_paraidparent_to_the_last_paragraph(self):
+        # Spec test 4.
+        reply = comments.execute_reply_to_comment(str(self.target), self.ROOT_DURABLE_ID, "a reply")
+        self.assertEqual(reply["comment_id_resolved_via"], "durableId")
+
+        with zipfile.ZipFile(self.target) as zf:
+            ext_root = ET.fromstring(zf.read("word/commentsExtended.xml"))
+        reply_ex = next(c for c in ext_root if projection._attr(c, "paraIdParent"))
+        self.assertEqual(projection._attr(reply_ex, "paraIdParent"), self.ROOT_LAST_PARA_ID)
+
+        thread = comments.execute_get_comment_thread(str(self.target), self.ROOT_DURABLE_ID)
+        self.assertEqual(thread["reply_count"], 1)
+        self.assertEqual(thread["replies"][0]["comment_id"], reply["comment_id"])
+
+    def test_w_id_fallback_on_resolve_and_get_comment_thread(self):
+        # Spec test 5, first two parts: resolve_comment(path, "1") and
+        # get_comment_thread(path, "0") both resolve via the raw w:id and
+        # report comment_id_resolved_via: "w_id".
+        resolve_evidence = comments.execute_resolve_comment(str(self.target), "1")
+        self.assertTrue(resolve_evidence["applied"])
+        self.assertEqual(resolve_evidence["comment_id_resolved_via"], "w_id")
+        single_thread = comments.execute_get_comment_thread(str(self.target), self.SINGLE_DURABLE_ID)
+        self.assertTrue(single_thread["resolved"])
+
+        root_thread = comments.execute_get_comment_thread(str(self.target), "0")
+        self.assertEqual(root_thread["comment_id_resolved_via"], "w_id")
+        self.assertEqual(root_thread["content"], self.ROOT_CONTENT)
+
+    def test_unknown_comment_id_lists_both_durable_ids_and_w_ids(self):
+        # Spec test 5, third part: a comment_id matching neither kind
+        # raises INVALID_INPUT with both id kinds in the diagnostics.
+        with self.assertRaises(VerifyError) as cm:
+            comments.execute_get_comment_thread(str(self.target), "nonexistent")
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        diagnostics = cm.exception.envelope.diagnostics
+        self.assertIn(self.ROOT_DURABLE_ID, diagnostics["available_durable_ids"])
+        self.assertIn(self.SINGLE_DURABLE_ID, diagnostics["available_durable_ids"])
+        self.assertIn("0", diagnostics["available_w_ids"])
+        self.assertIn("1", diagnostics["available_w_ids"])
+
+        with self.assertRaises(VerifyError) as cm2:
+            comments.execute_resolve_comment(str(self.target), "nonexistent")
+        self.assertEqual(cm2.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        self.assertIn("available_durable_ids", cm2.exception.envelope.diagnostics)
+        self.assertIn("available_w_ids", cm2.exception.envelope.diagnostics)
+
+
+class GoldenFixtureListOpenItemsRegressionTests(unittest.TestCase):
+    """Spec test 7: the identity fix must not change list_open_items'
+    output for the golden fixture -- it carries only single-paragraph
+    comments, so a first-vs-last-paragraph identity change is a no-op for
+    it. Pinned as an exact snapshot rather than a relative comparison
+    (there is no "before this change" binary to diff against here); a
+    single-paragraph comment has only one paraId, so this snapshot is
+    equally a regression pin against ANY future accidental identity
+    change, not just this one. Read-only, never writes to the golden."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_allowed = os.environ.get(paths._ALLOWED_FILE_ROOTS_ENV)
+        os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = self._tmp.name
+        self.target = Path(self._tmp.name) / "golden.docx"
+        shutil.copyfile(GOLDEN, self.target)
+
+    def tearDown(self):
+        if self._old_allowed is None:
+            os.environ.pop(paths._ALLOWED_FILE_ROOTS_ENV, None)
+        else:
+            os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = self._old_allowed
+        self._tmp.cleanup()
+        actual = __import__("hashlib").sha256(GOLDEN.read_bytes()).hexdigest()
+        assert actual == GOLDEN_SHA256, "golden-comment.docx was modified by a test -- this must never happen"
+
+    def test_list_open_items_output_unchanged(self):
+        open_items = tracked_changes.execute_list_open_items(str(self.target))
+        expected = [
+            {
+                "comment_id": "654503C0",
+                "w_id": "0",
+                "content": "comment.",
+                "resolved": False,
+                "reply_count": 0,
+                "replies": [],
+                "quoted_text": "role in making cities healthier and more livable. Parks, gardens, and "
+                "tree-lined streets help soften the hard edges ",
+                "author": "Michael Sutton",
+                "created_time": "2026-09-10T21:33:00Z",
+                "modified_time": "",
+                "scope": "document",
+            },
+            {
+                "comment_id": "7E7E1D27",
+                "w_id": "1",
+                "content": "reply.",
+                "resolved": False,
+                "reply_count": 0,
+                "replies": [],
+                "quoted_text": "role in making cities healthier and more livable. Parks, gardens, and "
+                "tree-lined streets help soften the hard edges ",
+                "author": "Michael Sutton",
+                "created_time": "2026-09-10T21:33:00Z",
+                "modified_time": "",
+                "scope": "document",
+            },
+        ]
+        self.assertEqual(open_items["comments"], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
