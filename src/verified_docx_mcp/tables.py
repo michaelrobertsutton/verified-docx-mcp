@@ -50,11 +50,12 @@ assumption (see its own module docstring), so ``replace_table_row``'s and
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from . import audit, markdown_to_ooxml, mutations, paths, projection, tracked_changes
+from . import audit, locate, markdown_to_ooxml, mutations, paths, projection, tracked_changes
 from .author import resolve_author_name
 from .errors import ErrorCode, _make_error
 from .projection import DEFAULT_PART, W_NS, TableBoundaryEvent
@@ -585,17 +586,465 @@ def execute_replace_cell_markdown(
 
 
 # ---------------------------------------------------------------------------
-# Tool: insert_table
+# Tool: insert_table -- structured cell objects (issue #100, D1 Option 1):
+# a cell may be a plain markdown string (today's behavior, unchanged) or a
+# CellSpec dict {"markdown", "span", "v_merge", "fill", "color", "bold",
+# "align", "valign"}. See server.py's insert_table docstring for the public
+# contract; the helpers below implement it.
 # ---------------------------------------------------------------------------
 
 _DXA_PER_INCH = 1440
 
+_HEX_COLOR_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+_ALIGN_VALUES = frozenset({"left", "center", "right", "both"})
+_VALIGN_VALUES = frozenset({"top", "center", "bottom"})
+_VMERGE_VALUES = frozenset({"restart", "continue"})
+
+# Schema child order (CT_TcPrBase, subset this module writes), CT_PPrBase
+# (subset: pStyle/numPr before jc), and CT_RPrBase (subset: rStyle before
+# b/bCs before i/iCs before color) -- Word is picky about this even though
+# ElementTree itself is not; _insert_ordered keeps every new child in the
+# right slot regardless of call order.
+_TCPR_CHILD_ORDER = ["tcW", "gridSpan", "vMerge", "shd", "vAlign"]
+_PPR_CHILD_ORDER = ["pStyle", "numPr", "jc"]
+_RPR_CHILD_ORDER = ["rStyle", "b", "bCs", "i", "iCs", "color"]
+
+
+def _insert_ordered(parent: Any, new_child: Any, order: list[str]) -> None:
+    """Insert *new_child* into *parent* at the position *order* (a list of
+    local tag names, schema order) says it belongs, regardless of what is
+    already present or the order this function is called in. A child whose
+    tag is not in *order* is always appended last (never expected here --
+    every tag this module inserts via this helper is in one of the three
+    ORDER lists above)."""
+    new_rank = order.index(projection._ln(new_child))
+    insert_at = len(list(parent))
+    for i, existing in enumerate(parent):
+        existing_ln = projection._ln(existing)
+        if existing_ln not in order:
+            continue
+        if order.index(existing_ln) > new_rank:
+            insert_at = i
+            break
+    parent.insert(insert_at, new_child)
+
+
+def _first_child(parent: Any, tag: str) -> Any | None:
+    for child in parent:
+        if projection._ln(child) == tag:
+            return child
+    return None
+
+
+def _validate_hex(value: Any, field_name: str, row_index: int, cell_index: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _HEX_COLOR_RE.match(value):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"row {row_index} cell {cell_index}: {field_name!r} must be a 6-hex-digit color string "
+            f"(e.g. \"3B3838\"), got {value!r}.",
+            {"row_index": row_index, "cell_index": cell_index, field_name: value},
+        )
+    return value.upper()
+
+
+def _normalize_cell(raw: Any, *, row_index: int, cell_index: int) -> dict[str, Any]:
+    """A plain str means {"markdown": str} with every other key at its
+    default (span=1, no merge/fill/formatting) -- today's behavior. A dict
+    is validated and filled out to the same canonical key set."""
+    if isinstance(raw, str):
+        return {
+            "markdown": raw,
+            "span": 1,
+            "v_merge": None,
+            "fill": None,
+            "color": None,
+            "bold": None,
+            "align": None,
+            "valign": None,
+        }
+    if not isinstance(raw, dict):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"row {row_index} cell {cell_index}: a cell must be a markdown string or a cell-spec object, "
+            f"got {type(raw).__name__}.",
+            {"row_index": row_index, "cell_index": cell_index},
+        )
+    markdown = raw.get("markdown")
+    if not isinstance(markdown, str):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"row {row_index} cell {cell_index}: a cell-spec object requires a string 'markdown' key.",
+            {"row_index": row_index, "cell_index": cell_index},
+        )
+    span = raw.get("span", 1)
+    if isinstance(span, bool) or not isinstance(span, int) or span < 1:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"row {row_index} cell {cell_index}: 'span' must be an integer >= 1, got {span!r}.",
+            {"row_index": row_index, "cell_index": cell_index, "span": span},
+        )
+    v_merge = raw.get("v_merge")
+    if v_merge is not None and v_merge not in _VMERGE_VALUES:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"row {row_index} cell {cell_index}: 'v_merge' must be \"restart\", \"continue\", or omitted, "
+            f"got {v_merge!r}.",
+            {"row_index": row_index, "cell_index": cell_index, "v_merge": v_merge},
+        )
+    bold = raw.get("bold")
+    if bold is not None and not isinstance(bold, bool):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"row {row_index} cell {cell_index}: 'bold' must be a boolean, got {bold!r}.",
+            {"row_index": row_index, "cell_index": cell_index, "bold": bold},
+        )
+    align = raw.get("align")
+    if align is not None and align not in _ALIGN_VALUES:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"row {row_index} cell {cell_index}: 'align' must be one of {sorted(_ALIGN_VALUES)}, got {align!r}.",
+            {"row_index": row_index, "cell_index": cell_index, "align": align},
+        )
+    valign = raw.get("valign")
+    if valign is not None and valign not in _VALIGN_VALUES:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"row {row_index} cell {cell_index}: 'valign' must be one of {sorted(_VALIGN_VALUES)}, got {valign!r}.",
+            {"row_index": row_index, "cell_index": cell_index, "valign": valign},
+        )
+    return {
+        "markdown": markdown,
+        "span": span,
+        "v_merge": v_merge,
+        "fill": _validate_hex(raw.get("fill"), "fill", row_index, cell_index),
+        "color": _validate_hex(raw.get("color"), "color", row_index, cell_index),
+        "bold": bold,
+        "align": align,
+        "valign": valign,
+    }
+
+
+def _validate_vmerge_chain(norm_rows: list[list[dict[str, Any]]]) -> None:
+    """A "continue" cell must have empty markdown, and the same grid
+    column (by col_start, already annotated on every cell) in the row
+    above must itself be "restart" or "continue" -- otherwise there is
+    nothing for it to continue."""
+    open_cols: dict[int, str] = {}
+    for row_index, row in enumerate(norm_rows):
+        new_open: dict[int, str] = {}
+        for cell_index, cell in enumerate(row):
+            v_merge = cell["v_merge"]
+            if v_merge == "continue":
+                if cell["markdown"] != "":
+                    raise _make_error(
+                        ErrorCode.INVALID_INPUT,
+                        f"row {row_index} cell {cell_index}: a v_merge=\"continue\" cell must have empty markdown.",
+                        {"row_index": row_index, "cell_index": cell_index},
+                    )
+                if open_cols.get(cell["col_start"]) not in ("restart", "continue"):
+                    raise _make_error(
+                        ErrorCode.INVALID_INPUT,
+                        f"row {row_index} cell {cell_index}: v_merge=\"continue\" has no \"restart\" (or "
+                        "\"continue\") cell at the same grid column in the row above.",
+                        {"row_index": row_index, "cell_index": cell_index, "col_start": cell["col_start"]},
+                    )
+                new_open[cell["col_start"]] = "continue"
+            elif v_merge == "restart":
+                new_open[cell["col_start"]] = "restart"
+        open_cols = new_open
+
+
+def _normalize_rows(rows: list[list[Any]], grid_dxa: list[int] | None) -> tuple[list[list[dict[str, Any]]], int]:
+    """Pure-string rows keep today's exact behavior: col_count is the
+    widest row, short rows are padded with empty cells (no grid
+    validation -- every span is 1, so a row's span-sum always equals
+    col_count once padded). The moment ANY cell in the table uses the
+    dict form, grid validation is strict instead: every row's cell spans
+    must sum to col_count exactly (from grid_dxa's length when given,
+    else the widest span-sum) -- no padding, a mismatch is INVALID_INPUT
+    naming the row and both numbers."""
+    structured = any(isinstance(c, dict) for row in rows for c in row)
+    if structured:
+        norm_rows = [
+            [_normalize_cell(c, row_index=i, cell_index=j) for j, c in enumerate(row)]
+            for i, row in enumerate(rows)
+        ]
+        col_count = len(grid_dxa) if grid_dxa else max(sum(c["span"] for c in row) for row in norm_rows)
+        for row_index, row in enumerate(norm_rows):
+            row_sum = sum(c["span"] for c in row)
+            if row_sum != col_count:
+                raise _make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"row {row_index}: cell spans sum to {row_sum}, but the table grid has {col_count} "
+                    "column(s); every row's cell spans must sum to the grid column count.",
+                    {"row_index": row_index, "row_span_sum": row_sum, "col_count": col_count},
+                )
+    else:
+        col_count = len(grid_dxa) if grid_dxa else max(len(r) for r in rows)
+        norm_rows = []
+        for row_index, row in enumerate(rows):
+            if len(row) > col_count:
+                raise _make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"row {row_index} has {len(row)} cell(s), more than the {col_count}-column grid_dxa given.",
+                    {"row_index": row_index, "row_cell_count": len(row), "col_count": col_count},
+                )
+            padded = list(row) + [""] * (col_count - len(row))
+            norm_rows.append(
+                [_normalize_cell(c, row_index=row_index, cell_index=j) for j, c in enumerate(padded)]
+            )
+
+    for row in norm_rows:
+        col = 0
+        for cell in row:
+            cell["col_start"] = col
+            col += cell["span"]
+
+    _validate_vmerge_chain(norm_rows)
+    return norm_rows, col_count
+
+
+def _apply_cell_formatting(elements: list[Any], cell: dict[str, Any]) -> None:
+    """align/bold/color live on the rendered runs/paragraphs themselves
+    (w:pPr/w:jc, w:rPr/w:b+w:bCs+w:color) -- see the docstring caveat on
+    execute_insert_table: replace_cell_markdown replaces these elements
+    wholesale, so this formatting does NOT survive a later cell edit
+    (unlike span/v_merge/fill/valign, which live in w:tcPr and do)."""
+    align = cell["align"]
+    bold = cell["bold"]
+    color = cell["color"]
+    if align is None and not bold and color is None:
+        return
+    for el in elements:
+        if projection._ln(el) != "p":
+            continue
+        if align is not None:
+            ppr = _first_child(el, "pPr")
+            if ppr is None:
+                ppr = ET.Element(_w("pPr"))
+                el.insert(0, ppr)
+            jc = _first_child(ppr, "jc")
+            if jc is None:
+                jc = ET.Element(_w("jc"))
+                _insert_ordered(ppr, jc, _PPR_CHILD_ORDER)
+            jc.set(_w("val"), align)
+        if bold or color:
+            for r in el:
+                if projection._ln(r) != "r":
+                    continue
+                rpr = _first_child(r, "rPr")
+                if rpr is None:
+                    rpr = ET.Element(_w("rPr"))
+                    r.insert(0, rpr)
+                if bold:
+                    if _first_child(rpr, "b") is None:
+                        _insert_ordered(rpr, ET.Element(_w("b")), _RPR_CHILD_ORDER)
+                    if _first_child(rpr, "bCs") is None:
+                        _insert_ordered(rpr, ET.Element(_w("bCs")), _RPR_CHILD_ORDER)
+                if color:
+                    c = _first_child(rpr, "color")
+                    if c is None:
+                        c = ET.Element(_w("color"))
+                        _insert_ordered(rpr, c, _RPR_CHILD_ORDER)
+                    c.set(_w("val"), color)
+
+
+def _texts_match_ladder(a: str, b: str) -> bool:
+    """Same normalization ladder locate.py's own locate() uses (exact ->
+    curly/straight quotes -> NBSP/whitespace-run collapse -> soft-hyphen
+    strip), composed for a single before/after text EQUALITY check rather
+    than a haystack search -- after_paragraph_text only ever needs "does
+    this one candidate paragraph's text equal the requested text",
+    not a position."""
+    if a == b:
+        return True
+    qa, _ = locate._norm_quotes(a)
+    qb, _ = locate._norm_quotes(b)
+    if qa == qb:
+        return True
+    wa, _ = locate._norm_whitespace(qa)
+    wb, _ = locate._norm_whitespace(qb)
+    if wa == wb:
+        return True
+    sa, _ = locate._norm_softhyphen(wa)
+    sb, _ = locate._norm_softhyphen(wb)
+    return sa == sb
+
+
+def _resolve_anchor_index(
+    anchor: dict[str, Any] | None,
+    body_children: list[Any],
+    document_root: Any,
+    resolved: Path,
+) -> tuple[int, dict[str, Any] | None]:
+    """(insert_index, anchor_resolved_evidence) -- insert_index is a body
+    index into *body_children* (append-at-end when *anchor* is None,
+    matching today's behavior; anchor_resolved is then None too)."""
+    if anchor is None:
+        return len(body_children), None
+    if not isinstance(anchor, dict):
+        raise _make_error(ErrorCode.INVALID_INPUT, "anchor must be an object.", {"anchor": anchor})
+
+    after_table_id = anchor.get("after_table_id")
+    section_key = anchor.get("section_key")
+    position = anchor.get("position")
+    after_paragraph_text = anchor.get("after_paragraph_text")
+
+    if after_table_id is not None:
+        if section_key is not None or position is not None or after_paragraph_text is not None:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                "anchor.after_table_id cannot be combined with section_key/position/after_paragraph_text.",
+                {"anchor": anchor},
+            )
+        tbl = _find_table_element(document_root, after_table_id)
+        if tbl not in body_children:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"table_id {after_table_id} is nested inside another table's cell, not a top-level body "
+                "table; use anchor.after_paragraph_text to place a table relative to a nested table's "
+                "host cell instead.",
+                {"after_table_id": after_table_id},
+            )
+        insert_at = body_children.index(tbl) + 1
+        return insert_at, {"body_index": insert_at, "section_key": None, "after_table_id": after_table_id}
+
+    if section_key is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "anchor must set either after_table_id, or section_key (with position or after_paragraph_text).",
+            {"anchor": anchor},
+        )
+
+    styles = projection.list_styles_impl(resolved)
+    styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
+    start, end = mutations.locate_section_range(body_children, section_key, styles_by_id)
+
+    if after_paragraph_text is not None:
+        if position is not None:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                "anchor cannot set both position and after_paragraph_text.",
+                {"anchor": anchor},
+            )
+        target = after_paragraph_text.strip()
+        candidates = [
+            idx
+            for idx in range(start, end)
+            if projection._ln(body_children[idx]) == "p"
+            and _texts_match_ladder(mutations._paragraph_text(body_children[idx]).strip(), target)
+        ]
+        if not candidates:
+            raise _make_error(
+                ErrorCode.ZERO_MATCH,
+                f"No top-level paragraph in section {section_key!r} matches after_paragraph_text "
+                f"{after_paragraph_text!r} (checked the exact/quotes/whitespace/soft-hyphen ladder).",
+                {"section_key": section_key, "after_paragraph_text": after_paragraph_text},
+            )
+        if len(candidates) > 1:
+            raise _make_error(
+                ErrorCode.MATCH_COUNT_MISMATCH,
+                f"{len(candidates)} top-level paragraphs in section {section_key!r} match "
+                f"after_paragraph_text {after_paragraph_text!r}; expected exactly 1.",
+                {
+                    "section_key": section_key,
+                    "after_paragraph_text": after_paragraph_text,
+                    "match_count": len(candidates),
+                },
+            )
+        insert_at = candidates[0] + 1
+    else:
+        pos = position if position is not None else "end"
+        if pos == "start":
+            insert_at = start + 1
+        elif pos == "end":
+            insert_at = end
+        else:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"anchor.position must be \"start\" or \"end\", got {position!r}.",
+                {"anchor": anchor},
+            )
+
+    return insert_at, {"body_index": insert_at, "section_key": section_key, "after_table_id": None}
+
+
+def _build_table_element(
+    ctx: markdown_to_ooxml.StyleContext,
+    style_id: str,
+    norm_rows: list[list[dict[str, Any]]],
+    col_count: int,
+    grid_cols_dxa: list[int] | None,
+    explicit_grid: bool,
+    header_rows: int,
+    cant_split: bool,
+) -> tuple[Any, list[list[list[Any]]]]:
+    tbl = ET.Element(_w("tbl"))
+    tblpr = ET.SubElement(tbl, _w("tblPr"))
+    ET.SubElement(tblpr, _w("tblStyle"), {_w("val"): style_id})
+    if explicit_grid:
+        ET.SubElement(tblpr, _w("tblW"), {_w("w"): str(sum(grid_cols_dxa)), _w("type"): "dxa"})
+    else:
+        ET.SubElement(tblpr, _w("tblW"), {_w("w"): "0", _w("type"): "auto"})
+
+    grid = ET.SubElement(tbl, _w("tblGrid"))
+    for i in range(col_count):
+        attrs = {_w("w"): str(grid_cols_dxa[i])} if grid_cols_dxa else {}
+        ET.SubElement(grid, _w("gridCol"), attrs)
+
+    per_row_new_elements: list[list[list[Any]]] = []
+    for row_index, row in enumerate(norm_rows):
+        tr = ET.SubElement(tbl, _w("tr"))
+        if cant_split or row_index < header_rows:
+            trpr = ET.SubElement(tr, _w("trPr"))
+            if cant_split:
+                ET.SubElement(trpr, _w("cantSplit"))
+            if row_index < header_rows:
+                ET.SubElement(trpr, _w("tblHeader"))
+
+        row_elements: list[list[Any]] = []
+        for cell in row:
+            tc = ET.SubElement(tr, _w("tc"))
+            tcpr = ET.SubElement(tc, _w("tcPr"))
+            if grid_cols_dxa:
+                tcw = sum(grid_cols_dxa[cell["col_start"] : cell["col_start"] + cell["span"]])
+                _insert_ordered(tcpr, ET.Element(_w("tcW"), {_w("w"): str(tcw), _w("type"): "dxa"}), _TCPR_CHILD_ORDER)
+            if cell["span"] > 1:
+                _insert_ordered(tcpr, ET.Element(_w("gridSpan"), {_w("val"): str(cell["span"])}), _TCPR_CHILD_ORDER)
+            if cell["v_merge"] == "restart":
+                _insert_ordered(tcpr, ET.Element(_w("vMerge"), {_w("val"): "restart"}), _TCPR_CHILD_ORDER)
+            elif cell["v_merge"] == "continue":
+                _insert_ordered(tcpr, ET.Element(_w("vMerge")), _TCPR_CHILD_ORDER)
+            if cell["fill"]:
+                _insert_ordered(
+                    tcpr,
+                    ET.Element(_w("shd"), {_w("val"): "clear", _w("color"): "auto", _w("fill"): cell["fill"]}),
+                    _TCPR_CHILD_ORDER,
+                )
+            if cell["valign"]:
+                _insert_ordered(tcpr, ET.Element(_w("vAlign"), {_w("val"): cell["valign"]}), _TCPR_CHILD_ORDER)
+
+            elements = _render_cell_markdown(cell["markdown"], ctx)
+            _apply_cell_formatting(elements, cell)
+            for el in elements:
+                tc.append(el)
+            row_elements.append(elements)
+        per_row_new_elements.append(row_elements)
+
+    return tbl, per_row_new_elements
+
 
 def execute_insert_table(
     path: str,
-    rows: list[list[str]],
+    rows: list[list[Any]],
     style_id: str,
     *,
+    header_rows: int = 0,
+    grid_dxa: list[int] | None = None,
+    cant_split: bool = False,
+    anchor: dict[str, Any] | None = None,
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
@@ -606,7 +1055,7 @@ def execute_insert_table(
 
     if not rows or any(len(r) == 0 for r in rows):
         raise _make_error(
-            ErrorCode.INVALID_INPUT, "rows must be a non-empty list of non-empty cell-markdown lists.", {"rows": rows}
+            ErrorCode.INVALID_INPUT, "rows must be a non-empty list of non-empty cell lists.", {"rows": rows}
         )
 
     styles = projection.list_styles_impl(resolved)
@@ -619,51 +1068,57 @@ def execute_insert_table(
         )
     styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
 
-    # New table's own eventual table_id: it is appended as the LAST
-    # top-level body element (before the trailing sectPr), so in a full
-    # document-order walk it gets whatever id comes right after every
-    # table (top-level or nested) already present.
-    new_table_id = len(list_tables_impl(resolved)) + 1
+    if not isinstance(header_rows, int) or isinstance(header_rows, bool) or header_rows < 0:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"header_rows must be an integer >= 0, got {header_rows!r}.",
+            {"header_rows": header_rows},
+        )
+    if header_rows >= len(rows):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"header_rows ({header_rows}) must be less than the number of rows ({len(rows)}).",
+            {"header_rows": header_rows, "row_count": len(rows)},
+        )
+
+    if grid_dxa and any(isinstance(w, bool) or not isinstance(w, int) or w <= 0 for w in grid_dxa):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "grid_dxa must be a list of positive integers (dxa units), one per grid column.",
+            {"grid_dxa": grid_dxa},
+        )
+
+    norm_rows, col_count = _normalize_rows(rows, grid_dxa if grid_dxa else None)
+
+    if grid_dxa:
+        grid_cols_dxa: list[int] | None = list(grid_dxa)
+        explicit_grid = True
+    else:
+        grid_cols_dxa = None
+        explicit_grid = False
+        page_sections = projection.list_page_sections_impl(resolved)
+        if page_sections and page_sections[0].get("column_widths_in"):
+            usable_in = page_sections[0]["column_widths_in"][0]
+            if usable_in:
+                col_width_dxa = max(1, round((usable_in * _DXA_PER_INCH) / col_count))
+                grid_cols_dxa = [col_width_dxa] * col_count
 
     document_root, raw_xml = mutations._load_document(resolved)
     body = mutations._find_body(document_root)
-    body_children, sect_pr = mutations._split_body(body)
+    # Unlike replace_body_markdown/append_markdown, insert_table never
+    # needs the trailing sectPr itself -- body.insert(insert_at, tbl)
+    # below is safe as long as insert_at <= len(body_children) (always
+    # true; every anchor index is derived from positions WITHIN
+    # body_children), since sectPr, when present, stays body's real last
+    # child either way.
+    body_children, _sect_pr = mutations._split_body(body)
 
-    col_count = max(len(r) for r in rows)
-
-    page_sections = projection.list_page_sections_impl(resolved)
-    col_width_dxa: int | None = None
-    if page_sections and page_sections[0].get("column_widths_in"):
-        usable_in = page_sections[0]["column_widths_in"][0]
-        if usable_in:
-            col_width_dxa = max(1, round((usable_in * _DXA_PER_INCH) / col_count))
+    insert_at, anchor_resolved = _resolve_anchor_index(anchor, body_children, document_root, resolved)
 
     ctx = markdown_to_ooxml.StyleContext.build(resolved)
-
-    tbl = ET.Element(_w("tbl"))
-    tblpr = ET.SubElement(tbl, _w("tblPr"))
-    ET.SubElement(tblpr, _w("tblStyle"), {_w("val"): style_id})
-    ET.SubElement(tblpr, _w("tblW"), {_w("w"): "0", _w("type"): "auto"})
-    grid = ET.SubElement(tbl, _w("tblGrid"))
-    for _ in range(col_count):
-        attrs = {_w("w"): str(col_width_dxa)} if col_width_dxa else {}
-        ET.SubElement(grid, _w("gridCol"), attrs)
-
-    per_row_new_elements: list[list[list[Any]]] = []
-    for row_cells in rows:
-        tr = ET.SubElement(tbl, _w("tr"))
-        row_elements: list[list[Any]] = []
-        for c in range(col_count):
-            tc = ET.SubElement(tr, _w("tc"))
-            tcpr = ET.SubElement(tc, _w("tcPr"))
-            if col_width_dxa:
-                ET.SubElement(tcpr, _w("tcW"), {_w("w"): str(col_width_dxa), _w("type"): "dxa"})
-            md = row_cells[c] if c < len(row_cells) else ""
-            elements = _render_cell_markdown(md, ctx)
-            for el in elements:
-                tc.append(el)
-            row_elements.append(elements)
-        per_row_new_elements.append(row_elements)
+    tbl, per_row_new_elements = _build_table_element(
+        ctx, style_id, norm_rows, col_count, grid_cols_dxa, explicit_grid, header_rows, cant_split
+    )
 
     track = tracked_changes.TrackContext(document_root, author=own_author) if track_changes else None
     if track:
@@ -675,11 +1130,21 @@ def execute_insert_table(
 
         tracked_changes.wrap_all_runs([tbl], _ins_wrap)
 
-    insert_at = len(body_children)
     body.insert(insert_at, tbl)
-    if sect_pr is not None:
-        body.remove(sect_pr)
-        body.append(sect_pr)
+
+    # New table's own eventual table_id: re-walk the now-live tree (the
+    # table is already spliced in, at whatever body position *insert_at*
+    # put it -- not necessarily last) and take the table_start event whose
+    # element IS this tbl, by identity. Replaces the old "always last, so
+    # count + 1" shortcut, which anchor placement breaks.
+    proj = projection.project_document_root(document_root)
+    new_table_id: int | None = None
+    for event in proj.events:
+        if isinstance(event, TableBoundaryEvent) and event.kind == "table_start" and event.element is tbl:
+            new_table_id = event.table_id
+            break
+    if new_table_id is None:  # pragma: no cover - defensive; tbl was just inserted into this same tree
+        raise RuntimeError("internal: could not locate the newly inserted table in the re-walked document tree")
 
     new_numbering_index = projection.numbering_index_from_elements(ctx.new_abstract_nums, ctx.new_nums)
     intended_rows = [
@@ -691,17 +1156,44 @@ def execute_insert_table(
         new_document_root, _ = mutations._load_document(written_path)
         new_tbl = _find_table_element(new_document_root, new_table_id)
         new_row_count, new_col_count, _has_merged, _has_nested = _table_stats(new_tbl)
-        if new_row_count != len(rows) or new_col_count != col_count:
+        if new_row_count != len(norm_rows) or new_col_count != col_count:
             raise ValueError(
-                f"re-read table has {new_row_count}x{new_col_count}, expected {len(rows)}x{col_count}"
+                f"re-read table has {new_row_count}x{new_col_count}, expected {len(norm_rows)}x{col_count}"
             )
         new_styles = projection.list_styles_impl(written_path)
         new_styles_by_id = {s["style_id"]: s for s in new_styles if s["style_id"]}
         written_numbering_index = projection.load_numbering_index(written_path)
         new_trs = [r for r in new_tbl if projection._ln(r) == "tr"]
-        for tr_elem, row_elements, intended_row in zip(new_trs, per_row_new_elements, intended_rows):
+        for row_index, (tr_elem, row_specs, row_elements, intended_row) in enumerate(
+            zip(new_trs, norm_rows, per_row_new_elements, intended_rows)
+        ):
             new_cells = _row_cells(tr_elem)
-            for tc, elements, intended in zip(new_cells, row_elements, intended_row):
+            if len(new_cells) != len(row_specs):
+                raise ValueError(f"row {row_index}: re-read {len(new_cells)} cell(s), expected {len(row_specs)}")
+            for cell_index, (tc, spec, elements, intended) in enumerate(
+                zip(new_cells, row_specs, row_elements, intended_row)
+            ):
+                actual_span = _cell_grid_span(tc)
+                if actual_span != spec["span"]:
+                    raise ValueError(
+                        f"row {row_index} cell {cell_index}: re-read grid_span {actual_span}, expected {spec['span']}"
+                    )
+                actual_v_merge = _cell_v_merge(tc)
+                expected_v_merge = spec["v_merge"] or "none"
+                if actual_v_merge != expected_v_merge:
+                    raise ValueError(
+                        f"row {row_index} cell {cell_index}: re-read v_merge {actual_v_merge!r}, "
+                        f"expected {expected_v_merge!r}"
+                    )
+                if spec["fill"]:
+                    tcpr = _cell_tcpr(tc)
+                    shd = _first_child(tcpr, "shd") if tcpr is not None else None
+                    actual_fill = projection._attr(shd, "fill") if shd is not None else None
+                    if actual_fill is None or actual_fill.upper() != spec["fill"]:
+                        raise ValueError(
+                            f"row {row_index} cell {cell_index}: re-read shd fill {actual_fill!r}, "
+                            f"expected {spec['fill']!r}"
+                        )
                 children = _cell_content_children(tc)
                 actual_children = children[-len(elements):] if elements else []
                 actual = _markdown_for_elements(actual_children, new_styles_by_id, written_numbering_index)
@@ -709,10 +1201,17 @@ def execute_insert_table(
                 if diff:
                     raise ValueError(f"re-read cell does not match the intended rendering modulo whitespace: {diff}")
 
+        for row_index in range(header_rows):
+            trpr = _first_child(new_trs[row_index], "trPr")
+            has_header = trpr is not None and _first_child(trpr, "tblHeader") is not None
+            if not has_header:
+                raise ValueError(f"row {row_index} was requested as a header row but w:tblHeader was not found on re-read")
+
     conflict_sweep = mutations._write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
     post_revision = projection.compute_revision(resolved)
     after_text = "\n".join("\t".join(row) for row in intended_rows)
+    merged_cells = sum(1 for row in norm_rows for cell in row if cell["span"] > 1 or cell["v_merge"] is not None)
     evidence = _evidence(
         applied=True,
         match_count=1,
@@ -727,6 +1226,8 @@ def execute_insert_table(
         conflict_sweep=conflict_sweep,
     )
     evidence["table_id"] = new_table_id
+    evidence["merged_cells"] = merged_cells
+    evidence["anchor_resolved"] = anchor_resolved
     logged, _ = audit.append_audit(path=str(resolved), tool="insert_table", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
