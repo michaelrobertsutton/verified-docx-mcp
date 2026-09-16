@@ -873,7 +873,7 @@ class InsertTableRealWorldShapeEndToEndTests(_TempFixtureCase):
             rows.append(
                 [
                     {
-                        "markdown": f"**{name}** - Skyward, {role}",
+                        "markdown": f"**{name}** - Contractor, {role}",
                         "span": 2,
                         "fill": "3B3838",
                         "color": "FFFFFF",
