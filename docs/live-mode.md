@@ -70,11 +70,11 @@ Word for Mac ─── task pane (Office.js, WordApi 1.4) ───────�
   document_url, connected_since, last_heartbeat_age_s, body_sha256,
   requirement_sets}]}`. An empty `sessions` list is normal before the
   lead opens the pane, not an error.
-- **Live write mode** (WP-3/WP-4, not yet wired): `replace_text`,
-  `format_text`, `add_anchored_comment`, `reply_to_comment`,
-  `resolve_comment` will gain `write_mode: "auto" | "file" | "live"`.
-  Not implemented by WP-2 — this WP delivers the transport, the protocol,
-  the pane dispatcher, and `live_status` only.
+- **Live write mode**: `replace_text`/`format_text`/`live_save` gained
+  `write_mode: "auto" | "file" | "live"` in WP-3 (below). The comment
+  tools (`add_anchored_comment`, `reply_to_comment`, `resolve_comment`)
+  gain the same parameter in WP-4, a separate, parallel PR against this
+  same WP-2 base.
 - **Testing**: `tests/unit/fake_pane.py` is a Python `websockets` client
   that answers every op deterministically against an in-memory document,
   mimicking the pane's semantics (including the `expected_matches`
@@ -82,6 +82,108 @@ Word for Mac ─── task pane (Office.js, WordApi 1.4) ───────�
   `tests/unit/test_live_protocol.py` and `tests/unit/test_live_session.py`
   exercise the schemas and the bridge/session wiring through it, on
   ephemeral ports.
+
+## Live edits (WP-3)
+
+`replace_text` and `format_text` (rungs 1 and 2 of
+`core/document-backend-protocol.md`'s edit ladder, in the JennyStack
+repo) and the new `live_save` tool now have a live path, alongside the
+unchanged file path. The shared resolver lives in
+`src/verified_docx_mcp/live/write_mode.py` — a small module both this WP
+and WP-4's live comment tools import, so the `auto` rule and the live
+evidence shape are defined exactly once.
+
+**`write_mode` rule** (`resolve_write_mode(path, requested)`):
+
+| `write_mode` | Rule |
+|---|---|
+| `"file"` | Always the file path — today's behavior, byte-for-byte. No bridge/registry lookup at all. |
+| `"live"` | Always the live pane. Raises `LIVE_UNAVAILABLE` if no pane session is connected for that document. |
+| `"auto"` (default) | Live only when BOTH hold: a pane session is connected for the file's name, AND `lock_status` reports a desktop Word owner file for the path. Otherwise file. |
+
+Matching is by file name exactly as a connected pane reports it
+(`documentUrl`'s basename, same as `live/session.py`'s
+`document_name_from_url`), never by full path. `resolve_write_mode` never
+starts the bridge itself (`live_bridge.current_registry()`, not
+`start_in_background()`) — a plain `write_mode="auto"` call (the default
+on every `replace_text`/`format_text` call today) must never bind the
+bridge's real ports as a side effect; only `live_status`, or an already-
+connected pane, brings the bridge up.
+
+**Why a document open in Word is now writable.** Before this WP, a desktop
+Word owner file on the target path only ever showed up as data
+(`lock_status`) or as `DOCX_LOCKED` on a file-mode write guard. `auto`
+routes that exact situation — the lead has the pursuit's document open,
+with the Live pane loaded — into a live edit instead: the same call that
+would have refused now applies immediately, in front of the lead.
+
+**Live op flow** (`replace`/`format`): `describe` (record the pane's
+pre-op `body.text` SHA-256; refuse `LIVE_STALE` if a caller-supplied
+`revision_before` starting with `live:sha256:` already disagrees with it)
+→ send the op with `expected_body_sha256` set to that same hash (so the
+session layer's own staleness check also covers the moment between
+`describe` and the op landing) → verify. Verification differs by op:
+`replace_text` requires the post-op hash to differ from the pre-op hash
+AND every matched range's `after` text to equal the requested
+replacement, since a real content change is expected; `format_text`
+requires the pane's `applied: true` and every matched range's `after`
+text to equal its own `before` text, since a format-only op is expected
+to leave `body.text` — and therefore the body hash — unchanged. Either
+verification failure raises `VERIFICATION_FAILED` with diagnostics
+stating there is nothing to roll back in live mode (Word, not this
+server, owns the document).
+
+A pane `ok:false` reply (an `expected_matches` gate failure) is mapped to
+`ZERO_MATCH` or `MATCH_COUNT_MISMATCH` by `write_mode.classify_op_failed`,
+which parses the actual count out of the pane's own documented message
+format (`"...found N"`) rather than requiring a new wire-level error code
+— an existing WP-2 test pins today's fake pane (and, per `protocol.py`'s
+own documented op contract, the real pane) to a single `LIVE_OP_FAILED`
+wire code with the count folded into the message, so this is additive,
+not a breaking change to that contract. A future pane/protocol version
+that reports `zero_match`/`match_count_mismatch` directly is honored
+immediately, with no code change needed here.
+
+**Live evidence** carries the same eight keys file-mode evidence always
+carries (`applied`, `match_count`, `rung`, `before`, `after`,
+`revision_before`, `revision_after`, `audit_logged`), plus:
+`write_mode: "live"`, `verified_via: "word-addin"`, `document_name`,
+`track_changes_author: "word-signed-in-user"` (the pane cannot set
+`w:author` — live track-changes authorship is always whoever is signed
+into that copy of Word), and `orphaned_comment_ids: []`. `rung` is `2`
+for `replace_text` and `1` for `format_text` (the edit-ladder rung
+numbers, not the file-mode normalization-ladder rung label like
+`"exact"`). `revision_before`/`revision_after` are
+`"live:sha256:<hex>"` of the pane's own body hash — there is no OOXML
+revision token until `live_save` writes the file back to disk. Never
+present: `conflict_copy_detected` and its siblings (Word owns the file
+for the whole live session, so there is no sync-conflict copy for a
+sweep to find) or `revision_ids` (the pane has no id-level view of a
+tracked change to report).
+
+**`live_save(path)`** sends the pane's `save` op
+(`document.save()`), then reports `{applied, saved, document_name,
+revision_after: "live:sha256:...", file_revision, audit_logged}` —
+`file_revision` is the plain file-mode revision TOKEN STRING
+(`projection.compute_revision(path)["token"]`), computed from the
+now-saved file, so a caller can pass it as the next file-mode call's
+`revision_before`. `live_save` is in `MUTATING_TOOLS`; `replace_text`/
+`format_text` were already there from WP-06 and are not added twice.
+
+**Rungs 3 and 4 never go live.** `replace_range_markdown`/
+`replace_body_markdown` have no `write_mode` parameter and always take
+the file path, even during a live session — structural verification
+against the file happens after `live_save`, via the existing read tools
+(`read_document`/`find_sections`/`diff_body_vs_file`) against the
+now-saved file, same as any other file-mode read.
+
+**Testing**: `tests/unit/test_live_write_mode.py` covers the resolver
+truth table (mocked, no bridge) and, over a real ephemeral-port bridge +
+`FakePane`, the live happy paths for `replace_text`/`format_text`/
+`live_save`, `MATCH_COUNT_MISMATCH`/`ZERO_MATCH`/`LIVE_STALE`/
+`LIVE_UNAVAILABLE`/`LIVE_DISCONNECTED`, and that `write_mode="file"`
+and `write_mode="auto"` with no owner file both still take the exact
+file-mode path (the fake pane receives no op at all in the latter case).
 
 ## WP-1 result (2026-09-16, Word for Mac 16.112.4)
 

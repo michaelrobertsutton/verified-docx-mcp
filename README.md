@@ -59,7 +59,15 @@ Tools implemented so far:
   targeted text edits located via a normalization ladder (exact ->
   curly/straight quotes -> NBSP/whitespace collapse -> soft-hyphen
   strip), with run splitting that clones a boundary run's original
-  `w:rPr` verbatim onto every surviving piece.
+  `w:rPr` verbatim onto every surviving piece. Both take a `write_mode:
+  "auto" | "file" | "live"` parameter (default `"auto"`): `"auto"` edits
+  through a connected Word task pane instead of the file when the
+  document is open in Word with the Live pane loaded, otherwise the file
+  path unchanged — see [Live mode](#live-mode) below.
+- **`live_save(path)`** — ask the connected pane to save the live
+  document, then report both the pane's own live revision token and a
+  bridge back to the file-mode revision contract (`file_revision`) for a
+  caller that wants to keep working against the file afterward.
 - **`list_open_items(path)`**, **`accept_tracked_changes(path,
   revision_ids?, ...)`**, **`reject_tracked_changes(path, revision_ids?,
   ...)`** — list open comments/pending tracked changes (Google's response
@@ -334,10 +342,13 @@ document_url, connected_since, last_heartbeat_age_s, body_sha256,
 requirement_sets}]}` — an empty `sessions` list is normal before the lead
 opens the pane in Word.
 
-`write_mode="live"` on the existing edit/comment tools is not wired up
-yet (tracked for a later work package) — this only delivers the
-transport, the protocol, the pane dispatcher, and `live_status`.
-Full architecture and the lead's sideload runbook:
+`write_mode: "auto" | "file" | "live"` on `replace_text`/`format_text`
+(default `"auto"`) sends the edit through the pane instead of the file
+when the document is open in Word with the Live pane connected;
+`live_save(path)` asks the pane to save. The live comment tools
+(`add_anchored_comment`/`reply_to_comment`/`resolve_comment`) are a
+separate, parallel work package. Full architecture, the `write_mode`
+rule and live evidence shape, and the lead's sideload runbook:
 [`docs/live-mode.md`](docs/live-mode.md).
 
 ## Path safety
