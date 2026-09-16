@@ -168,6 +168,25 @@ class MakeCertTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_OPENSSL, "openssl CLI not found on PATH")
+class TaskpaneApiUsageTests(unittest.TestCase):
+    """Regressions caught against the real pane on Word for Mac 16.112.4
+    (issue #106 acceptance run): Office.js exposes a comment's replies as
+    the `Comment.replies` property, not a `getReplies()` method, and an
+    item's `id` must be loaded (`items/id`) before `.find(c => c.id === …)`
+    can read it."""
+
+    def setUp(self):
+        self.js = (ADDIN_DIR / "taskpane.js").read_text(encoding="utf-8")
+
+    def test_replies_is_a_property_not_a_method(self):
+        self.assertNotIn("getReplies(", self.js)
+        self.assertIn("match.replies", self.js)
+
+    def test_by_id_lookups_load_items_id(self):
+        self.assertNotIn('comments.load("items");\n  await context.sync();\n  const match', self.js)
+        self.assertIn('comments.load("items/id")', self.js)
+
+
 class ServeOnlyTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

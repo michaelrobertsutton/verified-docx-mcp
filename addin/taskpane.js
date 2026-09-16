@@ -554,11 +554,11 @@ async function opCommentsList() {
 
 async function withReplies(context, commentSummary) {
   const comments = context.document.body.getComments();
-  comments.load("items");
+  comments.load("items/id");
   await context.sync();
   const match = comments.items.find((c) => c.id === commentSummary.id);
   if (!match) return Object.assign({}, commentSummary, { replies: [] });
-  const replies = match.getReplies();
+  const replies = match.replies; // CommentReplyCollection is a property, not a method
   replies.load("items");
   await context.sync();
   replies.items.forEach((r) => r.load(["id", "content", "authorName", "creationDate"]));
@@ -613,7 +613,7 @@ async function opCommentAdd(payload) {
 async function opCommentReply(payload) {
   return Word.run(async (context) => {
     const comments = context.document.body.getComments();
-    comments.load("items");
+    comments.load("items/id");
     await context.sync();
     const comment = comments.items.find((c) => c.id === payload.comment_id);
     if (!comment) throw refusalError(`no comment with id ${JSON.stringify(payload.comment_id)}`);
@@ -627,7 +627,7 @@ async function opCommentReply(payload) {
 async function opCommentResolve(payload) {
   return Word.run(async (context) => {
     const comments = context.document.body.getComments();
-    comments.load("items");
+    comments.load("items/id");
     await context.sync();
     const comment = comments.items.find((c) => c.id === payload.comment_id);
     if (!comment) throw refusalError(`no comment with id ${JSON.stringify(payload.comment_id)}`);
