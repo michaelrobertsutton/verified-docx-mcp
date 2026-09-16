@@ -108,6 +108,7 @@ async function runAndRender() {
     const report = await buildReport();
     lastReport = report;
     setOutput(report);
+    renderSummary(report);
     document.getElementById("copy-json").disabled = false;
     await postReport(report);
     setStatus(
@@ -196,7 +197,56 @@ let opLog = [];
 
 function setWsStatus(text) {
   const el = document.getElementById("ws-status");
-  if (el) el.textContent = `Ops channel: ${text}`;
+  if (!el) return;
+  el.textContent = `Ops channel: ${text}`;
+  // Color the line by state so it reads at a glance in Word's dark theme.
+  el.dataset.state = text === "connected" ? "connected" : /disconnected|failed/.test(text) ? "down" : "pending";
+}
+
+function renderSummary(report) {
+  // Plain-language card for the writer; the raw JSON stays under "Details".
+  const nameEl = document.getElementById("doc-name");
+  const capEl = document.getElementById("cap-line");
+  const commentsEl = document.getElementById("comments-line");
+  const warnEl = document.getElementById("doc-warning");
+  if (!nameEl || !capEl || !commentsEl || !warnEl) return;
+  const url = report.documentUrl || "";
+  const name = url ? url.split(/[\\/]/).pop() : "";
+  nameEl.textContent = name || "(unsaved document)";
+  warnEl.classList.toggle("show", !url);
+  const ok14 = !!(report.requirementSets && report.requirementSets["1.4"]);
+  capEl.textContent = ok14 ? "supported" : "NOT supported";
+  capEl.className = "v " + (ok14 ? "ok" : "bad");
+  const open = (report.comments || []).filter((c) => !c.resolved).length;
+  commentsEl.textContent = String(open);
+}
+
+function renderActivity() {
+  const ul = document.getElementById("activity");
+  if (!ul) return;
+  if (!opLog.length) {
+    ul.innerHTML = '<li class="t">No edits received yet.</li>';
+    return;
+  }
+  ul.innerHTML = "";
+  opLog.slice(0, 10).forEach((e) => {
+    const li = document.createElement("li");
+    const t = document.createElement("span");
+    t.className = "t";
+    t.textContent = e.time.slice(11, 19);
+    const label = document.createElement("span");
+    label.className = e.ok ? "ok" : "bad";
+    label.textContent = (e.ok ? "applied " : "refused ") + e.op;
+    li.appendChild(t);
+    li.appendChild(label);
+    if (e.detail) {
+      const d = document.createElement("span");
+      d.className = "t";
+      d.textContent = "  " + String(e.detail).slice(0, 80);
+      li.appendChild(d);
+    }
+    ul.appendChild(li);
+  });
 }
 
 function logOp(op, ok, detail) {
@@ -207,6 +257,7 @@ function logOp(op, ok, detail) {
   el.textContent = opLog
     .map((e) => `${e.time}  ${e.ok ? "OK  " : "FAIL"}  ${e.op}${e.detail ? "  " + e.detail : ""}`)
     .join("\n");
+  renderActivity();
 }
 
 async function currentBodyHash() {
