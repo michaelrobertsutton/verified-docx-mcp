@@ -1351,6 +1351,14 @@ def list_open_items(path: str) -> dict[str, Any]:
     replies=[]. reply_count/replies are still present, structurally, for
     forward compatibility with a later WP that resolves them.
 
+    Each comment's identity is keyed on its LAST paragraph (Word itself
+    keys commentsIds.xml/commentsExtended.xml this way for a
+    multi-paragraph comment, not its first -- issue #108); comment_id is
+    that paragraph's durableId when commentsIds.xml has one, falling back
+    to the raw w:comment/@w:id otherwise (e.g. no commentsIds.xml at all).
+    Every comment_id list_open_items emits is accepted by get_comment_thread/
+    reply_to_comment/resolve_comment, including that raw w:id fallback.
+
     Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
     Word's owner file is present, like every other read tool.
 
@@ -1509,13 +1517,20 @@ def add_anchored_comment(path: str, quote: str, text: str, expected_matches: int
 def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
     """Read a comment and its direct replies, by durableId (from
     add_anchored_comment's own evidence, or word/commentsIds.xml's
-    w16cid:durableId directly).
+    w16cid:durableId directly) -- or, as a fallback, a raw
+    word/comments.xml w:comment/@w:id (e.g. one list_open_items reported
+    on a file with no commentsIds.xml at all).
+
+    A multi-paragraph comment's identity is its LAST paragraph's paraId,
+    matching how Word itself keys commentsIds.xml/commentsExtended.xml
+    for one (not its first -- issue #108).
 
     Returns comment_id, content, author, created_time, resolved
     (commentsExtended.xml's w15:done), quoted_text (the live text its
-    range currently brackets), reply_count, and replies (each reply in
-    the same shape, one level deep -- a reply-of-reply is not walked
-    further).
+    range currently brackets), reply_count, replies (each reply in the
+    same shape, one level deep -- a reply-of-reply is not walked
+    further), and comment_id_resolved_via ("durableId" | "w_id", saying
+    which lookup path matched).
 
     Scope limit: if comment_id itself names a reply (it has its own
     w15:paraIdParent), this returns that reply alone with replies=[] --
@@ -1529,7 +1544,8 @@ def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
     Errors:
       INVALID_INPUT   - path does not exist or is outside the allowed roots,
                          the document has no comments at all, or comment_id
-                         does not match any commentsIds.xml durableId
+                         matches neither a commentsIds.xml durableId nor a
+                         word/comments.xml w:comment/@w:id
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
@@ -1552,10 +1568,20 @@ def reply_to_comment(path: str, comment_id: str, text: str) -> dict[str, Any]:
     reply's anchor brackets the SAME live text the parent's own anchor
     currently does; no new text is located or matched.
 
+    The PARENT'S own identity paraId is its LAST paragraph's, matching
+    how Word itself keys commentsIds.xml/commentsExtended.xml for a
+    multi-paragraph comment (not its first -- issue #108) -- so a reply
+    to a multi-paragraph comment links w15:paraIdParent to the correct
+    paragraph. *comment_id* resolves via commentsIds.xml's durableId
+    first, then falls back to a raw w:comment/@w:id match (same fallback
+    as get_comment_thread/resolve_comment).
+
     Returns the eight evidence keys (before/after are the parent's own
     quoted text, unchanged -- a reply never edits document text; rung is
     the fixed label "reply", since no text search is performed), plus
-    comment_id (the new reply's own durableId) and parent_comment_id.
+    comment_id (the new reply's own durableId), parent_comment_id, and
+    comment_id_resolved_via ("durableId" | "w_id", saying which lookup
+    path matched *comment_id*, the parent).
 
     Always also carries conflict_copy_detected (issue #28 WP-10's
     post-write conflict-copy sweep -- never raised, an evidence flag on
@@ -1600,9 +1626,20 @@ def resolve_comment(path: str, comment_id: str) -> dict[str, Any]:
     Idempotent: resolving an already-resolved comment succeeds again
     (not an error).
 
+    A multi-paragraph comment's identity is its LAST paragraph's paraId,
+    matching how Word itself keys commentsIds.xml/commentsExtended.xml
+    for one (not its first -- issue #108). *comment_id* resolves via
+    commentsIds.xml's durableId first, then falls back to a raw
+    w:comment/@w:id match (same fallback as get_comment_thread/
+    reply_to_comment) -- this is what makes every comment_id
+    list_open_items emits resolvable, including three real
+    multi-paragraph comments that were listed but unresolvable before
+    this fix.
+
     Returns the eight evidence keys (before="open", after="resolved";
     rung is the fixed label "resolve", since no text search is
-    performed), plus comment_id.
+    performed), plus comment_id and comment_id_resolved_via
+    ("durableId" | "w_id", saying which lookup path matched).
 
     Always also carries conflict_copy_detected (issue #28 WP-10's
     post-write conflict-copy sweep -- never raised, an evidence flag on

@@ -228,9 +228,9 @@ class _CommentParts:
         for c in self.comments_root:
             if projection._ln(c) != "comment" or projection._attr(c, "id") != w_id:
                 continue
-            for p in c:
-                if projection._ln(p) == "p":
-                    return projection._attr(p, "paraId")
+            # Issue #108: identity paraId is the comment's LAST w:p, not
+            # its first -- see projection.identity_para_id's own docstring.
+            return projection.identity_para_id(c, ids_root=self.ids_root, ext_root=self.ext_root)
         return None
 
     def w_id_for_durable_id(self, durable_id: str) -> str | None:
@@ -248,6 +248,48 @@ class _CommentParts:
                 if projection._ln(p) == "p" and projection._attr(p, "paraId") == para_id:
                     return projection._attr(c, "id")
         return None
+
+    def w_id_exists(self, w_id: str) -> bool:
+        return any(
+            projection._ln(c) == "comment" and projection._attr(c, "id") == w_id for c in self.comments_root
+        )
+
+    def all_w_ids(self) -> list[str]:
+        return sorted(
+            projection._attr(c, "id") or "" for c in self.comments_root if projection._ln(c) == "comment"
+        )
+
+    def all_durable_ids(self) -> list[str]:
+        return sorted(
+            projection._attr(child, "durableId") or ""
+            for child in self.ids_root
+            if projection._ln(child) == "commentId"
+        )
+
+    def resolve_w_id(self, comment_id: str) -> tuple[str, str]:
+        """Issue #108 fix item 2: resolve *comment_id* to a comment w:id,
+        trying commentsIds.xml's durableId first (the existing behavior),
+        then falling back to a direct w:comment/@w:id match -- this keeps
+        every id list_open_items can emit actionable here, including its
+        own raw-w:id fallback (which fires on a file with no
+        commentsIds.xml at all, or -- before this fix -- on a Word-authored
+        multi-paragraph comment). Returns (w_id, "durableId" | "w_id").
+        Raises INVALID_INPUT, listing both id kinds available, if neither
+        matches."""
+        w_id = self.w_id_for_durable_id(comment_id)
+        if w_id is not None:
+            return w_id, "durableId"
+        if self.w_id_exists(comment_id):
+            return comment_id, "w_id"
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"comment_id {comment_id!r} not found",
+            {
+                "comment_id": comment_id,
+                "available_durable_ids": self.all_durable_ids(),
+                "available_w_ids": self.all_w_ids(),
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -630,17 +672,25 @@ def _build_overrides(
 # ---------------------------------------------------------------------------
 
 
-def _comment_record(comment_elem: Any, *, durable_id: str, resolved: bool, quoted_by_para: dict[str, str]) -> dict[str, Any]:
+def _comment_record(
+    comment_elem: Any,
+    *,
+    durable_id: str,
+    resolved: bool,
+    quoted_by_para: dict[str, str],
+    ids_root: Any | None = None,
+    ext_root: Any | None = None,
+) -> dict[str, Any]:
     author = projection._attr(comment_elem, "author")
     date = projection._attr(comment_elem, "date")
     content_parts: list[str] = []
-    para_id: str | None = None
     for p in comment_elem:
         if projection._ln(p) != "p":
             continue
-        if para_id is None:
-            para_id = projection._attr(p, "paraId")
         content_parts.append(tracked_changes._collect_text(p, {"t"}))
+    # Issue #108: identity paraId is the comment's LAST w:p, not its
+    # first -- content_parts above still joins EVERY paragraph's text.
+    para_id = projection.identity_para_id(comment_elem, ids_root=ids_root, ext_root=ext_root)
     return {
         "comment_id": durable_id,
         "content": "".join(content_parts),
@@ -654,8 +704,12 @@ def _comment_record(comment_elem: Any, *, durable_id: str, resolved: bool, quote
 def execute_get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
     """Read-only: the comment named by *comment_id* (a durableId, from
     add_anchored_comment's own evidence or commentsIds.xml's
-    w16cid:durableId), plus its direct replies (commentsExtended.xml's
-    w15:paraIdParent linking a reply back to this comment's own paraId).
+    w16cid:durableId -- or, as a fallback, a raw word/comments.xml
+    w:comment/@w:id, e.g. one list_open_items reported when the document
+    has no commentsIds.xml at all), plus its direct replies
+    (commentsExtended.xml's w15:paraIdParent linking a reply back to this
+    comment's own paraId). The result carries comment_id_resolved_via
+    ("durableId" | "w_id") saying which path matched (issue #108).
 
     Scope limit: if *comment_id* itself names a REPLY (it has its own
     paraIdParent), this returns that reply alone with replies=[] -- it
@@ -671,14 +725,14 @@ def execute_get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
     try:
         with zipfile.ZipFile(local_path) as zf:
             names = set(zf.namelist())
-            if _COMMENTS_PART not in names or _COMMENTS_IDS_PART not in names:
+            if _COMMENTS_PART not in names:
                 raise _make_error(
                     ErrorCode.INVALID_INPUT,
                     f"document has no comments (comment_id {comment_id!r} cannot exist)",
                     {"comment_id": comment_id},
                 )
             comments_root = ET.fromstring(zf.read(_COMMENTS_PART))
-            ids_root = ET.fromstring(zf.read(_COMMENTS_IDS_PART))
+            ids_root = ET.fromstring(zf.read(_COMMENTS_IDS_PART)) if _COMMENTS_IDS_PART in names else None
             ext_root = ET.fromstring(zf.read(_COMMENTS_EXT_PART)) if _COMMENTS_EXT_PART in names else None
 
         proj = projection.project_part(local_path)
@@ -693,32 +747,45 @@ def execute_get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
             if projection._ln(c) != "comment":
                 continue
             w_id = projection._attr(c, "id") or ""
-            for p in c:
-                if projection._ln(p) == "p":
-                    pid = projection._attr(p, "paraId")
-                    if pid:
-                        para_id_by_w_id[w_id] = pid
-                        quoted_by_para[pid] = "".join(anchor_by_id.get(w_id, []))
-                    break
+            # Issue #108: identity paraId is the comment's LAST w:p, not
+            # its first -- see projection.identity_para_id's own docstring.
+            pid = projection.identity_para_id(c, ids_root=ids_root, ext_root=ext_root)
+            if pid:
+                para_id_by_w_id[w_id] = pid
+                quoted_by_para[pid] = "".join(anchor_by_id.get(w_id, []))
 
         para_id_by_durable: dict[str, str] = {}
         durable_by_para: dict[str, str] = {}
-        for child in ids_root:
-            if projection._ln(child) != "commentId":
-                continue
-            pid = projection._attr(child, "paraId")
-            did = projection._attr(child, "durableId")
-            if pid and did:
-                para_id_by_durable[did] = pid
-                durable_by_para[pid] = did
+        if ids_root is not None:
+            for child in ids_root:
+                if projection._ln(child) != "commentId":
+                    continue
+                pid = projection._attr(child, "paraId")
+                did = projection._attr(child, "durableId")
+                if pid and did:
+                    para_id_by_durable[did] = pid
+                    durable_by_para[pid] = did
 
+        # Issue #108 fix item 2: durableId first (existing behavior), then
+        # a raw w:comment/@w:id fallback -- keeps every id list_open_items
+        # can emit actionable here, including on a file with no
+        # commentsIds.xml at all.
+        comment_id_resolved_via = "durableId"
         target_para_id = para_id_by_durable.get(comment_id)
         if target_para_id is None:
-            raise _make_error(
-                ErrorCode.INVALID_INPUT,
-                f"comment_id {comment_id!r} not found in commentsIds.xml",
-                {"comment_id": comment_id, "available_comment_ids": sorted(para_id_by_durable)},
-            )
+            if comment_id in para_id_by_w_id:
+                target_para_id = para_id_by_w_id[comment_id]
+                comment_id_resolved_via = "w_id"
+            else:
+                raise _make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"comment_id {comment_id!r} not found",
+                    {
+                        "comment_id": comment_id,
+                        "available_durable_ids": sorted(para_id_by_durable),
+                        "available_w_ids": sorted(para_id_by_w_id),
+                    },
+                )
 
         done_by_para: dict[str, str | None] = {}
         parent_by_para: dict[str, str | None] = {}
@@ -746,7 +813,12 @@ def execute_get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
             )
             durable = durable_by_para.get(pid, "")
             return _comment_record(
-                comment_elem, durable_id=durable, resolved=done_by_para.get(pid) == "1", quoted_by_para=quoted_by_para
+                comment_elem,
+                durable_id=durable,
+                resolved=done_by_para.get(pid) == "1",
+                quoted_by_para=quoted_by_para,
+                ids_root=ids_root,
+                ext_root=ext_root,
             )
 
         thread = _record_for_para(target_para_id)
@@ -754,6 +826,7 @@ def execute_get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
         thread["reply_count"] = len(replies)
         thread["replies"] = replies
         thread["path"] = str(resolved_path)
+        thread["comment_id_resolved_via"] = comment_id_resolved_via
         return thread
     finally:
         if is_temp:
@@ -780,6 +853,11 @@ def execute_reply_to_comment(
     live span the parent already does; this matches the golden fixture's
     own shape exactly (its reply, id=1, has its own anchor triplet
     alongside the parent's, id=0, both around the same quoted text).
+
+    *comment_id* resolves via commentsIds.xml's durableId first, then
+    falls back to a raw w:comment/@w:id match (issue #108's
+    _CommentParts.resolve_w_id) -- the evidence's comment_id_resolved_via
+    key says which path matched.
     """
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(resolved, revision_before)
@@ -788,11 +866,7 @@ def execute_reply_to_comment(
     proj = projection.project_document_root(document_root)
 
     parts = _CommentParts(resolved)
-    parent_w_id = parts.w_id_for_durable_id(comment_id)
-    if parent_w_id is None:
-        raise _make_error(
-            ErrorCode.INVALID_INPUT, f"comment_id {comment_id!r} not found", {"comment_id": comment_id}
-        )
+    parent_w_id, comment_id_resolved_via = parts.resolve_w_id(comment_id)
     parent_para_id = parts.para_id_for_w_id(parent_w_id)
     if parent_para_id is None:
         raise _make_error(
@@ -867,6 +941,7 @@ def execute_reply_to_comment(
         "audit_logged": False,
         "comment_id": new_durable_id,
         "parent_comment_id": comment_id,
+        "comment_id_resolved_via": comment_id_resolved_via,
     }
     mutations._merge_conflict_sweep(evidence, conflict_sweep)  # issue #28 WP-10
     logged, _ = audit.append_audit(path=str(resolved), tool="reply_to_comment", evidence=evidence)
@@ -895,6 +970,11 @@ def execute_resolve_comment(
     VERIFICATION_FAILED) if it does not show resolved -- so the error
     VOCABULARY still matches Google's for this exact failure mode, giving
     a caller a more specific signal than VERIFICATION_FAILED would.
+
+    *comment_id* resolves via commentsIds.xml's durableId first, then
+    falls back to a raw w:comment/@w:id match (issue #108's
+    _CommentParts.resolve_w_id) -- the evidence's comment_id_resolved_via
+    key says which path matched.
     """
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(resolved, revision_before)
@@ -902,11 +982,7 @@ def execute_resolve_comment(
     document_root, raw_xml = mutations._load_document(resolved)
 
     parts = _CommentParts(resolved)
-    w_id = parts.w_id_for_durable_id(comment_id)
-    if w_id is None:
-        raise _make_error(
-            ErrorCode.INVALID_INPUT, f"comment_id {comment_id!r} not found", {"comment_id": comment_id}
-        )
+    w_id, comment_id_resolved_via = parts.resolve_w_id(comment_id)
     para_id = parts.para_id_for_w_id(w_id)
     if para_id is None:
         raise _make_error(
@@ -963,6 +1039,7 @@ def execute_resolve_comment(
         "revision_after": post_revision["token"],
         "audit_logged": False,
         "comment_id": comment_id,
+        "comment_id_resolved_via": comment_id_resolved_via,
     }
     mutations._merge_conflict_sweep(evidence, conflict_sweep)  # issue #28 WP-10
     logged, _ = audit.append_audit(path=str(resolved), tool="resolve_comment", evidence=evidence)
