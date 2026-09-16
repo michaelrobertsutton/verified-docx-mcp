@@ -173,7 +173,10 @@ class ServeOnlyTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         cert_dir = Path(self._tmp.name)
         self.cert_path, self.key_path = bridge.make_cert(cert_dir, openssl_bin=_OPENSSL)
-        self.httpd = bridge.make_server(ADDIN_DIR, port=0, certfile=self.cert_path, keyfile=self.key_path)
+        self.report_dir = Path(self._tmp.name) / "reports"
+        self.httpd = bridge.make_server(
+            ADDIN_DIR, port=0, certfile=self.cert_path, keyfile=self.key_path, report_dir=self.report_dir
+        )
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -191,6 +194,38 @@ class ServeOnlyTests(unittest.TestCase):
         conn = http.client.HTTPSConnection("127.0.0.1", self.port, context=ctx, timeout=10)
         conn.request("GET", path)
         return conn.getresponse()
+
+    def _post(self, path: str, body: bytes, content_type: str = "application/json") -> http.client.HTTPResponse:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection("127.0.0.1", self.port, context=ctx, timeout=10)
+        conn.request("POST", path, body=body, headers={"Content-Type": content_type, "Content-Length": str(len(body))})
+        return conn.getresponse()
+
+    def test_post_report_writes_latest_and_stamped_json(self):
+        import json
+
+        report = {"wp": "issue-106-wp1", "requirementSets": {"1.4": True}, "comments": [{"id": "abc"}]}
+        resp = self._post("/report", json.dumps(report).encode("utf-8"))
+        self.assertEqual(resp.status, 200)
+        reply = json.loads(resp.read())
+        self.assertTrue(reply["ok"])
+        latest = self.report_dir / "latest.json"
+        self.assertTrue(latest.is_file())
+        self.assertEqual(json.loads(latest.read_text(encoding="utf-8")), report)
+        stamped = [p for p in self.report_dir.iterdir() if p.name.startswith("report-")]
+        self.assertEqual(len(stamped), 1)
+        self.assertEqual(json.loads(stamped[0].read_text(encoding="utf-8")), report)
+
+    def test_post_report_rejects_non_json(self):
+        resp = self._post("/report", b"not json")
+        self.assertEqual(resp.status, 400)
+        self.assertFalse((self.report_dir / "latest.json").exists())
+
+    def test_post_unknown_route_is_404(self):
+        resp = self._post("/nope", b"{}")
+        self.assertEqual(resp.status, 404)
 
     def test_ping_returns_ok_json(self):
         import json
