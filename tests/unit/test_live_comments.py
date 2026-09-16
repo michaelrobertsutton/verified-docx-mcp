@@ -217,6 +217,44 @@ class ListOpenItemsLiveCorrelationTests(LiveCommentsTestCase):
         self.assertEqual(entry["confidence"], "none")
         self.assertIsNone(entry["comment_id"])
         self.assertIsNone(entry["w_id"])
+        self.assertIsNone(entry["date_skew_s"])
+
+    async def test_exact_confidence_survives_real_pane_date_skew(self):
+        """issue #106 WP-6 real-pane finding: Word for Mac wrote this
+        fixture's own w:date as '2026-09-16T14:06:00Z' (local wall-clock
+        time with a 'Z' suffix), while Office.js's real creationDate for
+        the SAME comment was true UTC, '2026-09-16T18:06:00.000Z' -- a
+        4-hour gap the old 2-minute date-tolerance window could never
+        close, so every real match came back 'content-only'. Confidence
+        must be 'exact' regardless (anchor + content + author all still
+        match); date_skew_s reports the gap, informationally, never
+        gates it."""
+        doc = self._fixture_comments()
+        doc.comments[0].creation_date = "2026-09-16T18:06:00.000Z"  # the root comment's live-side date
+        await self.connect_pane(document=doc)
+
+        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        correlation_by_live_id = {e["live_comment_id"]: e for e in result["correlation"]}
+        root = correlation_by_live_id["live:c-root"]
+        self.assertEqual(root["confidence"], "exact")
+        self.assertEqual(root["comment_id"], ROOT_DURABLE_ID)
+        # file-mode's own w:date for this fixture is "2026-09-16T14:06:00Z";
+        # 18:06 - 14:06 = 4 hours = 14400s, live side later (positive).
+        self.assertEqual(root["date_skew_s"], 14400)
+        self.assertFalse(root["w_id_stable"])
+
+    async def test_w_id_stable_false_on_every_correlation_entry(self):
+        """issue #106 WP-6 real-pane finding: a real Word for Mac save
+        renumbered a comment's w:id (1 -> 3), so w_id is only ever
+        advisory within one open session -- every correlation entry must
+        say so, regardless of confidence."""
+        doc = self._fixture_comments()
+        await self.connect_pane(document=doc)
+
+        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        self.assertTrue(result["correlation"], "expected at least one correlation entry")
+        for entry in result["correlation"]:
+            self.assertIs(entry["w_id_stable"], False)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +277,7 @@ class AddAnchoredCommentLiveTests(LiveCommentsTestCase):
         self.assertTrue(evidence["applied"])
         self.assertEqual(evidence["comment_id"], "live:c1")
         self.assertEqual(evidence["comment_ids"], ["live:c1"])
+        self.assertEqual(evidence["rung"], "exact")
         self.assertEqual(evidence["write_mode"], "live")
         self.assertEqual(evidence["verified_via"], "word-addin")
         self.assertEqual(evidence["author"], "word-signed-in-user")
@@ -246,6 +285,28 @@ class AddAnchoredCommentLiveTests(LiveCommentsTestCase):
         self.assertNotIn("conflict_copy_detected", evidence)
         self.assertEqual(len(doc.comments), 1)
         self.assertEqual(doc.comments[0].content, "Nice color choice.")
+
+    async def test_rung_equals_file_mode_add_anchored_comment(self):
+        """issue #106 WP-6 real-pane finding: live evidence used to report
+        the placeholder string "live" for `rung`; it must instead equal
+        whatever file mode's own `add_anchored_comment` reports for an
+        ordinary single-pass match (`locate.RUNG_EXACT`, "exact") -- not
+        the unrelated numeric edit-ladder `rung` replace_text/format_text
+        report."""
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        await self.connect_pane(document=doc)
+
+        live_evidence = await self.call(
+            comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "x", 1
+        )
+        # A separate quote on the SAME real fixture file -- file mode
+        # writes to self.target directly; the fake pane only ever
+        # touches the in-memory FakeDocument, so the two do not collide.
+        file_evidence = comments.execute_add_anchored_comment(str(self.target), "lazy dog", "y", 1)
+
+        self.assertIsInstance(live_evidence["rung"], str)
+        self.assertEqual(live_evidence["rung"], file_evidence["rung"])
+        self.assertEqual(live_evidence["rung"], "exact")
 
     async def test_match_count_mismatch(self):
         doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
@@ -286,6 +347,27 @@ class ReplyToCommentLiveTests(LiveCommentsTestCase):
         self.assertEqual(evidence["parent_comment_id"], live_id)
         self.assertEqual(len(doc.comments[0].replies), 1)
         self.assertEqual(doc.comments[0].replies[0].content, "a reply")
+
+    async def test_evidence_carries_live_sha256_revision_tokens(self):
+        """issue #106 WP-6 real-pane finding: reply evidence used to
+        report revision_before/revision_after as a bare None; they must
+        instead be "live:sha256:<hex>" describe()-sourced tokens, the
+        same shape replace_text/format_text/add_anchored_comment's live
+        evidence already uses. A reply never edits body text, so the two
+        are expected to be equal here (mirrors format_text's own
+        before==after case), not a sign nothing happened."""
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        await self.connect_pane(document=doc)
+
+        added = await self.call(comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "x", 1)
+        live_id = added["comment_id"]
+
+        evidence = await self.call(comments_live.execute_reply_to_comment_live, str(self.target), live_id, "a reply")
+        self.assertIsNotNone(evidence["revision_before"])
+        self.assertIsNotNone(evidence["revision_after"])
+        self.assertTrue(evidence["revision_before"].startswith("live:sha256:"))
+        self.assertTrue(evidence["revision_after"].startswith("live:sha256:"))
+        self.assertEqual(evidence["revision_before"], evidence["revision_after"])
 
 
 class ReplyToCommentLiveCorrelationTests(LiveCommentsTestCase):
@@ -352,6 +434,24 @@ class ResolveCommentLiveTests(LiveCommentsTestCase):
         self.assertEqual(evidence["after"], "resolved")
         self.assertEqual(evidence["comment_id_resolved_via"], "live-handle")
         self.assertTrue(doc.comments[0].resolved)
+
+    async def test_evidence_carries_live_sha256_revision_tokens(self):
+        """issue #106 WP-6 real-pane finding: resolve evidence used to
+        report revision_before/revision_after as a bare None; they must
+        instead be "live:sha256:<hex>" describe()-sourced tokens, same as
+        reply_to_comment's own fix -- see that test's docstring."""
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        await self.connect_pane(document=doc)
+
+        added = await self.call(comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "x", 1)
+        live_id = added["comment_id"]
+
+        evidence = await self.call(comments_live.execute_resolve_comment_live, str(self.target), live_id)
+        self.assertIsNotNone(evidence["revision_before"])
+        self.assertIsNotNone(evidence["revision_after"])
+        self.assertTrue(evidence["revision_before"].startswith("live:sha256:"))
+        self.assertTrue(evidence["revision_after"].startswith("live:sha256:"))
+        self.assertEqual(evidence["revision_before"], evidence["revision_after"])
 
     async def test_comment_still_open_when_pane_refuses_to_flip(self):
         doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")

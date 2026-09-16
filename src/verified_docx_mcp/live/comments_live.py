@@ -25,11 +25,22 @@ Both directions go through ``correlate_comments`` below: for each live
 comment, the best-matching file-mode comment (read from the same
 document's on-disk snapshot, via ``tracked_changes._parse_comments`` --
 the same function file-mode ``list_open_items`` itself uses) by
-normalized anchor text + normalized content, tie-broken by author and
-creation date when both sides have them. This is advisory, never
-authoritative -- a caller that already has a ``live:<id>`` handle should
-always prefer it; correlation only exists to make a durableId/`w:id`
-usable when that is all a caller has.
+normalized anchor text + normalized content, tie-broken by author when
+both sides have one. This is advisory, never authoritative -- a caller
+that already has a ``live:<id>`` handle should always prefer it;
+correlation only exists to make a durableId/``w:id`` usable when that is
+all a caller has.
+
+``w_id`` is NOT stable across saves (issue #106 WP-6 real-pane finding):
+a real Word for Mac save renumbered a document's second comment's
+``w:id`` from ``1`` to ``3``. Every correlation entry below carries
+``w_id_stable: False`` for this reason -- ``w_id`` is only ever a
+meaningful correlation key within the one Word session that has not yet
+saved since it was read; ``comment_id`` (the OOXML durableId) is the
+durable key across saves and sessions (issue #108). A caller resolving a
+handle by ``w_id`` should treat a miss as "the id renumbered, re-list and
+retry with the current durableId/w_id", not as evidence the comment is
+gone.
 
 Normalization
 -------------
@@ -47,20 +58,40 @@ Normalization
   break the very case this normalization exists to fix), not a general
   whitespace collapse.
 
-Confidence
-----------
+Confidence (issue #106 WP-6 real-pane finding: date must never gate this)
+--------------------------------------------------------------------------
+The first real-pane acceptance run (docs/live-mode.md's WP-3+WP-4
+acceptance entry) found every real match coming back ``content-only``
+instead of ``exact``: Word for Mac writes a comment's ``w:date`` as LOCAL
+wall-clock time with a ``Z`` suffix (fixture: ``2026-09-16T14:06:00Z``)
+while Office.js's ``creationDate`` reports TRUE UTC for the same moment
+(``2026-09-16T18:06:00.000Z``, a 4-hour offset here) -- a gap no fixed
+tolerance window can close in general (the offset is whatever the pane's
+local timezone is), so date can never be part of what makes a match
+``exact``.
+
 - ``exact``   -- normalized content matches AND normalized anchor text
-  matches AND (author matches, when both sides report one) AND (creation
-  dates are within 2 minutes of each other, when both sides report one).
+  matches AND (author matches, when both sides report one). Date is
+  NEVER part of this gate.
 - ``content-only`` -- normalized content matches but the anchor text (or
-  author/date, when present) does not corroborate it.
+  author, when present) does not corroborate it.
 - ``none``    -- no file-mode comment's normalized content matches this
   live comment's at all.
+
+Each correlation entry also carries ``date_skew_s``: the signed
+difference, in whole seconds, between the live comment's
+``creationDate`` and the correlated file-mode comment's ``w:date``
+(``round((live_dt - file_dt).total_seconds())``; positive means the live
+side reports a later timestamp), or ``None`` when either side has no
+date, or when nothing correlated (``confidence == "none"``) at all. This
+is informational only -- e.g. a lead noticing every ``date_skew_s`` on a
+document is the same fixed offset has effectively rediscovered the pane's
+local UTC offset -- and never gates ``confidence``.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from . import bridge as live_bridge
@@ -76,7 +107,6 @@ from .session import (
 VALID_WRITE_MODES = ("auto", "file", "live")
 VALID_SOURCES = ("auto", "file", "live")
 
-_CORRELATION_DATE_TOLERANCE = timedelta(minutes=2)
 _LIVE_HANDLE_PREFIX = "live:"
 
 
@@ -223,11 +253,18 @@ def _parse_date(value: str | None) -> datetime | None:
     return dt
 
 
-def _dates_corroborate(live_date: str | None, file_date: str | None) -> bool:
+def _date_skew_seconds(live_date: str | None, file_date: str | None) -> int | None:
+    """Signed whole-second gap between the two sides' timestamps, or
+    ``None`` when either is missing/unparseable -- informational only,
+    per this module's own docstring (issue #106 WP-6: Word for Mac writes
+    ``w:date`` as local wall-clock time with a ``Z`` suffix while
+    Office.js's ``creationDate`` is true UTC, so this routinely carries a
+    fixed non-zero offset -- e.g. 14400s for a 4-hour-behind-UTC pane --
+    and that is normal, not a sign of a bad correlation)."""
     live_dt, file_dt = _parse_date(live_date), _parse_date(file_date)
     if live_dt is None or file_dt is None:
-        return True  # unknown on either side never disqualifies a match
-    return abs(live_dt - file_dt) <= _CORRELATION_DATE_TOLERANCE
+        return None
+    return round((live_dt - file_dt).total_seconds())
 
 
 def _authors_corroborate(live_author: str | None, file_author: str | None) -> bool:
@@ -247,10 +284,17 @@ def correlate_comments(
     ``created_time``).
 
     Returns one entry per live comment: ``{live_comment_id: "live:<id>",
-    comment_id, w_id, confidence}`` -- ``comment_id``/``w_id`` are ``None``
-    when ``confidence`` is ``"none"``. Advisory only: never used to gate
-    anything, only to let a caller holding a durableId/w:id reach the live
-    comment it probably corresponds to (see ``_resolve_comment_handle``).
+    comment_id, w_id, w_id_stable, confidence, date_skew_s}`` --
+    ``comment_id``/``w_id``/``date_skew_s`` are ``None`` when ``confidence``
+    is ``"none"``. ``w_id_stable`` is always ``False`` (issue #106 WP-6:
+    a real Word for Mac save renumbered a comment's ``w:id``, so it is
+    only ever meaningful within one open session -- ``comment_id``, the
+    OOXML durableId, is the durable key, per issue #108). ``date_skew_s``
+    is informational only and NEVER factors into ``confidence`` -- see
+    this module's own docstring for why date can't gate a match here.
+    Advisory only: never used to gate anything, only to let a caller
+    holding a durableId/w:id reach the live comment it probably
+    corresponds to (see ``_resolve_comment_handle``).
     """
     out: list[dict[str, Any]] = []
     for live in live_comments_raw:
@@ -267,8 +311,7 @@ def correlate_comments(
                     continue
                 anchor_ok = bool(live_anchor) and live_anchor == _normalize_anchor(f.get("quoted_text"))
                 author_ok = _authors_corroborate(live_author, f.get("author"))
-                date_ok = _dates_corroborate(live_date, f.get("created_time"))
-                if anchor_ok and author_ok and date_ok:
+                if anchor_ok and author_ok:
                     best, best_confidence = f, "exact"
                     break  # an exact match is the best this can do
                 if best is None:
@@ -279,7 +322,9 @@ def correlate_comments(
                 "live_comment_id": f"{_LIVE_HANDLE_PREFIX}{live.get('id')}",
                 "comment_id": best.get("comment_id") if best else None,
                 "w_id": best.get("w_id") if best else None,
+                "w_id_stable": False,
                 "confidence": best_confidence,
+                "date_skew_s": _date_skew_seconds(live_date, best.get("created_time")) if best else None,
             }
         )
     return out
@@ -292,7 +337,21 @@ def _resolve_comment_handle(comment_id: str, correlation: list[dict[str, Any]]) 
     against). Returns (live_handle_without_prefix, resolved_via) where
     resolved_via is ``"live-handle"`` | ``"durableId-correlation"`` |
     ``"w_id-correlation"``. Raises INVALID_INPUT, naming both id spaces,
-    when nothing matches."""
+    when nothing matches.
+
+    *correlation* must come from a *correlation* built fresh for THIS
+    call (``execute_reply_to_comment_live``/``execute_resolve_comment_live``
+    below both call ``_live_state`` -- which re-reads the on-disk snapshot
+    via ``_file_comments_and_suggestions`` -- immediately before calling
+    this, never a listing cached from an earlier ``list_open_items`` call)
+    -- required because ``w:id`` is not stable across a Word save (see
+    this module's own docstring and ``w_id_stable`` in
+    ``correlate_comments``'s output): a ``w_id-correlation`` resolved
+    against a stale, pre-save correlation table could silently match the
+    wrong comment (or none) once Word has renumbered ids on save.
+    ``durableId-correlation`` does not have this hazard (the durableId is
+    stable), but the fresh re-read costs nothing extra and keeps one rule
+    for both."""
     from ..errors import ErrorCode
 
     if comment_id.startswith(_LIVE_HANDLE_PREFIX):
@@ -430,7 +489,34 @@ def execute_list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
 def execute_add_anchored_comment_live(
     path: str, quote: str, text: str, expected_matches: int
 ) -> dict[str, Any]:
+    """``write_mode="live"`` path for ``add_anchored_comment``: sends
+    ``comment_add`` (``find=quote``, ``expected_matches``) to the
+    connected pane and returns the same evidence shape file mode's own
+    ``comments.execute_add_anchored_comment`` does.
+
+    ``rung`` is ``locate.RUNG_EXACT`` (``"exact"``) -- the same value
+    file mode's own ``add_anchored_comment`` reports for an ordinary
+    single-pass match (``comments.execute_add_anchored_comment``'s
+    ``locate_result.rung``, from ``locate.py``'s normalization ladder;
+    NOT the unrelated numeric edit-ladder ``rung`` `replace_text`/
+    `format_text`'s live evidence reports -- see ``live/write_mode.py``
+    and ``docs/live-mode.md``'s own note on that overload). The pane's
+    own ``body.search`` has no multi-rung normalization ladder of its
+    own to fall back through the way file mode's ``locate()`` does, so
+    every successful live match is reported at this top rung.
+
+    Known limitation (issue #106 WP-6, unchanged by this fix -- inherited
+    from WP-2's already-built pane dispatcher, not something this PR's
+    plan touches): the pane's ``comment_add`` op inserts a comment on the
+    FIRST match only, even when ``expected_matches > 1`` -- unlike file
+    mode, which comments every match. The count is still verified before
+    anything is inserted (a count mismatch still raises
+    ``MATCH_COUNT_MISMATCH``/``ZERO_MATCH``), so this only affects WHERE
+    the comment lands when ``expected_matches > 1``, not whether the call
+    refuses on a bad count.
+    """
     from .. import audit
+    from ..locate import RUNG_EXACT
 
     resolved, document_name = _document_name_and_path(path)
     session = _session_for(path)
@@ -445,7 +531,7 @@ def execute_add_anchored_comment_live(
     evidence: dict[str, Any] = {
         "applied": True,
         "match_count": expected_matches,
-        "rung": "live",
+        "rung": RUNG_EXACT,
         "before": quote,
         "after": quote,  # a comment never edits document text, live or otherwise
         "revision_before": f"live:sha256:{pre}" if pre else None,
@@ -470,10 +556,24 @@ def execute_add_anchored_comment_live(
 
 
 def execute_reply_to_comment_live(path: str, comment_id: str, text: str) -> dict[str, Any]:
+    """``write_mode="live"`` path for ``reply_to_comment``.
+
+    ``revision_before``/``revision_after`` are ``"live:sha256:<hex>"`` of
+    a ``describe`` call's ``bodySha256`` taken immediately before and
+    after the ``comment_reply`` op -- the same ``live:sha256:`` token
+    shape ``live/write_mode.live_evidence`` uses for ``replace_text``/
+    ``format_text``, so a reply's evidence is never the bare ``None`` a
+    caller might mistake for "not computed". A comment reply never edits
+    document body text, so the two will typically read identical (mirrors
+    ``format_text``'s own ``revision_before == revision_after`` case) --
+    that is expected, not a sign the op did nothing.
+    """
     from .. import audit
 
     resolved, document_name = _document_name_and_path(path)
     session = _session_for(path)
+
+    pre_body_sha256 = _request(session, "describe").get("bodySha256")
 
     raw_comments, correlation = _live_state(path, session)
     live_handle, resolved_via = _resolve_comment_handle(comment_id, correlation)
@@ -498,14 +598,16 @@ def execute_reply_to_comment_live(path: str, comment_id: str, text: str) -> dict
             {"comment_id": comment_id, "live_handle": f"{_LIVE_HANDLE_PREFIX}{live_handle}"},
         )
 
+    post_body_sha256 = _request(session, "describe").get("bodySha256")
+
     evidence: dict[str, Any] = {
         "applied": True,
         "match_count": 1,
         "rung": "reply",
         "before": parent_anchor,
         "after": parent_anchor,  # a reply never edits document text
-        "revision_before": None,
-        "revision_after": None,
+        "revision_before": f"live:sha256:{pre_body_sha256}" if pre_body_sha256 else None,
+        "revision_after": f"live:sha256:{post_body_sha256}" if post_body_sha256 else None,
         "audit_logged": False,
         "comment_id": f"{_LIVE_HANDLE_PREFIX}{live_handle}",
         "parent_comment_id": comment_id,
@@ -521,11 +623,18 @@ def execute_reply_to_comment_live(path: str, comment_id: str, text: str) -> dict
 
 
 def execute_resolve_comment_live(path: str, comment_id: str) -> dict[str, Any]:
+    """``write_mode="live"`` path for ``resolve_comment``. See
+    ``execute_reply_to_comment_live``'s own docstring for why
+    ``revision_before``/``revision_after`` are ``describe``-sourced
+    ``live:sha256:`` tokens rather than ``None`` -- the same reasoning
+    applies here (a resolve never edits body text either)."""
     from .. import audit
     from ..errors import ErrorCode, _make_error
 
     resolved, document_name = _document_name_and_path(path)
     session = _session_for(path)
+
+    pre_body_sha256 = _request(session, "describe").get("bodySha256")
 
     _raw_comments, correlation = _live_state(path, session)
     live_handle, resolved_via = _resolve_comment_handle(comment_id, correlation)
@@ -543,14 +652,16 @@ def execute_resolve_comment_live(path: str, comment_id: str) -> dict[str, Any]:
             {"comment_id": comment_id, "live_handle": f"{_LIVE_HANDLE_PREFIX}{live_handle}"},
         )
 
+    post_body_sha256 = _request(session, "describe").get("bodySha256")
+
     evidence: dict[str, Any] = {
         "applied": True,
         "match_count": 1,
         "rung": "resolve",
         "before": "open",
         "after": "resolved",
-        "revision_before": None,
-        "revision_after": None,
+        "revision_before": f"live:sha256:{pre_body_sha256}" if pre_body_sha256 else None,
+        "revision_after": f"live:sha256:{post_body_sha256}" if post_body_sha256 else None,
         "audit_logged": False,
         "comment_id": f"{_LIVE_HANDLE_PREFIX}{live_handle}",
         "comment_id_resolved_via": resolved_via,
