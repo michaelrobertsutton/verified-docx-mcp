@@ -117,6 +117,12 @@ def _parse_comments(local_path: Path, proj: projection.Projection) -> list[dict[
             return []
         comments_root = ET.fromstring(zf.read("word/comments.xml"))
         ext_by_paraid: dict[str, dict[str, Any]] = {}
+        # ext_root/ids_root stay in scope (possibly None) past these two
+        # `if` blocks -- issue #108's identity_para_id needs the parsed
+        # roots themselves, not just the paraId->value dicts built below,
+        # to resolve a multi-paragraph comment's identity paraId.
+        ext_root: Any | None = None
+        ids_root: Any | None = None
         if "word/commentsExtended.xml" in names:
             ext_root = ET.fromstring(zf.read("word/commentsExtended.xml"))
             for child in ext_root:
@@ -167,13 +173,15 @@ def _parse_comments(local_path: Path, proj: projection.Projection) -> list[dict[
         author = projection._attr(c, "author")
         date = projection._attr(c, "date")
         content_parts: list[str] = []
-        own_para_id: str | None = None
         for p in c:
             if projection._ln(p) != "p":
                 continue
-            if own_para_id is None:
-                own_para_id = projection._attr(p, "paraId")
             content_parts.append(_collect_text(p, {"t"}))
+        # Issue #108: identity paraId is the LAST w:p's, not the first --
+        # see projection.identity_para_id's own docstring. `content_parts`
+        # above still joins EVERY paragraph's text; only the identity
+        # lookup key changes.
+        own_para_id = projection.identity_para_id(c, ids_root=ids_root, ext_root=ext_root)
         ext = ext_by_paraid.get(own_para_id or "", {})
         # durableId is the durable, opaque identifier (Google's own shape:
         # a comment id independent of the document's own w:id numbering,

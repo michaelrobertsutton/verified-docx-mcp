@@ -101,6 +101,61 @@ def _attr(elem: Any, local_name: str) -> str | None:
     return None
 
 
+def identity_para_id(comment_elem: Any, *, ids_root: Any | None = None, ext_root: Any | None = None) -> str | None:
+    """Issue #108: the ``w14:paraId`` Word itself keys ``word/commentsIds.xml``
+    (``w16cid:commentId/@w16cid:paraId``) and ``word/commentsExtended.xml``
+    (``w15:commentEx/@w15:paraId``) on for *comment_elem* (a
+    ``word/comments.xml`` ``w:comment`` element) -- the LAST ``w:p`` inside
+    it, not the first. A single-paragraph comment has only one candidate, so
+    this only matters for a multi-paragraph one; verified against
+    ``tests/fixtures/comments/multipara-comment.docx`` (Word 16.112.4):
+    a two-paragraph comment's first ``w:p`` paraId appears in NEITHER
+    ``commentsIds.xml`` nor ``commentsExtended.xml``, only its last one does.
+
+    *ids_root*/*ext_root* (the parsed roots of those two parts, either or
+    both omittable) are used defensively: if the last paragraph's own
+    paraId is not actually present in either part while an EARLIER
+    paragraph's paraId of this same comment is, that earlier paraId is
+    returned instead -- a client that keys differently than Word does
+    should still resolve, rather than this helper insisting on Word's own
+    convention against evidence in the file itself. With neither root
+    given, the last paragraph's paraId is returned unconditionally.
+
+    Returns None if *comment_elem* has no ``w:p`` children with a paraId at
+    all (malformed input)."""
+    para_ids: list[str] = []
+    for p in comment_elem:
+        if _ln(p) != "p":
+            continue
+        pid = _attr(p, "paraId")
+        if pid:
+            para_ids.append(pid)
+    if not para_ids:
+        return None
+
+    last = para_ids[-1]
+    if ids_root is None and ext_root is None:
+        return last
+
+    def _known(pid: str) -> bool:
+        if ids_root is not None:
+            for child in ids_root:
+                if _ln(child) == "commentId" and _attr(child, "paraId") == pid:
+                    return True
+        if ext_root is not None:
+            for child in ext_root:
+                if _ln(child) == "commentEx" and _attr(child, "paraId") == pid:
+                    return True
+        return False
+
+    if _known(last):
+        return last
+    for pid in para_ids[:-1]:
+        if _known(pid):
+            return pid
+    return last
+
+
 def _bool_toggle(pr_elem: Any | None, tag: str) -> bool:
     """OOXML boolean-toggle convention: the element's mere presence means
     true UNLESS it carries an explicit ``w:val="false"``/``"0"``."""

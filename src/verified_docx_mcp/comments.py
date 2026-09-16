@@ -228,9 +228,9 @@ class _CommentParts:
         for c in self.comments_root:
             if projection._ln(c) != "comment" or projection._attr(c, "id") != w_id:
                 continue
-            for p in c:
-                if projection._ln(p) == "p":
-                    return projection._attr(p, "paraId")
+            # Issue #108: identity paraId is the comment's LAST w:p, not
+            # its first -- see projection.identity_para_id's own docstring.
+            return projection.identity_para_id(c, ids_root=self.ids_root, ext_root=self.ext_root)
         return None
 
     def w_id_for_durable_id(self, durable_id: str) -> str | None:
@@ -630,17 +630,25 @@ def _build_overrides(
 # ---------------------------------------------------------------------------
 
 
-def _comment_record(comment_elem: Any, *, durable_id: str, resolved: bool, quoted_by_para: dict[str, str]) -> dict[str, Any]:
+def _comment_record(
+    comment_elem: Any,
+    *,
+    durable_id: str,
+    resolved: bool,
+    quoted_by_para: dict[str, str],
+    ids_root: Any | None = None,
+    ext_root: Any | None = None,
+) -> dict[str, Any]:
     author = projection._attr(comment_elem, "author")
     date = projection._attr(comment_elem, "date")
     content_parts: list[str] = []
-    para_id: str | None = None
     for p in comment_elem:
         if projection._ln(p) != "p":
             continue
-        if para_id is None:
-            para_id = projection._attr(p, "paraId")
         content_parts.append(tracked_changes._collect_text(p, {"t"}))
+    # Issue #108: identity paraId is the comment's LAST w:p, not its
+    # first -- content_parts above still joins EVERY paragraph's text.
+    para_id = projection.identity_para_id(comment_elem, ids_root=ids_root, ext_root=ext_root)
     return {
         "comment_id": durable_id,
         "content": "".join(content_parts),
@@ -693,13 +701,12 @@ def execute_get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
             if projection._ln(c) != "comment":
                 continue
             w_id = projection._attr(c, "id") or ""
-            for p in c:
-                if projection._ln(p) == "p":
-                    pid = projection._attr(p, "paraId")
-                    if pid:
-                        para_id_by_w_id[w_id] = pid
-                        quoted_by_para[pid] = "".join(anchor_by_id.get(w_id, []))
-                    break
+            # Issue #108: identity paraId is the comment's LAST w:p, not
+            # its first -- see projection.identity_para_id's own docstring.
+            pid = projection.identity_para_id(c, ids_root=ids_root, ext_root=ext_root)
+            if pid:
+                para_id_by_w_id[w_id] = pid
+                quoted_by_para[pid] = "".join(anchor_by_id.get(w_id, []))
 
         para_id_by_durable: dict[str, str] = {}
         durable_by_para: dict[str, str] = {}
@@ -746,7 +753,12 @@ def execute_get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
             )
             durable = durable_by_para.get(pid, "")
             return _comment_record(
-                comment_elem, durable_id=durable, resolved=done_by_para.get(pid) == "1", quoted_by_para=quoted_by_para
+                comment_elem,
+                durable_id=durable,
+                resolved=done_by_para.get(pid) == "1",
+                quoted_by_para=quoted_by_para,
+                ids_root=ids_root,
+                ext_root=ext_root,
             )
 
         thread = _record_for_para(target_para_id)
