@@ -47,7 +47,17 @@ from typing import Any, NoReturn
 
 from fastmcp import FastMCP
 
-from . import comments, images, mutations, paths, projection, tables, text_edit, tracked_changes
+from . import (
+    comments,
+    geometry,
+    images,
+    mutations,
+    paths,
+    projection,
+    tables,
+    text_edit,
+    tracked_changes,
+)
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .middleware import EvidenceEnforcementMiddleware
@@ -111,22 +121,97 @@ def _resolve_export_output_path(output_path: str) -> Path:
     return resolved
 
 
+def _section_keys_error(missing: list[str]) -> Any:
+    return _make_error(
+        ErrorCode.SECTION_NOT_FOUND,
+        f"section_keys named section(s) not found: {missing!r} "
+        "(call find_sections to enumerate the current ones).",
+        {"section_keys": missing},
+    )
+
+
+def _plan_section_probes(
+    source: Path, section_keys: list[str] | None
+) -> tuple[list[dict[str, Any]], list[str], list[int]]:
+    """(headings, all_para_refs, probe_ordinals) for export_pdf's section
+    geometry, computed BEFORE any render happens.
+
+    headings is projection.find_sections_impl(source)'s "heading"-kind
+    entries, in document order, each augmented with a
+    "next_start_para_ref" key (start_para_ref of the FULL document's next
+    heading, or None when this heading is the document's last one),
+    filtered to *section_keys* when given. That augmentation happens
+    BEFORE filtering, deliberately: the skills' primary call is
+    export_pdf(section_keys=[<one section>]) for a page-budget check, and
+    that section's true end is the FULL document's next heading's start
+    when one exists — even though that next heading is not itself part
+    of the filtered/requested set and never appears in the returned
+    "sections" list. Only a heading with no next one AT ALL (the
+    document's last heading) falls back to the +0.03 last-paragraph
+    approximation in geometry.assemble_sections, regardless of whether
+    section_keys narrowed the request down to just that one heading. An
+    unknown key in *section_keys* raises SECTION_NOT_FOUND here — before
+    render_word() ever runs — since the caller asked for that section by
+    name (mirrors mutations.locate_section_range's SECTION_NOT_FOUND).
+    all_para_refs is projection.project_part(source)'s main-story
+    paragraph order (only computed when there is at least one heading to
+    map, since it walks the whole document). probe_ordinals is
+    geometry.build_probe_ordinals(headings, all_para_refs) — [] when
+    headings is empty, so export_pdf passes probe_paragraphs=None and
+    render_word() does no extra work for a document (or a filtered
+    section_keys view of one) with nothing to probe.
+    """
+    all_sections = projection.find_sections_impl(source)
+    all_headings = [s for s in all_sections if s["kind"] == "heading"]
+
+    headings = [
+        {
+            **heading,
+            "next_start_para_ref": (
+                all_headings[idx + 1]["start_para_ref"] if idx + 1 < len(all_headings) else None
+            ),
+        }
+        for idx, heading in enumerate(all_headings)
+    ]
+
+    if section_keys is not None:
+        known = {s["section_key"] for s in headings}
+        missing = [k for k in section_keys if k not in known]
+        if missing:
+            raise _section_keys_error(missing)
+        wanted = set(section_keys)
+        headings = [s for s in headings if s["section_key"] in wanted]
+
+    if not headings:
+        return [], [], []
+
+    proj = projection.project_part(source)
+    all_para_refs = [m.para_ref for m in proj.paragraphs]
+    probe_ordinals = geometry.build_probe_ordinals(headings, all_para_refs)
+    return headings, all_para_refs, probe_ordinals
+
+
 def execute_export_pdf(
     path: str,
     output_path: str,
     *,
     timeout: int = render_module.DEFAULT_TIMEOUT,
     close_after: bool = True,
+    section_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     """Render *path* (.docx) to *output_path* (.pdf) via Word automation.
 
     Returns {pdf_path, sha256, page_count, page_count_source, engine,
-    left_open_document, closed_after, close_error}. page_count is Word's own
-    count when available (authoritative — see render.py's module docstring),
+    left_open_document, closed_after, close_error, page_height_pt,
+    sections, sections_error}. page_count is Word's own count when
+    available (authoritative — see render.py's module docstring),
     cross-checked against pdfinfo/regex; None (never a guessed 0) when
     neither source can determine it. Raises VerifyError(RENDER_ENGINE_UNAVAILABLE),
-    (AUTOMATION_NOT_GRANTED), (WORD_SANDBOX_UNAVAILABLE), or (RENDER_FAILED)
-    — see errors.py and render.py's module docstring for exactly when each
+    (AUTOMATION_NOT_GRANTED), (WORD_SANDBOX_UNAVAILABLE), (RENDER_FAILED),
+    (SECTION_NOT_FOUND) (an unknown section_keys entry, checked before any
+    render happens), or (SECTION_GEOMETRY_UNAVAILABLE) (section_keys was
+    given and a requested section's page-span could not be verified) — see
+    errors.py and render.py's module docstring for exactly when each
     fires.
 
     Not gated by DOCX_LOCKED (core/document-backend-protocol.md §4:
@@ -138,9 +223,15 @@ def execute_export_pdf(
     source = paths.resolve_allowed_docx_path(path, must_exist=True)
     target = _resolve_export_output_path(output_path)
 
+    headings, all_para_refs, probe_ordinals = _plan_section_probes(source, section_keys)
+
     try:
         result = render_module.render_word(
-            str(source), str(target), timeout=timeout, close_after=close_after
+            str(source),
+            str(target),
+            timeout=timeout,
+            close_after=close_after,
+            probe_paragraphs=probe_ordinals or None,
         )
     except render_module.RenderError as exc:
         # 1:1 name mapping between render.py's RenderError codes and this
@@ -162,6 +253,21 @@ def execute_export_pdf(
     else:
         page_count_value, page_count_source = cross_check_pages, cross_check_source
 
+    sections_result, sections_error = geometry.assemble_sections(
+        headings, all_para_refs, result.get("paragraph_geometry") or {}, result.get("page_height_pt")
+    )
+    if sections_result is None and section_keys is not None:
+        # Explicit mode: the caller asked for this section's geometry by
+        # name, so a verification failure is not something export_pdf can
+        # silently paper over — raise rather than degrade. The PDF is
+        # already written to *target* by this point; only the tool call
+        # itself fails.
+        raise _make_error(
+            ErrorCode.SECTION_GEOMETRY_UNAVAILABLE,
+            sections_error or "section geometry unavailable",
+            {"detail": sections_error, "section_keys": section_keys},
+        )
+
     return {
         "pdf_path": pdf_path,
         "sha256": _sha256_file(pdf_path),
@@ -175,6 +281,17 @@ def execute_export_pdf(
         "left_open_document": result.get("left_open_document"),
         "closed_after": result.get("closed_after", False),
         "close_error": result.get("close_error"),
+        # page_height_pt / sections / sections_error (issue #102): see
+        # geometry.py and this function's docstring. page_height_pt is
+        # None when no section had to be probed (no headings, or an empty
+        # section_keys filter). sections is [] (never null) when there
+        # were no headings to probe in the first place; it is null only
+        # on a default-mode (section_keys=None) verification failure,
+        # paired with sections_error explaining why — page_count and
+        # every field above are unaffected either way.
+        "page_height_pt": result.get("page_height_pt"),
+        "sections": sections_result,
+        "sections_error": sections_error,
     }
 
 
@@ -189,7 +306,12 @@ def _sha256_file(path: str) -> str:
 
 
 @mcp.tool()
-def export_pdf(path: str, output_path: str, close_after: bool = True) -> dict[str, Any]:
+def export_pdf(
+    path: str,
+    output_path: str,
+    close_after: bool = True,
+    section_keys: list[str] | None = None,
+) -> dict[str, Any]:
     """Render a local .docx to PDF via Microsoft Word and report its page count.
 
     output_path must fall inside VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS
@@ -210,27 +332,86 @@ def export_pdf(path: str, output_path: str, close_after: bool = True) -> dict[st
     page_count are still returned. Pass close_after=False to leave the
     window open on purpose (e.g. to inspect it).
 
+    section_keys (issue #102, optional): restrict per-section page-span
+    reporting to these find_sections() section_key values (find_sections'
+    "heading" entries only — a "textbox" key is never probed and is never
+    a valid section_keys entry). Omit it (the default, None) to report
+    every heading section the document has. Every probe this needs runs
+    inside the SAME osascript call as the render, right after the page
+    count is read and before the document is closed, so the pagination
+    the probes see is identical to page_count's — never a second Word
+    round trip with its own, possibly different, layout.
+
+    Each entry of the returned "sections" list is one heading section's
+    page span: section_key (matches find_sections), heading_text,
+    start_page/start_fraction and end_page/end_fraction (the vertical
+    position on those pages as a fraction of page_height_pt — a partial
+    page is reported as a fraction, never rounded away), pages (the
+    derived span, end - start), start_paragraph/end_paragraph (that
+    section's own 1-based Word paragraph ordinals, from
+    projection.find_sections_impl's start_para_ref/end_para_ref — see
+    geometry.ordinal_of), and text_verified (always true on an entry that
+    made it into this list — see below). A section's end is the FULL
+    DOCUMENT's next heading's own start — not merely the next entry in
+    this call's own "sections" list — whenever the document has one, even
+    when section_keys narrowed the request down to just that one section
+    and its true next heading is not itself part of the returned list (so
+    a single-section, page-budget-style section_keys=[...] call still
+    gets an exact boundary, not an approximation, whenever a following
+    heading exists). Only a section with no next heading AT ALL — the
+    document's own last heading — uses its own last paragraph's probe,
+    with end_fraction nudged by +0.03 of a page (capped at 1.0) to
+    approximate that last line's own height. The borrowed next heading's
+    probed text is never verified against anything — only the start
+    position it supplies is used, purely as boundary geometry.
+
+    Every probed section's start paragraph must verify: its probed text,
+    after geometry.normalize_probe_text(), must equal that section's
+    heading_text, also normalized. Default mode (section_keys=None)
+    degrades on any verification failure or probe error rather than
+    failing the whole call: "sections" comes back null and
+    "sections_error" names which ordinal and what mismatched, while
+    pdf_path, page_count, and every other field are unaffected. Explicit
+    mode (section_keys given — the caller asked for these sections by
+    name) raises SECTION_GEOMETRY_UNAVAILABLE instead, carrying the same
+    detail in diagnostics, since a number the caller asked for by name
+    that this server cannot stand behind should not come back silently
+    as null. A document with zero headings (or an empty section_keys
+    filter after SECTION_NOT_FOUND validation) returns sections: [] and
+    sections_error: null — nothing to verify, nothing probed. Top-level
+    page_height_pt is the document's own page height in points (None
+    when nothing was probed).
+
     Returns pdf_path, sha256, page_count (best-effort; None — never a
     guessed 0 — when it cannot be determined), page_count_source
     ("word"|"pdfinfo"|"regex"|None), engine ("word"; the only engine, D2:
     no LibreOffice), left_open_document (null when the window was closed,
-    else its title), closed_after (bool — whether the close succeeded), and
-    close_error (the close attempt's error text, or null).
+    else its title), closed_after (bool — whether the close succeeded),
+    close_error (the close attempt's error text, or null), page_height_pt,
+    sections, and sections_error (see above).
 
     Errors:
-      INVALID_INPUT             - a bad path or output_path
-      RENDER_ENGINE_UNAVAILABLE - no render engine available (Word only)
-      AUTOMATION_NOT_GRANTED    - macOS declined Automation control of Word
-                                   for this app; run `verified-docx-mcp
-                                   doctor` for the fix, scoped to the app
-                                   hosting this MCP server's own process
-      WORD_SANDBOX_UNAVAILABLE  - Word has never been launched on this
-                                   machine (its sandbox container does not
-                                   exist yet)
-      RENDER_FAILED             - any other Word automation failure
+      INVALID_INPUT              - a bad path or output_path
+      RENDER_ENGINE_UNAVAILABLE  - no render engine available (Word only)
+      AUTOMATION_NOT_GRANTED     - macOS declined Automation control of Word
+                                    for this app; run `verified-docx-mcp
+                                    doctor` for the fix, scoped to the app
+                                    hosting this MCP server's own process
+      WORD_SANDBOX_UNAVAILABLE   - Word has never been launched on this
+                                    machine (its sandbox container does not
+                                    exist yet)
+      RENDER_FAILED              - any other Word automation failure
+      SECTION_NOT_FOUND          - a section_keys entry does not match any
+                                    current heading section (checked before
+                                    any render happens)
+      SECTION_GEOMETRY_UNAVAILABLE - section_keys was given and a requested
+                                    section's page-span could not be
+                                    verified (see above)
     """
     try:
-        return execute_export_pdf(path, output_path, close_after=close_after)
+        return execute_export_pdf(
+            path, output_path, close_after=close_after, section_keys=section_keys
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
