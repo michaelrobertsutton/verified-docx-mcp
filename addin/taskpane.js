@@ -97,6 +97,7 @@ async function runAndRender() {
     lastReport = report;
     setOutput(report);
     document.getElementById("copy-json").disabled = false;
+    await postReport(report);
     setStatus(
       `OK — host=${report.host} platform=${report.platform} ` +
         `WordApi1.4=${report.requirementSets["1.4"]} comments=${report.comments.length}`
@@ -107,6 +108,24 @@ async function runAndRender() {
     const message = err && err.message ? err.message : String(err);
     setOutput({ error: message, debugInfo: err && err.debugInfo ? err.debugInfo : undefined });
     setStatus(`ERROR: ${message}`);
+  }
+}
+
+async function postReport(report) {
+  // WP-1 convenience: hand the report to the bridge so nothing has to be
+  // copied out of the pane by hand. Failure is reported, never fatal --
+  // the JSON stays visible below and "Copy JSON" still works.
+  const resultEl = document.getElementById("ping-result");
+  try {
+    const resp = await fetch("https://localhost:53135/report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(report),
+    });
+    const body = await resp.json();
+    resultEl.textContent = `report posted to bridge (HTTP ${resp.status}): ${JSON.stringify(body)}`;
+  } catch (err) {
+    resultEl.textContent = `report POST failed: ${err && err.message ? err.message : String(err)}`;
   }
 }
 

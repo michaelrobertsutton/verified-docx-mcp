@@ -56,6 +56,7 @@ DEFAULT_HOST = "127.0.0.1"
 REPO_ADDIN_DIR = Path(__file__).resolve().parents[3] / "addin"
 
 DEFAULT_CERT_DIR = Path.home() / ".cache" / "verified-docx-mcp" / "live-cert"
+DEFAULT_REPORT_DIR = Path.home() / ".cache" / "verified-docx-mcp" / "live-report"
 CERT_FILENAME = "localhost.pem"
 KEY_FILENAME = "localhost-key.pem"
 
@@ -104,9 +105,42 @@ class _AddinRequestHandler(http.server.SimpleHTTPRequestHandler):
     by default -- the lead runs this in a foreground terminal per
     docs/live-mode.md and does not need a request log for the spike."""
 
-    def __init__(self, *args, addin_dir: Path, **kwargs):
+    def __init__(self, *args, addin_dir: Path, report_dir: Path = DEFAULT_REPORT_DIR, **kwargs):
         self._addin_dir = addin_dir
+        self._report_dir = report_dir
         super().__init__(*args, directory=str(addin_dir), **kwargs)
+
+    def do_POST(self) -> None:  # stdlib override name
+        """`POST /report` (WP-1 convenience): the pane hands its JSON report
+        straight to the bridge, so the lead never has to copy it out of Word
+        by hand. Written to `<report_dir>/latest.json` (overwritten) and a
+        timestamped sibling; replies with where it landed."""
+        if not (self.path == "/report" or self.path.startswith("/report?")):
+            self.send_error(404, "unknown POST route")
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            report = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._send_json(400, {"ok": False, "error": f"body is not JSON: {exc}"})
+            return
+        self._report_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        stamped = self._report_dir / f"report-{stamp}.json"
+        latest = self._report_dir / "latest.json"
+        text = json.dumps(report, indent=2, ensure_ascii=False)
+        stamped.write_text(text, encoding="utf-8")
+        latest.write_text(text, encoding="utf-8")
+        self._send_json(200, {"ok": True, "saved": str(latest), "stamped": str(stamped)})
+
+    def _send_json(self, status: int, obj: dict) -> None:
+        payload = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def do_GET(self) -> None:  # stdlib override name, not our naming convention to control
         if self.path == "/ping" or self.path.startswith("/ping?"):
@@ -135,12 +169,13 @@ def make_server(
     port: int = DEFAULT_PORT,
     certfile: Path,
     keyfile: Path,
+    report_dir: Path = DEFAULT_REPORT_DIR,
 ) -> http.server.HTTPServer:
     """Build (but do not start) an HTTPS `HTTPServer` bound to `host:port`
     serving `addin_dir`. `port=0` binds an ephemeral port -- the unit
     tests use that to avoid colliding with a real WP-1 run on
     DEFAULT_PORT; read the actual port back from `httpd.server_address`."""
-    handler = functools.partial(_AddinRequestHandler, addin_dir=addin_dir)
+    handler = functools.partial(_AddinRequestHandler, addin_dir=addin_dir, report_dir=report_dir)
     httpd = http.server.HTTPServer((host, port), handler)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=str(certfile), keyfile=str(keyfile))
