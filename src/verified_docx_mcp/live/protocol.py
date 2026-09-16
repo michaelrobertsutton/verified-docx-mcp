@@ -150,6 +150,18 @@ VALID_OPS: frozenset[str] = frozenset(
 )
 
 
+# Pane-side OpError.code values for a search-and-count-gate refusal on
+# `replace`/`format`/`comment_add` (issue #106 WP-3/WP-4: both add a
+# write_mode="live" path and both need to tell "nothing matched" apart
+# from "the wrong number matched" the same way the file-mode ZERO_MATCH/
+# MATCH_COUNT_MISMATCH split already does -- see errors.py's ErrorCode
+# members of the same name, which server.py's live tool wrappers map
+# these two onto). Lowercase, snake_case, and named identically on both
+# WPs' branches so the two additions merge without conflict.
+OP_ERROR_ZERO_MATCH = "zero_match"
+OP_ERROR_MATCH_COUNT_MISMATCH = "match_count_mismatch"
+
+
 def _require(obj: dict[str, Any], key: str, expected_type: type | tuple[type, ...]) -> Any:
     if key not in obj:
         raise ProtocolError(f"missing required field {key!r}")
