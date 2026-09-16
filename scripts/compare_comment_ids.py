@@ -51,7 +51,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from verified_docx_mcp import tracked_changes  # noqa: E402
+from verified_docx_mcp import tracked_changes
 
 MATCH_THRESHOLD = 0.55
 

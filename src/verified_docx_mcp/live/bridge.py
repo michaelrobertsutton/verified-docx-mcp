@@ -108,7 +108,7 @@ class _AddinRequestHandler(http.server.SimpleHTTPRequestHandler):
         self._addin_dir = addin_dir
         super().__init__(*args, directory=str(addin_dir), **kwargs)
 
-    def do_GET(self) -> None:  # noqa: N802 (stdlib override name)
+    def do_GET(self) -> None:  # stdlib override name, not our naming convention to control
         if self.path == "/ping" or self.path.startswith("/ping?"):
             self._send_ping()
             return
@@ -124,7 +124,7 @@ class _AddinRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+    def log_message(self, format: str, *args: object) -> None:  # stdlib override signature
         pass
 
 
