@@ -317,6 +317,18 @@ files — no Word installation required. `tests/live` needs a real Word
 install and a macOS Automation grant; it is skipped unless `--run-live` is
 passed.
 
+## Live mode (WP-1 spike)
+
+A hello-world Word task-pane add-in (`addin/`) plus a local HTTPS bridge
+(`python -m verified_docx_mcp.live.bridge --serve-only`) that a lead can
+sideload into Word for Mac to check `WordApi 1.4` support and correlate
+Office.js comment ids against this server's OOXML `durableId`s. This is
+the WP-1 spike for
+[issue #106](https://github.com/michaelrobertsutton/JennyStack/issues/106)'s
+live co-editing bridge — throwaway scaffolding, not yet wired into the
+MCP server itself (importing `verified_docx_mcp.live` never starts
+anything). Full step-by-step: [`docs/live-mode.md`](docs/live-mode.md).
+
 ## Path safety
 
 Every tool resolves its path argument through an allowlist
