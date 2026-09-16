@@ -392,22 +392,40 @@ owner file is present, same as every other read tool):
 2. *Normalize anchor text* on both sides by collapsing whitespace runs
    to single spaces and stripping the ends (`" ".join(text.split())`).
 3. A live comment whose normalized content matches NO file comment gets
-   `confidence: "none"`, `comment_id: null`, `w_id: null`.
+   `confidence: "none"`, `comment_id: null`, `w_id: null`, `date_skew_s:
+   null`.
 4. Otherwise, the first file comment whose normalized content matches:
    `confidence: "exact"` if its normalized anchor ALSO matches, AND
-   (author matches, when both sides report one) AND (creation dates are
-   within 2 minutes of each other, when both sides report one);
-   `confidence: "content-only"` otherwise.
+   (author matches, when both sides report one); `confidence:
+   "content-only"` otherwise. **Date is never part of this gate** — see
+   below.
+
+**WP-6 real-pane fix: date never gates confidence.** The first real-pane
+acceptance run ([issue #106](https://github.com/michaelrobertsutton/JennyStack/issues/106)'s
+WP-3+WP-4 acceptance comment) found every real match coming back
+`content-only` instead of `exact`: Word for Mac writes
+a comment's `w:date` as LOCAL wall-clock time with a `Z` suffix (fixture:
+`2026-09-16T14:06:00Z`) while Office.js's `creationDate` reports TRUE UTC
+for the same moment (`2026-09-16T18:06:00.000Z` — a 4-hour offset here),
+so a fixed tolerance window can never bridge that gap in general (the
+offset is whatever the pane's own local timezone is). Date is now purely
+informational: every correlation entry carries `date_skew_s`, the signed
+whole-second gap `round((live_dt - file_dt).total_seconds())` between
+the live comment's `creationDate` and the correlated file comment's
+`w:date` (positive means the live side is later), or `null` when either
+side has no date or nothing correlated at all.
 
 Verified against `tests/fixtures/comments/multipara-comment.docx` (also
-`tests/unit/test_comments.py`'s own fixture): its two-paragraph root
+`tests/unit/test_comments.py`'s own fixture) with the exact skewed
+timestamps above (`ROOT_DATE = "2026-09-16T14:06:00Z"` on the file side,
+`"2026-09-16T18:06:00.000Z"` on the live side): its two-paragraph root
 comment (file mode's `comment_id="58A3F864"`, anchored to `"Fixture"`,
 content `"First paragraph of a two-paragraph comment.Second paragraph of
-the same comment."`) correlates `"exact"` against a fake-pane comment
-with the same anchor/author/date and content joined with `\r`
+the same comment."`) still correlates `"exact"` against a fake-pane
+comment with the same anchor/author and content joined with `\r`
 (`"First paragraph of a two-paragraph comment.\rSecond paragraph of the
-same comment."`); a live comment with unrelated content correlates
-`"none"`.
+same comment."`), with `date_skew_s == 14400`; a live comment with
+unrelated content correlates `"none"`.
 
 **This is advisory, never authoritative.** Confidence is data for the
 caller (or the lead) to read, not a gate — `reply_to_comment`/
@@ -418,20 +436,35 @@ caller (or the lead) to read, not a gate — `reply_to_comment`/
 caller already holding a `live:<id>` handle should always use it
 directly rather than round-tripping through correlation.
 
+**`w:id` is not stable across saves (WP-6 real-pane finding).** A real
+Word for Mac save renumbered a document's second comment's `w:id` from
+`1` to `3`. Every correlation entry therefore carries `w_id_stable:
+false` — `w_id` is only ever a meaningful correlation key within the one
+Word session that has not yet saved since it was read; `comment_id` (the
+OOXML durableId) is the durable key across saves and sessions (issue
+#108). Because of this, `reply_to_comment`/`resolve_comment`'s
+`w_id-correlation` path always resolves against a correlation table
+built fresh — by re-reading the on-disk file (`_file_comments_and_
+suggestions`) immediately before the op, inside the same call — never a
+correlation list cached from an earlier `list_open_items` call, which
+could otherwise match the wrong comment (or none) after a save
+renumbers `w:id`.
+
 **`list_open_items(source="live")` response shape.** Same top-level shape
 as file mode (`path`, `comments`, `pending_suggestions`) plus `source:
 "live"` and a top-level `correlation` list (one entry per listed live
-comment: `{live_comment_id, comment_id, w_id, confidence}`). Each
-listed comment's own `comment_id` is `live:<Comment.id>`, `w_id` is
-`null`, and it carries `anchor_text`/`author`/`created_time`/`resolved`/
-`replies` read straight from the pane — including real reply threading,
-which the pane sees but file mode's own `list_open_items` does not
-resolve (its `reply_count`/`replies` are always `0`/`[]` by that tool's
-own documented scope limit). Resolved comments are filtered out the same
-way file mode does, even though the pane reports them too —
-`pending_suggestions` is unaffected either way (read from the same
-on-disk snapshot regardless of source, since the live protocol has no
-tracked-change read op of its own).
+comment: `{live_comment_id, comment_id, w_id, w_id_stable, confidence,
+date_skew_s}`). Each listed comment's own `comment_id` is
+`live:<Comment.id>`, `w_id` is `null`, and it carries
+`anchor_text`/`author`/`created_time`/`resolved`/`replies` read straight
+from the pane — including real reply threading, which the pane sees but
+file mode's own `list_open_items` does not resolve (its
+`reply_count`/`replies` are always `0`/`[]` by that tool's own documented
+scope limit). Resolved comments are filtered out the same way file mode
+does, even though the pane reports them too — `pending_suggestions` is
+unaffected either way (read from the same on-disk snapshot regardless of
+source, since the live protocol has no tracked-change read op of its
+own).
 
 **`add_anchored_comment(write_mode="live")`.** Sends `comment_add`
 (`find`, `expected_matches`); the pane's own `zero_match`/

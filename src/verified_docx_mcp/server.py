@@ -1591,13 +1591,23 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     also carries a top-level `correlation` list: for each listed live
     comment, the best-matching file-mode comment_id (durableId, or a raw
     w:id fallback) from this same document's on-disk snapshot, matched by
-    normalized anchor text + normalized content (+ author + creation date
-    within 2 minutes, when both sides have them) -- `confidence` is
-    `"exact"` | `"content-only"` | `"none"`. This is ADVISORY, never
-    authoritative: a caller already holding a `live:<id>` handle should
-    use it directly; correlation only exists so a durableId/w:id (from an
-    earlier file-mode call, or pasted in by the lead) can still be used
-    with `reply_to_comment`/`resolve_comment(write_mode="live")`.
+    normalized anchor text + normalized content (+ author, when both
+    sides have one) -- `confidence` is `"exact"` | `"content-only"` |
+    `"none"`. Date is NEVER part of the `confidence` match (issue #106
+    WP-6 real-pane finding: Word for Mac writes `w:date` as local
+    wall-clock time with a `Z` suffix while Office.js's `creationDate` is
+    true UTC, so the two routinely differ by several hours for the SAME
+    comment); each entry instead carries `date_skew_s`, the signed
+    whole-second gap between the two sides' timestamps (or `null`),
+    informational only. Each entry also carries `w_id_stable: false` --
+    `w_id` is only a meaningful correlation key within one open Word
+    session (a real save has been observed to renumber it); `comment_id`
+    (the durableId) is the durable key across saves/sessions (issue
+    #108). This is ADVISORY, never authoritative: a caller already
+    holding a `live:<id>` handle should use it directly; correlation only
+    exists so a durableId/w:id (from an earlier file-mode call, or pasted
+    in by the lead) can still be used with
+    `reply_to_comment`/`resolve_comment(write_mode="live")`.
 
     Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
     Word's owner file is present, like every other read tool.

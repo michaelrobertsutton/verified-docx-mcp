@@ -25,11 +25,22 @@ Both directions go through ``correlate_comments`` below: for each live
 comment, the best-matching file-mode comment (read from the same
 document's on-disk snapshot, via ``tracked_changes._parse_comments`` --
 the same function file-mode ``list_open_items`` itself uses) by
-normalized anchor text + normalized content, tie-broken by author and
-creation date when both sides have them. This is advisory, never
-authoritative -- a caller that already has a ``live:<id>`` handle should
-always prefer it; correlation only exists to make a durableId/`w:id`
-usable when that is all a caller has.
+normalized anchor text + normalized content, tie-broken by author when
+both sides have one. This is advisory, never authoritative -- a caller
+that already has a ``live:<id>`` handle should always prefer it;
+correlation only exists to make a durableId/``w:id`` usable when that is
+all a caller has.
+
+``w_id`` is NOT stable across saves (issue #106 WP-6 real-pane finding):
+a real Word for Mac save renumbered a document's second comment's
+``w:id`` from ``1`` to ``3``. Every correlation entry below carries
+``w_id_stable: False`` for this reason -- ``w_id`` is only ever a
+meaningful correlation key within the one Word session that has not yet
+saved since it was read; ``comment_id`` (the OOXML durableId) is the
+durable key across saves and sessions (issue #108). A caller resolving a
+handle by ``w_id`` should treat a miss as "the id renumbered, re-list and
+retry with the current durableId/w_id", not as evidence the comment is
+gone.
 
 Normalization
 -------------
@@ -47,20 +58,40 @@ Normalization
   break the very case this normalization exists to fix), not a general
   whitespace collapse.
 
-Confidence
-----------
+Confidence (issue #106 WP-6 real-pane finding: date must never gate this)
+--------------------------------------------------------------------------
+The first real-pane acceptance run (docs/live-mode.md's WP-3+WP-4
+acceptance entry) found every real match coming back ``content-only``
+instead of ``exact``: Word for Mac writes a comment's ``w:date`` as LOCAL
+wall-clock time with a ``Z`` suffix (fixture: ``2026-09-16T14:06:00Z``)
+while Office.js's ``creationDate`` reports TRUE UTC for the same moment
+(``2026-09-16T18:06:00.000Z``, a 4-hour offset here) -- a gap no fixed
+tolerance window can close in general (the offset is whatever the pane's
+local timezone is), so date can never be part of what makes a match
+``exact``.
+
 - ``exact``   -- normalized content matches AND normalized anchor text
-  matches AND (author matches, when both sides report one) AND (creation
-  dates are within 2 minutes of each other, when both sides report one).
+  matches AND (author matches, when both sides report one). Date is
+  NEVER part of this gate.
 - ``content-only`` -- normalized content matches but the anchor text (or
-  author/date, when present) does not corroborate it.
+  author, when present) does not corroborate it.
 - ``none``    -- no file-mode comment's normalized content matches this
   live comment's at all.
+
+Each correlation entry also carries ``date_skew_s``: the signed
+difference, in whole seconds, between the live comment's
+``creationDate`` and the correlated file-mode comment's ``w:date``
+(``round((live_dt - file_dt).total_seconds())``; positive means the live
+side reports a later timestamp), or ``None`` when either side has no
+date, or when nothing correlated (``confidence == "none"``) at all. This
+is informational only -- e.g. a lead noticing every ``date_skew_s`` on a
+document is the same fixed offset has effectively rediscovered the pane's
+local UTC offset -- and never gates ``confidence``.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from . import bridge as live_bridge
@@ -76,7 +107,6 @@ from .session import (
 VALID_WRITE_MODES = ("auto", "file", "live")
 VALID_SOURCES = ("auto", "file", "live")
 
-_CORRELATION_DATE_TOLERANCE = timedelta(minutes=2)
 _LIVE_HANDLE_PREFIX = "live:"
 
 
@@ -223,11 +253,18 @@ def _parse_date(value: str | None) -> datetime | None:
     return dt
 
 
-def _dates_corroborate(live_date: str | None, file_date: str | None) -> bool:
+def _date_skew_seconds(live_date: str | None, file_date: str | None) -> int | None:
+    """Signed whole-second gap between the two sides' timestamps, or
+    ``None`` when either is missing/unparseable -- informational only,
+    per this module's own docstring (issue #106 WP-6: Word for Mac writes
+    ``w:date`` as local wall-clock time with a ``Z`` suffix while
+    Office.js's ``creationDate`` is true UTC, so this routinely carries a
+    fixed non-zero offset -- e.g. 14400s for a 4-hour-behind-UTC pane --
+    and that is normal, not a sign of a bad correlation)."""
     live_dt, file_dt = _parse_date(live_date), _parse_date(file_date)
     if live_dt is None or file_dt is None:
-        return True  # unknown on either side never disqualifies a match
-    return abs(live_dt - file_dt) <= _CORRELATION_DATE_TOLERANCE
+        return None
+    return round((live_dt - file_dt).total_seconds())
 
 
 def _authors_corroborate(live_author: str | None, file_author: str | None) -> bool:
@@ -247,10 +284,17 @@ def correlate_comments(
     ``created_time``).
 
     Returns one entry per live comment: ``{live_comment_id: "live:<id>",
-    comment_id, w_id, confidence}`` -- ``comment_id``/``w_id`` are ``None``
-    when ``confidence`` is ``"none"``. Advisory only: never used to gate
-    anything, only to let a caller holding a durableId/w:id reach the live
-    comment it probably corresponds to (see ``_resolve_comment_handle``).
+    comment_id, w_id, w_id_stable, confidence, date_skew_s}`` --
+    ``comment_id``/``w_id``/``date_skew_s`` are ``None`` when ``confidence``
+    is ``"none"``. ``w_id_stable`` is always ``False`` (issue #106 WP-6:
+    a real Word for Mac save renumbered a comment's ``w:id``, so it is
+    only ever meaningful within one open session -- ``comment_id``, the
+    OOXML durableId, is the durable key, per issue #108). ``date_skew_s``
+    is informational only and NEVER factors into ``confidence`` -- see
+    this module's own docstring for why date can't gate a match here.
+    Advisory only: never used to gate anything, only to let a caller
+    holding a durableId/w:id reach the live comment it probably
+    corresponds to (see ``_resolve_comment_handle``).
     """
     out: list[dict[str, Any]] = []
     for live in live_comments_raw:
@@ -267,8 +311,7 @@ def correlate_comments(
                     continue
                 anchor_ok = bool(live_anchor) and live_anchor == _normalize_anchor(f.get("quoted_text"))
                 author_ok = _authors_corroborate(live_author, f.get("author"))
-                date_ok = _dates_corroborate(live_date, f.get("created_time"))
-                if anchor_ok and author_ok and date_ok:
+                if anchor_ok and author_ok:
                     best, best_confidence = f, "exact"
                     break  # an exact match is the best this can do
                 if best is None:
@@ -279,7 +322,9 @@ def correlate_comments(
                 "live_comment_id": f"{_LIVE_HANDLE_PREFIX}{live.get('id')}",
                 "comment_id": best.get("comment_id") if best else None,
                 "w_id": best.get("w_id") if best else None,
+                "w_id_stable": False,
                 "confidence": best_confidence,
+                "date_skew_s": _date_skew_seconds(live_date, best.get("created_time")) if best else None,
             }
         )
     return out
@@ -292,7 +337,21 @@ def _resolve_comment_handle(comment_id: str, correlation: list[dict[str, Any]]) 
     against). Returns (live_handle_without_prefix, resolved_via) where
     resolved_via is ``"live-handle"`` | ``"durableId-correlation"`` |
     ``"w_id-correlation"``. Raises INVALID_INPUT, naming both id spaces,
-    when nothing matches."""
+    when nothing matches.
+
+    *correlation* must come from a *correlation* built fresh for THIS
+    call (``execute_reply_to_comment_live``/``execute_resolve_comment_live``
+    below both call ``_live_state`` -- which re-reads the on-disk snapshot
+    via ``_file_comments_and_suggestions`` -- immediately before calling
+    this, never a listing cached from an earlier ``list_open_items`` call)
+    -- required because ``w:id`` is not stable across a Word save (see
+    this module's own docstring and ``w_id_stable`` in
+    ``correlate_comments``'s output): a ``w_id-correlation`` resolved
+    against a stale, pre-save correlation table could silently match the
+    wrong comment (or none) once Word has renumbered ids on save.
+    ``durableId-correlation`` does not have this hazard (the durableId is
+    stable), but the fresh re-read costs nothing extra and keeps one rule
+    for both."""
     from ..errors import ErrorCode
 
     if comment_id.startswith(_LIVE_HANDLE_PREFIX):
