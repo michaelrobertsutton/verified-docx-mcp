@@ -19,6 +19,7 @@ with w:tcPr byte-identical -- see MergedTableFixtureBTests below.
 
 from __future__ import annotations
 
+import copy
 import os
 import shutil
 import sys
@@ -26,6 +27,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from typing import Any
 from xml.etree import ElementTree as ET
 
 REPO = Path(__file__).resolve().parents[2]
@@ -85,6 +87,43 @@ def _tc_pr_bytes(path: Path, table_id: int, row_index: int, cell_index: int) -> 
     tc = tables._find_cell(tr, cell_index, table_id=table_id, row_index=row_index)
     tcpr = tables._cell_tcpr(tc)
     return ET.tostring(tcpr) if tcpr is not None else None
+
+
+def _find_cell_xml(path: Path, table_id: int, row_index: int, cell_index: int) -> Any:
+    with zipfile.ZipFile(path) as zf:
+        root = ET.fromstring(zf.read(projection.DEFAULT_PART))
+    tbl = tables._find_table_element(root, table_id)
+    tr = tables._find_row(tbl, row_index, table_id=table_id)
+    return tables._find_cell(tr, cell_index, table_id=table_id, row_index=row_index)
+
+
+def _row_xml(path: Path, table_id: int, row_index: int) -> Any:
+    with zipfile.ZipFile(path) as zf:
+        root = ET.fromstring(zf.read(projection.DEFAULT_PART))
+    tbl = tables._find_table_element(root, table_id)
+    return tables._find_row(tbl, row_index, table_id=table_id)
+
+
+def _duplicate_body_paragraph(path: Path, body_index: int) -> None:
+    """Test-only fixture mutation: duplicate the top-level body paragraph
+    at *body_index* (0-based, into body_children) right after itself --
+    used to exercise MATCH_COUNT_MISMATCH on after_paragraph_text without
+    hand-building a whole new fixture (every real fixture's sections have
+    exactly one non-heading paragraph, never two identical ones)."""
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        parts = {n: zf.read(n) for n in names}
+    raw = parts[projection.DEFAULT_PART]
+    decls = mutations._capture_source_namespaces(raw)
+    root = ET.fromstring(raw)
+    body = mutations._find_body(root)
+    body_children, _sect_pr = mutations._split_body(body)
+    dup = copy.deepcopy(body_children[body_index])
+    body.insert(body_index + 1, dup)
+    parts[projection.DEFAULT_PART] = mutations._serialize_xml(root, decls)
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, content in parts.items():
+            zf.writestr(name, content)
 
 
 class MutatingToolsRegistrationTests(unittest.TestCase):
@@ -480,6 +519,420 @@ class InsertTableTests(_TempFixtureCase):
         self.assertTrue(evidence["revision_ids"])
         xml = _document_xml(self.target)
         self.assertIn("<w:ins ", xml)
+
+
+# ---------------------------------------------------------------------------
+# issue #100: insert_table structured cell objects (gridSpan/vMerge/shading/
+# header rows/placement anchor). Group numbers below match the issue's
+# implementation spec ("Tests" section, groups 1-11); group 1 (back-compat)
+# is covered by InsertTableTests above, unchanged.
+# ---------------------------------------------------------------------------
+
+
+class InsertTableStructuredCellsTests(_TempFixtureCase):
+    """Groups 2, 3, 4, 5: the CellSpec object form."""
+
+    fixture_name = "tables.docx"
+
+    def test_title_row_span_reports_gridspan_and_is_lossy_on_read(self):
+        evidence = tables.execute_insert_table(
+            str(self.target),
+            [[{"markdown": "Program Title", "span": 2}], ["Role", "PM"]],
+            "TableNormal",
+        )
+        table_id = evidence["table_id"]
+        info = tables.get_table_impl(self.target, table_id)
+        self.assertEqual(info["col_count"], 2)
+        self.assertTrue(info["has_merged_cells"])
+        self.assertEqual(info["rows"][0][0]["grid_span"], 2)
+        self.assertEqual(info["rows"][0][0]["text"], "Program Title")
+        self.assertEqual(evidence["merged_cells"], 1)
+
+        markdown, _warnings, lossy = projection.read_document_markdown(self.target)
+        self.assertEqual(markdown.count("Program Title"), 1)
+        self.assertTrue(any(item["kind"] == "table_merge" for item in lossy))
+        title_line = next(line for line in markdown.splitlines() if "Program Title" in line)
+        self.assertEqual(title_line, "| Program Title |  |")  # text once, one empty cell
+
+    def test_explicit_grid_dxa_widths(self):
+        evidence = tables.execute_insert_table(
+            str(self.target),
+            [[{"markdown": "Title", "span": 2}], ["A", "B"]],
+            "TableNormal",
+            grid_dxa=[5935, 3415],
+        )
+        table_id = evidence["table_id"]
+        with zipfile.ZipFile(self.target) as zf:
+            root = ET.fromstring(zf.read(projection.DEFAULT_PART))
+        tbl = tables._find_table_element(root, table_id)
+        tblpr = next(c for c in tbl if projection._ln(c) == "tblPr")
+        tblw = next(c for c in tblpr if projection._ln(c) == "tblW")
+        self.assertEqual(projection._attr(tblw, "w"), "9350")
+        self.assertEqual(projection._attr(tblw, "type"), "dxa")
+        grid = next(c for c in tbl if projection._ln(c) == "tblGrid")
+        widths = [projection._attr(c, "w") for c in grid if projection._ln(c) == "gridCol"]
+        self.assertEqual(widths, ["5935", "3415"])
+
+        title_tc = _find_cell_xml(self.target, table_id, 1, 1)
+        tcpr = tables._cell_tcpr(title_tc)
+        tcw = next(c for c in tcpr if projection._ln(c) == "tcW")
+        self.assertEqual(projection._attr(tcw, "w"), "9350")  # spans both grid columns
+
+    def test_header_rows_and_cant_split(self):
+        evidence = tables.execute_insert_table(
+            str(self.target),
+            [["H1", "H2"], ["A", "B"], ["C", "D"]],
+            "TableNormal",
+            header_rows=1,
+            cant_split=True,
+        )
+        table_id = evidence["table_id"]
+
+        def _trpr_children(row_index: int) -> set[str]:
+            tr = _row_xml(self.target, table_id, row_index)
+            trpr = next((c for c in tr if projection._ln(c) == "trPr"), None)
+            return {projection._ln(c) for c in trpr} if trpr is not None else set()
+
+        self.assertEqual(_trpr_children(1), {"cantSplit", "tblHeader"})
+        self.assertEqual(_trpr_children(2), {"cantSplit"})
+        self.assertEqual(_trpr_children(3), {"cantSplit"})
+
+    def test_cell_formatting_present_only_on_requested_cell(self):
+        evidence = tables.execute_insert_table(
+            str(self.target),
+            [
+                [
+                    {
+                        "markdown": "Styled",
+                        "fill": "3b3838",
+                        "color": "ffffff",
+                        "bold": True,
+                        "align": "center",
+                        "valign": "center",
+                    },
+                    "Plain",
+                ]
+            ],
+            "TableNormal",
+        )
+        table_id = evidence["table_id"]
+        styled_xml = ET.tostring(_find_cell_xml(self.target, table_id, 1, 1), encoding="unicode")
+        plain_xml = ET.tostring(_find_cell_xml(self.target, table_id, 1, 2), encoding="unicode")
+
+        self.assertIn('w:fill="3B3838"', styled_xml)
+        self.assertIn('w:val="FFFFFF"', styled_xml)
+        self.assertIn("<w:b", styled_xml)
+        self.assertIn("<w:bCs", styled_xml)
+        self.assertIn('w:jc w:val="center"', styled_xml)
+        self.assertIn('w:vAlign w:val="center"', styled_xml)
+
+        self.assertNotIn("w:fill", plain_xml)
+        self.assertNotIn("<w:b", plain_xml)
+        self.assertNotIn("w:jc", plain_xml)
+        self.assertNotIn("w:vAlign", plain_xml)
+
+
+class InsertTableValidationTests(_TempFixtureCase):
+    """Group 6: strict grid/hex/header_rows validation."""
+
+    fixture_name = "tables.docx"
+
+    def test_grid_mismatch_names_row_and_both_numbers(self):
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(
+                str(self.target),
+                [[{"markdown": "A", "span": 2}], ["a", "b", "c"]],
+                "TableNormal",
+            )
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        message = str(ctx.exception)
+        self.assertIn("row 0", message)
+        self.assertIn("2", message)
+        self.assertIn("3", message)
+
+    def test_bad_hex_fill_refused(self):
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(
+                str(self.target), [[{"markdown": "A", "fill": "not-a-color"}]], "TableNormal"
+            )
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    def test_header_rows_at_or_above_row_count_refused(self):
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(str(self.target), [["a", "b"]], "TableNormal", header_rows=1)
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+
+class InsertTableAnchorTests(_TempFixtureCase):
+    """Group 7: anchor placement on sections.docx (Overview / Background /
+    Next Steps, one body paragraph per section)."""
+
+    fixture_name = "sections.docx"
+
+    def test_position_start_lands_right_after_the_heading(self):
+        evidence = tables.execute_insert_table(
+            str(self.target),
+            [["A", "B"]],
+            "TableNormal",
+            anchor={"section_key": "overview-1", "position": "start"},
+        )
+        self.assertEqual(
+            evidence["anchor_resolved"], {"body_index": 1, "section_key": "overview-1", "after_table_id": None}
+        )
+        markdown, _w, _l = projection.read_document_markdown(self.target)
+        lines = [line for line in markdown.splitlines() if line.strip()]
+        self.assertLess(lines.index("# Overview"), lines.index("| A | B |"))
+        self.assertLess(lines.index("| A | B |"), lines.index("Some overview text."))
+
+    def test_position_end_lands_before_the_next_heading(self):
+        evidence = tables.execute_insert_table(
+            str(self.target),
+            [["A", "B"]],
+            "TableNormal",
+            anchor={"section_key": "overview-1", "position": "end"},
+        )
+        self.assertEqual(evidence["anchor_resolved"]["section_key"], "overview-1")
+        markdown, _w, _l = projection.read_document_markdown(self.target)
+        lines = [line for line in markdown.splitlines() if line.strip()]
+        self.assertLess(lines.index("Some overview text."), lines.index("| A | B |"))
+        self.assertLess(lines.index("| A | B |"), lines.index("## Background"))
+
+    def test_after_paragraph_text_lands_after_that_paragraph(self):
+        evidence = tables.execute_insert_table(
+            str(self.target),
+            [["A", "B"]],
+            "TableNormal",
+            anchor={"section_key": "overview-1", "after_paragraph_text": "Some overview text."},
+        )
+        self.assertEqual(evidence["anchor_resolved"]["section_key"], "overview-1")
+        markdown, _w, _l = projection.read_document_markdown(self.target)
+        lines = [line for line in markdown.splitlines() if line.strip()]
+        self.assertLess(lines.index("Some overview text."), lines.index("| A | B |"))
+        self.assertLess(lines.index("| A | B |"), lines.index("## Background"))
+
+    def test_unknown_section_key_raises_section_not_found(self):
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(
+                str(self.target),
+                [["A"]],
+                "TableNormal",
+                anchor={"section_key": "does-not-exist", "position": "start"},
+            )
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.SECTION_NOT_FOUND)
+
+    def test_after_paragraph_text_zero_matches_raises_zero_match(self):
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(
+                str(self.target),
+                [["A"]],
+                "TableNormal",
+                anchor={"section_key": "overview-1", "after_paragraph_text": "Not in this section."},
+            )
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.ZERO_MATCH)
+
+    def test_after_paragraph_text_matching_twice_raises_match_count_mismatch(self):
+        _duplicate_body_paragraph(self.target, 3)  # "Background text." (body index 3)
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(
+                str(self.target),
+                [["A"]],
+                "TableNormal",
+                anchor={"section_key": "background-1", "after_paragraph_text": "Background text."},
+            )
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.MATCH_COUNT_MISMATCH)
+
+    def test_table_id_when_inserted_before_an_existing_table(self):
+        """Group 8: table_id correctness when the new table lands BEFORE
+        an existing one in document order."""
+        first = tables.execute_insert_table(str(self.target), [["X"]], "TableNormal")
+        self.assertEqual(first["table_id"], 1)
+        second = tables.execute_insert_table(
+            str(self.target),
+            [["Y"]],
+            "TableNormal",
+            anchor={"section_key": "overview-1", "position": "start"},
+        )
+        self.assertEqual(second["table_id"], 1)
+        self.assertEqual([t["table_id"] for t in tables.list_tables_impl(self.target)], [1, 2])
+        self.assertEqual(tables.get_table_impl(self.target, 1)["rows"][0][0]["text"], "Y")
+        self.assertEqual(tables.get_table_impl(self.target, 2)["rows"][0][0]["text"], "X")
+
+
+class InsertTableAfterTableIdAnchorTests(_TempFixtureCase):
+    """Group 7 (continued): the after_table_id anchor form on tables.docx."""
+
+    fixture_name = "tables.docx"
+
+    def test_after_table_id_places_table_right_after_and_gets_next_id(self):
+        evidence = tables.execute_insert_table(
+            str(self.target), [["new"]], "TableNormal", anchor={"after_table_id": 1}
+        )
+        self.assertEqual(evidence["table_id"], 2)
+        self.assertEqual(
+            evidence["anchor_resolved"], {"body_index": 2, "section_key": None, "after_table_id": 1}
+        )
+        markdown, _w, _l = projection.read_document_markdown(self.target)
+        lines = [line for line in markdown.splitlines() if line.strip()]
+        self.assertLess(lines.index("| new |"), lines.index("After the table."))
+
+    def test_after_table_id_missing_raises_table_not_found(self):
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(
+                str(self.target), [["x"]], "TableNormal", anchor={"after_table_id": 99}
+            )
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.TABLE_NOT_FOUND)
+
+
+class InsertTableAfterNestedTableIdTests(_TempFixtureCase):
+    fixture_name = "tables-merged.docx"
+
+    def test_after_table_id_on_nested_table_refused(self):
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(
+                str(self.target), [["x"]], "TableNormal", anchor={"after_table_id": 2}
+            )
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        self.assertIn("nested", str(ctx.exception).lower())
+
+
+class InsertTableVMergeTests(_TempFixtureCase):
+    """Group 9: a v_merge restart/continue pair."""
+
+    fixture_name = "tables.docx"
+
+    def test_restart_then_continue_reports_v_merge(self):
+        evidence = tables.execute_insert_table(
+            str(self.target),
+            [
+                [{"markdown": "Merged", "v_merge": "restart"}, "B1"],
+                [{"markdown": "", "v_merge": "continue"}, "B2"],
+            ],
+            "TableNormal",
+        )
+        table_id = evidence["table_id"]
+        info = tables.get_table_impl(self.target, table_id)
+        self.assertEqual(info["rows"][0][0]["v_merge"], "restart")
+        self.assertEqual(info["rows"][1][0]["v_merge"], "continue")
+        self.assertEqual(info["rows"][1][0]["text"], "")
+        self.assertEqual(evidence["merged_cells"], 2)
+
+    def test_continue_with_nonempty_markdown_refused(self):
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(
+                str(self.target),
+                [
+                    [{"markdown": "Merged", "v_merge": "restart"}],
+                    [{"markdown": "not empty", "v_merge": "continue"}],
+                ],
+                "TableNormal",
+            )
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    def test_continue_with_no_restart_above_refused(self):
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(
+                str(self.target),
+                [["plain"], [{"markdown": "", "v_merge": "continue"}]],
+                "TableNormal",
+            )
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+
+class InsertTableTrackChangesStructuredTests(_TempFixtureCase):
+    """Group 10: track_changes=True extended to a dict-form row."""
+
+    fixture_name = "tables.docx"
+
+    def test_track_changes_wraps_every_run_in_structured_row(self):
+        evidence = tables.execute_insert_table(
+            str(self.target),
+            [[{"markdown": "**Spanning title**", "span": 2, "fill": "3B3838"}], ["a", "b"]],
+            "TableNormal",
+            track_changes=True,
+        )
+        self.assertTrue(evidence["track_changes"])
+        self.assertTrue(evidence["revision_ids"])
+        xml = _document_xml(self.target)
+        self.assertIn("<w:ins ", xml)
+        self.assertIn("Spanning title", xml)
+
+
+class InsertTableRealWorldShapeEndToEndTests(_TempFixtureCase):
+    """Group 11: two real-world merged-cell table shapes, built
+    end-to-end -- a contract-information table (2 columns, each program a
+    3-row block whose first row spans both columns with a fill) and a
+    proof table (a spanning title row, a shaded header row via
+    header_rows=1, body rows)."""
+
+    fixture_name = "tables.docx"
+
+    def test_contract_information_table_program_blocks(self):
+        programs = [("Program A", "Prime"), ("Program B", "Subcontractor")]
+        rows: list[list[Any]] = []
+        for name, role in programs:
+            rows.append(
+                [
+                    {
+                        "markdown": f"**{name}** - Skyward, {role}",
+                        "span": 2,
+                        "fill": "3B3838",
+                        "color": "FFFFFF",
+                        "bold": True,
+                    }
+                ]
+            )
+            rows.append(["Contract Number", "GS-00F-1234X"])
+            rows.append(["Period of Performance", "2024-2029"])
+
+        evidence = tables.execute_insert_table(str(self.target), rows, "TableNormal", grid_dxa=[5935, 3415])
+        table_id = evidence["table_id"]
+        info = tables.get_table_impl(self.target, table_id)
+        self.assertEqual(info["row_count"], 6)
+        self.assertEqual(info["col_count"], 2)
+        self.assertTrue(info["has_merged_cells"])
+        self.assertEqual(info["rows"][0][0]["grid_span"], 2)
+        self.assertIn("Program A", info["rows"][0][0]["text"])
+        self.assertEqual(info["rows"][3][0]["grid_span"], 2)
+        self.assertIn("Program B", info["rows"][3][0]["text"])
+        self.assertEqual(evidence["merged_cells"], 2)
+
+        title_xml = ET.tostring(_find_cell_xml(self.target, table_id, 1, 1), encoding="unicode")
+        self.assertIn('w:fill="3B3838"', title_xml)
+
+    def test_proof_table_title_and_shaded_header_row(self):
+        rows = [
+            [
+                {
+                    "markdown": "**Table 3: Proof Points**",
+                    "span": 2,
+                    "fill": "3B3838",
+                    "color": "FFFFFF",
+                    "align": "center",
+                }
+            ],
+            [
+                {"markdown": "**Metric**", "fill": "D9D9D9", "bold": True},
+                {"markdown": "**Result**", "fill": "D9D9D9", "bold": True},
+            ],
+            ["Uptime", "99.99%"],
+            ["Response Time", "<2h"],
+        ]
+        evidence = tables.execute_insert_table(str(self.target), rows, "TableNormal", header_rows=1)
+        table_id = evidence["table_id"]
+        info = tables.get_table_impl(self.target, table_id)
+        self.assertEqual(info["row_count"], 4)
+        self.assertEqual(info["col_count"], 2)
+        self.assertEqual(info["rows"][0][0]["grid_span"], 2)
+        self.assertIn("Table 3", info["rows"][0][0]["text"])
+
+        title_row = _row_xml(self.target, table_id, 1)
+        trpr = next((c for c in title_row if projection._ln(c) == "trPr"), None)
+        self.assertIsNotNone(trpr)
+        self.assertTrue(any(projection._ln(c) == "tblHeader" for c in trpr))
+
+        header_cell_xml = ET.tostring(_find_cell_xml(self.target, table_id, 2, 1), encoding="unicode")
+        self.assertIn('w:fill="D9D9D9"', header_cell_xml)
+        self.assertIn("<w:b", header_cell_xml)
 
 
 if __name__ == "__main__":
