@@ -299,9 +299,11 @@ passed.
 
 Every tool resolves its path argument through an allowlist
 (`VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS`, defaulting to the user's home
-directory) and a denylist of well-known credential locations
-(`~/.ssh`, `~/.aws`, etc.) that is never overridable. See
-`src/verified_docx_mcp/paths.py`.
+directory plus the Claude Code scratch root, `/private/tmp/claude-<uid>`,
+when that directory exists) and a denylist of well-known credential
+locations (`~/.ssh`, `~/.aws`, etc.) that is never overridable. Setting
+`VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS` explicitly replaces the default list
+verbatim rather than widening it. See `src/verified_docx_mcp/paths.py`.
 
 ## License
 
