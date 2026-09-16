@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import stat
 import sys
 import tempfile
@@ -33,6 +34,17 @@ sys.path.insert(0, str(REPO / "src"))
 
 from verified_docx_mcp import paths, server
 from verified_docx_mcp.errors import ErrorCode, VerifyError
+
+FIXTURE_DIR = REPO / "tests" / "fixtures"
+# A real, valid .docx with zero headings (confirmed via find_sections_impl)
+# -- used wherever a test needs execute_export_pdf's *source* path to
+# survive projection.find_sections_impl() (issue #102's section-geometry
+# planning runs before render_word() is ever invoked) without pulling in
+# any actual section probing. Tests exercising rendering-path behavior
+# unrelated to sections (error mapping, close_after) use this rather than
+# a fake byte blob, now that execute_export_pdf reads the source .docx
+# directly (not just stages it for a mocked Word to "open").
+NO_HEADINGS_FIXTURE = FIXTURE_DIR / "frag.docx"
 
 
 def _write_fake_osascript(bin_dir: Path, stderr_text: str, exit_code: int = 1) -> None:
@@ -71,7 +83,12 @@ class ExportPdfErrorMappingTests(unittest.TestCase):
         os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = self._tmp.name
 
         self._in_path = Path(self._tmp.name) / "test-input.docx"
-        self._in_path.write_bytes(b"not a real docx, but osascript never reads it")
+        # A real, headingless .docx (issue #102: execute_export_pdf now
+        # calls projection.find_sections_impl() on the source BEFORE
+        # render_word() is invoked, which needs a real OOXML zip --
+        # osascript itself still never reads this file's bytes, only
+        # Python's own zipfile-based section planning does.
+        shutil.copyfile(NO_HEADINGS_FIXTURE, self._in_path)
         self._out_path = Path(self._tmp.name) / "out" / "test-output.pdf"
         self._out_path.parent.mkdir()
 
@@ -152,7 +169,12 @@ class ExportPdfCloseAfterTests(unittest.TestCase):
         os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = self._tmp.name
 
         self._in_path = Path(self._tmp.name) / "test-input.docx"
-        self._in_path.write_bytes(b"not a real docx, but osascript never reads it")
+        # A real, headingless .docx (issue #102: execute_export_pdf now
+        # calls projection.find_sections_impl() on the source BEFORE
+        # render_word() is invoked, which needs a real OOXML zip --
+        # osascript itself still never reads this file's bytes, only
+        # Python's own zipfile-based section planning does.
+        shutil.copyfile(NO_HEADINGS_FIXTURE, self._in_path)
         self._out_path = Path(self._tmp.name) / "out" / "test-output.pdf"
         self._out_path.parent.mkdir()
 
