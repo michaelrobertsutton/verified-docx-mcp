@@ -218,12 +218,17 @@ async function currentBodyHash() {
   });
 }
 
-function refusalError(message) {
-  // Thrown by an op handler below to make the WSS reply ok:false with
-  // LIVE_OP_FAILED, matching live/protocol.py's documented refusal shape
-  // -- never an uncaught exception reaching the pane's onmessage handler.
+function refusalError(message, code) {
+  // Thrown by an op handler below to make the WSS reply ok:false with a
+  // typed code, matching live/protocol.py's documented refusal shape --
+  // never an uncaught exception reaching the pane's onmessage handler.
+  // Defaults to LIVE_OP_FAILED; a search-and-count-gate refusal (issue
+  // #106 WP-4) passes "zero_match"/"match_count_mismatch" instead, the
+  // same two names live/protocol.py's OP_ERROR_* constants use, so
+  // server.py's live comment tools can map them onto ZERO_MATCH/
+  // MATCH_COUNT_MISMATCH the same way file mode's locate() ladder does.
   const err = new Error(message);
-  err.code = "LIVE_OP_FAILED";
+  err.code = code || "LIVE_OP_FAILED";
   return err;
 }
 
@@ -581,8 +586,14 @@ async function opCommentAdd(payload) {
     await context.sync();
 
     if (results.items.length !== expectedMatches) {
+      // issue #106 WP-4: zero_match vs match_count_mismatch, the same
+      // split live/protocol.py's OP_ERROR_* constants name (see
+      // refusalError above) -- server.py maps these onto file mode's own
+      // ZERO_MATCH/MATCH_COUNT_MISMATCH.
+      const code = results.items.length === 0 ? "zero_match" : "match_count_mismatch";
       throw refusalError(
-        `expected ${expectedMatches} match(es) for ${JSON.stringify(payload.find)}, found ${results.items.length}`
+        `expected ${expectedMatches} match(es) for ${JSON.stringify(payload.find)}, found ${results.items.length}`,
+        code
       );
     }
 
