@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # Vendored verbatim from JennyStack scripts/docx_render.py at commit
-# aedd94c (PR #50, "Add the Word PDF render path: docx_render.py,
-# docx-to-pdf.sh, docx-doctor.sh"), source sha256
-# fc41610cc137f01edab24dcf2e583c0653963c9372ec831f08ac48c8fe094f50, size
-# 24691 bytes. Copied verbatim per issue #28 WP-02 (D3: a standalone,
-# stdlib-only Python module vendored into both repos with a source-hash
-# comment). Do not diverge from the JennyStack copy without also updating
-# it there — see that repo's copy for the canonical version. Everything
-# below this header comment, including the module's own docstring, is
-# unmodified from the source file. NOTE: this file is deliberately
-# exempted from `ruff check --fix` / autoformatting — `ruff --fix`
-# rewrites `Optional[str]` to `str | None` here (a legal, semantically
-# identical change) and removes the now-unused `Optional` import, which
-# breaks byte-for-byte verbatim parity with the source and this header's
-# own sha256. Lint it read-only; never run --fix against it (see
+# 175c6fe (JennyStack PR #104, "close_after"), source sha256
+# 7120f7a3d9cf4d4a6ef2cc3cb06d15516ac67cd78f1b9f08910141851ce39c19,
+# size 30153 bytes. Copied verbatim per issue #28 WP-02 (D3: a
+# standalone, stdlib-only Python module vendored into both repos with
+# a source-hash comment). Do not diverge from the JennyStack copy
+# without also updating it there — see that repo's copy for the
+# canonical version. Everything below this header comment, including
+# the module's own docstring, is unmodified from the source file.
+# NOTE: this file is deliberately exempted from `ruff check --fix` /
+# autoformatting — `ruff --fix` rewrites `Optional[str]` to
+# `str | None` here (a legal, semantically identical change) and
+# removes the now-unused `Optional` import, which breaks
+# byte-for-byte verbatim parity with the source and this header's own
+# sha256. Lint it read-only; never run --fix against it (see
 # pyproject.toml's per-file-ignores / the CI lint step, if either is
 # later added, for the corresponding exclusion).
 """docx_render.py — render a .docx to PDF via Microsoft Word automation, and
@@ -115,31 +115,59 @@ Two pitfalls found the hard way:
       the sdef's plain-English parameter labels and enumerator NAMES,
       not their four-character or ordinal codes.
 
-**`close` does not exist on this Word build's AppleScript surface, for
-either class that could plausibly carry it.** Read directly from
-Word.sdef: the `document` class declares `<responds-to>` for NOTHING —
-no close, no save, no print. The `window` class DOES declare
+**16.112.3 finding, SUPERSEDED 2026-09-16 (see the corrected finding
+below) — `close` appeared not to exist on this Word build's AppleScript
+surface, for either class that could plausibly carry it.** Read directly
+from Word.sdef: the `document` class declares `<responds-to>` for
+NOTHING — no close, no save, no print. The `window` class DOES declare
 `<responds-to command="close">` (delegating to a `handleCloseScriptCommand:`
-Cocoa method) — but invoking it, in every form tried (JXA and classic
-AppleScript; by document name, window name, index, and `active
-document`/`active window`) fails identically with "doesn't understand
-the 'close' message" (-1708). This is a genuine gap in Word's Automation
-implementation on this build, not a syntax error on the caller's side —
-confirmed by reading the dictionary, not just observing failures.
-`do Visual Basic` is not in the dictionary either (fails to compile,
--2741), so there is no macro-side escape hatch. GUI automation (System
-Events keystrokes to close the window) is deliberately NOT used here —
-it needs a separate Accessibility grant this module has no business
-requesting, and is racy against whatever else is on screen.
+Cocoa method) — but invoking it, in every form tried on 16.112.3 (JXA and
+classic AppleScript; by document name, window name, index, and `active
+document`/`active window`) failed identically with "doesn't understand
+the 'close' message" (-1708). This looked like a genuine gap in Word's
+Automation implementation on that build, not a syntax error on the
+caller's side — confirmed by reading the dictionary, not just observing
+failures. `do Visual Basic` is not in the dictionary either (fails to
+compile, -2741), so there was no macro-side escape hatch. GUI automation
+(System Events keystrokes to close the window) was deliberately NOT
+used — it needs a separate Accessibility grant this module has no
+business requesting, and is racy against whatever else is on screen.
 
-**Consequence: every successful render leaves its document open in
-Word.** `render_word()` does not treat this as a failure — the PDF is
-produced correctly regardless — but reports it: the result dict's
-`"left_open_document"` names the (uniquely-prefixed, see below) window
-title, and the CLI's JSON line and human-readable output both surface
-it. `scripts/docx-doctor.sh` counts current `jennystack-render-*`
-windows as its own advisory line so the leak is visible over time
-rather than silently accumulating. A lead can close these by hand at any
+**CORRECTED FINDING, verified live 2026-09-16 against Word 16.112.4:**
+`close window "<exact window name>" saving no` WORKS — the window closes
+immediately, with no save prompt, and closes ONLY that window. The
+16.112.3 failure above was real on that build; it simply does not
+reproduce on 16.112.4. Two other close forms were also tried against
+leftover `jennystack-render-*` windows and BOTH FAIL, so this module's
+close call must take exactly the working shape and no other:
+  - `close document "<name>"` fails with -1728 ("object not found") —
+    document names carry the `.docx` extension, window names do not, and
+    `document` still declares no `<responds-to>` for `close` per the
+    sdef read above.
+  - `tell (first window whose …) to close saving no` fails with -1750.
+  - **`close (first window whose name contains "…") saving no` is the
+    most dangerous failure mode of all: it RETURNS 0 (apparent success)
+    but closes the WRONG window** — a live probe closed two of the
+    lead's real, unrelated documents this way. Word's `whose` filter
+    against windows is UNRELIABLE and must NEVER be used here, for
+    closing or anything else. The only safe reference is the EXACT
+    window name this render itself captured via `name of active
+    window`, taken immediately after the existing poll confirms `name of
+    active document is inName` — never a `whose` clause, never an index,
+    never "first window".
+
+**Consequence: `render_word()` now closes its own staged document by
+default (`close_after=True`).** A close failure is reported, never
+fatal — the PDF is already written to disk before the close is
+attempted, so a failed close never loses output. The result dict's
+`"left_open_document"` is `None` when the close succeeded; when it fails
+(or when the caller passes `close_after=False` to keep the window open
+on purpose), it names the window title as before, and `"close_error"`
+carries the close attempt's own error text (`None` when there was
+nothing to report). `scripts/docx-doctor.sh` counts current
+`jennystack-render-*` windows as its own advisory line so any leftovers
+(pre-dating this change, or from a close failure) stay visible rather
+than silently accumulating. A lead can close these by hand at any
 point — none of them are real documents, and this module NEVER acts on
 any document or window it did not just create itself (see the staging
 section below on unique naming, and the safety note in
@@ -243,22 +271,31 @@ DEFAULT_TIMEOUT = 90
 # JXA was abandoned and why the enumerator/active-document form below is
 # required). Written to a temp file inside the SAME staging directory as
 # the copied .docx (both already inside Word's sandbox container), then
-# run via plain `osascript <script> <in.docx> <out.pdf> <in-basename>`
-# (osascript's DEFAULT language is AppleScript; no `-l JavaScript` flag)
-# using `on run argv`. All three arguments describe the already-staged
-# paths; the script never makes its own sandbox decisions. Prints
-# "OK <page-count>" on success; any failure (including the `-1712`/
-# `-1743` automation-declined case, and the bounded active-document poll
-# below timing out) raises an AppleScript error, which osascript reports
-# on stderr with a non-zero exit — parsed by render_word() below. There
-# is deliberately no `close` here (see the module docstring: the command
-# does not exist on this Word build's AppleScript surface for any object
-# tried).
+# run via plain `osascript <script> <in.docx> <out.pdf> <in-basename>
+# <close|keep>` (osascript's DEFAULT language is AppleScript; no
+# `-l JavaScript` flag) using `on run argv`. The first three arguments
+# describe the already-staged paths; the script never makes its own
+# sandbox decisions. The fourth argument is "close" (close the staged
+# document after rendering — render_word()'s default) or "keep" (leave
+# it open, close_after=False). Prints "OK <page-count> closed=<0|1>
+# <close-error-text-or-empty>" on success; any failure before that point
+# (including the `-1712`/`-1743` automation-declined case, and the
+# bounded active-document poll below timing out) raises an AppleScript
+# error, which osascript reports on stderr with a non-zero exit — parsed
+# by render_word() below. A close FAILURE (as opposed to a render
+# failure) is never raised as an AppleScript error — it is caught,
+# reported in the "closed="/error-text fields of the OK line, and never
+# fails the render, because the PDF is already on disk by then. The
+# close call itself must reference the window by the EXACT name this
+# script captured via `name of active window` — see the module
+# docstring's CORRECTED FINDING section for why a `whose` filter must
+# NEVER be used here (it can close the wrong window).
 _APPLESCRIPT_RENDER = r"""
 on run argv
   set inPath to item 1 of argv
   set outPath to item 2 of argv
   set inName to item 3 of argv
+  set closeMode to item 4 of argv
   tell application "Microsoft Word"
     set display alerts to alerts none
     open POSIX file inPath
@@ -267,7 +304,7 @@ on run argv
     -- screen or a document-recovery pane can make "active document"
     -- unready, or the wrong document, for well over a second. 80 tries
     -- * 0.5s = 40s, leaving headroom under render_word()'s own timeout
-    -- for the compute-statistics/save-as steps that follow.
+    -- for the compute-statistics/save-as/close steps that follow.
     set foundIt to false
     repeat 80 times
       try
@@ -282,10 +319,32 @@ on run argv
       error "timed out waiting for the opened document (" & inName & ") to become Word's active document (a cold Word launch, a start screen, or a document-recovery pane are the likely causes)"
     end if
     set d to active document
+    -- Capture the EXACT window name right after the poll confirms this
+    -- is our document, and verify it belongs to it before doing
+    -- anything else with it. NEVER a `whose` filter (see the module
+    -- docstring: a `whose` reference against Word windows has been
+    -- observed to resolve to the WRONG window).
+    set winName to name of active window
+    if (name of document of window winName) is not inName then
+      error "active window (" & winName & ") does not belong to the just-opened document (" & inName & ") — refusing to touch a window this render did not create"
+    end if
     set pg to compute statistics d statistic statistic pages
     save as d file name outPath file format format PDF
+    set closed to "0"
+    set closeErr to ""
+    if closeMode is "close" then
+      try
+        close window winName saving no
+        if (name of every window) contains winName then
+          error "window \"" & winName & "\" is still listed after close"
+        end if
+        set closed to "1"
+      on error errMsg
+        set closeErr to errMsg
+      end try
+    end if
   end tell
-  return "OK " & (pg as string)
+  return "OK " & (pg as string) & " closed=" & closed & " " & closeErr
 end run
 """
 
@@ -317,24 +376,37 @@ def _classify_automation_error(text: str) -> bool:
     return "-1712" in text or "-1743" in text
 
 
-def render_word(in_path: str, out_path: str, timeout: int = DEFAULT_TIMEOUT) -> dict:
+def render_word(
+    in_path: str,
+    out_path: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    close_after: bool = True,
+) -> dict:
     """Render in_path (.docx) to out_path (.pdf) via Word automation.
 
     Returns {"pdf": <out_path str>, "pages": <int|None>,
-    "left_open_document": <window title str>} on success. "pages" is
-    Word's OWN page count (from `compute statistics ... statistic pages`)
-    — the authoritative source per the module docstring; a caller should
-    still cross-check against page_count() (pdfinfo/regex) for a second
+    "left_open_document": <window title str | None>, "closed_after":
+    <bool>, "close_error": <str | None>} on success. "pages" is Word's
+    OWN page count (from `compute statistics ... statistic pages`) — the
+    authoritative source per the module docstring; a caller should still
+    cross-check against page_count() (pdfinfo/regex) for a second
     opinion, which the CLI (_main, below) does.
+
+    close_after (default True, D3): when true, the staged document is
+    closed (no save — nothing is discarded, the PDF is already written)
+    after rendering. "closed_after" reports whether that close actually
+    succeeded; "left_open_document" is None when it did, and the window
+    title when it did not (either because close_after was False, or the
+    close itself failed — "close_error" then carries the close attempt's
+    own error text, None otherwise). A close failure never raises
+    RenderError and never affects "pages" or the written PDF — see the
+    module docstring's CORRECTED FINDING section for the verified-working
+    close form and why a `whose` window reference must never be used.
 
     Raises RenderError on any failure — never returns a partial/silent
     result, and never leaves a stray PDF in Word's sandbox staging
     directory (cleaned up in `finally` regardless of outcome) nor
-    clobbers an existing file at the destination. The rendered document
-    itself is NOT closed (see the module docstring: `close` does not
-    exist on this Word build's AppleScript surface) — its window title is
-    returned as "left_open_document" so a caller can report it rather
-    than let it go unnoticed.
+    clobbers an existing file at the destination.
     """
     in_path = Path(in_path).resolve()
     out_path = Path(out_path).resolve()
@@ -354,9 +426,9 @@ def render_word(in_path: str, out_path: str, timeout: int = DEFAULT_TIMEOUT) -> 
     try:
         # The staged copy's FILENAME (not just its directory) must be
         # unique across every document Word already has open — a stale
-        # document left open from an earlier render (there is no `close`
-        # to have run one — see the module docstring) must never collide
-        # with, and get mistaken for, this render's own input. The
+        # document left open from an earlier render (close_after=False,
+        # or a close that failed — see the module docstring) must never
+        # collide with, and get mistaken for, this render's own input. The
         # "jennystack-render-" prefix also makes every window this module
         # ever opens unmistakably its own: never a real lead document, so
         # any future cleanup tooling (or a human) can act on windows
@@ -369,9 +441,17 @@ def render_word(in_path: str, out_path: str, timeout: int = DEFAULT_TIMEOUT) -> 
         script_path = stage_dir / "_render.applescript"
         script_path.write_text(_APPLESCRIPT_RENDER, encoding="utf-8")
 
+        close_mode = "close" if close_after else "keep"
         try:
             proc = subprocess.run(
-                [_osascript_bin(), str(script_path), str(staged_in), str(staged_out), staged_in.name],
+                [
+                    _osascript_bin(),
+                    str(script_path),
+                    str(staged_in),
+                    str(staged_out),
+                    staged_in.name,
+                    close_mode,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -402,7 +482,12 @@ def render_word(in_path: str, out_path: str, timeout: int = DEFAULT_TIMEOUT) -> 
                 stderr or stdout or "(no output)",
             )
 
-        m = re.match(r"^OK\s+(\d+)\s*$", stdout)
+        # ^OK\s+(\d+)\s+closed=([01])\s*(.*)$ — the "closed=" token was
+        # added alongside close_after (D3); the legacy bare "OK <n>" form
+        # (no "closed=" token) is now RENDER_FAILED "unexpected form", not
+        # silently accepted, because the AppleScript worker and this
+        # parser ship together and must never drift apart.
+        m = re.match(r"^OK\s+(\d+)\s+closed=([01])\s*(.*)$", stdout, re.DOTALL)
         if not m:
             raise RenderError(
                 "RENDER_FAILED",
@@ -410,6 +495,8 @@ def render_word(in_path: str, out_path: str, timeout: int = DEFAULT_TIMEOUT) -> 
                 stdout or "(no output)",
             )
         word_pages = int(m.group(1))
+        closed_after = m.group(2) == "1"
+        close_error = m.group(3).strip() or None
 
         if not staged_out.is_file():
             raise RenderError(
@@ -435,7 +522,9 @@ def render_word(in_path: str, out_path: str, timeout: int = DEFAULT_TIMEOUT) -> 
         return {
             "pdf": str(out_path),
             "pages": word_pages,
-            "left_open_document": staged_in.name,
+            "left_open_document": None if closed_after else staged_in.name,
+            "closed_after": closed_after,
+            "close_error": close_error,
         }
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
@@ -513,6 +602,13 @@ def _main(argv: list[str]) -> int:
         default=DEFAULT_TIMEOUT,
         help=f"Seconds to wait for Word automation (default {DEFAULT_TIMEOUT}).",
     )
+    parser.add_argument(
+        "--keep-open",
+        action="store_true",
+        help="Do not close the staged document after rendering (default: "
+        "close it — D3). Useful for inspecting the rendered document in "
+        "Word by hand.",
+    )
     args = parser.parse_args(argv)
 
     if args.engine != "word":
@@ -524,7 +620,12 @@ def _main(argv: list[str]) -> int:
         return 1
 
     try:
-        result = render_word(args.input, args.output, timeout=args.timeout)
+        result = render_word(
+            args.input,
+            args.output,
+            timeout=args.timeout,
+            close_after=not args.keep_open,
+        )
     except RenderError as e:
         print(json.dumps(e.to_dict()))
         return 1
@@ -553,14 +654,18 @@ def _main(argv: list[str]) -> int:
         pages, source = cross_check_pages, cross_check_source
 
     left_open = result.get("left_open_document")
+    closed_after = result.get("closed_after", False)
+    close_error = result.get("close_error")
+    # Prints only when a document was ACTUALLY left open (closed_after
+    # False) — not on every render, now that closing is the default.
     if left_open:
-        print(
-            f"docx_render.py: NOTE Word document \"{left_open}\" was left open "
-            "(no `close` command exists on this Word build's AppleScript "
-            "surface — see the module docstring). Safe to close by hand; it "
-            "carries no content beyond the rendered input.",
-            file=sys.stderr,
-        )
+        note = f'docx_render.py: NOTE Word document "{left_open}" was left open'
+        if close_error:
+            note += f" (close failed: {close_error})"
+        else:
+            note += " (--keep-open was passed)"
+        note += ". Safe to close by hand; it carries no content beyond the rendered input."
+        print(note, file=sys.stderr)
 
     line = {
         "engine": "word",
@@ -569,6 +674,8 @@ def _main(argv: list[str]) -> int:
         "page_count": pages,
         "page_count_source": source,
         "left_open_document": left_open,
+        "closed_after": closed_after,
+        "close_error": close_error,
     }
     print(json.dumps(line))
     return 0

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# Vendored from JennyStack scripts/test_docx_render.py at commit aedd94c
-# (PR #50), source sha256
-# ecee4997eb13ed7d6b72deb865eb6e48f05f3b2dbf882fe61dc9f70a5a569687, 10
+# Vendored from JennyStack scripts/test_docx_render.py at commit 175c6fe
+# (PR #104), source sha256
+# f9721c6a405712a61c5b379d8b801978495b3a8336d646d50cd997a676c20ff2, 14
 # tests. Adapted (issue #28 WP-02) for this repo's layout only: the
 # module under test is `verified_docx_mcp.render` here (the source file
 # is `scripts/docx_render.py` there — the scaffold names it `render.py`),
@@ -33,12 +33,17 @@ Covers:
     prints a recorded stderr and exits 1 — an agent cannot revoke a real
     macOS Automation grant to exercise the failure path for real, so this
     is the documented substitute (WP-02 acceptance, agent side).
+  - render_word()'s close_after / closed_after / close_error handling
+    (issue #103, D3: close_after defaults to True), exercised via a fake
+    `osascript` that prints the "OK <pages> closed=<0|1> <err>" form the
+    real AppleScript worker emits.
   - WORD_SANDBOX_UNAVAILABLE when Word's container directory is absent.
 """
 
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import sys
 import tempfile
@@ -178,6 +183,109 @@ class ErrorMappingTests(unittest.TestCase):
         self.assertEqual(
             before, after, "render_word() left a stray staging directory behind on failure"
         )
+
+
+def _write_fake_osascript_success(bin_dir: Path, stdout_text: str, args_log: Path | None = None) -> None:
+    """A fake `osascript` that simulates a SUCCESSFUL render: it `touch`es
+    the staged-output path (argv[3] from render_word()'s own subprocess
+    call — the sh script's own $3, since $1 is the AppleScript file and
+    $2 is the staged input) so render_word()'s staged_out.is_file() check
+    passes without a real Word instance, then prints stdout_text (the
+    "OK <pages> closed=<0|1> <err>" line under test) and exits 0. When
+    args_log is given, the fake also writes its own argv (space-joined)
+    there, so a test can assert the 5th argument (the close_after
+    "close"/"keep" flag added for issue #103) took the expected value."""
+    lines = ["#!/bin/sh", 'touch "$3"']
+    if args_log is not None:
+        lines.append(f'echo "$@" > {shlex.quote(str(args_log))}')
+    lines.append(f"echo {stdout_text!r}")
+    lines.append("exit 0")
+    script = bin_dir / "osascript"
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+class CloseAfterTests(unittest.TestCase):
+    """Exercises render_word()'s close_after / closed_after / close_error
+    handling (issue #103, D3: close_after defaults to True) via a fake
+    `osascript` that prints the "OK <pages> closed=<0|1> <err>" form the
+    real AppleScript worker now emits — no real Word instance needed.
+    Guarded on Word's sandbox container directory existing, same as
+    ErrorMappingTests above, for the same reason."""
+
+    def setUp(self):
+        if not render._word_sandbox_root().is_dir():
+            self.skipTest(
+                "Word's sandbox container directory does not exist on this "
+                "machine (Word never launched) — render_word() would raise "
+                "WORD_SANDBOX_UNAVAILABLE before ever reaching osascript."
+            )
+        self._tmp = tempfile.TemporaryDirectory()
+        self._bin_dir = Path(self._tmp.name) / "bin"
+        self._bin_dir.mkdir()
+        self._old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self._bin_dir}{os.pathsep}{self._old_path}"
+
+        self._in_dir = Path(self._tmp.name) / "in"
+        self._in_dir.mkdir()
+        self._in_path = self._in_dir / "test-input.docx"
+        self._in_path.write_bytes(b"not a real docx, but osascript never reads it")
+        self._out_path = Path(self._tmp.name) / "out" / "test-output.pdf"
+
+    def tearDown(self):
+        os.environ["PATH"] = self._old_path
+        self._tmp.cleanup()
+
+    def test_closed_after_true(self):
+        # Spec test 1: "OK 3 closed=1" -> pages 3, closed_after True,
+        # left_open_document None, close_error None.
+        _write_fake_osascript_success(self._bin_dir, "OK 3 closed=1 ")
+        result = render.render_word(str(self._in_path), str(self._out_path))
+        self.assertEqual(result["pages"], 3)
+        self.assertTrue(result["closed_after"])
+        self.assertIsNone(result["left_open_document"])
+        self.assertIsNone(result["close_error"])
+
+    def test_closed_after_false_with_error_and_no_exception(self):
+        # Spec test 2: "OK 3 closed=0 <error text>" -> closed_after False,
+        # left_open_document == staged name, close_error contains the
+        # error text, and NO exception is raised (a close failure is
+        # reported, never fatal — the PDF is already written).
+        _write_fake_osascript_success(
+            self._bin_dir,
+            "OK 3 closed=0 AppleEvent error -1708 while closing the render window",
+        )
+        result = render.render_word(str(self._in_path), str(self._out_path))
+        self.assertEqual(result["pages"], 3)
+        self.assertFalse(result["closed_after"])
+        self.assertTrue(result["left_open_document"])
+        self.assertIn(self._in_path.stem, result["left_open_document"])
+        self.assertIn("-1708", result["close_error"])
+
+    def test_close_after_false_passes_keep_as_fourth_applescript_argument(self):
+        # Spec test 3: close_after=False -> the fourth AppleScript
+        # argument (closeMode) is "keep", not "close" — asserted via a
+        # fake osascript that echoes its own argv to a file. Result is
+        # closed_after False with no close_error (kept open on purpose,
+        # not a close failure).
+        args_log = Path(self._tmp.name) / "argv.log"
+        _write_fake_osascript_success(self._bin_dir, "OK 3 closed=0 ", args_log=args_log)
+        result = render.render_word(
+            str(self._in_path), str(self._out_path), close_after=False
+        )
+        self.assertFalse(result["closed_after"])
+        self.assertIsNone(result["close_error"])
+        logged_argv = args_log.read_text().strip().split()
+        self.assertEqual(logged_argv[-1], "keep", logged_argv)
+
+    def test_legacy_ok_only_form_is_render_failed(self):
+        # Spec test 4: the legacy bare "OK 3" (no "closed=" token) is now
+        # RENDER_FAILED "unexpected form" — the script and parser ship
+        # together and the old form is never silently accepted.
+        _write_fake_osascript_success(self._bin_dir, "OK 3")
+        with self.assertRaises(render.RenderError) as ctx:
+            render.render_word(str(self._in_path), str(self._out_path))
+        self.assertEqual(ctx.exception.code, "RENDER_FAILED")
 
 
 class WordSandboxUnavailableTests(unittest.TestCase):

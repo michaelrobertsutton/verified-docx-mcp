@@ -29,8 +29,11 @@ macOS-only dependency, for reference.)
 
 Tools implemented so far:
 
-- **`export_pdf(path, output_path)`** — render a `.docx` to PDF via
-  Microsoft Word automation and report its page count.
+- **`export_pdf(path, output_path, close_after=True)`** — render a `.docx`
+  to PDF via Microsoft Word automation and report its page count; the
+  result also reports `closed_after` (whether the staged copy's window was
+  closed), `close_error` (why not, when it wasn't), and
+  `left_open_document` (null once closed).
 - **`lock_status(path)`** — report Word/LibreOffice owner-file presence
   and sync-quiesce state, as data only. Never refuses.
 - **`list_parts(path)`**, **`read_document(path, format, part)`**,
@@ -309,9 +312,11 @@ passed.
 
 Every tool resolves its path argument through an allowlist
 (`VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS`, defaulting to the user's home
-directory) and a denylist of well-known credential locations
-(`~/.ssh`, `~/.aws`, etc.) that is never overridable. See
-`src/verified_docx_mcp/paths.py`.
+directory plus the Claude Code scratch root, `/private/tmp/claude-<uid>`,
+when that directory exists) and a denylist of well-known credential
+locations (`~/.ssh`, `~/.aws`, etc.) that is never overridable. Setting
+`VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS` explicitly replaces the default list
+verbatim rather than widening it. See `src/verified_docx_mcp/paths.py`.
 
 ## License
 
