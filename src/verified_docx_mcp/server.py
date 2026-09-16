@@ -1591,22 +1591,78 @@ def replace_cell_markdown(
 @mcp.tool()
 def insert_table(
     path: str,
-    rows: list[list[str]],
+    rows: list[list[str | dict[str, Any]]],
     style_id: str,
+    header_rows: int = 0,
+    grid_dxa: list[int] | None = None,
+    cant_split: bool = False,
+    anchor: dict[str, Any] | None = None,
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
 ) -> dict[str, Any]:
-    """Append a new table at the end of the document body, one markdown
-    string per cell (rows is a list of rows, each a list of cell markdown;
-    short rows are padded with empty cells up to the widest row).
+    """Insert a new table, one markdown string OR cell-spec object per
+    cell (issue #100: https://github.com/michaelrobertsutton/JennyStack/issues/100).
+
+    rows is a list of rows, each a list of cells. A plain string cell
+    means {"markdown": that string} -- today's exact behavior: short rows
+    are padded with empty cells up to the widest row, columns split
+    evenly across the text-column width list_page_sections reports.  A
+    cell may instead be an OBJECT: {"markdown" (required), "span" (int
+    >=1, default 1, -> w:tcPr/w:gridSpan), "v_merge" ("restart"|
+    "continue", -> w:tcPr/w:vMerge -- a "continue" cell's markdown must be
+    "", and the same grid column in the row above must itself be
+    "restart"/"continue"), "fill" (6-hex color, -> w:tcPr/w:shd),
+    "color" (6-hex color, -> w:rPr/w:color on every run in the cell),
+    "bold" (bool, -> w:rPr/w:b+w:bCs on every run), "align" ("left"|
+    "center"|"right"|"both", -> w:pPr/w:jc on every paragraph), "valign"
+    ("top"|"center"|"bottom", -> w:tcPr/w:vAlign)}. The MOMENT any cell in
+    the table uses the object form, grid validation is strict: every
+    row's cell spans must sum to the same column count (grid_dxa's length
+    when given, else the widest span-sum) -- no padding, a mismatch is
+    INVALID_INPUT naming the row and both numbers.
+
+    Formatting caveat: fill/valign/span/v_merge live in w:tcPr, which
+    replace_cell_markdown preserves byte-identical, so they survive a
+    later cell edit. bold/color/align live on the cell's own runs/
+    paragraphs and are REPLACED by the next replace_cell_markdown on that
+    cell -- put content emphasis in the markdown itself (**bold**) and
+    reserve bold/color/align for header/title rows you will not re-edit.
 
     style_id is REQUIRED and must name an existing w:type="table" style in
     this document's styles.xml (list_styles reports style type) -- unlike
     GoogleDocs-MCP's insert_table, which relies on the Docs API's own
     default table style, raw OOXML has no sensible default to fall back
-    to. Column widths are dxa, split evenly across the text-column width
-    list_page_sections reports for this document's first page section.
+    to.
+
+    header_rows (default 0) sets w:tblHeader (repeating header row(s)) on
+    the first N rows; must be < len(rows). grid_dxa (default None) gives
+    explicit per-column widths in dxa -- when given, w:tblW becomes an
+    explicit dxa sum and each cell's own w:tcW is the sum of the grid
+    columns it spans; when omitted, columns split evenly across the
+    text-column width as before (w:tblW stays "auto"). cant_split
+    (default False) sets w:cantSplit (no page-break-inside-row) on every
+    row.
+
+    anchor (default None keeps today's append-at-the-end behavior) places
+    the table somewhere else in the body instead:
+      {"section_key": "<from find_sections>", "position": "start"|"end"}
+        - "start": right after that section's own heading paragraph.
+        - "end": at the end of that section (before the next heading, or
+          the end of the body).
+      {"section_key": "...", "after_paragraph_text": "<exact text of one
+       top-level paragraph inside that section>"} - right after that
+       paragraph (0 matches -> ZERO_MATCH, >1 -> MATCH_COUNT_MISMATCH; a
+       paragraph inside a table is never a candidate). Matched through the
+       same exact/quotes/whitespace/soft-hyphen normalization ladder
+       locate.py's own text search uses.
+      {"after_table_id": <int from list_tables>} - right after that
+       top-level body table (a nested table -> INVALID_INPUT; use
+       after_paragraph_text on its host cell's section instead).
+
+    The new table's own table_id is computed by re-walking the document
+    tree after insertion (its position may no longer be last), NOT by
+    counting existing tables.
 
     Same guard/atomic-write/audit machinery as append_markdown.
     track_changes=True wraps the new table's own runs in w:ins (nothing
@@ -1615,21 +1671,45 @@ def insert_table(
     Returns the eight evidence keys (before="", after is the new table's
     rows tab/newline-joined), plus table_id (the new table's own id, for a
     follow-up get_table/replace_table_row/replace_cell_markdown call),
-    (track_changes=True only) revision_ids/track_changes, and
-    conflict_copy_detected (+ conflict_copies/sibling_files_changed when
-    non-empty).
+    merged_cells (count of cells with span>1 or a v_merge), and
+    anchor_resolved ({"body_index", "section_key", "after_table_id"}, or
+    null when appended), (track_changes=True only) revision_ids/
+    track_changes, and conflict_copy_detected (+ conflict_copies/
+    sibling_files_changed when non-empty).
+
+    Post-write verification re-reads the table and checks row count, grid
+    column count, every cell's grid_span/v_merge, every cell's text
+    modulo whitespace, w:shd fill per requested cell, and w:tblHeader on
+    the header rows -- any mismatch is VERIFICATION_FAILED (rolled back).
 
     Errors:
-      INVALID_INPUT      - a bad path, or rows is empty or contains an empty row
+      INVALID_INPUT       - a bad path; rows is empty or contains an empty
+                             row; a bad cell-spec field (span/v_merge/fill/
+                             color/bold/align/valign); a grid-sum mismatch
+                             naming the row and both numbers; a bad
+                             header_rows/grid_dxa/anchor
       DOCX_LOCKED, SYNC_IN_FLIGHT - the write guard
-      REVISION_CONFLICT  - revision_before is stale
-      STYLE_NOT_FOUND    - style_id does not name a table style in this document
-      OPC_INVALID        - the rendered .docx failed OPC validation
+      REVISION_CONFLICT   - revision_before is stale
+      STYLE_NOT_FOUND     - style_id does not name a table style in this document
+      SECTION_NOT_FOUND   - anchor.section_key does not match find_sections' output
+      TABLE_NOT_FOUND     - anchor.after_table_id does not match any table
+      ZERO_MATCH / MATCH_COUNT_MISMATCH - anchor.after_paragraph_text matched
+                             0 or >1 top-level paragraphs in the section
+      OPC_INVALID         - the rendered .docx failed OPC validation
       VERIFICATION_FAILED - post-write verification failed; rolled back
     """
     try:
         return tables.execute_insert_table(
-            path, rows, style_id, revision_before=revision_before, force=force, track_changes=track_changes
+            path,
+            rows,
+            style_id,
+            header_rows=header_rows,
+            grid_dxa=grid_dxa,
+            cant_split=cant_split,
+            anchor=anchor,
+            revision_before=revision_before,
+            force=force,
+            track_changes=track_changes,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
