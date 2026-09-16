@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<!--
+  WP-1 spike pane (https://github.com/michaelrobertsutton/JennyStack/issues/106).
+  Plain HTML, no framework, no build step. Loaded by Word over local HTTPS
+  from src/verified_docx_mcp/live/bridge.py --serve-only. See
+  docs/live-mode.md for the sideload runbook.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
+  <title>verified-docx-mcp live (WP-1 spike)</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js" type="text/javascript"></script>
+  <style>
+    body {
+      font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 13px;
+      margin: 0;
+      padding: 12px;
+      color: #1b1b1b;
+    }
+    h1 {
+      font-size: 15px;
+      margin: 0 0 8px 0;
+    }
+    button {
+      margin: 4px 8px 4px 0;
+      padding: 6px 10px;
+      font-size: 13px;
+    }
+    #status {
+      white-space: pre-wrap;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    pre#output {
+      background: #f3f3f3;
+      border: 1px solid #ccc;
+      padding: 8px;
+      max-height: 420px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #ping-result {
+      white-space: pre-wrap;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <h1>verified-docx-mcp live (WP-1 spike)</h1>
+  <div id="status">Loading Office.js…</div>
+
+  <div>
+    <button id="copy-json" disabled>Copy JSON</button>
+    <button id="ping-bridge" disabled>Ping bridge</button>
+  </div>
+
+  <div id="ping-result"></div>
+
+  <pre id="output">(waiting for Office.onReady)</pre>
+
+  <script src="taskpane.js" type="text/javascript"></script>
+</body>
+</html>

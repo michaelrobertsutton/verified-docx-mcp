@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Classic (XML, add-in only) task-pane manifest for the WP-1 spike of
+  https://github.com/michaelrobertsutton/JennyStack/issues/106.
+
+  Hello-world only: proves a pane can be sideloaded into Word for Mac,
+  loaded over local HTTPS, and report WordApi 1.4 support plus the
+  document URL / body hash / comment list. Nothing here writes to the
+  document; that is WP-2 onward, on the file path documented in
+  docs/live-mode.md.
+
+  Id below is a fresh GUID generated for this manifest only (not reused
+  from any other add-in). Sideload steps: docs/live-mode.md.
+-->
+<OfficeApp
+    xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+    xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
+    xsi:type="TaskPaneApp">
+
+  <Id>d7243f65-6b35-4169-8276-c45fa0a7a95a</Id>
+  <Version>0.1.0</Version>
+  <ProviderName>verified-docx-mcp</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="verified-docx-mcp live" />
+  <Description DefaultValue="WP-1 spike pane: confirms WordApi 1.4 support and reads the document URL, body hash, and comment list. No document writes." />
+
+  <IconUrl DefaultValue="https://localhost:53135/icon-32.png" />
+  <HighResolutionIconUrl DefaultValue="https://localhost:53135/icon-80.png" />
+  <SupportUrl DefaultValue="https://github.com/michaelrobertsutton/verified-docx-mcp" />
+
+  <AppDomains>
+    <AppDomain>https://localhost:53135</AppDomain>
+  </AppDomains>
+
+  <Hosts>
+    <Host Name="Document" />
+  </Hosts>
+
+  <Requirements>
+    <Sets DefaultMinVersion="1.1">
+      <Set Name="WordApi" MinVersion="1.4" />
+    </Sets>
+  </Requirements>
+
+  <DefaultSettings>
+    <SourceLocation DefaultValue="https://localhost:53135/taskpane.html" />
+  </DefaultSettings>
+
+  <Permissions>ReadWriteDocument</Permissions>
+
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Hosts>
+      <Host xsi:type="Document">
+        <DesktopFormFactor>
+          <GetStarted>
+            <Title resid="GetStarted.Title" />
+            <Description resid="GetStarted.Description" />
+            <LearnMoreUrl resid="GetStarted.LearnMoreUrl" />
+          </GetStarted>
+          <FunctionFile resid="Taskpane.Url" />
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="VerifiedDocxMcp.Group">
+                <Label resid="CommandsGroup.Label" />
+                <Icon>
+                  <bt:Image size="16" resid="Icon.16x16" />
+                  <bt:Image size="32" resid="Icon.32x32" />
+                  <bt:Image size="80" resid="Icon.80x80" />
+                </Icon>
+                <Control xsi:type="Button" id="VerifiedDocxMcp.ShowTaskpaneButton">
+                  <Label resid="ShowTaskpane.Label" />
+                  <Supertip>
+                    <Title resid="ShowTaskpane.Label" />
+                    <Description resid="ShowTaskpane.Tooltip" />
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Icon.16x16" />
+                    <bt:Image size="32" resid="Icon.32x32" />
+                    <bt:Image size="80" resid="Icon.80x80" />
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>VerifiedDocxMcp.Taskpane</TaskpaneId>
+                    <SourceLocation resid="Taskpane.Url" />
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+
+    <Resources>
+      <bt:Images>
+        <bt:Image id="Icon.16x16" DefaultValue="https://localhost:53135/icon-16.png" />
+        <bt:Image id="Icon.32x32" DefaultValue="https://localhost:53135/icon-32.png" />
+        <bt:Image id="Icon.80x80" DefaultValue="https://localhost:53135/icon-80.png" />
+      </bt:Images>
+      <bt:Urls>
+        <bt:Url id="Taskpane.Url" DefaultValue="https://localhost:53135/taskpane.html" />
+        <bt:Url id="GetStarted.LearnMoreUrl" DefaultValue="https://github.com/michaelrobertsutton/verified-docx-mcp" />
+      </bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="GetStarted.Title" DefaultValue="verified-docx-mcp live pane loaded" />
+        <bt:String id="CommandsGroup.Label" DefaultValue="verified-docx-mcp" />
+        <bt:String id="ShowTaskpane.Label" DefaultValue="Live pane" />
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="GetStarted.Description" DefaultValue="WP-1 spike: confirms WordApi 1.4 and reads document/comment info. Makes no edits." />
+        <bt:String id="ShowTaskpane.Tooltip" DefaultValue="Open the verified-docx-mcp WP-1 spike pane" />
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>
