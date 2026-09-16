@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# Vendored from JennyStack scripts/test_docx_render.py at commit 175c6fe
-# (PR #104), source sha256
-# f9721c6a405712a61c5b379d8b801978495b3a8336d646d50cd997a676c20ff2, 14
+# Vendored from JennyStack scripts/test_docx_render.py at commit 678aac1
+# (PR #105), source sha256
+# 7d1eed51e5fe0470d0409787da9ff550eba3de8fd2829a2ac478844f452f478c, 19
 # tests. Adapted (issue #28 WP-02) for this repo's layout only: the
 # module under test is `verified_docx_mcp.render` here (the source file
 # is `scripts/docx_render.py` there — the scaffold names it `render.py`),
@@ -37,6 +37,11 @@ Covers:
     (issue #103, D3: close_after defaults to True), exercised via a fake
     `osascript` that prints the "OK <pages> closed=<0|1> <err>" form the
     real AppleScript worker emits.
+  - probe_paragraphs / page_height_pt / paragraph_geometry parsing
+    (issue #102): PROBE/PAGEH line parsing, a per-ordinal PROBE ERR
+    line, a missing PAGEH line when probes were requested, no extra
+    argv when no ordinals were requested, and an invalid ordinal
+    failing before osascript is ever invoked.
   - WORD_SANDBOX_UNAVAILABLE when Word's container directory is absent.
 """
 
@@ -286,6 +291,137 @@ class CloseAfterTests(unittest.TestCase):
         with self.assertRaises(render.RenderError) as ctx:
             render.render_word(str(self._in_path), str(self._out_path))
         self.assertEqual(ctx.exception.code, "RENDER_FAILED")
+
+
+def _write_fake_osascript_multiline(
+    bin_dir: Path, stdout_lines: list[str], args_log: Path | None = None
+) -> None:
+    """A fake `osascript` like `_write_fake_osascript_success` above, but
+    emitting several REAL newline-separated lines of stdout (PROBE/PAGEH
+    lines followed by the OK line — issue #102), rather than the single
+    line that helper's `!r`-based echo is limited to. Each line is
+    printed with its own shell-quoted `echo` statement so embedded tabs
+    survive intact."""
+    lines = ["#!/bin/sh", 'touch "$3"']
+    if args_log is not None:
+        lines.append(f'echo "$@" > {shlex.quote(str(args_log))}')
+    for out_line in stdout_lines:
+        lines.append(f"echo {shlex.quote(out_line)}")
+    lines.append("exit 0")
+    script = bin_dir / "osascript"
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+class ProbeParagraphsTests(unittest.TestCase):
+    """Exercises render_word()'s probe_paragraphs / page_height_pt /
+    paragraph_geometry handling (issue #102) via a fake `osascript` that
+    prints the PROBE/PAGEH/OK lines the real AppleScript worker now
+    emits when ordinals are requested — no real Word instance needed.
+    Guarded on Word's sandbox container directory existing, same as
+    ErrorMappingTests/CloseAfterTests above, for the same reason."""
+
+    def setUp(self):
+        if not render._word_sandbox_root().is_dir():
+            self.skipTest(
+                "Word's sandbox container directory does not exist on this "
+                "machine (Word never launched) — render_word() would raise "
+                "WORD_SANDBOX_UNAVAILABLE before ever reaching osascript."
+            )
+        self._tmp = tempfile.TemporaryDirectory()
+        self._bin_dir = Path(self._tmp.name) / "bin"
+        self._bin_dir.mkdir()
+        self._old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self._bin_dir}{os.pathsep}{self._old_path}"
+
+        self._in_dir = Path(self._tmp.name) / "in"
+        self._in_dir.mkdir()
+        self._in_path = self._in_dir / "test-input.docx"
+        self._in_path.write_bytes(b"not a real docx, but osascript never reads it")
+        self._out_path = Path(self._tmp.name) / "out" / "test-output.pdf"
+
+    def tearDown(self):
+        os.environ["PATH"] = self._old_path
+        self._tmp.cleanup()
+
+    def test_a_two_probes_and_pageh_are_parsed(self):
+        _write_fake_osascript_multiline(
+            self._bin_dir,
+            [
+                "PROBE\t1\t1\t72.0\tHello world",
+                "PROBE\t2\t5\t540.0\tSecond probed paragraph",
+                "PAGEH\t792.0",
+                "OK 4 closed=1 ",
+            ],
+        )
+        result = render.render_word(
+            str(self._in_path), str(self._out_path), probe_paragraphs=[1, 2]
+        )
+        self.assertEqual(result["pages"], 4)
+        self.assertEqual(result["page_height_pt"], 792.0)
+        self.assertIsInstance(result["page_height_pt"], float)
+        geometry = result["paragraph_geometry"]
+        self.assertEqual(geometry[1], {"page": 1, "vpos_pt": 72.0, "text": "Hello world"})
+        self.assertIsInstance(geometry[1]["page"], int)
+        self.assertIsInstance(geometry[1]["vpos_pt"], float)
+        self.assertEqual(
+            geometry[2],
+            {"page": 5, "vpos_pt": 540.0, "text": "Second probed paragraph"},
+        )
+
+    def test_b_probe_error_line_is_captured_without_exception(self):
+        _write_fake_osascript_multiline(
+            self._bin_dir,
+            [
+                "PROBE\t7\tERR\tparagraph 7 of active document is out of range",
+                "PAGEH\t792.0",
+                "OK 4 closed=1 ",
+            ],
+        )
+        result = render.render_word(
+            str(self._in_path), str(self._out_path), probe_paragraphs=[7]
+        )
+        self.assertEqual(
+            result["paragraph_geometry"][7],
+            {"error": "paragraph 7 of active document is out of range"},
+        )
+
+    def test_c_probes_requested_but_no_pageh_line_is_render_failed(self):
+        _write_fake_osascript_multiline(self._bin_dir, ["OK 4 closed=1 "])
+        with self.assertRaises(render.RenderError) as ctx:
+            render.render_word(
+                str(self._in_path), str(self._out_path), probe_paragraphs=[1]
+            )
+        self.assertEqual(ctx.exception.code, "RENDER_FAILED")
+
+    def test_d_no_probes_requested_adds_no_extra_argv(self):
+        args_log = Path(self._tmp.name) / "argv.log"
+        _write_fake_osascript_multiline(
+            self._bin_dir, ["OK 4 closed=1 "], args_log=args_log
+        )
+        result = render.render_word(str(self._in_path), str(self._out_path))
+        self.assertEqual(result["page_height_pt"], None)
+        self.assertEqual(result["paragraph_geometry"], {})
+        logged_argv = args_log.read_text().strip().split()
+        # $1 script, $2 staged-in, $3 staged-out, $4 staged-in-name, $5
+        # close_mode — nothing after it when no ordinals were requested.
+        self.assertEqual(len(logged_argv), 5, logged_argv)
+        self.assertEqual(logged_argv[-1], "close", logged_argv)
+
+    def test_e_invalid_ordinal_fails_before_osascript_runs(self):
+        args_log = Path(self._tmp.name) / "argv.log"
+        _write_fake_osascript_multiline(
+            self._bin_dir, ["OK 4 closed=1 "], args_log=args_log
+        )
+        with self.assertRaises(render.RenderError) as ctx:
+            render.render_word(
+                str(self._in_path), str(self._out_path), probe_paragraphs=[0]
+            )
+        self.assertEqual(ctx.exception.code, "RENDER_FAILED")
+        self.assertIn("invalid probe ordinal", ctx.exception.message)
+        self.assertFalse(
+            args_log.exists(), "osascript (fake) was invoked despite the bad ordinal"
+        )
 
 
 class WordSandboxUnavailableTests(unittest.TestCase):
