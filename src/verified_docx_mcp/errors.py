@@ -56,6 +56,7 @@ class ErrorCode(Enum):
     WORD_SANDBOX_UNAVAILABLE = "WORD_SANDBOX_UNAVAILABLE"
     RENDER_FAILED = "RENDER_FAILED"
     RENDER_ENGINE_UNAVAILABLE = "RENDER_ENGINE_UNAVAILABLE"
+    SECTION_GEOMETRY_UNAVAILABLE = "SECTION_GEOMETRY_UNAVAILABLE"  # export_pdf(section_keys=[...]) (issue #102): a requested section's page-span could not be verified -- a probed heading's text did not match find_sections_impl's heading_text, a probed ordinal came back {"error": ...}, or page_height_pt was missing. Raised only in explicit mode (section_keys given); default mode (section_keys=None) degrades instead, returning sections: null + sections_error alongside the PDF and page_count, which are unaffected either way -- see geometry.assemble_sections and execute_export_pdf.
 
     # Markdown mutations (mutations.py, markdown_to_ooxml.py; WP-04)
     REVISION_CONFLICT = "REVISION_CONFLICT"  # a passed revision_before no longer matches the file on disk
