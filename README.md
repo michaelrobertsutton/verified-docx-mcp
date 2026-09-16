@@ -107,11 +107,21 @@ Tools implemented so far:
   `numId`/`abstractNum` tree shared across nesting levels via increasing
   `w:ilvl`, the same machinery `replace_body_markdown`/`append_markdown`
   already use.
-- **`insert_table(path, rows, style_id, ...)`** — append a new table at
-  the end of the body, one markdown string per cell. `style_id` is
-  REQUIRED and must name an existing `w:type="table"` style in the
-  document; column widths split evenly across the text-column width
-  `list_page_sections` reports.
+- **`insert_table(path, rows, style_id, header_rows=0, grid_dxa=None,
+  cant_split=False, anchor=None, ...)`** — insert a new table, one
+  markdown string OR cell-spec object (`{"markdown", "span", "v_merge",
+  "fill", "color", "bold", "align", "valign"}`) per cell — a spanning
+  (`w:gridSpan`) or vertically merged (`w:vMerge`) title/header row,
+  shading, and per-row `w:tblHeader` are all write paths now, not just a
+  read-side report. `style_id` is REQUIRED and must name an existing
+  `w:type="table"` style in the document; `grid_dxa` gives explicit
+  per-column dxa widths, otherwise columns split evenly across the
+  text-column width `list_page_sections` reports (unchanged default).
+  `anchor` places the table by `section_key` (`position` or
+  `after_paragraph_text`) or `after_table_id` instead of always appending
+  at the end of the body. Cell-level `fill`/`valign`/`span`/`v_merge` live
+  in `w:tcPr` and survive a later `replace_cell_markdown`; `bold`/`color`/
+  `align` live on the cell's own runs/paragraphs and do not.
 - **`insert_image(path, image_path, width_in, ...)`** — append a new
   inline picture at the end of the body, from a LOCAL `.png` or `.svg`
   file (read natively — no `IMAGE_SOURCE_UNSUPPORTED`, unlike
