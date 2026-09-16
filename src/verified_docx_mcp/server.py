@@ -65,6 +65,7 @@ from . import (
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .live import bridge as live_bridge
+from .live import comments_live
 from .middleware import EvidenceEnforcementMiddleware
 
 mcp = FastMCP(
@@ -1422,7 +1423,7 @@ def format_text(
 
 
 @mcp.tool()
-def list_open_items(path: str) -> dict[str, Any]:
+def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     """List every open comment and pending tracked change (w:ins/w:del) in
     a .docx.
 
@@ -1436,9 +1437,9 @@ def list_open_items(path: str) -> dict[str, Any]:
     owning paragraph's own live text).
 
     Scope limit: comment REPLY THREADING (commentsExtended's parent/child
-    linking) is not resolved here -- every comment reports reply_count=0/
-    replies=[]. reply_count/replies are still present, structurally, for
-    forward compatibility with a later WP that resolves them.
+    linking) is not resolved in file mode -- every comment reports
+    reply_count=0/replies=[]. reply_count/replies are still present,
+    structurally, for forward compatibility.
 
     Each comment's identity is keyed on its LAST paragraph (Word itself
     keys commentsIds.xml/commentsExtended.xml this way for a
@@ -1448,15 +1449,47 @@ def list_open_items(path: str) -> dict[str, Any]:
     Every comment_id list_open_items emits is accepted by get_comment_thread/
     reply_to_comment/resolve_comment, including that raw w:id fallback.
 
+    source: "auto" (default) | "file" | "live" -- issue #106 WP-4. "file"
+    is today's OOXML read (unchanged), and the response gets an added
+    `source: "file"` key. "live" reads through the connected Word task
+    pane instead (`comments_list`, live/protocol.py), raising
+    LIVE_UNAVAILABLE if no pane session for this document's file name is
+    connected. "auto" picks live whenever such a session exists (a read
+    never refuses, so this is simpler than write_mode's own "auto" rule),
+    else file.
+
+    In live mode: `source: "live"`; each comment's `comment_id` is a live
+    handle `live:<Comment.id>` (Office.js's own id, unrelated to the OOXML
+    durableId/w:id -- docs/live-mode.md's WP-1 finding; it does not
+    survive a Word restart), `w_id` is null, and each comment also carries
+    `anchor_text`/`author`/`created_time`/`resolved`/`replies` read
+    straight from the pane (including real reply threading, since the
+    pane sees it and file mode's own reply_count=0/replies=[] limit above
+    does not apply here). Resolved comments are filtered out the same way
+    file mode does, even though the pane reports them too. The response
+    also carries a top-level `correlation` list: for each listed live
+    comment, the best-matching file-mode comment_id (durableId, or a raw
+    w:id fallback) from this same document's on-disk snapshot, matched by
+    normalized anchor text + normalized content (+ author + creation date
+    within 2 minutes, when both sides have them) -- `confidence` is
+    `"exact"` | `"content-only"` | `"none"`. This is ADVISORY, never
+    authoritative: a caller already holding a `live:<id>` handle should
+    use it directly; correlation only exists so a durableId/w:id (from an
+    earlier file-mode call, or pasted in by the lead) can still be used
+    with `reply_to_comment`/`resolve_comment(write_mode="live")`.
+
     Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
     Word's owner file is present, like every other read tool.
 
     Errors:
-      INVALID_INPUT   - path does not exist or is outside the allowed roots
-      SNAPSHOT_FAILED - the read-path snapshot could not be validated
+      INVALID_INPUT    - path does not exist or is outside the allowed
+                          roots, or source is not "auto"/"file"/"live"
+      SNAPSHOT_FAILED  - the read-path snapshot could not be validated
+      LIVE_UNAVAILABLE - source="live" requested but no connected pane
+                          session for this document
     """
     try:
-        return tracked_changes.execute_list_open_items(path)
+        return comments_live.execute_list_open_items(path, source)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -1540,8 +1573,27 @@ def reject_tracked_changes(
 
 
 @mcp.tool()
-def add_anchored_comment(path: str, quote: str, text: str, expected_matches: int) -> dict[str, Any]:
+def add_anchored_comment(
+    path: str, quote: str, text: str, expected_matches: int, write_mode: str = "auto"
+) -> dict[str, Any]:
     """Add a comment anchored to a quoted passage, atomically.
+
+    write_mode: "auto" (default) | "file" | "live" -- issue #106 WP-4.
+    "file" is today's OOXML path, unchanged. "live" sends `comment_add` to
+    the connected Word task pane instead (live/protocol.py), raising
+    LIVE_UNAVAILABLE if no pane session for this document's file name is
+    connected. "auto" picks live only when BOTH lock_status shows a
+    desktop Word owner file for this path AND such a session exists;
+    otherwise file. A live comment's id is a `live:<Comment.id>` handle --
+    Office.js's own Comment.id is unrelated to the OOXML durableId/w:id
+    (docs/live-mode.md's WP-1 finding) and does not survive a Word
+    restart. `write_mode="live"` currently creates exactly ONE comment
+    anchored to the FIRST match even when expected_matches > 1 (the pane's
+    own comment_add op, built in WP-2, inserts on results.items[0] only) --
+    unlike file mode's one-comment-per-match behavior; the count is still
+    verified before anything is inserted. Word's signed-in user is always
+    the comment's author in live mode; this server cannot spoof a
+    different one.
 
     Locates `quote` via the same locate()/expected_matches contract as
     replace_text (normalization ladder, STRUCTURAL_BOUNDARY refusal,
@@ -1584,19 +1636,28 @@ def add_anchored_comment(path: str, quote: str, text: str, expected_matches: int
     Always also carries conflict_copy_detected (issue #28 WP-10's
     post-write conflict-copy sweep -- never raised, an evidence flag on
     an already-successful write); conflict_copies/sibling_files_changed
-    are added only when non-empty.
+    are added only when non-empty. Not present in live mode (no conflict-
+    copy fields there); live evidence instead carries write_mode
+    ("live"), verified_via ("word-addin"), document_name, author
+    ("word-signed-in-user"), and orphaned_comment_ids ([]).
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or an empty quote
-      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
-      REVISION_CONFLICT                 - revision_before is stale
-      ZERO_MATCH                        - quote not located after the full ladder
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard (file mode only)
+      REVISION_CONFLICT                 - revision_before is stale (file mode only)
+      ZERO_MATCH                        - quote not located (file mode's full ladder; live mode's pane search)
       MATCH_COUNT_MISMATCH              - the located count != expected_matches
-      STRUCTURAL_BOUNDARY               - a match crosses a w:p/w:tbl/w:tc boundary
-      OPC_INVALID                       - the rendered .docx failed OPC validation
-      VERIFICATION_FAILED               - post-write verification failed; rolled back
+      STRUCTURAL_BOUNDARY               - a match crosses a w:p/w:tbl/w:tc boundary (file mode only)
+      OPC_INVALID                       - the rendered .docx failed OPC validation (file mode only)
+      VERIFICATION_FAILED               - post-write verification failed; rolled back (file mode only)
+      LIVE_UNAVAILABLE                  - write_mode="live" requested but no connected pane session
+      LIVE_DISCONNECTED                 - the pane disconnected mid-op or an op reply timed out
+      LIVE_STALE                        - a caller-supplied expected body hash disagreed with the pane's own pre-op hash
     """
     try:
+        mode = comments_live._resolve_write_mode(path, write_mode)
+        if mode == "live":
+            return comments_live.execute_add_anchored_comment_live(path, quote, text, expected_matches)
         return comments.execute_add_anchored_comment(path, quote, text, expected_matches)
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1644,9 +1705,23 @@ def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def reply_to_comment(path: str, comment_id: str, text: str) -> dict[str, Any]:
+def reply_to_comment(path: str, comment_id: str, text: str, write_mode: str = "auto") -> dict[str, Any]:
     """Reply to an existing comment (durableId), atomically -- issue #28
     WP-09.
+
+    write_mode: "auto" (default) | "file" | "live" -- issue #106 WP-4.
+    "file" is today's OOXML path, unchanged. "live" sends `comment_reply`
+    to the connected Word task pane, accepting a `live:<Comment.id>`
+    handle directly OR a durableId/w:id resolved through
+    `list_open_items(source="live")`'s own `correlation` list (exact or
+    content-only confidence; INVALID_INPUT, naming both id spaces and
+    suggesting that call, if neither resolves). "auto" picks live only
+    when BOTH lock_status shows a desktop Word owner file for this path
+    AND a pane session exists; otherwise file. Verified by re-listing the
+    pane's comments and confirming a reply with the given text now
+    exists. Word's signed-in user is always the reply's author in live
+    mode. A live comment id does not survive a Word restart; correlation
+    is advisory only, never authoritative.
 
     Creates a NEW, independent comment (its own w:comment / w:id / paraId
     / durableId, and its own full commentRangeStart/End/commentReference
@@ -1675,30 +1750,55 @@ def reply_to_comment(path: str, comment_id: str, text: str) -> dict[str, Any]:
     Always also carries conflict_copy_detected (issue #28 WP-10's
     post-write conflict-copy sweep -- never raised, an evidence flag on
     an already-successful write); conflict_copies/sibling_files_changed
-    are added only when non-empty.
+    are added only when non-empty. Not present in live mode; live
+    evidence instead carries write_mode ("live"), verified_via
+    ("word-addin"), document_name, and author ("word-signed-in-user").
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or
                          comment_id does not match any existing comment,
-                         or that comment has no live anchor to reply against
-      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
-      REVISION_CONFLICT                 - revision_before is stale
-      OPC_INVALID                       - the rendered .docx failed OPC validation
-      VERIFICATION_FAILED               - post-write verification failed; rolled back
+                         or that comment has no live anchor to reply against,
+                         or (live mode) comment_id matches neither a
+                         live:<id> handle nor a correlated durableId/w:id
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard (file mode only)
+      REVISION_CONFLICT                 - revision_before is stale (file mode only)
+      OPC_INVALID                       - the rendered .docx failed OPC validation (file mode only)
+      VERIFICATION_FAILED               - post-write verification failed; rolled back (file mode only)
+      LIVE_UNAVAILABLE                  - write_mode="live" requested but no connected pane session
+      LIVE_DISCONNECTED                 - the pane disconnected mid-op or an op reply timed out
+      LIVE_OP_FAILED                    - the reply was not found after re-listing the pane's comments
     """
     try:
+        mode = comments_live._resolve_write_mode(path, write_mode)
+        if mode == "live":
+            return comments_live.execute_reply_to_comment_live(path, comment_id, text)
         return comments.execute_reply_to_comment(path, comment_id, text)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
 @mcp.tool()
-def resolve_comment(path: str, comment_id: str) -> dict[str, Any]:
+def resolve_comment(path: str, comment_id: str, write_mode: str = "auto") -> dict[str, Any]:
     """Resolve a comment thread (durableId), atomically -- issue #28
     WP-09. Sets w15:done="1" on the comment's own commentsExtended.xml
     entry; list_open_items excludes it afterward (it is no longer an
     "open" item), but get_comment_thread still fetches it by id --
     resolved is not deleted, only marked.
+
+    write_mode: "auto" (default) | "file" | "live" -- issue #106 WP-4.
+    "file" is today's OOXML path, unchanged. "live" sends `comment_resolve`
+    (resolved=true) to the connected Word task pane, accepting a
+    `live:<Comment.id>` handle directly OR a durableId/w:id resolved
+    through `list_open_items(source="live")`'s own `correlation` list
+    (exact or content-only confidence; INVALID_INPUT, naming both id
+    spaces and suggesting that call, if neither resolves). "auto" picks
+    live only when BOTH lock_status shows a desktop Word owner file for
+    this path AND a pane session exists; otherwise file. Verified the
+    same way file mode is: re-listed independently after the op, not
+    trusted on the pane's own ok=true -- COMMENT_STILL_OPEN if the
+    re-list does not show it resolved. Word's signed-in user is always
+    the resolver's identity in live mode; a live comment id does not
+    survive a Word restart, and correlation is advisory only.
 
     COMMENT_STILL_OPEN is adapted, not lifted verbatim, from
     GoogleDocs-MCP's own member of the same name: that server's version
@@ -1733,18 +1833,27 @@ def resolve_comment(path: str, comment_id: str) -> dict[str, Any]:
     Always also carries conflict_copy_detected (issue #28 WP-10's
     post-write conflict-copy sweep -- never raised, an evidence flag on
     an already-successful write); conflict_copies/sibling_files_changed
-    are added only when non-empty.
+    are added only when non-empty. Not present in live mode; live
+    evidence instead carries write_mode ("live"), verified_via
+    ("word-addin"), document_name, and author ("word-signed-in-user").
 
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or
-                         comment_id does not match any existing comment
-      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
-      REVISION_CONFLICT                 - revision_before is stale
-      COMMENT_STILL_OPEN                - the post-write re-read did not confirm w15:done="1" (see this tool's own docstring)
-      OPC_INVALID                       - the rendered .docx failed OPC validation
-      VERIFICATION_FAILED               - post-write verification failed; rolled back
+                         comment_id does not match any existing comment, or
+                         (live mode) comment_id matches neither a live:<id>
+                         handle nor a correlated durableId/w:id
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard (file mode only)
+      REVISION_CONFLICT                 - revision_before is stale (file mode only)
+      COMMENT_STILL_OPEN                - the post-write re-read did not confirm the resolve (see this tool's own docstring)
+      OPC_INVALID                       - the rendered .docx failed OPC validation (file mode only)
+      VERIFICATION_FAILED               - post-write verification failed; rolled back (file mode only)
+      LIVE_UNAVAILABLE                  - write_mode="live" requested but no connected pane session
+      LIVE_DISCONNECTED                 - the pane disconnected mid-op or an op reply timed out
     """
     try:
+        mode = comments_live._resolve_write_mode(path, write_mode)
+        if mode == "live":
+            return comments_live.execute_resolve_comment_live(path, comment_id)
         return comments.execute_resolve_comment(path, comment_id)
     except VerifyError as exc:
         _raise_tool_error(exc)

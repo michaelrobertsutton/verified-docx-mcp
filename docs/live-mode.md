@@ -70,11 +70,13 @@ Word for Mac ─── task pane (Office.js, WordApi 1.4) ───────�
   document_url, connected_since, last_heartbeat_age_s, body_sha256,
   requirement_sets}]}`. An empty `sessions` list is normal before the
   lead opens the pane, not an error.
-- **Live write mode** (WP-3/WP-4, not yet wired): `replace_text`,
-  `format_text`, `add_anchored_comment`, `reply_to_comment`,
-  `resolve_comment` will gain `write_mode: "auto" | "file" | "live"`.
-  Not implemented by WP-2 — this WP delivers the transport, the protocol,
-  the pane dispatcher, and `live_status` only.
+- **Live write mode**: `replace_text`/`format_text` (WP-3) and
+  `add_anchored_comment`/`reply_to_comment`/`resolve_comment` (WP-4) all
+  gained `write_mode: "auto" | "file" | "live"`; `list_open_items` gained
+  a parallel `source: "auto" | "file" | "live"`. Not implemented by WP-2
+  itself — this WP-2 section describes the transport, the protocol, the
+  pane dispatcher, and `live_status` only; see "Live comments (WP-4)"
+  below for the comment tools' own design.
 - **Testing**: `tests/unit/fake_pane.py` is a Python `websockets` client
   that answers every op deterministically against an in-memory document,
   mimicking the pane's semantics (including the `expected_matches`
@@ -238,6 +240,125 @@ Check off each of these in the issue comment:
 - [ ] Any prompt, warning, or error Word or the pane showed (screenshot
       or exact text) — including anything the "Ping bridge" button
       reported
+
+## Live comments (WP-4)
+
+`write_mode="live"` for `add_anchored_comment`/`reply_to_comment`/
+`resolve_comment`, and `source="live"` for `list_open_items` — issue #106
+WP-4, built off WP-2's bridge/session/protocol and WP-1's id-correlation
+finding above. Implemented in `src/verified_docx_mcp/live/comments_live.py`
+(private helpers, `# TODO(WP-3 merge)`-marked for dedup against WP-3's own
+`live/write_mode.py` once both land); `server.py`'s four comment tools
+dispatch to it. Tested against `tests/unit/fake_pane.py` in
+`tests/unit/test_live_comments.py` — no Word, no real pane.
+
+**write_mode / source resolution.** `"file"` is today's OOXML path,
+unchanged. `"live"` requires a connected pane session for the target
+document's file name (`live/session.py`'s `document_name_from_url`
+basename rule), else `LIVE_UNAVAILABLE`. `"auto"` on a WRITE tool picks
+live only when BOTH `lock_status` shows a desktop Word owner file for the
+path AND such a session exists; otherwise file. `"auto"` on the READ tool
+(`list_open_items`) is simpler — live whenever a session exists, since a
+read never refuses and gains nothing from the owner-file check.
+
+**The id-correlation problem.** A live comment's id is a `live:<Comment.id>`
+handle, valid only for the one connected session that created it (it does
+not survive a Word restart) — WP-1 already showed Office.js's `Comment.id`
+has no relation to the OOXML `durableId`/`w:id` `list_open_items`'s file
+mode reports. So `reply_to_comment`/`resolve_comment(write_mode="live")`
+need to accept EITHER a `live:<id>` handle directly OR a durableId/w:id a
+caller already has (from an earlier file-mode call, or pasted in by the
+lead), and `list_open_items(source="live")` needs to tell a caller which
+durableId a live comment probably corresponds to. Both directions go
+through `comments_live.correlate_comments`.
+
+**Correlation algorithm.** For each live comment (`comments_list`'s own
+wire shape: `id`, `content`, `authorName`, `creationDate`, `anchorText`),
+find the best-matching entry from this same document's on-disk snapshot
+(`tracked_changes._parse_comments` — the exact function file-mode
+`list_open_items` itself uses, read via a validated snapshot when Word's
+owner file is present, same as every other read tool):
+
+1. *Normalize content* on both sides by dropping `\r`/`\n` outright
+   (never replacing with a space). The pane's own `Comment.content`/reply
+   content joins a multi-paragraph comment's paragraphs with `\r` (WP-1's
+   finding); file mode's own join (`tracked_changes.execute_list_open_items`,
+   `comments._comment_record`) has no separator between paragraphs at
+   all. Dropping `\r` on the live side (not replacing it with a space)
+   is what makes the two comparable — a space would break the very
+   "comment.Second" boundary the file side already has no gap in.
+2. *Normalize anchor text* on both sides by collapsing whitespace runs
+   to single spaces and stripping the ends (`" ".join(text.split())`).
+3. A live comment whose normalized content matches NO file comment gets
+   `confidence: "none"`, `comment_id: null`, `w_id: null`.
+4. Otherwise, the first file comment whose normalized content matches:
+   `confidence: "exact"` if its normalized anchor ALSO matches, AND
+   (author matches, when both sides report one) AND (creation dates are
+   within 2 minutes of each other, when both sides report one);
+   `confidence: "content-only"` otherwise.
+
+Verified against `tests/fixtures/comments/multipara-comment.docx` (also
+`tests/unit/test_comments.py`'s own fixture): its two-paragraph root
+comment (file mode's `comment_id="58A3F864"`, anchored to `"Fixture"`,
+content `"First paragraph of a two-paragraph comment.Second paragraph of
+the same comment."`) correlates `"exact"` against a fake-pane comment
+with the same anchor/author/date and content joined with `\r`
+(`"First paragraph of a two-paragraph comment.\rSecond paragraph of the
+same comment."`); a live comment with unrelated content correlates
+`"none"`.
+
+**This is advisory, never authoritative.** Confidence is data for the
+caller (or the lead) to read, not a gate — `reply_to_comment`/
+`resolve_comment(write_mode="live")` accept both `"exact"` and
+`"content-only"` matches when resolving a durableId/w:id, and raise
+`INVALID_INPUT` (naming both id spaces and pointing at
+`list_open_items(source="live")`) only when nothing correlates at all. A
+caller already holding a `live:<id>` handle should always use it
+directly rather than round-tripping through correlation.
+
+**`list_open_items(source="live")` response shape.** Same top-level shape
+as file mode (`path`, `comments`, `pending_suggestions`) plus `source:
+"live"` and a top-level `correlation` list (one entry per listed live
+comment: `{live_comment_id, comment_id, w_id, confidence}`). Each
+listed comment's own `comment_id` is `live:<Comment.id>`, `w_id` is
+`null`, and it carries `anchor_text`/`author`/`created_time`/`resolved`/
+`replies` read straight from the pane — including real reply threading,
+which the pane sees but file mode's own `list_open_items` does not
+resolve (its `reply_count`/`replies` are always `0`/`[]` by that tool's
+own documented scope limit). Resolved comments are filtered out the same
+way file mode does, even though the pane reports them too —
+`pending_suggestions` is unaffected either way (read from the same
+on-disk snapshot regardless of source, since the live protocol has no
+tracked-change read op of its own).
+
+**`add_anchored_comment(write_mode="live")`.** Sends `comment_add`
+(`find`, `expected_matches`); the pane's own `zero_match`/
+`match_count_mismatch` `OpError.code` values (`live/protocol.py`'s
+`OP_ERROR_ZERO_MATCH`/`OP_ERROR_MATCH_COUNT_MISMATCH` — the same two
+names WP-3 adds for `replace_text`/`format_text`, so the two branches'
+additions to `protocol.py` merge without conflict) map onto `ZERO_MATCH`/
+`MATCH_COUNT_MISMATCH`. Known limitation, inherited from WP-2's already-
+built pane dispatcher: the pane's `comment_add` op inserts on the FIRST
+match only, even when `expected_matches > 1` — unlike file mode's one-
+comment-per-match behavior — though the count is still verified before
+anything is inserted. Evidence carries the usual eight keys (`before`/
+`after` are the quote, unchanged) plus `comment_id`/`comment_ids` (the
+`live:<id>` handle), `revision_before`/`revision_after` as
+`"live:sha256:<pre/post>"`, `write_mode: "live"`, `verified_via:
+"word-addin"`, `document_name`, `author: "word-signed-in-user"` (Word's
+signed-in user; the pane cannot be told to claim a different one), and
+`orphaned_comment_ids: []`. No conflict-copy fields — those are a file-
+mode-only concept.
+
+**`reply_to_comment`/`resolve_comment(write_mode="live")`.** Resolve the
+handle as described above (`comment_id_resolved_via`: `"live-handle"` |
+`"durableId-correlation"` | `"w_id-correlation"`), send `comment_reply`/
+`comment_resolve`, then re-list independently to verify — never trusting
+the pane's own `ok:true` alone, the same discipline file mode's own
+`resolve_comment` already applies to its post-write re-read. Reply
+verification looks for a reply whose content equals the text sent;
+resolve verification raises the existing `COMMENT_STILL_OPEN` if the
+re-list does not show `resolved: true`.
 
 ## What could block this, and the fix
 

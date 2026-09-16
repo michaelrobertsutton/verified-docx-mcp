@@ -49,6 +49,8 @@ from typing import Any
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from verified_docx_mcp.live.protocol import OP_ERROR_MATCH_COUNT_MISMATCH, OP_ERROR_ZERO_MATCH
+
 
 class OpRefused(Exception):
     """Raised by a `FakeDocument` op handler to make `FakePane` reply
@@ -129,6 +131,13 @@ class FakeDocument:
         self.saved = True
         self._next_comment_id = 1
         self._next_reply_seq: dict[str, int] = {}
+        # Comment ids that refuse to flip `resolved` when comment_resolve is
+        # called -- issue #106 WP-4's fake-pane knob for exercising
+        # COMMENT_STILL_OPEN over the live path the same way file mode's own
+        # independent post-write re-read can catch a resolve that did not
+        # durably stick. Empty by default (every existing test's behavior is
+        # unchanged); a test opts a specific comment id in.
+        self.stuck_ids: set[str] = set()
 
     def sha256(self) -> str:
         return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
@@ -232,8 +241,14 @@ class FakeDocument:
         pre = self.sha256()
         positions = _find_all(self.text, find)
         if len(positions) != expected_matches:
+            # issue #106 WP-4: distinguish "nothing matched" from "the wrong
+            # count matched" the same way live/protocol.py's OP_ERROR_*
+            # constants name it -- server.py's live comment tools map these
+            # two onto ZERO_MATCH/MATCH_COUNT_MISMATCH (errors.py), same as
+            # file mode's locate() ladder already does.
+            code = OP_ERROR_ZERO_MATCH if not positions else OP_ERROR_MATCH_COUNT_MISMATCH
             raise OpRefused(
-                "LIVE_OP_FAILED",
+                code,
                 f"expected {expected_matches} match(es) for {find!r}, found {len(positions)}",
             )
         comment = FakeComment(
@@ -257,7 +272,14 @@ class FakeDocument:
 
     def comment_resolve(self, comment_id: str, resolved: bool) -> dict[str, Any]:
         comment = self._find_comment(comment_id)
-        comment.resolved = resolved
+        if comment_id not in self.stuck_ids:
+            comment.resolved = resolved
+        # A "stuck" comment still replies ok=true (this is not an op
+        # refusal -- Word's own comment.resolved assignment has no
+        # equivalent of a Drive-API write failure) but reports its
+        # UNCHANGED state, so a caller that independently re-lists to
+        # confirm (rather than trusting this reply) catches it -- see
+        # comments_live.py's COMMENT_STILL_OPEN path.
         return {"resolved": comment.resolved}
 
     def save(self) -> dict[str, Any]:
