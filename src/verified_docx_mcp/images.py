@@ -467,6 +467,7 @@ def execute_insert_image(
         "revision_before": pre_revision["token"],
         "revision_after": post_revision["token"],
         "audit_logged": False,
+        "write_mode": "file",  # issue #154: insert_image has no live-mode path
     }
     if track is not None:
         evidence["track_changes"] = True

@@ -1290,16 +1290,21 @@ def replace_text(
     `write_mode` (issue #106 WP-3, "auto" | "file" | "live", default
     "auto"): whether this call edits the .docx file directly (today's
     path, unchanged) or sends the edit to a connected Word task pane over
-    the live bridge instead. "file" always uses the file path. "live"
-    always uses the live pane, raising LIVE_UNAVAILABLE if none is
-    connected for this document. "auto" uses live only when BOTH hold:
-    lock_status reports a desktop Word owner file for `path`, AND a pane
-    session is connected for that file's name -- i.e. the lead has the
-    document open in Word with the Live pane loaded right now. This is
-    why a document being open in Word (`DOCX_LOCKED` today) is now
-    writable instead of refused: the open copy is the very thing "auto"
-    routes the edit into, live, in front of the lead, rather than
-    treating "someone has it open" as a reason to refuse.
+    the live bridge instead. "file" always uses the file path -- issue
+    #154: BUT it now refuses with LIVE_SESSION_ACTIVE if a pane session
+    is connected for this document, rather than writing to disk
+    underneath Word's own open, autosaving buffer (see that error code
+    below). "live" always uses the live pane, raising LIVE_UNAVAILABLE if
+    none is connected for this document. "auto" (issue #154) uses live
+    whenever a pane session is connected for this file's name -- no
+    lock_status/owner-file check any more (that signal is unreliable: a
+    desktop Word owner file never appears in a SharePoint/OneDrive-synced
+    folder on Mac, so the old "both must hold" rule could never route
+    live there at all). This is why a document being open in Word
+    (`DOCX_LOCKED` today) is now writable instead of refused: the open
+    copy is the very thing "auto" routes the edit into, live, in front of
+    the lead, rather than treating "someone has it open" as a reason to
+    refuse.
 
     Live-mode evidence differs from file mode in three ways: (1)
     `revision_before`/`revision_after` are `"live:sha256:<hex>"` of the
@@ -1386,6 +1391,13 @@ def replace_text(
                                            nothing to roll back (live mode -- Word owns the file)
       LIVE_UNAVAILABLE                  - write_mode="live" (or "auto" routed to live) but no
                                            connected pane session for this document
+      LIVE_SESSION_ACTIVE               - write_mode="file" (or "auto" routed to file for some
+                                           other reason) but a pane session IS connected for this
+                                           document -- use write_mode="live", or save and close the
+                                           document in Word (not just the pane), then retry (issue #154)
+      LIVE_SESSION_MISMATCH             - a session shares this document's file name but its own
+                                           document_url names a different local file; refused rather
+                                           than risk mutating the wrong document (issue #154)
       LIVE_DISCONNECTED                 - the pane's socket closed, or an op timed out, mid-call
       LIVE_STALE                        - a "live:sha256:..." revision_before no longer matches the
                                            pane's current body hash
@@ -1710,12 +1722,16 @@ def add_anchored_comment(
     """Add a comment anchored to a quoted passage, atomically.
 
     write_mode: "auto" (default) | "file" | "live" -- issue #106 WP-4.
-    "file" is today's OOXML path, unchanged. "live" sends `comment_add` to
-    the connected Word task pane instead (live/protocol.py), raising
+    "file" is today's OOXML path -- issue #154: BUT it now refuses with
+    LIVE_SESSION_ACTIVE if a pane session is connected for this document
+    (see that error code below), rather than writing to disk underneath
+    Word's own open, autosaving buffer. "live" sends `comment_add` to the
+    connected Word task pane instead (live/protocol.py), raising
     LIVE_UNAVAILABLE if no pane session for this document's file name is
-    connected. "auto" picks live only when BOTH lock_status shows a
-    desktop Word owner file for this path AND such a session exists;
-    otherwise file. A live comment's id is a `live:<Comment.id>` handle --
+    connected. "auto" (issue #154) picks live whenever such a session
+    exists -- no lock_status/owner-file check any more (see
+    `replace_text`'s own `write_mode` docstring for why that signal was
+    dropped). A live comment's id is a `live:<Comment.id>` handle --
     Office.js's own Comment.id is unrelated to the OOXML durableId/w:id
     (docs/live-mode.md's WP-1 finding) and does not survive a Word
     restart. `write_mode="live"` currently creates exactly ONE comment
@@ -1786,6 +1802,11 @@ def add_anchored_comment(
       OPC_INVALID                       - the rendered .docx failed OPC validation (file mode only)
       VERIFICATION_FAILED               - post-write verification failed; rolled back (file mode only)
       LIVE_UNAVAILABLE                  - write_mode="live" requested but no connected pane session
+      LIVE_SESSION_ACTIVE               - write_mode="file" (or "auto" routed to file for some other
+                                           reason) but a pane session IS connected for this document
+                                           (issue #154)
+      LIVE_SESSION_MISMATCH             - a session shares this document's file name but its own
+                                           document_url names a different local file (issue #154)
       LIVE_DISCONNECTED                 - the pane disconnected mid-op or an op reply timed out
       LIVE_STALE                        - a caller-supplied expected body hash disagreed with the pane's own pre-op hash
     """
@@ -1845,14 +1866,17 @@ def reply_to_comment(path: str, comment_id: str, text: str, write_mode: str = "a
     WP-09.
 
     write_mode: "auto" (default) | "file" | "live" -- issue #106 WP-4.
-    "file" is today's OOXML path, unchanged. "live" sends `comment_reply`
-    to the connected Word task pane, accepting a `live:<Comment.id>`
-    handle directly OR a durableId/w:id resolved through
-    `list_open_items(source="live")`'s own `correlation` list (exact or
-    content-only confidence; INVALID_INPUT, naming both id spaces and
-    suggesting that call, if neither resolves). "auto" picks live only
-    when BOTH lock_status shows a desktop Word owner file for this path
-    AND a pane session exists; otherwise file. Verified by re-listing the
+    "file" is today's OOXML path -- issue #154: BUT it now refuses with
+    LIVE_SESSION_ACTIVE if a pane session is connected for this document,
+    rather than writing to disk underneath Word's own open, autosaving
+    buffer. "live" sends `comment_reply` to the connected Word task pane,
+    accepting a `live:<Comment.id>` handle directly OR a durableId/w:id
+    resolved through `list_open_items(source="live")`'s own `correlation`
+    list (exact or content-only confidence; INVALID_INPUT, naming both id
+    spaces and suggesting that call, if neither resolves). "auto" (issue
+    #154) picks live whenever a pane session exists for this document --
+    no lock_status/owner-file check any more (see `replace_text`'s own
+    `write_mode` docstring for why). Verified by re-listing the
     pane's comments and confirming a reply with the given text now
     exists. Word's signed-in user is always the reply's author in live
     mode. A live comment id does not survive a Word restart; correlation
@@ -1905,6 +1929,11 @@ def reply_to_comment(path: str, comment_id: str, text: str, write_mode: str = "a
       OPC_INVALID                       - the rendered .docx failed OPC validation (file mode only)
       VERIFICATION_FAILED               - post-write verification failed; rolled back (file mode only)
       LIVE_UNAVAILABLE                  - write_mode="live" requested but no connected pane session
+      LIVE_SESSION_ACTIVE               - write_mode="file" (or "auto" routed to file for some other
+                                           reason) but a pane session IS connected for this document
+                                           (issue #154)
+      LIVE_SESSION_MISMATCH             - a session shares this document's file name but its own
+                                           document_url names a different local file (issue #154)
       LIVE_DISCONNECTED                 - the pane disconnected mid-op or an op reply timed out
       LIVE_OP_FAILED                    - the reply was not found after re-listing the pane's comments
     """
@@ -1926,14 +1955,18 @@ def resolve_comment(path: str, comment_id: str, write_mode: str = "auto") -> dic
     resolved is not deleted, only marked.
 
     write_mode: "auto" (default) | "file" | "live" -- issue #106 WP-4.
-    "file" is today's OOXML path, unchanged. "live" sends `comment_resolve`
-    (resolved=true) to the connected Word task pane, accepting a
-    `live:<Comment.id>` handle directly OR a durableId/w:id resolved
-    through `list_open_items(source="live")`'s own `correlation` list
-    (exact or content-only confidence; INVALID_INPUT, naming both id
-    spaces and suggesting that call, if neither resolves). "auto" picks
-    live only when BOTH lock_status shows a desktop Word owner file for
-    this path AND a pane session exists; otherwise file. Verified the
+    "file" is today's OOXML path -- issue #154: BUT it now refuses with
+    LIVE_SESSION_ACTIVE if a pane session is connected for this document,
+    rather than writing to disk underneath Word's own open, autosaving
+    buffer. "live" sends `comment_resolve` (resolved=true) to the
+    connected Word task pane, accepting a `live:<Comment.id>` handle
+    directly OR a durableId/w:id resolved through
+    `list_open_items(source="live")`'s own `correlation` list (exact or
+    content-only confidence; INVALID_INPUT, naming both id spaces and
+    suggesting that call, if neither resolves). "auto" (issue #154) picks
+    live whenever a pane session exists for this document -- no
+    lock_status/owner-file check any more (see `replace_text`'s own
+    `write_mode` docstring for why). Verified the
     same way file mode is: re-listed independently after the op, not
     trusted on the pane's own ok=true -- COMMENT_STILL_OPEN if the
     re-list does not show it resolved. Word's signed-in user is always
@@ -1993,6 +2026,11 @@ def resolve_comment(path: str, comment_id: str, write_mode: str = "auto") -> dic
       OPC_INVALID                       - the rendered .docx failed OPC validation (file mode only)
       VERIFICATION_FAILED               - post-write verification failed; rolled back (file mode only)
       LIVE_UNAVAILABLE                  - write_mode="live" requested but no connected pane session
+      LIVE_SESSION_ACTIVE               - write_mode="file" (or "auto" routed to file for some other
+                                           reason) but a pane session IS connected for this document
+                                           (issue #154)
+      LIVE_SESSION_MISMATCH             - a session shares this document's file name but its own
+                                           document_url names a different local file (issue #154)
       LIVE_DISCONNECTED                 - the pane disconnected mid-op or an op reply timed out
     """
     try:
@@ -2371,6 +2409,17 @@ def apply_style(
     """Apply a NAMED style (from list_styles) to text located via find --
     the named-style counterpart to format_text's four boolean toggles.
 
+    This tool has no `write_mode` parameter -- it always writes the
+    .docx file directly. Issue #154: that means it now refuses with
+    LIVE_SESSION_ACTIVE if a pane session is connected for this document
+    (the exact case a real incident hit -- 14 calls to this tool
+    returned `applied: true` while a Live pane was open on the same
+    document, and every one was silently reverted by Word's own next
+    autosave). There is no live-mode equivalent of this tool today; use
+    `format_text`/`replace_text` with `write_mode="live"` for a live
+    character-formatting edit, or save and close the document in Word
+    (not just the pane) before calling this tool.
+
     A CHARACTER style (w:type="character") applies to the matched run(s)
     exactly like format_text (same locate()/normalization-ladder/
     STRUCTURAL_BOUNDARY contract, same run-splitting rule, same
@@ -2388,10 +2437,16 @@ def apply_style(
     `warnings` when non-empty, and (character style, track_changes=True
     only) revision_ids/track_changes.
 
-    Errors: as format_text, plus:
+    Errors: as format_text's file-mode errors ONLY (this tool has no
+    write_mode parameter, so it never itself goes live -- the
+    LIVE_UNAVAILABLE/LIVE_DISCONNECTED/LIVE_STALE codes format_text's own
+    docstring lists do not apply here), plus:
       STYLE_NOT_FOUND        - style_id is not a style in this document's styles.xml
       UNSUPPORTED_STYLE_TYPE - style_id names neither a paragraph nor a character style
       INVALID_INPUT          - track_changes=True on a paragraph style (see above)
+      LIVE_SESSION_ACTIVE    - a pane session IS connected for this document; use
+                               format_text/replace_text(write_mode="live") for a live edit, or
+                               save and close the document in Word, then retry (issue #154)
     """
     try:
         return text_edit.execute_apply_style(

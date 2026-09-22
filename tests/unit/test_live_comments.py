@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_pane import FakeComment, FakeDocument, FakePane
 
-from verified_docx_mcp import comments, mutations, paths
+from verified_docx_mcp import comments, mutations, paths, server
 from verified_docx_mcp.errors import ErrorCode, VerifyError
 from verified_docx_mcp.live import bridge, comments_live
 
@@ -292,16 +292,28 @@ class AddAnchoredCommentLiveTests(LiveCommentsTestCase):
         whatever file mode's own `add_anchored_comment` reports for an
         ordinary single-pass match (`locate.RUNG_EXACT`, "exact") -- not
         the unrelated numeric edit-ladder `rung` replace_text/format_text
-        report."""
+        report.
+
+        issue #154: the file-mode half of this comparison must run with
+        NO pane connected -- since a connected pane now makes
+        mutations._guard_before_write refuse every file-mode write with
+        LIVE_SESSION_ACTIVE (this test's own pane is connected for this
+        same document/basename), so the live half runs first and its
+        pane is closed before the file-mode half runs."""
         doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
-        await self.connect_pane(document=doc)
+        pane = await self.connect_pane(document=doc)
 
         live_evidence = await self.call(
             comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "x", 1
         )
-        # A separate quote on the SAME real fixture file -- file mode
-        # writes to self.target directly; the fake pane only ever
-        # touches the in-memory FakeDocument, so the two do not collide.
+        await pane.close()
+        self._panes.remove(pane)
+        await asyncio.sleep(0.1)  # let the bridge's receive loop process the close and unregister
+
+        # A separate quote on the SAME real fixture file, now with no pane
+        # connected -- file mode writes to self.target directly; the fake
+        # pane only ever touched the in-memory FakeDocument, so the two
+        # never collided on content, only on the (now-closed) session.
         file_evidence = comments.execute_add_anchored_comment(str(self.target), "lazy dog", "y", 1)
 
         self.assertIsInstance(live_evidence["rung"], str)
@@ -468,6 +480,48 @@ class ResolveCommentLiveTests(LiveCommentsTestCase):
         self.assertFalse(doc.comments[0].resolved)
 
 
+class DefaultAutoDispatchRegressionTests(LiveCommentsTestCase):
+    """issue #154's actual repro for the comment tools: every test above
+    calls comments_live.execute_*_live DIRECTLY, bypassing the
+    write_mode="auto" DISPATCH that a real caller (and the original
+    incident) actually goes through -- server.reply_to_comment/
+    resolve_comment, which resolve the mode themselves via
+    comments_live._resolve_write_mode before picking an implementation.
+    None of the tests above would have caught the original bug: on Mac +
+    SharePoint (no owner file), "auto" used to resolve to "file", so a
+    live:<id> handle from list_open_items(source="live") reached
+    comments.execute_reply_to_comment's file-mode durableId lookup and
+    failed with INVALID_INPUT: comment_id 'live:<id>' not found -- exactly
+    the failure the incident report quotes verbatim. These tests exercise
+    the dispatch layer itself, with write_mode left at its default."""
+
+    fixture_name = "frag.docx"
+
+    async def test_reply_to_comment_default_auto_dispatches_live_handle(self):
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        await self.connect_pane(document=doc)
+
+        added = await self.call(comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "x", 1)
+        live_id = added["comment_id"]  # "live:c1" -- the exact handle shape the incident's comment_id was
+
+        evidence = await self.call(server.reply_to_comment, str(self.target), live_id, "a reply")
+        self.assertTrue(evidence["applied"])
+        self.assertEqual(evidence["write_mode"], "live")
+        self.assertEqual(len(doc.comments[0].replies), 1)
+
+    async def test_resolve_comment_default_auto_dispatches_live_handle(self):
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        await self.connect_pane(document=doc)
+
+        added = await self.call(comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "x", 1)
+        live_id = added["comment_id"]
+
+        evidence = await self.call(server.resolve_comment, str(self.target), live_id)
+        self.assertTrue(evidence["applied"])
+        self.assertEqual(evidence["write_mode"], "live")
+        self.assertTrue(doc.comments[0].resolved)
+
+
 # ---------------------------------------------------------------------------
 # write_mode resolution: LIVE_UNAVAILABLE / auto without an owner file.
 # ---------------------------------------------------------------------------
@@ -481,20 +535,25 @@ class WriteModeResolutionTests(LiveCommentsTestCase):
             comments_live._resolve_write_mode(str(self.target), "live")
         self.assertEqual(cm.exception.envelope.error_code, ErrorCode.LIVE_UNAVAILABLE)
 
-    async def test_auto_without_owner_file_takes_the_file_path(self):
-        # A pane IS connected, but no Word/LibreOffice owner file exists
-        # for self.target -- "auto" must still resolve to "file" (both
-        # conditions are required, not either) and the write must go
-        # through comments.py's own file-mode path, untouched.
+    async def test_auto_without_owner_file_resolves_live_and_file_mode_refuses(self):
+        """issue #154: a pane IS connected, and no Word/LibreOffice owner
+        file exists for self.target (Word for Mac + a SharePoint/OneDrive
+        sync never writes one) -- "auto" must resolve to "live" on the
+        connected-session signal alone, and an explicit file-mode write
+        for this same document must now refuse with LIVE_SESSION_ACTIVE
+        rather than silently write to disk underneath Word's own open
+        buffer. This inverts the pre-#154 version of this test, which
+        asserted the opposite of both."""
         doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
         await self.connect_pane(document=doc)
 
         mode = comments_live._resolve_write_mode(str(self.target), "auto")
-        self.assertEqual(mode, "file")
+        self.assertEqual(mode, "live")
 
-        evidence = comments.execute_add_anchored_comment(str(self.target), "brown fox", "file-mode text", 1)
-        self.assertTrue(evidence["applied"])
-        self.assertEqual(doc.comments, [])  # the fake pane received no op
+        with self.assertRaises(VerifyError) as ctx:
+            comments.execute_add_anchored_comment(str(self.target), "brown fox", "file-mode text", 1)
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.LIVE_SESSION_ACTIVE)
+        self.assertEqual(doc.comments, [])  # the fake pane received no op either
 
 
 if __name__ == "__main__":

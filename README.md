@@ -61,9 +61,13 @@ Tools implemented so far:
   strip), with run splitting that clones a boundary run's original
   `w:rPr` verbatim onto every surviving piece. Both take a `write_mode:
   "auto" | "file" | "live"` parameter (default `"auto"`): `"auto"` edits
-  through a connected Word task pane instead of the file when the
-  document is open in Word with the Live pane loaded, otherwise the file
-  path unchanged — see [Live mode](#live-mode) below.
+  through a connected Word task pane instead of the file whenever a Live
+  pane is connected for that document, otherwise the file path — see
+  [Live mode](#live-mode) below. `apply_style(path, find, style_id,
+  expected_matches, ...)` has no `write_mode` parameter and always takes
+  the file path — including refusing (`LIVE_SESSION_ACTIVE`) while a Live
+  pane is connected for that document, same as every other write_mode-less
+  mutating tool (issue #154 — see "Live mode" below).
 - **`live_save(path)`** — ask the connected pane to save the live
   document, then report both the pane's own live revision token and a
   bridge back to the file-mode revision contract (`file_revision`) for a
@@ -351,11 +355,25 @@ opens the pane in Word.
 `replace_text`/`format_text` (WP-3) and on
 `add_anchored_comment`/`reply_to_comment`/`resolve_comment` (WP-4), with a
 parallel `source="live"` on `list_open_items` — each goes through the connected
-pane instead of the on-disk `.docx` parts when the document is open in Word with
-the Live pane loaded, otherwise the file path unchanged. `live_save(path)` asks the
-pane to save. `list_open_items(source="live")` carries a `correlation` list bridging
+pane instead of the on-disk `.docx` parts whenever a Live pane is connected for
+that document, otherwise the file path. `live_save(path)` asks the pane to save.
+`list_open_items(source="live")` carries a `correlation` list bridging
 a live comment's own id back to the durableId/w:id file mode reports (Office.js's
-`Comment.id` is unrelated to either). Full architecture, the `write_mode` rule and
+`Comment.id` is unrelated to either).
+
+Issue #154: every OTHER mutating tool — `apply_style`, `insert_table`,
+`insert_image`, `replace_table_row`, `replace_cell_markdown`,
+`replace_range_markdown`, `replace_body_markdown`, `append_markdown`,
+`accept_tracked_changes`, `reject_tracked_changes` — has no `write_mode`
+parameter and always takes the file path, but now **refuses**
+(`LIVE_SESSION_ACTIVE`) while a Live pane is connected for that document,
+rather than writing to disk underneath Word's own open, autosaving
+buffer. The remedy is to save and close the document itself in Word, not
+just the pane. Every mutating tool's evidence also now carries its own
+`write_mode` key (`"file"` or `"live"`), so a caller never has to infer
+routing from the shape of a `revision_*` token.
+
+Full architecture, the `write_mode` rule and
 live evidence shape, the correlation algorithm, and the lead's sideload runbook:
 [`docs/live-mode.md`](docs/live-mode.md).
 

@@ -602,6 +602,7 @@ def _run_accept_or_reject(
         "revision_before": pre_revision["token"],
         "revision_after": post_revision["token"],
         "audit_logged": False,
+        "write_mode": "file",  # issue #154: accept/reject_tracked_changes have no live-mode path
         "revision_ids": processed_ids,
     }
     mutations._merge_conflict_sweep(evidence, conflict_sweep)  # issue #28 WP-10
