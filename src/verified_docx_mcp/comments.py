@@ -366,6 +366,7 @@ def execute_add_anchored_comment(
         "revision_before": pre_revision["token"],
         "revision_after": post_revision["token"],
         "audit_logged": False,
+        "write_mode": "file",  # issue #154: this function is file-mode only
         "comment_ids": comment_ids_created,
     }
     if len(comment_ids_created) == 1:
@@ -939,6 +940,7 @@ def execute_reply_to_comment(
         "revision_before": pre_revision["token"],
         "revision_after": post_revision["token"],
         "audit_logged": False,
+        "write_mode": "file",  # issue #154: this function is file-mode only
         "comment_id": new_durable_id,
         "parent_comment_id": comment_id,
         "comment_id_resolved_via": comment_id_resolved_via,
@@ -1038,6 +1040,7 @@ def execute_resolve_comment(
         "revision_before": pre_revision["token"],
         "revision_after": post_revision["token"],
         "audit_logged": False,
+        "write_mode": "file",  # issue #154: this function is file-mode only
         "comment_id": comment_id,
         "comment_id_resolved_via": comment_id_resolved_via,
     }

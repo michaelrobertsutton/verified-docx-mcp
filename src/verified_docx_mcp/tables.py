@@ -363,6 +363,9 @@ def _evidence(
         "revision_before": revision_before,
         "revision_after": revision_after,
         "audit_logged": audit_logged,
+        # issue #154: tables.py has no live-mode path at all -- every
+        # write here is file mode.
+        "write_mode": "file",
     }
     if orphaned_comment_ids:
         evidence["orphaned_comment_ids"] = orphaned_comment_ids

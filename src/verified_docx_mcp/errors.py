@@ -120,6 +120,15 @@ class ErrorCode(Enum):
     LIVE_STALE = "LIVE_STALE"  # the pane's body hash before the op (result["pre"]) did not match a caller-supplied expected_body_sha256 (live/session.py LiveStale)
     LIVE_OP_FAILED = "LIVE_OP_FAILED"  # the pane replied ok=false (e.g. an expected_matches count mismatch it refused to act on) (live/session.py LiveOpFailed)
 
+    # Issue #154: a Live pane is connected for the target document, so the
+    # server-side "lock_status owner file" signal that used to gate a
+    # file-mode write is unreliable (Word for Mac + a SharePoint/OneDrive
+    # sync never writes that owner file) -- the connected-pane check below
+    # is the independent second signal that actually protects a file-mode
+    # write from racing Word's own autosave.
+    LIVE_SESSION_ACTIVE = "LIVE_SESSION_ACTIVE"  # mutations._guard_before_write refused a FILE-MODE write because a pane session is connected for this document -- use write_mode="live" (where the tool has one), or save and close the document in Word (not just the pane) and retry
+    LIVE_SESSION_MISMATCH = "LIVE_SESSION_MISMATCH"  # live/write_mode.py's auto/live routing found a session matching this document's basename, but that session's own document_url resolves to a different local file -- refusing rather than risk mutating the wrong document
+
 
 # Which codes signal a transient condition worth a single retry by the
 # caller. Empty for now — WP-02 has no revision-stamped write to race

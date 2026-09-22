@@ -524,6 +524,11 @@ def _evidence(
         "audit_logged": audit_logged,
         "runs_before": runs_before,
         "runs_after": runs_after,
+        # issue #154: this builder is only ever used for the file-mode
+        # path (live goes through live_write_mode.live_evidence, which
+        # sets this same key to "live") -- see that module's own
+        # write_mode key.
+        "write_mode": "file",
     }
     if warnings:
         evidence["warnings"] = warnings
@@ -1348,6 +1353,10 @@ def execute_live_save(path: str) -> dict[str, Any]:
         "applied": True,
         "saved": True,
         "document_name": document_name,
+        # issue #154: live_save is a LIVE operation (it goes through the
+        # pane, not atomic_replace_docx_parts) -- "live", matching every
+        # other live-mode evidence's write_mode key, never "file".
+        "write_mode": "live",
         "revision_after": f"live:sha256:{post_hash}",
         "file_revision": file_revision,
     }

@@ -99,9 +99,9 @@ evidence shape are defined exactly once.
 
 | `write_mode` | Rule |
 |---|---|
-| `"file"` | Always the file path — today's behavior, byte-for-byte. No bridge/registry lookup at all. |
+| `"file"` | Always the file path — today's behavior, byte-for-byte, EXCEPT (issue #154): refuses with `LIVE_SESSION_ACTIVE` if a pane session is connected for this document. |
 | `"live"` | Always the live pane. Raises `LIVE_UNAVAILABLE` if no pane session is connected for that document. |
-| `"auto"` (default) | Live only when BOTH hold: a pane session is connected for the file's name, AND `lock_status` reports a desktop Word owner file for the path. Otherwise file. |
+| `"auto"` (default) | Live whenever a pane session is connected for the file's name. Otherwise file. |
 
 Matching is by file name exactly as a connected pane reports it
 (`documentUrl`'s basename, same as `live/session.py`'s
@@ -118,6 +118,74 @@ Word owner file on the target path only ever showed up as data
 routes that exact situation — the lead has the pursuit's document open,
 with the Live pane loaded — into a live edit instead: the same call that
 would have refused now applies immediately, in front of the lead.
+
+### Why a file-mode write refuses under a live pane (issue #154)
+
+`auto` originally required BOTH a connected pane session AND
+`lock_status` reporting a desktop Word owner file for the path. That
+second condition is gone. It was never a reliable signal in the first
+place: Word for Mac editing a document opened from a SharePoint/OneDrive-
+synced path never writes the `~$*` owner file `lock_status` looks for, so
+on that platform/storage combination `auto` could **never** route to
+live — it silently fell back to file mode every time, with no warning.
+A real incident hit this directly: `apply_style` (which has no
+`write_mode` parameter at all, so it only ever took the file path) made
+14 calls that each returned `applied: true` while a Live pane was open on
+the same document; minutes later Word's own autosave silently reverted
+every one, along with several comment replies/resolutions made the same
+way.
+
+The fix has two parts:
+
+1. **`auto`/`"live"`'s own routing** (`live/write_mode.py`) no longer
+   consults the owner file at all — a connected pane session is
+   sufficient on its own, matching the rule the read-side
+   `list_open_items(source="auto")` already used
+   (`comments_live._resolve_source`).
+2. **Every file-mode mutating write** — including the ten tools that
+   have no `write_mode` parameter at all (`apply_style`, `insert_table`,
+   `insert_image`, `replace_table_row`, `replace_cell_markdown`,
+   `replace_range_markdown`, `replace_body_markdown`, `append_markdown`,
+   `accept_tracked_changes`, `reject_tracked_changes`) — now refuses with
+   `LIVE_SESSION_ACTIVE` when a pane session is connected for that
+   document, via `mutations._guard_before_write` (checked once, well
+   before the write; and again, immediately before
+   `atomic_replace_docx_parts` actually writes, narrowing the race
+   between the two). There is **no escape hatch**: an explicit
+   `write_mode="file"` refuses too. A write to disk cannot be made
+   durable while Word owns the open document's in-memory buffer, so
+   there is nothing a caller could safely override to.
+
+**The remedy is to close the document, not just the pane.** Closing only
+the Live task pane drops its WebSocket connection, but Word still holds
+the document open with its own unsaved in-memory buffer — a file-mode
+write immediately after would still race Word's next autosave, which is
+the exact hazard this refusal exists to prevent. `LIVE_SESSION_ACTIVE`'s
+message says so explicitly: use `write_mode="live"` on a tool that has
+one, or save and **close the document itself** in Word, then retry.
+
+**Session identity** (`live/write_mode.py`'s `_check_session_identity`,
+issue #154 WP-1b): `SessionRegistry` keys purely on file **basename**
+(deliberate — a synced folder's absolute path differs per machine), so a
+session for `/a/Foo.docx` and a call against `/b/Foo.docx` would
+otherwise match by name alone. `resolve_write_mode`'s `"auto"`/`"live"`
+branches additionally compare the target path against the session's own
+`document_url`: when that URL resolves to a local file path and it
+differs from the target, the call refuses with `LIVE_SESSION_MISMATCH`
+rather than risk mutating the wrong document. When `document_url` is a
+SharePoint/OneDrive web URL (not a local path — the actual shape of the
+incident above), there is no local path to compare, so this falls back
+to the basename match already performed; it does not fail closed, since
+doing so would disable live mode on exactly the platform this issue is
+about.
+
+**Every mutating tool's evidence now states its own `write_mode`**
+(`"file"` or `"live"`) — issue #154 WP-3. Previously only live evidence
+carried this key; a caller had to infer file-mode routing from the
+absence of a `"live:sha256:"`-prefixed `revision_*` token. Every
+file-mode evidence-building site now sets `write_mode: "file"`
+explicitly (`live_save`'s evidence, which is a live operation despite
+living in `text_edit.py`, correctly carries `write_mode: "live"`).
 
 **Live op flow** (`replace`/`format`): `describe` (record the pane's
 pre-op `body.text` SHA-256; refuse `LIVE_STALE` if a caller-supplied
@@ -183,9 +251,16 @@ now-saved file, same as any other file-mode read.
 truth table (mocked, no bridge) and, over a real ephemeral-port bridge +
 `FakePane`, the live happy paths for `replace_text`/`format_text`/
 `live_save`, `MATCH_COUNT_MISMATCH`/`ZERO_MATCH`/`LIVE_STALE`/
-`LIVE_UNAVAILABLE`/`LIVE_DISCONNECTED`, and that `write_mode="file"`
-and `write_mode="auto"` with no owner file both still take the exact
-file-mode path (the fake pane receives no op at all in the latter case).
+`LIVE_UNAVAILABLE`/`LIVE_DISCONNECTED`; the issue #154 regression pin
+(`auto` with a connected pane and no owner file goes live, sends the op,
+and never calls `lock_status`); `LIVE_SESSION_ACTIVE` refusing
+`apply_style` (the literal repro) and an explicit `write_mode="file"`
+under a connected pane, plus one representative markdown-rung and one
+table-rung tool to show the guard reaches tools with no `write_mode`
+parameter at all; `LIVE_SESSION_MISMATCH` on a session naming a
+different local file, and the SharePoint-web-URL fallback that still
+matches by basename; and a no-bridge test confirming an ordinary
+file-mode write never calls `start_in_background`.
 
 ## WP-1 result (2026-09-16, Word for Mac 16.112.4)
 
@@ -354,14 +429,19 @@ finding above. Implemented in `src/verified_docx_mcp/live/comments_live.py`
 dispatch to it. Tested against `tests/unit/fake_pane.py` in
 `tests/unit/test_live_comments.py` — no Word, no real pane.
 
-**write_mode / source resolution.** `"file"` is today's OOXML path,
-unchanged. `"live"` requires a connected pane session for the target
+**write_mode / source resolution.** `"file"` is today's OOXML path —
+issue #154: BUT it now refuses with `LIVE_SESSION_ACTIVE` if a pane
+session is connected for the target document, same as every other
+file-mode mutating tool (see "Why a file-mode write refuses under a live
+pane" above). `"live"` requires a connected pane session for the target
 document's file name (`live/session.py`'s `document_name_from_url`
-basename rule), else `LIVE_UNAVAILABLE`. `"auto"` on a WRITE tool picks
-live only when BOTH `lock_status` shows a desktop Word owner file for the
-path AND such a session exists; otherwise file. `"auto"` on the READ tool
-(`list_open_items`) is simpler — live whenever a session exists, since a
-read never refuses and gains nothing from the owner-file check.
+basename rule), else `LIVE_UNAVAILABLE`. `"auto"` on a WRITE tool (issue
+#154) picks live whenever such a session exists — no `lock_status`/
+owner-file check any more; that signal never appears on Word for Mac
+against a SharePoint/OneDrive-synced path, so the old "both must hold"
+rule could never route live there at all. `"auto"` on the READ tool
+(`list_open_items`) was already this simple — live whenever a session
+exists, since a read never refuses.
 
 **The id-correlation problem.** A live comment's id is a `live:<Comment.id>`
 handle, valid only for the one connected session that created it (it does

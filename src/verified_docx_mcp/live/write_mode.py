@@ -16,6 +16,13 @@ small:
   ``live_evidence(...)`` -- build + audit-log the live-mode evidence
       envelope (the same eight keys as file mode, plus the live-only
       keys the plan names).
+  ``raise_if_live_session_active(resolved)`` (issue #154) -- the
+      file-mode-write counterpart of the three above: raises
+      ``LIVE_SESSION_ACTIVE`` if a pane session is connected for
+      *resolved*'s document name. ``mutations._guard_before_write`` calls
+      this before every file-mode write (and ``atomic_replace_docx_parts``
+      calls it again immediately before the write itself lands, to
+      narrow the race between the two).
 
 Plus two small helpers every live write op needs and that would
 otherwise be duplicated in both PRs' own tool modules:
@@ -33,20 +40,33 @@ Deliberately NOT here: never calls ``live/bridge.py``'s
 ``resolve_write_mode`` runs on every ``replace_text``/``format_text``
 call, including the overwhelming common case where the caller never
 touched anything live-related (``write_mode="auto"``, no pane ever
-connected) -- that path must be a cheap, side-effect-free lock check,
-never an attempt to bind the bridge's real ports (53135/53136 in
+connected) -- that path must be a cheap, side-effect-free registry
+lookup, never an attempt to bind the bridge's real ports (53135/53136 in
 production; see this repo's own hard rule against a test or an
 unrelated call path ever touching those two specific ports). Starting
 the bridge lazily stays ``live_status``'s job (and, from here on, any
 live op's, once a session already exists) -- ``resolve_write_mode``
 only ever asks "is one already running, and if so, is a pane already
 connected for this document", never "start one so I can ask".
+
+Issue #154 fix: ``auto`` used to also require ``lock_status`` to report
+a desktop Word owner file next to a connected pane session -- a signal
+Word for Mac never writes into a SharePoint/OneDrive-synced folder, so
+``auto`` could never reach live on that platform/storage combination.
+That condition is gone; ``auto`` now matches ``comments_live.py``'s own
+read-side ``_resolve_source`` rule exactly: a connected pane session is
+sufficient on its own. See ``mutations._guard_before_write`` for the
+matching fix on the file-mode side (a connected pane now REFUSES a
+file-mode write with ``LIVE_SESSION_ACTIVE`` instead of relying on that
+same dead owner-file signal to protect it).
 """
 
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from .. import audit, paths
 from ..errors import ErrorCode, _make_error
@@ -68,29 +88,56 @@ def _document_name(path: str) -> str:
     return resolved.name
 
 
-def _desktop_word_owner_present(path: str) -> bool:
-    """True if ``lock_status``'s owner-file check reports a DESKTOP WORD
-    owner file for *path* (not LibreOffice, and not merely "some sync
-    artifact present") -- the first half of the ``auto`` rule.
-
-    Deferred import: ``server.py`` imports this module at process start
-    (for ``replace_text``/``format_text``/``live_save``'s ``write_mode``
-    dispatch), so a module-level ``from .. import server`` here would be
-    a circular import -- the same deferred-import pattern ``mutations.py``
-    already uses for ``tracked_changes.py``, and ``server.py``'s own
-    ``_raise_tool_error`` uses for ``fastmcp.exceptions``.
-
-    ``quiesce_interval=0.0``: ``execute_lock_status`` also samples the
-    file twice ~1.5s apart (by default) to report sync-quiesce state,
-    which this check does not need (only ``owner_file`` matters here) --
-    passing 0 skips that wait rather than taxing every ``auto``-mode call
-    with a needless 1.5s pause.
+def _session_url_local_path(document_url: str) -> Path | None:
+    """*document_url* as a local filesystem path, or ``None`` if it isn't
+    one (a SharePoint/OneDrive web URL, e.g. ``https://...`` -- the
+    actual shape of issue #154's incident). Only a bare path or an
+    explicit ``file://`` URL resolves; anything else is left to
+    basename-only matching (see ``_check_session_identity`` below), since
+    a web URL carries no local path this process could compare against.
     """
-    from .. import server as server_module
+    parsed = urlparse(document_url)
+    if parsed.scheme in ("", "file"):
+        raw = unquote(parsed.path) if parsed.scheme == "file" else document_url
+        if raw:
+            return Path(raw)
+    return None
 
-    status = server_module.execute_lock_status(path, quiesce_interval=0.0)
-    owner = status["owner_file"]
-    return bool(owner.get("present")) and owner.get("format") == "word"
+
+def _check_session_identity(path: str, session: LiveSession) -> None:
+    """Issue #154 WP-1b: ``SessionRegistry`` keys purely on basename
+    (deliberate -- a synced folder's absolute path differs per machine),
+    so ``auto``/``live`` routing a *different* document that happens to
+    share a file name into this session's pane would silently mutate the
+    wrong file. Match counts on the pane's side cannot catch this; only
+    comparing *path* against the session's own ``document_url`` can.
+
+    Refuses (``LIVE_SESSION_MISMATCH``) only when ``document_url``
+    resolves to a LOCAL path (see ``_session_url_local_path``) that
+    differs from *path*'s own resolved real path. When ``document_url``
+    is a web URL (SharePoint/OneDrive -- issue #154's actual incident
+    shape), there is no local path to compare, so this falls back to the
+    basename match the registry lookup already performed and does not
+    fail closed -- doing so would disable live mode on exactly the
+    platform/storage combination this issue is about.
+    """
+    session_local = _session_url_local_path(session.document_url)
+    if session_local is None:
+        return
+    target_resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    try:
+        session_real = session_local.resolve()
+    except OSError:
+        return
+    if session_real != target_resolved.resolve():
+        raise _make_error(
+            ErrorCode.LIVE_SESSION_MISMATCH,
+            f"a connected pane session shares this document's file name ({session.document_name!r}) "
+            f"but its own document_url resolves to a different file ({session_real}) than the one "
+            f"requested ({target_resolved}). Refusing to route to a session that may be editing a "
+            "different document than the one this call names.",
+            {"path": str(target_resolved), "session_document_url": session.document_url},
+        )
 
 
 def resolve_write_mode(path: str, requested: str) -> str:
@@ -103,14 +150,21 @@ def resolve_write_mode(path: str, requested: str) -> str:
       byte-for-byte, with zero added cost or side effect.
     - ``"live"`` -- always ``"live"`` if a pane session is connected for
       *path*'s document name; otherwise raises ``LIVE_UNAVAILABLE``.
-    - ``"auto"`` (default) -- ``"live"`` only when BOTH hold: a pane
-      session is connected for *path*'s document name, AND
-      ``lock_status`` reports a desktop Word owner file for *path*.
-      Otherwise ``"file"``. Matching is by file name exactly as a
-      connected pane reports it (``live/session.py``'s
-      ``document_name_from_url``), never by full path -- a synced folder
-      can differ in absolute path between machines while naming the same
-      file the pane opened.
+    - ``"auto"`` (default, issue #154) -- ``"live"`` whenever a pane
+      session is connected for *path*'s document name; otherwise
+      ``"file"``. Matching is by file name exactly as a connected pane
+      reports it (``live/session.py``'s ``document_name_from_url``),
+      never by full path -- a synced folder can differ in absolute path
+      between machines while naming the same file the pane opened. (A
+      desktop Word owner file used to be required too; that signal never
+      appears on Word for Mac against a SharePoint/OneDrive-synced path,
+      so ``auto`` could never route live there -- see this module's own
+      header comment.)
+
+    Either branch that resolves to ``"live"`` also runs
+    ``_check_session_identity`` (issue #154 WP-1b) to refuse
+    (``LIVE_SESSION_MISMATCH``) a session whose own ``document_url``
+    names a different local file than *path*.
 
     Raises ``INVALID_INPUT`` for any other *requested* value.
     """
@@ -136,14 +190,54 @@ def resolve_write_mode(path: str, requested: str) -> str:
                 "or call live_status to confirm the bridge is running.",
                 {"document_name": document_name, "path": path},
             )
+        _check_session_identity(path, session)
         return "live"
 
-    # auto
+    # auto (issue #154: session alone is sufficient -- no owner-file check)
     if session is None:
         return "file"
-    if not _desktop_word_owner_present(path):
-        return "file"
+    _check_session_identity(path, session)
     return "live"
+
+
+def raise_if_live_session_active(resolved: Path) -> None:
+    """Issue #154: refuse a FILE-MODE write with ``LIVE_SESSION_ACTIVE``
+    when a pane session is connected for *resolved*'s document name (by
+    basename, same key ``SessionRegistry`` uses -- ``resolved`` is
+    already a resolved, existing path, so no ``_document_name`` call is
+    needed here).
+
+    Called from two places, on purpose, to narrow (not eliminate) the
+    window between the guard and the write actually landing:
+    ``mutations._guard_before_write`` (well before the write: hazard
+    scan, revision check, markdown render all still have to happen) and
+    ``mutations.atomic_replace_docx_parts`` itself (immediately before
+    the write -- a pane can connect during the guard's own
+    sync-quiesce wait, which is up to ~10s). Never starts the bridge
+    lazily (same rule as ``resolve_write_mode`` -- an ordinary file-mode
+    write must not bind ports 53135/53136).
+
+    The remedy in the message is "save and CLOSE THE DOCUMENT in Word",
+    never "close the pane": closing only the task pane drops its socket
+    but leaves Word holding the document open with an unsaved in-memory
+    buffer, so a file write immediately after would still race Word's
+    own next autosave -- the exact hazard this function exists to stop.
+    """
+    document_name = resolved.name
+    registry = live_bridge.current_registry()
+    session = registry.get(document_name) if registry is not None else None
+    if session is None:
+        return
+    raise _make_error(
+        ErrorCode.LIVE_SESSION_ACTIVE,
+        f"a Live pane session is connected for {document_name!r} (document_url="
+        f"{session.document_url!r}). Writing to disk now would race Word's own autosave of its "
+        "open in-memory copy and the file-mode write would likely be silently reverted (issue "
+        "#154). Use write_mode=\"live\" on this call if it takes one, or save and CLOSE THE "
+        "DOCUMENT in Word -- closing only the Live pane is not enough, Word keeps its buffer "
+        "open until the document itself closes -- then retry.",
+        {"document_name": document_name, "session_document_url": session.document_url},
+    )
 
 
 def live_session_for(path: str) -> LiveSession:
@@ -153,7 +247,8 @@ def live_session_for(path: str) -> LiveSession:
     connected for that document -- the same condition
     ``resolve_write_mode(path, "live")`` checks; a caller that already
     resolved ``mode == "live"`` calls this next to get the actual session
-    object to send ops to.
+    object to send ops to. Also runs ``_check_session_identity`` (issue
+    #154 WP-1b), same as ``resolve_write_mode``'s own ``"live"`` branch.
     """
     document_name = _document_name(path)
     registry = live_bridge.current_registry()
@@ -166,6 +261,7 @@ def live_session_for(path: str) -> LiveSession:
             "running.",
             {"document_name": document_name, "path": path},
         )
+    _check_session_identity(path, session)
     return session
 
 

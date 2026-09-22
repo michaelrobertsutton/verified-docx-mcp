@@ -67,6 +67,7 @@ from xml.etree import ElementTree as ET
 
 from . import audit, markdown_to_ooxml, paths, projection
 from .errors import ErrorCode, _make_error
+from .live import write_mode as live_write_mode
 from .projection import DEFAULT_PART, R_NS, W_NS
 
 # ---------------------------------------------------------------------------
@@ -629,8 +630,22 @@ def atomic_replace_docx_parts(
     opc_valid runs, so a test can exercise the "corrupted temp write"
     acceptance case deterministically without depending on a real
     filesystem fault.
+
+    Issue #154: re-checks for a connected Live pane session immediately
+    before doing any of the above -- ``_guard_before_write`` already
+    checked once, but that can run several seconds before this function
+    is even called (hazard scan, markdown render, the guard's own
+    sync-quiesce wait), during which a pane could connect. This does not
+    close that window (a pane could still connect in the instant between
+    this check and ``os.replace()`` below), but it narrows it from
+    "the whole guard-to-write gap" to "this function's own few
+    milliseconds" -- ``_guard_before_write`` is the single caller-side
+    convention every mutating tool goes through, but enforcing the check
+    again HERE, at the actual write primitive, means a future write path
+    that skips ``_guard_before_write`` is still covered by this one.
     """
     since_ns = time.time_ns()
+    live_write_mode.raise_if_live_session_active(original_path)
     claim_path = acquire_lock(original_path)
     try:
         tmp_fd, tmp_name = tempfile.mkstemp(
@@ -697,6 +712,15 @@ _QUIESCE_INTERVAL_SECONDS = 1.5
 
 
 def _guard_before_write(resolved: Path, revision_before: str | None) -> dict[str, Any]:
+    # Issue #154: a connected Live pane session is checked BEFORE the
+    # owner-file/sync-quiesce checks below, not instead of them -- the
+    # owner-file signal is unreliable on its own (Word for Mac + a
+    # SharePoint/OneDrive sync never writes it), so a connected pane is
+    # now an independent, sufficient reason to refuse a file-mode write.
+    # Never starts the bridge lazily; see raise_if_live_session_active's
+    # own docstring.
+    live_write_mode.raise_if_live_session_active(resolved)
+
     # Lazy import: server.py imports this module at load time to register
     # the tools below, so a module-level "from . import server" here would
     # be circular. By the time any tool is actually CALLED both modules are
@@ -1060,6 +1084,12 @@ def _evidence(
         "revision_before": revision_before,
         "revision_after": revision_after,
         "audit_logged": audit_logged,
+        # issue #154: every mutating tool's evidence now states which path
+        # it took, so a caller never has to infer it from the
+        # revision_*/"live:sha256:" prefix. File-mode evidence always
+        # carries "file" -- live/write_mode.py's live_evidence() sets the
+        # same key to "live" for a live-mode write.
+        "write_mode": "file",
     }
     if orphaned_comment_ids:
         evidence["orphaned_comment_ids"] = orphaned_comment_ids
