@@ -98,6 +98,45 @@ class HelloRegistrationTests(LiveBridgeTestCase):
         self.assertEqual(names, ["One.docx", "Two.docx"])
 
 
+class SessionCollisionTests(LiveBridgeTestCase):
+    """Issue #22 B3 follow-up: SessionRegistry keys purely on basename, so
+    two DIFFERENT documents sharing a file name are indistinguishable by
+    name alone. Never refused (the common case -- the SAME document
+    reconnecting -- must not be flagged), but recorded so it is visible."""
+
+    async def test_same_url_reconnect_is_not_a_collision(self):
+        await self.connect_pane(document_url="/tmp/Shared/Proposal.docx")
+        await self.connect_pane(document_url="/tmp/Shared/Proposal.docx")  # reconnect, same doc
+        self.assertEqual(self.registry.collisions(), [])
+
+    async def test_different_url_same_basename_is_recorded_not_refused(self):
+        await self.connect_pane(document_url="https://contoso.sharepoint.com/sites/A/Proposal.docx")
+        await self.connect_pane(document_url="https://contoso.sharepoint.com/sites/B/Proposal.docx")
+
+        # Not refused: the second connection still registers and takes
+        # over routing for "Proposal.docx" -- today's existing behavior.
+        sessions = self.registry.list()
+        self.assertEqual([s.document_name for s in sessions], ["Proposal.docx"])
+        self.assertEqual(
+            self.registry.get("Proposal.docx").document_url,
+            "https://contoso.sharepoint.com/sites/B/Proposal.docx",
+        )
+
+        collisions = self.registry.collisions()
+        self.assertEqual(len(collisions), 1)
+        self.assertEqual(collisions[0]["document_name"], "Proposal.docx")
+        self.assertEqual(
+            collisions[0]["displaced_document_url"], "https://contoso.sharepoint.com/sites/A/Proposal.docx"
+        )
+        self.assertEqual(collisions[0]["new_document_url"], "https://contoso.sharepoint.com/sites/B/Proposal.docx")
+        self.assertIn("at", collisions[0])
+
+    async def test_collision_log_is_capped(self):
+        for i in range(25):
+            await self.connect_pane(document_url=f"https://contoso.sharepoint.com/sites/{i}/Cap.docx")
+        self.assertEqual(len(self.registry.collisions()), 20)
+
+
 class OpRoundTripTests(LiveBridgeTestCase):
     async def test_describe_round_trips(self):
         doc = FakeDocument(text="Hello world.")
@@ -277,6 +316,7 @@ class LiveStatusShapeTests(LiveBridgeTestCase):
         self.assertEqual(status_before["port"], self.port)
         self.assertEqual(status_before["ops_port"], self.ops_port)
         self.assertEqual(status_before["sessions"], [])
+        self.assertEqual(status_before["session_collisions"], [])
 
         doc = FakeDocument(text="hello")
         await self.connect_pane(
@@ -292,6 +332,17 @@ class LiveStatusShapeTests(LiveBridgeTestCase):
         self.assertGreaterEqual(entry["last_heartbeat_age_s"], 0)
         self.assertEqual(entry["body_sha256"], doc.sha256())
         self.assertEqual(entry["requirement_sets"], {"1.4": True, "1.5": False})
+        self.assertEqual(status_after["session_collisions"], [])
+
+    async def test_live_status_surfaces_session_collisions(self):
+        from verified_docx_mcp import server as server_module
+
+        await self.connect_pane(document_url="https://contoso.sharepoint.com/sites/A/Dup.docx")
+        await self.connect_pane(document_url="https://contoso.sharepoint.com/sites/B/Dup.docx")
+
+        status = server_module.execute_live_status()
+        self.assertEqual(len(status["session_collisions"]), 1)
+        self.assertEqual(status["session_collisions"][0]["document_name"], "Dup.docx")
 
 
 if __name__ == "__main__":

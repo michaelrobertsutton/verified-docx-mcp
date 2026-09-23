@@ -357,8 +357,12 @@ document back after a mutation. The MCP server starts the bridge lazily
 `live_status` (read-only) reports bridge and connected-pane state:
 `{bridge_running, port, ops_port, sessions: [{document_name,
 document_url, connected_since, last_heartbeat_age_s, body_sha256,
-requirement_sets}]}` — an empty `sessions` list is normal before the lead
-opens the pane in Word.
+requirement_sets}], session_collisions}` — an empty `sessions` list is
+normal before the lead opens the pane in Word. `session_collisions`
+(empty unless it's happened) flags two *different* documents that share
+a file name connecting at once — `SessionRegistry` keys purely on
+basename, so it can't tell them apart on its own; check this before
+trusting a live write's routing if that's possible.
 
 `write_mode: "auto" | "file" | "live"` (default `"auto"`) is wired up on
 `replace_text`/`format_text` (WP-3) and on
