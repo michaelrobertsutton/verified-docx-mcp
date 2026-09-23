@@ -1711,6 +1711,14 @@ def execute_live_save(path: str) -> dict[str, Any]:
     caller's own job afterward, via the existing read tools
     (``read_document``/``find_sections``/``diff_body_vs_file``/etc.) --
     this tool only confirms the save itself, not the file's contents.
+    Those read tools remain FILE-ONLY (issue #22 B3 does not add a live
+    read path for them) -- when there is no local file at all (see
+    below), that follow-up verification simply isn't available.
+
+    Issue #22 B3: ``file_revision`` is ``None`` when *path* names no
+    local file -- e.g. a SharePoint/OneDrive document with no local sync
+    (Word's own save just went there, not to anything this server could
+    read). This call no longer requires *path* to exist locally at all.
 
     Errors:
       LIVE_UNAVAILABLE   - no connected pane session for this document
@@ -1743,8 +1751,14 @@ def execute_live_save(path: str) -> dict[str, Any]:
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
     post_hash = describe_result["bodySha256"]
 
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    file_revision = projection.compute_revision(resolved)["token"]
+    # Issue #22 B3: must_exist=False -- Word's own save just went to
+    # wherever the live document actually lives (a SharePoint/OneDrive
+    # document with no local sync saves there, never to a path this
+    # server could read). file_revision is None when there is nothing
+    # local to compute it from, rather than this call raising right
+    # after a save that just succeeded.
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=False)
+    file_revision = projection.compute_revision(resolved)["token"] if resolved.is_file() else None
 
     evidence: dict[str, Any] = {
         "applied": True,

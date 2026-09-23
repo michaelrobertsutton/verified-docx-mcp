@@ -1562,7 +1562,9 @@ def live_save(path: str) -> dict[str, Any]:
     `projection.compute_revision(path)["token"]` -- the same shape
     `replace_text`/`replace_body_markdown`/etc. use as `revision_before`/
     `revision_after` in file mode, computed from the now-saved file on
-    disk), and `audit_logged`.
+    disk; `null` (issue #22 B3) when `path` names no local file at all --
+    e.g. a SharePoint/OneDrive document with no local sync, where Word's
+    own save just went there instead), and `audit_logged`.
 
     Errors:
       LIVE_UNAVAILABLE   - no connected pane session for this document
@@ -1650,6 +1652,21 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     exists so a durableId/w:id (from an earlier file-mode call, or pasted
     in by the lead) can still be used with
     `reply_to_comment`/`resolve_comment(write_mode="live")`.
+
+    Issue #22 B3: live mode no longer requires `path` to name a file that
+    exists locally (a SharePoint/OneDrive document with no local sync is
+    the real incident this fixes -- previously the caller had to
+    fabricate a same-named local stand-in file just to get here). When
+    there is genuinely no local file, `pending_suggestions` is `null`
+    (never `[]` -- an empty list would silently claim "nothing pending,"
+    which isn't knowable without the file) and `correlation` is `[]`; the
+    added `file_side_available` (bool) names the reason explicitly. A
+    `live:<id>` comment handle from this same call's own `comments` list
+    still works fully in `reply_to_comment`/`resolve_comment` either way
+    -- only durableId/w:id-based resolution needs the file-side
+    correlation this degrades. `read_document`/`list_parts`/
+    `find_sections`/etc. remain FILE-ONLY -- this does not add a live
+    read path for them.
 
     Not gated by DOCX_LOCKED -- reads a validated snapshot instead when
     Word's owner file is present, like every other read tool.

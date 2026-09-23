@@ -370,6 +370,16 @@ that document, otherwise the file path. `live_save(path)` asks the pane to save.
 a live comment's own id back to the durableId/w:id file mode reports (Office.js's
 `Comment.id` is unrelated to either).
 
+Issue #22 B3: none of the live comment tools (or `live_save`) require
+`path` to name a file that exists locally anymore — a SharePoint/OneDrive
+document with no local sync now works directly, without fabricating a
+same-named local stand-in file first. When there's genuinely no local
+file, `list_open_items(source="live")`'s `pending_suggestions` is `null`
+(never `[]`, which would look like "nothing pending") and it carries
+`file_side_available: false`; `live_save`'s `file_revision` is `null`.
+`read_document`/`list_parts`/`find_sections`/etc. remain file-only — this
+does not add a live read path for the structural read tools.
+
 Issue #154: every OTHER mutating tool — `apply_style`, `insert_table`,
 `insert_image`, `replace_table_row`, `replace_cell_markdown`,
 `replace_range_markdown`, `replace_body_markdown`, `append_markdown`,

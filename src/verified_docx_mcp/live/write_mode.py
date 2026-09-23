@@ -81,10 +81,21 @@ def _document_name(path: str) -> str:
     """The file name a connected pane would report for *path* -- the same
     basename ``live/session.py``'s ``document_name_from_url`` derives
     from the pane's own ``hello.documentUrl``, and the same key
-    ``SessionRegistry`` uses. Requires the file to exist (a live session
-    can only ever exist for a file Word already has open, which by
-    definition already exists on disk)."""
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    ``SessionRegistry`` uses.
+
+    Issue #22 B3: resolved with ``must_exist=False`` -- a live session's
+    document does NOT need to exist locally (a SharePoint/OneDrive
+    document with no local sync is the real incident this fixes: the
+    caller previously had to fabricate a same-named local stand-in file
+    in an allowed root just so this call would not raise, before any
+    live routing even happened). The allowlist/denylist floor
+    ``resolve_allowed_docx_path`` enforces is unaffected -- *path* must
+    still name something inside an allowed root, it just doesn't have to
+    exist there. Only used from the live-routing branches of
+    ``resolve_write_mode``/``live_session_for`` (never from a file-mode
+    path, which still requires the file to exist via its own
+    ``resolve_allowed_docx_path(path, must_exist=True)`` call)."""
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=False)
     return resolved.name
 
 
@@ -124,7 +135,13 @@ def _check_session_identity(path: str, session: LiveSession) -> None:
     session_local = _session_url_local_path(session.document_url)
     if session_local is None:
         return
-    target_resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    # Issue #22 B3: must_exist=False -- path.resolve(strict=False) still
+    # normalizes to a comparable absolute path for a document that
+    # genuinely has no local file (this check's own job is comparing
+    # paths, not reading one), and requiring existence here would refuse
+    # every live call for such a document before this function even gets
+    # to compare anything.
+    target_resolved = paths.resolve_allowed_docx_path(path, must_exist=False)
     try:
         session_real = session_local.resolve()
     except OSError:

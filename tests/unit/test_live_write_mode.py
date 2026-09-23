@@ -662,6 +662,21 @@ class LiveSaveTests(LiveWriteBridgeTestCase):
             projection.compute_revision(self.target)["token"],
         )
 
+    async def test_file_revision_is_none_with_no_local_file(self) -> None:
+        # Issue #22 B3: a SharePoint/OneDrive document with no local sync
+        # -- Word's own save went there, not to anything this server
+        # could read. Must not raise; file_revision degrades to None.
+        self.target.unlink()
+        doc = FakeDocument(text="alpha")
+        doc.saved = False
+        await self.connect_pane(doc)
+
+        evidence = await asyncio.to_thread(text_edit.execute_live_save, str(self.target))
+
+        self.assertTrue(evidence["applied"])
+        self.assertTrue(evidence["saved"])
+        self.assertIsNone(evidence["file_revision"])
+
     async def test_live_unavailable_with_no_session(self) -> None:
         with self.assertRaises(VerifyError) as ctx:
             text_edit.execute_live_save(str(self.target))
