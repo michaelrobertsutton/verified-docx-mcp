@@ -315,11 +315,17 @@ def execute_insert_image(
     *,
     revision_before: str | None = None,
     force: bool = False,
+    allow_concurrent_editor: bool = False,
     track_changes: bool = False,
 ) -> dict[str, Any]:
     own_author = resolve_author_name()
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = mutations._guard_before_write(resolved, revision_before)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=False,
+    )
 
     # Same allowlist floor diff_body_vs_file already applies to its own
     # second, non-docx local path (paths.resolve_allowed_docx_path is the
@@ -457,7 +463,7 @@ def execute_insert_image(
 
     conflict_sweep = mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     evidence: dict[str, Any] = {
         "applied": True,
         "match_count": 1,

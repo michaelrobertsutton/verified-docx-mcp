@@ -157,9 +157,69 @@ class FakeDocument:
         # durably stick. Empty by default (every existing test's behavior is
         # unchanged); a test opts a specific comment id in.
         self.stuck_ids: set[str] = set()
+        # Issue #27: a minimal table model for cell_get/cell_set --
+        # tables[t][r][c] is the plain text of that cell (all 0-based here,
+        # the wire is 1-based). Empty by default, so every existing test's
+        # body hash (text only) is unchanged; a test opts in by filling it.
+        self.tables: list[list[list[str]]] = []
+        # Set True to make cell ops refuse the way the real pane does for a
+        # document containing a nested table.
+        self.has_nested_table = False
+        # Called (with no arguments) right before cell_set's compare-and-set
+        # check -- lets a test simulate a co-author editing the cell between
+        # the server's cell_get and its cell_set.
+        self.before_cell_set: Any = None
+        # Cell addresses (0-based (table, row, cell)) whose cell_set is
+        # accepted (ok=true, applied=true) but silently does not take -- the
+        # fake's analogue of a write Word dropped, for the server's
+        # independent read-back to catch.
+        self.dropped_cell_writes: set[tuple[int, int, int]] = set()
 
     def sha256(self) -> str:
-        return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+        payload = self.text
+        if self.tables:
+            payload += "\x1f" + json.dumps(self.tables)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _cell(self, payload: dict[str, Any]) -> tuple[int, int, int]:
+        if self.has_nested_table:
+            raise OpRefused(
+                "LIVE_OP_FAILED",
+                "the document contains a nested table; table numbering cannot be mapped reliably, "
+                "so live cell edits are refused",
+            )
+        t, r, c = (int(payload[k]) - 1 for k in ("table_index", "row_index", "cell_index"))
+        if not 0 <= t < len(self.tables):
+            raise OpRefused("LIVE_OP_FAILED", f"no table {t + 1} (the document has {len(self.tables)})")
+        if not 0 <= r < len(self.tables[t]):
+            raise OpRefused("LIVE_OP_FAILED", f"row_index {r + 1} is out of range for table {t + 1}")
+        if not 0 <= c < len(self.tables[t][r]):
+            raise OpRefused("LIVE_OP_FAILED", f"cell_index {c + 1} is out of range for row {r + 1}")
+        return t, r, c
+
+    def cell_get(self, payload: dict[str, Any]) -> dict[str, Any]:
+        t, r, c = self._cell(payload)
+        return {"text": self.tables[t][r][c]}
+
+    def cell_set(self, payload: dict[str, Any]) -> dict[str, Any]:
+        pre = self.sha256()
+        if self.before_cell_set is not None:
+            self.before_cell_set()
+        t, r, c = self._cell(payload)
+        before = self.tables[t][r][c]
+        if before != payload["expected_before_text"]:
+            raise OpRefused(
+                "LIVE_OP_FAILED",
+                "the cell's text changed since it was read (another editor may be working in it); "
+                "nothing was written",
+            )
+        if (t, r, c) not in self.dropped_cell_writes:
+            paragraphs = [
+                "".join("\n" if run.get("hard_break") else run["text"] for run in runs)
+                for runs in payload["paragraphs"]
+            ]
+            self.tables[t][r][c] = "\n".join(paragraphs)
+        return {"applied": True, "before": before, "after": self.tables[t][r][c], "pre": pre, "post": self.sha256()}
 
     def _row_bounds(self, row_anchor: str) -> tuple[int, int]:
         """(start, end) absolute offsets of the ROW_DELIMITER-bounded
@@ -399,7 +459,7 @@ class FakePane:
         # "row_scope"); pass capabilities=[] to simulate an old,
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
-        self.capabilities = ["row_scope"] if capabilities is None else list(capabilities)
+        self.capabilities = ["row_scope", "cell_edit"] if capabilities is None else list(capabilities)
         # Ops named here are received but never answered -- lets a test
         # simulate an unresponsive pane (for LIVE_DISCONNECTED-by-timeout)
         # without needing a full socket-level failure injection.
@@ -518,6 +578,10 @@ class FakePane:
             return doc.comment_reply(payload["comment_id"], payload["text"])
         if op == "comment_resolve":
             return doc.comment_resolve(payload["comment_id"], bool(payload["resolved"]))
+        if op == "cell_get":
+            return doc.cell_get(payload)
+        if op == "cell_set":
+            return doc.cell_set(payload)
         if op == "save":
             return doc.save()
         raise OpRefused("LIVE_OP_FAILED", f"fake pane does not implement op {op!r}")

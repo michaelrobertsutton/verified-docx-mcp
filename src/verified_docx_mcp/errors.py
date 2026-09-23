@@ -44,6 +44,7 @@ class ErrorCode(Enum):
 
     # Lock / consistency window (core/document-backend-protocol.md §4, §9)
     DOCX_LOCKED = "DOCX_LOCKED"  # writes only; reads snapshot instead (WP-02). Also raised by acquire_lock's own layer-4 .jsclaim O_EXCL mutex (WP-10) when this same server has a write to the same file already in flight -- a same-machine case, distinct from (but reported with the same code as) the owner-file (layer 0) case.
+    EXTERNAL_EDITOR_ACTIVE = "EXTERNAL_EDITOR_ACTIVE"  # issue #27: mutations._guard_before_write refused a FILE-MODE write because the package on disk diverged from this server's last recorded write within the observation window (or its write-ledger record is unreadable) -- some other writer, plausibly Office Online co-authoring, changed the file, and its autosave would likely revert this write. Never bypasses REVISION_CONFLICT, DOCX_LOCKED or LIVE_SESSION_ACTIVE; overridable with allow_concurrent_editor=True.
     SNAPSHOT_FAILED = "SNAPSHOT_FAILED"  # read-path snapshot validation exhausted its retries (WP-02)
     SYNC_IN_FLIGHT = "SYNC_IN_FLIGHT"  # reserved: write guard, WP-04/WP-10
     CONFLICT_COPY_DETECTED = "CONFLICT_COPY_DETECTED"  # WP-10's post-write conflict-copy sweep: an EVIDENCE FLAG (evidence["conflict_copy_detected"]=True + the sibling's name), never raised -- the write itself still succeeded and is reported as applied

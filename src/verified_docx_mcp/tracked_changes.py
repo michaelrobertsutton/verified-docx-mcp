@@ -652,11 +652,17 @@ def _run_accept_or_reject(
     *,
     revision_before: str | None,
     force: bool,
+    allow_concurrent_editor: bool,
     tool_name: str,
     apply_one,
 ) -> dict[str, Any]:
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = mutations._guard_before_write(resolved, revision_before)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=False,
+    )
 
     document_root, raw_xml = mutations._load_document(resolved)
     before_proj = projection.project_document_root(document_root)
@@ -682,7 +688,7 @@ def _run_accept_or_reject(
         resolved, {projection.DEFAULT_PART: new_xml_bytes}, post_verify=_post_verify
     )
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     evidence: dict[str, Any] = {
         "applied": True,
         "match_count": len(processed_ids),
@@ -702,18 +708,30 @@ def _run_accept_or_reject(
 
 
 def execute_accept_tracked_changes(
-    path: str, revision_ids: list[str] | None = None, *, revision_before: str | None = None, force: bool = False
+    path: str,
+    revision_ids: list[str] | None = None,
+    *,
+    revision_before: str | None = None,
+    force: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     return _run_accept_or_reject(
         path, revision_ids, revision_before=revision_before, force=force,
+        allow_concurrent_editor=allow_concurrent_editor,
         tool_name="accept_tracked_changes", apply_one=_accept_one,
     )
 
 
 def execute_reject_tracked_changes(
-    path: str, revision_ids: list[str] | None = None, *, revision_before: str | None = None, force: bool = False
+    path: str,
+    revision_ids: list[str] | None = None,
+    *,
+    revision_before: str | None = None,
+    force: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     return _run_accept_or_reject(
         path, revision_ids, revision_before=revision_before, force=force,
+        allow_concurrent_editor=allow_concurrent_editor,
         tool_name="reject_tracked_changes", apply_one=_reject_one,
     )

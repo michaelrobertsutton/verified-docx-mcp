@@ -1016,6 +1016,39 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def compute_package_fingerprint(source: Path | bytes) -> str:
+    """Full sha256 over EVERY zip entry of a .docx (issue #27).
+
+    Distinct from ``compute_revision``: that token is 2x32 bits over
+    word/document.xml plus the comment parts only, which is right for the
+    caller-facing ``revision_before`` handshake but is not a file
+    fingerprint -- a styles/numbering/header/footer/media change leaves it
+    untouched. This one is what the write ledger and the write-window
+    rechecks compare, so "did anyone else change this package" has a
+    defined scope.
+
+    Entries are hashed sorted by name, each framed as (name length, name,
+    data length, decompressed data), so compression level, entry order,
+    and zip timestamps -- which a co-authoring editor's re-save changes
+    freely -- do not matter, but any content change does. A path is read
+    with ONE ``read_bytes()`` and the zip parsed from that buffer, so the
+    hash never mixes two versions of a file that changed mid-read.
+    """
+    import io
+
+    data = source if isinstance(source, bytes) else Path(source).read_bytes()
+    hasher = hashlib.sha256()
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for name in sorted(zf.namelist()):
+            encoded = name.encode("utf-8")
+            payload = zf.read(name)
+            hasher.update(len(encoded).to_bytes(8, "big"))
+            hasher.update(encoded)
+            hasher.update(len(payload).to_bytes(8, "big"))
+            hasher.update(payload)
+    return hasher.hexdigest()
+
+
 def compute_revision(docx_path: Path) -> dict[str, Any]:
     """Revision token for *docx_path*: ``{"token": "<doc8>:<cmt8>",
     "detail": {...}}``.
