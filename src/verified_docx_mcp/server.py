@@ -1421,7 +1421,7 @@ def replace_text(
 def format_text(
     path: str,
     find: str,
-    style: dict[str, bool],
+    style: dict[str, bool | str],
     expected_matches: int,
     revision_before: str | None = None,
     force: bool = False,

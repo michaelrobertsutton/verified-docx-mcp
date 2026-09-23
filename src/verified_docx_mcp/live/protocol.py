@@ -69,16 +69,26 @@ pane must honor.
                      before and after the whole op).
 
   format          -- ``FormatPayload`` (find, expected_matches, bold,
-                     italic, underline, track_changes). Same
-                     search-and-count-gate as replace; on a match, Word
-                     calls: ``range.font.bold``/``.italic``/``.underline``
-                     assignment for whichever of the three are not
-                     ``None``, under the same optional
-                     ``changeTrackingMode`` toggle. Reply result: same
-                     shape as ``ReplaceResult`` (before/after are the
-                     matched text, unchanged by a format-only op, so the
-                     evidence is the pre/post body hash plus
-                     match_count).
+                     italic, underline, strike, color, track_changes).
+                     Same search-and-count-gate as replace; on a match,
+                     Word calls: ``range.font.bold``/``.italic``/
+                     ``.underline``/``.strikeThrough`` assignment for
+                     whichever of the four are not ``None``, and
+                     ``range.font.color = "#RRGGBB"`` when ``color`` is
+                     given, under the same optional ``changeTrackingMode``
+                     toggle. After ``context.sync()``, the pane RE-LOADS
+                     ``range.font.color``/``.strikeThrough`` per match and
+                     includes the read-back values in the reply
+                     (``colorAfter``/``strikeAfter`` on each match) --
+                     issue #22: a caller checks these against what it
+                     asked for, rather than trusting an echo of the
+                     request, so a write that silently didn't take (a
+                     protected range, a stale object reference) is
+                     detectable. Reply result: same shape as
+                     ``ReplaceResult`` (before/after are the matched text,
+                     unchanged by a format-only op, so the evidence is
+                     the pre/post body hash plus match_count) plus the
+                     two read-back fields above on each match.
 
   comments_list   -- no payload. Word calls: ``body.getComments()``,
                      ``comment.load(["id","content","authorName",
@@ -440,6 +450,8 @@ class FormatPayload:
     bold: bool | None = None
     italic: bool | None = None
     underline: bool | None = None
+    strike: bool | None = None
+    color: str | None = None
     track_changes: bool = False
     expected_body_sha256: str | None = None
 
@@ -450,6 +462,8 @@ class FormatPayload:
             "bold": self.bold,
             "italic": self.italic,
             "underline": self.underline,
+            "strike": self.strike,
+            "color": self.color,
             "track_changes": self.track_changes,
         }
         if self.expected_body_sha256 is not None:
@@ -467,14 +481,18 @@ class FormatPayload:
         bold = _optional(obj, "bold", bool, default=None)
         italic = _optional(obj, "italic", bool, default=None)
         underline = _optional(obj, "underline", bool, default=None)
-        if bold is None and italic is None and underline is None:
-            raise ProtocolError("at least one of bold/italic/underline must be set")
+        strike = _optional(obj, "strike", bool, default=None)
+        color = _optional(obj, "color", str, default=None)
+        if bold is None and italic is None and underline is None and strike is None and color is None:
+            raise ProtocolError("at least one of bold/italic/underline/strike/color must be set")
         return cls(
             find=find,
             expected_matches=expected_matches,
             bold=bold,
             italic=italic,
             underline=underline,
+            strike=strike,
+            color=color,
             track_changes=_optional(obj, "track_changes", bool, default=False),
             expected_body_sha256=_optional(obj, "expectedBodySha256", str, default=None),
         )

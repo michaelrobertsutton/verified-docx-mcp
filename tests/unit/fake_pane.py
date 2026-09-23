@@ -18,12 +18,19 @@ editing engine):
     the real pane's `document.changeTrackingMode` assignment) but does
     not synthesize `w:ins`/`w:del`-equivalent revision marks -- there is
     no OOXML here at all, just a Python string.
-  - `format`'s bold/italic/underline payload fields are accepted and
-    validated but not stored against a run model (this fake has no
-    run/style model); the op still enforces the same
+  - `format`'s bold/italic/underline/strike/color payload fields are
+    accepted and validated but not stored against a run model (this fake
+    has no run/style model); the op still enforces the same
     search-and-count-gate and returns the same result shape
     (`ReplaceResult`-shaped: applied, match_count, matches, pre, post)
-    the real pane does.
+    the real pane does. `colorAfter`/`strikeAfter` (issue #22: the real
+    pane's read-back-after-sync fields, so a caller can tell a write that
+    didn't take from one that did) are present on every match for shape
+    parity, but this fake ECHOES the request rather than reading anything
+    back -- it cannot prove the real Office JS `font.color`/
+    `.strikeThrough` read-back path works, only that the server correctly
+    checks whatever the pane sends. A real pane sideload (docs/live-mode.md)
+    is the only thing that exercises the actual Word object-model path.
   - A comment's `anchor_text` is captured once, at `comment_add` time,
     rather than tracked live against a `Word.Range` that could shift as
     later edits land -- good enough for the WP-2 fixture scenarios, which
@@ -207,6 +214,8 @@ class FakeDocument:
         bold: bool | None = None,
         italic: bool | None = None,
         underline: bool | None = None,
+        strike: bool | None = None,
+        color: str | None = None,
         track_changes: bool = False,
     ) -> dict[str, Any]:
         pre = self.sha256()
@@ -223,7 +232,17 @@ class FakeDocument:
             # Formatting never changes body text in this fake (no run
             # model to mutate) -- see the module docstring's fidelity
             # notes. before == after == the matched text itself.
-            matches_result = [{"before": find, "after": find} for _ in positions]
+            # issue #22: colorAfter/strikeAfter mirror the real pane's
+            # read-back contract in SHAPE (present on every match), but
+            # this fake has no run/style model to read back from -- it
+            # echoes the request, same limitation the module docstring
+            # already names for bold/italic/underline. A test that needs
+            # to prove the real Office JS read-back path (not just that
+            # the server checks whatever the pane sends) uses a real pane
+            # sideload instead -- see docs/live-mode.md.
+            matches_result = [
+                {"before": find, "after": find, "colorAfter": color, "strikeAfter": strike} for _ in positions
+            ]
         finally:
             self.change_tracking_mode = previous_mode
         return {
@@ -419,6 +438,8 @@ class FakePane:
                 bold=payload.get("bold"),
                 italic=payload.get("italic"),
                 underline=payload.get("underline"),
+                strike=payload.get("strike"),
+                color=payload.get("color"),
                 track_changes=bool(payload.get("track_changes", False)),
             )
         if op == "comments_list":

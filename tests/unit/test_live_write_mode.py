@@ -487,6 +487,70 @@ class FormatTextLiveTests(LiveWriteBridgeTestCase):
         self.assertEqual(evidence["revision_before"], evidence["revision_after"])
         self.assertEqual(doc.text, "alpha beta")
 
+    async def test_color_and_strike_happy_path(self) -> None:
+        # Issue #22: live format_text used to silently drop strike, and
+        # had no color key at all.
+        doc = FakeDocument(text="alpha beta")
+        await self.connect_pane(doc)
+
+        evidence = await asyncio.to_thread(
+            text_edit.execute_format_text,
+            str(self.target),
+            "beta",
+            {"strike": True, "color": "3B3838"},
+            1,
+            write_mode="live",
+        )
+        self.assertTrue(evidence["applied"])
+        self.assertEqual(evidence["write_mode"], "live")
+
+    async def test_color_mismatch_after_sync_raises_verification_failed(self) -> None:
+        # The pane's read-back (colorAfter) is what gets checked, not an
+        # echo of the request -- simulate a pane whose write silently
+        # didn't take by overriding FakeDocument.format's own echo.
+        class _StaleColorDocument(FakeDocument):
+            def format(self, *args, **kwargs):
+                result = super().format(*args, **kwargs)
+                for m in result["matches"]:
+                    m["colorAfter"] = "000000"
+                return result
+
+        doc = _StaleColorDocument(text="alpha beta")
+        await self.connect_pane(doc)
+
+        with self.assertRaises(VerifyError) as cm:
+            await asyncio.to_thread(
+                text_edit.execute_format_text,
+                str(self.target),
+                "beta",
+                {"color": "3B3838"},
+                1,
+                write_mode="live",
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.VERIFICATION_FAILED)
+
+    async def test_strike_mismatch_after_sync_raises_verification_failed(self) -> None:
+        class _StaleStrikeDocument(FakeDocument):
+            def format(self, *args, **kwargs):
+                result = super().format(*args, **kwargs)
+                for m in result["matches"]:
+                    m["strikeAfter"] = False
+                return result
+
+        doc = _StaleStrikeDocument(text="alpha beta")
+        await self.connect_pane(doc)
+
+        with self.assertRaises(VerifyError) as cm:
+            await asyncio.to_thread(
+                text_edit.execute_format_text,
+                str(self.target),
+                "beta",
+                {"strike": True},
+                1,
+                write_mode="live",
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.VERIFICATION_FAILED)
+
 
 class LiveSaveTests(LiveWriteBridgeTestCase):
     async def test_returns_both_revisions(self) -> None:

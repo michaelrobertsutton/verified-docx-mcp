@@ -212,6 +212,20 @@ class FormatPayloadTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             FormatPayload.from_json({"find": "a", "expected_matches": 0, "bold": True})
 
+    def test_strike_only_round_trips(self):
+        # Issue #22: live format_text used to silently drop strike -- it
+        # must round-trip on its own, without bold/italic/underline/color.
+        payload = FormatPayload(find="alpha", expected_matches=1, strike=True)
+        self.assertEqual(FormatPayload.from_json(payload.to_json()), payload)
+
+    def test_color_only_round_trips(self):
+        payload = FormatPayload(find="alpha", expected_matches=1, color="3B3838")
+        self.assertEqual(FormatPayload.from_json(payload.to_json()), payload)
+
+    def test_color_alone_satisfies_the_at_least_one_requirement(self):
+        parsed = FormatPayload.from_json({"find": "a", "expected_matches": 1, "color": "3B3838"})
+        self.assertEqual(parsed.color, "3B3838")
+
 
 class ReplaceMatchResultTests(unittest.TestCase):
     def test_from_json(self):

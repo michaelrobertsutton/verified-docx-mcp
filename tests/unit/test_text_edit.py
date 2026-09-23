@@ -203,6 +203,93 @@ class FormatTextTests(_TempFixtureCase):
         self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
 
 
+class FormatTextColorTests(_TempFixtureCase):
+    """Issue #22: format_text's color key (file mode)."""
+
+    def _rpr_snippet(self) -> str:
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        idx = xml.find("brown")
+        return xml[max(0, idx - 250) : idx]
+
+    def test_sets_color_normalized_uppercase_with_leading_hash_accepted(self):
+        evidence = text_edit.execute_format_text(str(self.target), "brown", {"color": "#3b3838"}, 1)
+        self.assertEqual(evidence["runs_after"][0][0]["color"], "3B3838")
+        self.assertIn('<w:color w:val="3B3838"', self._rpr_snippet())
+
+    def test_bad_hex_color_rejected(self):
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_format_text(str(self.target), "brown", {"color": "not-a-color"}, 1)
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    def test_noop_when_color_already_matches(self):
+        text_edit.execute_format_text(str(self.target), "brown", {"color": "3B3838"}, 1)
+        evidence = text_edit.execute_format_text(str(self.target), "brown", {"color": "3B3838"}, 1)
+        self.assertEqual(evidence["revision_before"], evidence["revision_after"])
+
+    def test_color_insertion_respects_schema_order_against_unlisted_trailing_children(self):
+        # Hand-inject w:sz/w:lang (not in ANY narrow allowlist) after the
+        # existing w:b on "brown"'s rPr -- format_text's new w:i/w:color
+        # must land BEFORE them, matching CT_RPrBase's fixed order, not
+        # wherever a blind append would put them.
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        xml2 = xml.replace(
+            "<w:rPr><w:b/></w:rPr>",
+            '<w:rPr><w:b/><w:sz w:val="28"/><w:lang w:val="en-US"/></w:rPr>',
+            1,
+        )
+        self.assertNotEqual(xml, xml2, "fixture's rPr shape changed -- update this test's replace target")
+        with zipfile.ZipFile(self.target) as zin:
+            names = zin.namelist()
+            datas = {n: (xml2.encode("utf-8") if n == "word/document.xml" else zin.read(n)) for n in names}
+        os.remove(self.target)
+        with zipfile.ZipFile(self.target, "w", zipfile.ZIP_DEFLATED) as zout:
+            for n in names:
+                zout.writestr(n, datas[n])
+
+        text_edit.execute_format_text(str(self.target), "brown", {"italic": True, "color": "3B3838"}, 1)
+        snippet = self._rpr_snippet()
+        self.assertIn('<w:b /><w:i /><w:color w:val="3B3838" /><w:sz w:val="28" /><w:lang w:val="en-US" />', snippet)
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
+
+    def test_explicit_color_clears_theme_attributes(self):
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        xml2 = xml.replace(
+            "<w:rPr><w:b/></w:rPr>",
+            '<w:rPr><w:b/><w:color w:val="1F4E79" w:themeColor="accent1" w:themeShade="BF"/></w:rPr>',
+            1,
+        )
+        self.assertNotEqual(xml, xml2)
+        with zipfile.ZipFile(self.target) as zin:
+            names = zin.namelist()
+            datas = {n: (xml2.encode("utf-8") if n == "word/document.xml" else zin.read(n)) for n in names}
+        os.remove(self.target)
+        with zipfile.ZipFile(self.target, "w", zipfile.ZIP_DEFLATED) as zout:
+            for n in names:
+                zout.writestr(n, datas[n])
+
+        text_edit.execute_format_text(str(self.target), "brown", {"color": "3B3838"}, 1)
+        snippet = self._rpr_snippet()
+        self.assertIn('<w:color w:val="3B3838" />', snippet)
+        self.assertNotIn("themeColor", snippet)
+        self.assertNotIn("themeShade", snippet)
+
+    def test_tracked_color_change_produces_rprchange_and_no_double_nesting_on_repeat(self):
+        with mock.patch("verified_docx_mcp.text_edit.resolve_author_name", return_value="Jane Reviewer"):
+            first = text_edit.execute_format_text(str(self.target), "brown", {"color": "3B3838"}, 1, track_changes=True)
+            second = text_edit.execute_format_text(str(self.target), "brown", {"color": "FF0000"}, 1, track_changes=True)
+        self.assertEqual(len(first["revision_ids"]), 1)
+        self.assertEqual(second["revision_ids"], [])  # same author, same run -- reused, not stacked
+        snippet = self._rpr_snippet()
+        self.assertEqual(snippet.count("<w:rPrChange "), 1)
+        self.assertIn('<w:color w:val="FF0000" />', snippet)
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
+
+
 class WarningsSurfaceOnEvidenceTests(_TempFixtureCase):
     fixture_name = "revision/commented.docx"
 

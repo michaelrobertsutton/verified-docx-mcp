@@ -172,17 +172,26 @@ def _bool_toggle(pr_elem: Any | None, tag: str) -> bool:
 
 def _run_properties(rpr_elem: Any | None) -> dict[str, Any]:
     if rpr_elem is None:
-        return {"bold": False, "italic": False, "underline": None, "strike": False}
+        return {"bold": False, "italic": False, "underline": None, "strike": False, "color": None}
     underline = None
+    color = None
     for child in rpr_elem:
         if _ln(child) == "u":
             underline = _attr(child, "val") or "single"
-            break
+        elif _ln(child) == "color":
+            # issue #22: a themeColor-only w:color (val="auto" or absent,
+            # theme attributes present) has no explicit RGB to report --
+            # left as None rather than "auto", since "auto" is not a
+            # settable hex value format_text's own color key accepts.
+            val = _attr(child, "val")
+            if val and val.lower() != "auto":
+                color = val.upper()
     return {
         "bold": _bool_toggle(rpr_elem, "b"),
         "italic": _bool_toggle(rpr_elem, "i"),
         "underline": underline,
         "strike": _bool_toggle(rpr_elem, "strike"),
+        "color": color,
     }
 
 

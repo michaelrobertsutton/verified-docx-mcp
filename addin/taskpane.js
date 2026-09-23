@@ -494,6 +494,12 @@ async function opSearch(payload) {
 
 // -- replace / format ---------------------------------------------------
 
+// issue #22 (Codex review): both ops toggle changeTrackingMode for the
+// duration of the mutation and must restore it afterward even if the
+// mutation's own context.sync() throws -- a plain sequential restore (the
+// pre-issue-#22 shape) left the document stuck on trackAll on that path.
+// Both now restore in a finally block.
+
 async function opReplace(payload) {
   const expectedMatches = payload.expected_matches;
   return Word.run(async (context) => {
@@ -521,12 +527,14 @@ async function opReplace(payload) {
     }
 
     const matches = results.items.map((range) => ({ before: range.text, after: payload.replace }));
-    results.items.forEach((range) => range.insertText(payload.replace, Word.InsertLocation.replace));
-    await context.sync();
-
-    if (previousMode !== null) {
-      context.document.changeTrackingMode = previousMode;
+    try {
+      results.items.forEach((range) => range.insertText(payload.replace, Word.InsertLocation.replace));
       await context.sync();
+    } finally {
+      if (previousMode !== null) {
+        context.document.changeTrackingMode = previousMode;
+        await context.sync();
+      }
     }
 
     const postBody = context.document.body;
@@ -565,19 +573,37 @@ async function opFormat(payload) {
     }
 
     const matches = results.items.map((range) => ({ before: range.text, after: range.text }));
-    results.items.forEach((range) => {
-      if (payload.bold !== null && payload.bold !== undefined) range.font.bold = payload.bold;
-      if (payload.italic !== null && payload.italic !== undefined) range.font.italic = payload.italic;
-      if (payload.underline !== null && payload.underline !== undefined) {
-        range.font.underline = payload.underline ? Word.UnderlineType.single : Word.UnderlineType.none;
-      }
-    });
-    await context.sync();
-
-    if (previousMode !== null) {
-      context.document.changeTrackingMode = previousMode;
+    try {
+      results.items.forEach((range) => {
+        if (payload.bold !== null && payload.bold !== undefined) range.font.bold = payload.bold;
+        if (payload.italic !== null && payload.italic !== undefined) range.font.italic = payload.italic;
+        if (payload.underline !== null && payload.underline !== undefined) {
+          range.font.underline = payload.underline ? Word.UnderlineType.single : Word.UnderlineType.none;
+        }
+        // issue #22: strike/color, the two format_text gained for the
+        // proposal-lead incident (marking edits in a font color; strike
+        // was silently dropped in live mode before this).
+        if (payload.strike !== null && payload.strike !== undefined) range.font.strikeThrough = payload.strike;
+        if (payload.color !== null && payload.color !== undefined) range.font.color = payload.color;
+      });
       await context.sync();
+    } finally {
+      if (previousMode !== null) {
+        context.document.changeTrackingMode = previousMode;
+        await context.sync();
+      }
     }
+
+    // issue #22: re-load font.color/strikeThrough per match AFTER sync,
+    // rather than echoing the request back -- lets the server detect a
+    // write that didn't actually take (a protected range, a stale
+    // object reference) instead of trusting an unconfirmed "applied".
+    results.items.forEach((range) => range.font.load(["color", "strikeThrough"]));
+    await context.sync();
+    results.items.forEach((range, i) => {
+      matches[i].colorAfter = range.font.color;
+      matches[i].strikeAfter = range.font.strikeThrough;
+    });
 
     const postBody = context.document.body;
     postBody.load("text");

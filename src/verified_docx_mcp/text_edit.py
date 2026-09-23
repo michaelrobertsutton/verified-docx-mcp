@@ -72,11 +72,12 @@ over the same span before any accept/reject in between.
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from . import audit, mutations, paths, projection, tracked_changes
+from . import audit, mutations, paths, projection, tables, tracked_changes
 from .author import resolve_author_name
 from .errors import ErrorCode, _make_error
 from .live import write_mode as live_write_mode
@@ -95,20 +96,50 @@ def _w(name: str) -> str:
 # Style allowlist (format_text) -- our own rPr model carries strike in
 # addition to Google's bold/italic/underline (projection._run_properties
 # already reads/writes all four), so this server's format_text supports one
-# more field than the Google original.
+# more field than the Google original. Issue #22 adds "color" (a 6-hex
+# string, not a bool) -- the proposal-lead incident that opened that issue
+# had no way to mark inserted text in a font color.
 # ---------------------------------------------------------------------------
 
-_STYLE_ALLOWLIST = ("bold", "italic", "underline", "strike")
+_STYLE_ALLOWLIST = ("bold", "italic", "underline", "strike", "color")
+_BOOL_STYLE_KEYS = ("bold", "italic", "underline", "strike")
 _BOOL_TOGGLE_TAGS = {"bold": "b", "italic": "i", "strike": "strike"}
 
 _EXCERPT_RADIUS = 200
 
+_HEX_COLOR_RE = re.compile(r"^#?([0-9A-Fa-f]{6})$")
 
-def _validate_style(style: Any) -> dict[str, bool]:
+# Full CT_RPrBase child order (ECMA-376 5th ed. Part 1 §17.3.2.1), scoped
+# to THIS module rather than reusing tables._RPR_CHILD_ORDER -- that list
+# was built only for insert_table's cells, which are always FRESHLY BUILT
+# runs that never carry a child outside its own narrow subset (rStyle/b/
+# bCs/i/iCs/color). format_text/apply_style operate on ARBITRARY
+# Word-authored runs, which routinely carry w:rFonts/w:sz/w:lang/etc. that
+# tables.py's own list has never had to account for -- reusing it as-is
+# here would silently misplace a new w:b/w:color relative to those
+# unlisted siblings (verified: this is exactly the ordering bug a plain
+# `ET.SubElement(rpr, tag)` append, THIS module's own pre-issue-#22 code,
+# already had for any run whose rPr carried a trailing child -- just never
+# exercised, since no caller combined color/sz with a boolean toggle
+# before now). w:rPrChange is pinned LAST -- it must always stay rPr's
+# final child (tracked_changes.apply_rpr_change appends to it directly,
+# never through this ordered-insert path, but a NEW toggle/color on a run
+# that already carries one must still land BEFORE it, never after).
+_RPR_CHILD_ORDER = [
+    "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike",
+    "outline", "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden",
+    "color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight", "u", "effect",
+    "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout",
+    "specVanish", "oMath", "rPrChange",
+]
+
+
+def _validate_style(style: Any) -> dict[str, bool | str]:
     if not isinstance(style, dict):
         raise _make_error(
             ErrorCode.INVALID_INPUT,
-            "style must be an object mapping bold/italic/underline/strike to true/false",
+            "style must be an object mapping bold/italic/underline/strike (true/false) and/or "
+            "color (a 6-hex-digit string) to a value",
             {"style": repr(style)},
         )
     if not style:
@@ -120,14 +151,25 @@ def _validate_style(style: Any) -> dict[str, bool]:
             f"unknown style key(s): {unknown}; allowed: {list(_STYLE_ALLOWLIST)}",
             {"unknown_keys": unknown},
         )
-    non_bool = {k: repr(v) for k, v in style.items() if type(v) is not bool}
+    non_bool = {k: repr(v) for k in _BOOL_STYLE_KEYS if k in style for v in [style[k]] if type(v) is not bool}
     if non_bool:
         raise _make_error(
             ErrorCode.INVALID_INPUT,
             f"style values must be true/false booleans, got: {non_bool}",
             {"invalid_values": non_bool},
         )
-    return style
+    result: dict[str, bool | str] = dict(style)
+    if "color" in result:
+        raw = result["color"]
+        match = _HEX_COLOR_RE.match(raw) if isinstance(raw, str) else None
+        if match is None:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f'style["color"] must be a 6-hex-digit color string (e.g. "3B3838" or "#3B3838"), got {raw!r}',
+                {"color": raw},
+            )
+        result["color"] = match.group(1).upper()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +203,7 @@ def _run_dict(event: RunEvent, clip_start: int, clip_end: int, node_start: int) 
         "italic": bool(event.rpr.get("italic", False)),
         "underline": bool(event.rpr.get("underline")),
         "strike": bool(event.rpr.get("strike", False)),
+        "color": event.rpr.get("color"),
     }
 
 
@@ -177,7 +220,7 @@ def _collect_style_runs(proj: projection.Projection, spans: list[tuple[int, int]
     return result
 
 
-def _style_matches(runs_before: list[list[dict[str, Any]]], style: dict[str, bool]) -> bool:
+def _style_matches(runs_before: list[list[dict[str, Any]]], style: dict[str, bool | str]) -> bool:
     return all(
         run.get(field) == value
         for span_runs in runs_before
@@ -240,7 +283,14 @@ def _index_of(parent: Any, elem: Any) -> int | None:
     return None
 
 
-def _toggle_style(r_elem: Any, style: dict[str, bool]) -> None:
+def _toggle_style(r_elem: Any, style: dict[str, bool | str]) -> None:
+    """Apply every field in *style* to r_elem's own w:rPr (creating one if
+    absent). Issue #22: every insertion now goes through
+    tables._insert_ordered against this module's own full _RPR_CHILD_ORDER
+    (see that list's own comment) -- fixes a latent ordering bug this
+    function already had for b/i/strike/u against a run whose rPr carries
+    a trailing child outside the four booleans (e.g. sz, or now color),
+    not just a new bug color would have introduced on its own."""
     rpr = None
     for child in r_elem:
         if projection._ln(child) == "rPr":
@@ -251,6 +301,29 @@ def _toggle_style(r_elem: Any, style: dict[str, bool]) -> None:
         r_elem.insert(0, rpr)
 
     for field, value in style.items():
+        if field == "color":
+            existing = None
+            for child in rpr:
+                if projection._ln(child) == "color":
+                    existing = child
+                    break
+            if existing is None:
+                existing = ET.Element(_w("color"))
+                tables._insert_ordered(rpr, existing, _RPR_CHILD_ORDER)
+            existing.set(_w("val"), value)
+            # Issue #22 (Codex review): a themeColor-based color takes
+            # visual precedence over w:val in Word's own rendering -- an
+            # explicit RGB set here without clearing the theme attributes
+            # would silently keep displaying the OLD theme color, making
+            # this write look applied (val is correct) while Word shows
+            # something else. Clear all three whenever an explicit val is
+            # set.
+            for theme_attr in ("themeColor", "themeTint", "themeShade"):
+                attr_name = _w(theme_attr)
+                if attr_name in existing.attrib:
+                    del existing.attrib[attr_name]
+            continue
+
         if field == "underline":
             existing = None
             for child in rpr:
@@ -259,7 +332,8 @@ def _toggle_style(r_elem: Any, style: dict[str, bool]) -> None:
                     break
             if value:
                 if existing is None:
-                    ET.SubElement(rpr, _w("u"), {_w("val"): "single"})
+                    new_u = ET.Element(_w("u"), {_w("val"): "single"})
+                    tables._insert_ordered(rpr, new_u, _RPR_CHILD_ORDER)
                 else:
                     existing.set(_w("val"), "single")
             elif existing is not None:
@@ -274,7 +348,8 @@ def _toggle_style(r_elem: Any, style: dict[str, bool]) -> None:
                 break
         if value:
             if existing is None:
-                ET.SubElement(rpr, _w(tag))
+                new_child = ET.Element(_w(tag))
+                tables._insert_ordered(rpr, new_child, _RPR_CHILD_ORDER)
             else:
                 for key in list(existing.attrib):
                     del existing.attrib[key]
@@ -282,7 +357,7 @@ def _toggle_style(r_elem: Any, style: dict[str, bool]) -> None:
             rpr.remove(existing)
 
 
-def _apply_style_to_run(r_elem: Any, style: dict[str, bool], *, track: _TrackContext | None) -> None:
+def _apply_style_to_run(r_elem: Any, style: dict[str, bool | str], *, track: _TrackContext | None) -> None:
     """_toggle_style, plus (when tracking) recording the PRE-change rPr in
     a w:rPrChange (issue #28 plan WP-07b-a: "formatting changes use
     w:rPrChange"). The snapshot is taken BEFORE _toggle_style mutates
@@ -450,7 +525,7 @@ def _remove_if_present(parent: Any, elem: Any) -> None:
 def _apply_format_span(
     start: int,
     end: int,
-    style: dict[str, bool],
+    style: dict[str, bool | str],
     atoms: list[tuple[int, int, RunEvent]],
     *,
     track: _TrackContext | None = None,
@@ -873,7 +948,7 @@ def execute_replace_text(
 def execute_format_text_live(
     path: str,
     find: str,
-    style: dict[str, bool],
+    style: dict[str, bool | str],
     expected_matches: int,
     *,
     revision_before: str | None = None,
@@ -895,6 +970,15 @@ def execute_format_text_live(
     still equals its own ``before`` text (format changes styling, never
     content -- a match whose text changed anyway is a real verification
     failure, not a false alarm).
+
+    Issue #22: ``style`` may also carry ``strike``/``color`` (a 6-hex
+    string). The pane's reply carries a read-back ``colorAfter``/
+    ``strikeAfter`` per match (the pane's own ``font.color``/
+    ``.strikeThrough`` re-loaded AFTER ``context.sync()``, not an echo of
+    the request) -- when either was requested, this function checks the
+    read-back value against what was asked for, so a write that silently
+    didn't take on the real Word object model is a verification failure,
+    not a false "applied: true".
     """
     style = _validate_style(style)
     if not find:
@@ -914,6 +998,8 @@ def execute_format_text_live(
         "bold": style.get("bold"),
         "italic": style.get("italic"),
         "underline": style.get("underline"),
+        "strike": style.get("strike"),
+        "color": style.get("color"),
         "track_changes": track_changes,
     }
     try:
@@ -950,6 +1036,26 @@ def execute_format_text_live(
                 "roll back in live mode -- Word, not this server, owns the document.",
                 {"matches": matches},
             )
+        requested_color = style.get("color")
+        if requested_color is not None and (m.get("colorAfter") or "").upper() != requested_color:
+            raise _make_error(
+                ErrorCode.VERIFICATION_FAILED,
+                "live format did not verify: the pane's read-back font.color "
+                f"({m.get('colorAfter')!r}) does not equal the requested color "
+                f"({requested_color!r}) after context.sync(). Nothing to roll back in live mode "
+                "-- Word, not this server, owns the document.",
+                {"matches": matches, "requested_color": requested_color},
+            )
+        requested_strike = style.get("strike")
+        if requested_strike is not None and bool(m.get("strikeAfter")) != bool(requested_strike):
+            raise _make_error(
+                ErrorCode.VERIFICATION_FAILED,
+                "live format did not verify: the pane's read-back font.strikeThrough "
+                f"({m.get('strikeAfter')!r}) does not equal the requested strike "
+                f"({requested_strike!r}) after context.sync(). Nothing to roll back in live mode "
+                "-- Word, not this server, owns the document.",
+                {"matches": matches, "requested_strike": requested_strike},
+            )
 
     before_text = "\n".join(m.get("before", "") for m in matches)
     after_text = "\n".join(m.get("after", "") for m in matches)
@@ -976,7 +1082,7 @@ def execute_format_text_live(
 def execute_format_text(
     path: str,
     find: str,
-    style: dict[str, bool],
+    style: dict[str, bool | str],
     expected_matches: int,
     *,
     revision_before: str | None = None,
