@@ -295,17 +295,37 @@ def _collect_ins_del(root: Any) -> list[tuple[Any, Any, str, str]]:
 # ---------------------------------------------------------------------------
 
 
+def _collect_change_record_ids(root: Any) -> list[str]:
+    """Every w:id on a w:rPrChange/w:pPrChange anywhere in *root*, any
+    nesting depth. These nest inside w:rPr/w:pPr, never as a direct
+    parent/child pair _collect_ins_del's ins/del-only walk would ever
+    visit, so RevisionIdAllocator needs a separate scan to see them --
+    issue #7: without this, a fresh id could collide with an existing
+    rPrChange/pPrChange id on a Word-authored fixture that mixes ins/del
+    with formatting-change revisions."""
+    ids: list[str] = []
+    for node in root.iter():
+        if projection._ln(node) in ("rPrChange", "pPrChange"):
+            rid = projection._attr(node, "id")
+            if rid:
+                ids.append(rid)
+    return ids
+
+
 class RevisionIdAllocator:
-    """Hands out w:id values for new w:ins/w:del/w:rPrChange elements,
-    each guaranteed above every id already in *document_root* (issue #28
-    plan WP-07b-a: "w:id values allocated above the package maximum") and
-    never repeated within one guarded call, without re-scanning the tree
-    per id."""
+    """Hands out w:id values for new w:ins/w:del/w:rPrChange/w:pPrChange
+    elements, each guaranteed above every id already in *document_root*
+    (issue #28 plan WP-07b-a: "w:id values allocated above the package
+    maximum") and never repeated within one guarded call, without
+    re-scanning the tree per id."""
 
     def __init__(self, document_root: Any) -> None:
         body = mutations._find_body(document_root)
         self._next = 1
         for _parent, _elem, _kind, rid in _collect_ins_del(body):
+            if rid.isdigit():
+                self._next = max(self._next, int(rid) + 1)
+        for rid in _collect_change_record_ids(body):
             if rid.isdigit():
                 self._next = max(self._next, int(rid) + 1)
 
@@ -397,6 +417,41 @@ def convert_t_to_deltext(r_elem: Any) -> None:
             node.tag = _w("delText")
 
 
+def _remove_change_record(prop_elem: Any, tag: str) -> None:
+    """Remove *prop_elem*'s existing w:rPrChange/w:pPrChange child (*tag*),
+    if any. CT_RPr/CT_PPr allow at most ONE change record -- it is not a
+    repeatable element -- so apply_rpr_change/apply_ppr_change call this
+    on the LIVE element before appending a new one, making both functions
+    safe regardless of what a caller passes: a second tracked edit on the
+    same run/paragraph before any accept/reject (own author or, with
+    force=True, someone else's) replaces the existing record rather than
+    stacking a second, invalid one next to it."""
+    for child in list(prop_elem):
+        if projection._ln(child) == tag:
+            prop_elem.remove(child)
+
+
+def existing_change_author(prop_elem: Any | None, tag: str) -> str | None:
+    """The w:author of *prop_elem*'s existing w:rPrChange/w:pPrChange
+    child (*tag*), or None if *prop_elem* is None or has no such child.
+    Issue #7: lets a caller detect a PENDING formatting/paragraph-style
+    change before writing another one -- Word's own model does not
+    itself protect a foreign author's pending change here (verified,
+    tests/fixtures/revision/pstyle-tracked-foreign.docx: a second Word
+    session under a different user name silently updates the live
+    property and leaves the FIRST author's pPrChange completely
+    untouched -- same id/date/snapshot), so this repo's own guard
+    (text_edit.py's _check_foreign_rpr_change/_check_foreign_ppr_change)
+    is a deliberate safety policy stricter than Word's own UI, not an
+    emulation of a rule Word itself enforces."""
+    if prop_elem is None:
+        return None
+    for child in prop_elem:
+        if projection._ln(child) == tag:
+            return projection._attr(child, "author")
+    return None
+
+
 def apply_rpr_change(rpr_elem: Any, *, old_rpr_elem: Any | None, rid: str, author: str, date: str) -> None:
     """Append <w:rPrChange id author date><w:rPr>...</w:rPr></w:rPrChange>
     to *rpr_elem*, recording the run's PRE-change formatting (issue #28
@@ -404,16 +459,51 @@ def apply_rpr_change(rpr_elem: Any, *, old_rpr_elem: Any | None, rid: str, autho
     must be a snapshot the caller took BEFORE applying the new style (a
     deep copy, or None if the run previously had no w:rPr at all, in which
     case the previous state was "no explicit properties" and an empty
-    <w:rPr/> is recorded) -- this function does not itself snapshot
-    anything; it only records what it is given.
+    <w:rPr/> is recorded) -- this function does not itself snapshot the
+    LIVE rPr; it only records what it is given.
+
+    Issue #7 fix: any EXISTING w:rPrChange on *rpr_elem* is removed first
+    (CT_RPr allows at most one -- never stacked, never nested), and any
+    w:rPrChange nested inside *old_rpr_elem*'s own snapshot is stripped
+    before it is embedded (CT_RPrChange's inner w:rPr is a plain
+    formatting snapshot, never another change record). Without this, a
+    second track_changes=True call on the same run before any accept/
+    reject produced invalid, doubly-nested XML -- a pre-existing defect
+    this function now closes for every caller, not just the new
+    paragraph-style path.
     """
+    import copy
+
+    _remove_change_record(rpr_elem, "rPrChange")
     change = ET.SubElement(rpr_elem, _w("rPrChange"), {_w("id"): rid, _w("author"): author, _w("date"): date})
     if old_rpr_elem is not None:
-        import copy
-
-        change.append(copy.deepcopy(old_rpr_elem))
+        snapshot = copy.deepcopy(old_rpr_elem)
+        _remove_change_record(snapshot, "rPrChange")
+        change.append(snapshot)
     else:
         ET.SubElement(change, _w("rPr"))
+
+
+def apply_ppr_change(ppr_elem: Any, *, old_ppr_elem: Any | None, rid: str, author: str, date: str) -> None:
+    """Append <w:pPrChange id author date><w:pPr>...</w:pPr></w:pPrChange>
+    to *ppr_elem* -- the paragraph-formatting analogue of apply_rpr_change
+    (issue #7). Placement, shape, and the empty-<w:pPr/> convention for
+    "no properties existed before" are all taken directly from a real
+    Word-authored fixture (tests/fixtures/revision/pstyle-tracked.docx:
+    Track Changes on, one paragraph style change, saved), not guessed --
+    w:pPrChange lands as pPr's LAST child, right after w:pStyle. Same
+    remove-existing/strip-nested safety as apply_rpr_change.
+    """
+    import copy
+
+    _remove_change_record(ppr_elem, "pPrChange")
+    change = ET.SubElement(ppr_elem, _w("pPrChange"), {_w("id"): rid, _w("author"): author, _w("date"): date})
+    if old_ppr_elem is not None:
+        snapshot = copy.deepcopy(old_ppr_elem)
+        _remove_change_record(snapshot, "pPrChange")
+        change.append(snapshot)
+    else:
+        ET.SubElement(change, _w("pPr"))
 
 
 def foreign_crosses_revision(proj: projection.Projection, start: int, end: int, own_author: str) -> bool:
