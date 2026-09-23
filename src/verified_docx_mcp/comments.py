@@ -305,9 +305,15 @@ def execute_add_anchored_comment(
     *,
     revision_before: str | None = None,
     force: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = mutations._guard_before_write(resolved, revision_before)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=True,
+    )
 
     document_root, raw_xml = mutations._load_document(resolved)
     proj = projection.project_document_root(document_root)
@@ -354,7 +360,7 @@ def execute_add_anchored_comment(
     overrides = parts.build_overrides(document_root=document_root, raw_xml=raw_xml)
     conflict_sweep = mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     after_excerpt = before_excerpt  # a comment never changes document text
 
     evidence: dict[str, Any] = {
@@ -840,7 +846,13 @@ def execute_get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
 
 
 def execute_reply_to_comment(
-    path: str, comment_id: str, text: str, *, revision_before: str | None = None, force: bool = False
+    path: str,
+    comment_id: str,
+    text: str,
+    *,
+    revision_before: str | None = None,
+    force: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Reply to an existing comment (a NEW, independent w:comment whose
     commentEx carries w15:paraIdParent pointing at the parent's own
@@ -861,7 +873,12 @@ def execute_reply_to_comment(
     key says which path matched.
     """
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = mutations._guard_before_write(resolved, revision_before)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=True,
+    )
 
     document_root, raw_xml = mutations._load_document(resolved)
     proj = projection.project_document_root(document_root)
@@ -925,7 +942,7 @@ def execute_reply_to_comment(
     overrides = parts.build_overrides(document_root=document_root, raw_xml=raw_xml)
     conflict_sweep = mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     evidence: dict[str, Any] = {
         "applied": True,
         "match_count": 1,
@@ -952,7 +969,12 @@ def execute_reply_to_comment(
 
 
 def execute_resolve_comment(
-    path: str, comment_id: str, *, revision_before: str | None = None, force: bool = False
+    path: str,
+    comment_id: str,
+    *,
+    revision_before: str | None = None,
+    force: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Resolve a comment thread (w15:done="1" on its own commentEx entry).
 
@@ -979,7 +1001,12 @@ def execute_resolve_comment(
     key says which path matched.
     """
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = mutations._guard_before_write(resolved, revision_before)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=True,
+    )
 
     document_root, raw_xml = mutations._load_document(resolved)
 
@@ -1030,7 +1057,7 @@ def execute_resolve_comment(
             {"comment_id": comment_id},
         )
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     evidence: dict[str, Any] = {
         "applied": True,
         "match_count": 1,

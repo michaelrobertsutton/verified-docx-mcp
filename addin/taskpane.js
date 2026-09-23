@@ -191,7 +191,10 @@ const OP_LOG_LIMIT = 20;
 
 // issue #22 B2: sent in `hello`; see the capabilities comment at the send
 // site (connectOpsSocket's onopen) for what this defends against.
-const PANE_CAPABILITIES = ["row_scope"];
+// issue #27: "cell_edit" = the cell_get/cell_set ops below (live table-cell
+// edits). Reported only by builds that implement them, so a server never
+// sends cell_set to a pane that would answer "unknown op".
+const PANE_CAPABILITIES = ["row_scope", "cell_edit"];
 
 let opsSocket = null;
 let heartbeatTimer = null;
@@ -409,6 +412,8 @@ function summarizeResult(op, result) {
   if (op === "search") return `${(result.matches || []).length} match(es)`;
   if (op === "replace" || op === "format") return `match_count=${result.match_count}`;
   if (op === "comment_add") return `comment_id=${result.comment_id}`;
+  if (op === "cell_get") return `${(result.text || "").length} char(s)`;
+  if (op === "cell_set") return `applied=${result.applied}`;
   return "";
 }
 
@@ -432,6 +437,10 @@ async function dispatchOp(op, payload) {
       return opCommentReply(payload);
     case "comment_resolve":
       return opCommentResolve(payload);
+    case "cell_get":
+      return opCellGet(payload);
+    case "cell_set":
+      return opCellSet(payload);
     case "save":
       return opSave();
     default:
@@ -683,6 +692,135 @@ async function opFormat(payload) {
     const postHash = await sha256Hex(postBody.text || "");
 
     return { applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
+  });
+}
+
+// -- table cells (issue #27) ----------------------------------------------
+
+// Resolves payload.{table_index,row_index,cell_index} (all 1-based; the
+// table numbering is list_tables' table_id) to a Word.TableCell.
+//
+// A document with a NESTED table is refused outright: the server numbers
+// tables in document order INCLUDING nested ones, and body.tables' handling
+// of nested tables is not something this pane can map back onto that
+// numbering with confidence. A refusal is honest; a wrong-cell edit into a
+// co-author's open document is not recoverable. (cell_set's own
+// compare-and-set on the cell's text is a second line of defense.)
+//
+// Uses only stable members: Body.tables, Table.nestingLevel, Table.rows,
+// TableRow.cells (WordApi 1.3). Rows/cells are addressed by their position
+// in rows.items / row.cells.items, matching the server's own <w:tr>/<w:tc>
+// counting (a horizontally merged cell counts once; a vertically merged
+// continuation cell is still a cell of its row). Manual sideload
+// verification against a real table (docs/live-mode.md) is still needed --
+// fake_pane.py's table model cannot exercise this object graph.
+async function resolveTableCell(context, payload) {
+  const tables = context.document.body.tables;
+  tables.load("items");
+  await context.sync();
+  tables.items.forEach((t) => t.load("nestingLevel"));
+  await context.sync();
+  if (tables.items.some((t) => t.nestingLevel > 1)) {
+    throw refusalError(
+      "the document contains a nested table; table numbering cannot be mapped reliably, so live cell edits are refused"
+    );
+  }
+  const table = tables.items[payload.table_index - 1];
+  if (!table) {
+    throw refusalError(`no table ${payload.table_index} (the document has ${tables.items.length})`);
+  }
+  const rows = table.rows;
+  rows.load("items");
+  await context.sync();
+  const row = rows.items[payload.row_index - 1];
+  if (!row) {
+    throw refusalError(
+      `row_index ${payload.row_index} is out of range for table ${payload.table_index} (${rows.items.length} row(s))`
+    );
+  }
+  row.cells.load("items");
+  await context.sync();
+  const cell = row.cells.items[payload.cell_index - 1];
+  if (!cell) {
+    throw refusalError(
+      `cell_index ${payload.cell_index} is out of range for row ${payload.row_index} (${row.cells.items.length} cell(s))`
+    );
+  }
+  return cell;
+}
+
+async function opCellGet(payload) {
+  return Word.run(async (context) => {
+    const cell = await resolveTableCell(context, payload);
+    cell.body.load("text");
+    await context.sync();
+    return { text: cell.body.text || "" };
+  });
+}
+
+async function opCellSet(payload) {
+  return Word.run(async (context) => {
+    const body = context.document.body;
+    body.load("text");
+    await context.sync();
+    const preHash = await sha256Hex(body.text || "");
+
+    const cell = await resolveTableCell(context, payload);
+    cell.body.load("text");
+    await context.sync();
+    const before = cell.body.text || "";
+    // Compare-and-set: refuse if the cell changed since the server read it
+    // (a co-author typing in this same cell), rather than overwrite them.
+    if (before !== payload.expected_before_text) {
+      throw refusalError(
+        "the cell's text changed since it was read (another editor may be working in it); nothing was written"
+      );
+    }
+
+    let previousMode = null;
+    if (payload.track_changes) {
+      context.document.load("changeTrackingMode");
+      await context.sync();
+      previousMode = context.document.changeTrackingMode;
+      context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
+    }
+
+    try {
+      cell.body.clear();
+      const paragraphs = payload.paragraphs || [];
+      paragraphs.forEach((runs, i) => {
+        // After clear() the cell holds one empty paragraph: fill it first,
+        // append the rest.
+        const paragraph =
+          i === 0 ? cell.body.paragraphs.getFirst() : cell.body.insertParagraph("", Word.InsertLocation.end);
+        (runs || []).forEach((run) => {
+          if (run.hard_break) {
+            paragraph.insertBreak(Word.BreakType.line, Word.InsertLocation.end);
+            return;
+          }
+          const range = paragraph.insertText(run.text, Word.InsertLocation.end);
+          range.font.bold = !!run.bold;
+          range.font.italic = !!run.italic;
+          if (run.link) {
+            range.hyperlink = run.link;
+          }
+        });
+      });
+      await context.sync();
+    } finally {
+      if (previousMode !== null) {
+        context.document.changeTrackingMode = previousMode;
+        await context.sync();
+      }
+    }
+
+    cell.body.load("text");
+    const postBody = context.document.body;
+    postBody.load("text");
+    await context.sync();
+    const postHash = await sha256Hex(postBody.text || "");
+
+    return { applied: true, before, after: cell.body.text || "", pre: preHash, post: postHash };
   });
 }
 

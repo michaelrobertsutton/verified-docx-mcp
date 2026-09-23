@@ -58,6 +58,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import zipfile
 from collections.abc import Callable
@@ -65,7 +66,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from . import audit, markdown_to_ooxml, paths, projection
+from . import audit, markdown_to_ooxml, paths, projection, write_ledger
 from .errors import ErrorCode, _make_error
 from .live import write_mode as live_write_mode
 from .projection import DEFAULT_PART, R_NS, W_NS
@@ -594,6 +595,80 @@ def _merge_conflict_sweep(evidence: dict[str, Any], sweep: dict[str, Any]) -> No
         evidence["conflict_copies"] = sweep["conflict_copies"]
     if sweep["sibling_files_changed"]:
         evidence["sibling_files_changed"] = sweep["sibling_files_changed"]
+    # Issue #27: write-window evidence from atomic_replace_docx_parts. Absent
+    # from a bare conflict_copy_sweep() result, so every key is optional.
+    if "ledger_logged" in sweep:
+        evidence["ledger_logged"] = sweep["ledger_logged"]
+    if sweep.get("ledger_reason"):
+        evidence["ledger_reason"] = sweep["ledger_reason"]
+    if sweep.get("external_change_during_write"):
+        evidence["external_change_during_write"] = True
+    if sweep.get("concurrent_editor_override"):
+        evidence["concurrent_editor_override"] = sweep["concurrent_editor_override"]
+
+
+# Issue #27: what _guard_before_write learned about the source file, handed
+# to atomic_replace_docx_parts without changing the signature of the ~14
+# call sites (and the _write_and_verify/_serialize_and_write wrappers)
+# between them. Thread-local (FastMCP may run sync tools on worker threads)
+# and keyed by resolved path; an entry older than _PENDING_MAX_AGE_S is
+# ignored, so a guard that passed but whose tool then refused on a hazard
+# can never leak a stale fingerprint into some later write that skipped the
+# guard.
+_pending = threading.local()
+_PENDING_MAX_AGE_S = 300.0
+
+
+def _pending_put(resolved: Path, source_fingerprint: str, override: dict[str, Any] | None) -> None:
+    store = getattr(_pending, "by_path", None)
+    if store is None:
+        store = _pending.by_path = {}
+    store[str(resolved)] = {
+        "source_fingerprint": source_fingerprint,
+        "override": override,
+        "at": time.monotonic(),
+    }
+
+
+def _pending_pop(resolved: Path) -> dict[str, Any]:
+    store = getattr(_pending, "by_path", None)
+    if not store:
+        return {}
+    entry = store.pop(str(resolved), None)
+    if entry is None or time.monotonic() - entry["at"] > _PENDING_MAX_AGE_S:
+        return {}
+    return entry
+
+
+def _recheck_source(original_path: Path, expected_fingerprint: str | None, *, stage: str) -> None:
+    """Refuse (REVISION_CONFLICT) if *original_path*'s package no longer
+    matches the fingerprint the guard saw. Run under the ``.jsclaim`` claim,
+    twice: before building the replacement and immediately before
+    ``os.replace``. Catches an external change during the prepare window
+    and two calls into this server racing on stale prepared XML. Cannot
+    exclude Office Online, which does not honor ``.jsclaim``."""
+    if expected_fingerprint is None:
+        return
+    try:
+        current = projection.compute_package_fingerprint(original_path)
+    except Exception as exc:
+        raise _make_error(
+            ErrorCode.REVISION_CONFLICT,
+            f"could not re-read {original_path} to confirm it is unchanged ({stage}): {exc}",
+            {"detail": "source could not be re-read", "stage": stage},
+        ) from exc
+    if current != expected_fingerprint:
+        raise _make_error(
+            ErrorCode.REVISION_CONFLICT,
+            f"{original_path} changed while this edit was being prepared ({stage}); nothing was written. "
+            "Re-read the document and retry.",
+            {
+                "detail": "source changed while the edit was being prepared",
+                "stage": stage,
+                "expected_source_fingerprint": expected_fingerprint,
+                "current_source_fingerprint": current,
+            },
+        )
 
 
 def atomic_replace_docx_parts(
@@ -601,6 +676,7 @@ def atomic_replace_docx_parts(
     overrides: dict[str, bytes],
     *,
     post_verify: Callable[[Path], None],
+    expected_source_fingerprint: str | None = None,
     _corrupt_temp_for_test: bool = False,
 ) -> dict[str, Any]:
     """Write *overrides* (part name -> new bytes; any name not already in
@@ -621,9 +697,35 @@ def atomic_replace_docx_parts(
     function has any acquire/release mechanics of its own to get wrong),
     and on a successful write returns conflict_copy_sweep's result (layer
     3) as this function's own return value — EVERY caller must capture it
-    now (the return type changed from None) and fold it into its own
-    evidence dict via _merge_conflict_sweep, since a raised exception
-    means no write happened and no sweep is meaningful.
+    and fold it into its own evidence dict via _merge_conflict_sweep,
+    since a raised exception means no write happened and no sweep is
+    meaningful.
+
+    Issue #27 extends that return value (same dict, extra keys) and the
+    write window itself:
+
+    - ``revision_after``: the revision token of the bytes THIS call
+      staged, computed before ``os.replace``. Callers must use it instead
+      of re-reading the file afterwards: an external write landing after
+      the replace would otherwise be folded into the token they return,
+      the next call's ``revision_before`` would match it, and
+      ``REVISION_CONFLICT`` would never fire.
+    - The source is re-fingerprinted under the claim (once before
+      building the replacement, once immediately before ``os.replace``)
+      against *expected_source_fingerprint* -- by default the one
+      ``_guard_before_write`` saw for this path -- and a mismatch raises
+      REVISION_CONFLICT with nothing written.
+    - After ``post_verify``, the installed file is fingerprinted again;
+      a mismatch with the staged bytes is ``external_change_during_write``
+      (evidence flag) and the ledger is NOT updated to claim bytes this
+      server did not produce.
+    - Rollback from ``.jsbak`` on a ``post_verify`` failure happens only
+      if the installed file is still the staged one. Otherwise an external
+      save landed and restoring the pre-write copy would clobber it: the
+      file is left alone, ``.jsbak`` is kept, and VERIFICATION_FAILED
+      carries ``rollback_skipped``.
+    - Success records the staged fingerprint in the write ledger
+      (``write_ledger.record_write``), reported as ``ledger_logged``.
 
     ``_corrupt_temp_for_test`` is a test-only seam (never set by a tool):
     it corrupts the temp file's bytes AFTER it is built but BEFORE
@@ -645,8 +747,15 @@ def atomic_replace_docx_parts(
     that skips ``_guard_before_write`` is still covered by this one.
     """
     since_ns = time.time_ns()
+    pending = _pending_pop(original_path)
+    if expected_source_fingerprint is None:
+        expected_source_fingerprint = pending.get("source_fingerprint")
     live_write_mode.raise_if_live_session_active(original_path)
     claim_path = acquire_lock(original_path)
+    ledger_ok = False
+    ledger_reason = ""
+    external_change_during_write = False
+    staged_revision = ""
     try:
         tmp_fd, tmp_name = tempfile.mkstemp(
             prefix=f"{original_path.stem}.tmp-", suffix=".docx", dir=str(original_path.parent)
@@ -657,6 +766,7 @@ def atomic_replace_docx_parts(
         jsbak_path = original_path.with_name(original_path.name + ".jsbak")
         replaced = False
         try:
+            _recheck_source(original_path, expected_source_fingerprint, stage="before building the replacement")
             _rebuild_zip(original_path, overrides, tmp_path)
 
             if _corrupt_temp_for_test:
@@ -672,7 +782,11 @@ def atomic_replace_docx_parts(
                     {"problems": problems},
                 )
 
+            staged_fingerprint = projection.compute_package_fingerprint(tmp_path)
+            staged_revision = projection.compute_revision(tmp_path)["token"]
+
             shutil.copyfile(original_path, jsbak_path)
+            _recheck_source(original_path, expected_source_fingerprint, stage="immediately before replacing")
             os.replace(str(tmp_path), str(original_path))
             replaced = True
             tmp_consumed = True
@@ -680,14 +794,35 @@ def atomic_replace_docx_parts(
             try:
                 post_verify(original_path)
             except Exception as exc:
-                os.replace(str(jsbak_path), str(original_path))
+                if _installed_fingerprint(original_path) == staged_fingerprint:
+                    os.replace(str(jsbak_path), str(original_path))
+                    raise _make_error(
+                        ErrorCode.VERIFICATION_FAILED,
+                        f"Post-write verification failed; restored the original from .jsbak. Detail: {exc}",
+                        {"detail": str(exc)},
+                    ) from exc
                 raise _make_error(
                     ErrorCode.VERIFICATION_FAILED,
-                    f"Post-write verification failed; restored the original from .jsbak. Detail: {exc}",
-                    {"detail": str(exc)},
+                    "Post-write verification failed, and the file was changed by another writer after "
+                    "this write landed; NOT restoring the pre-write copy (that would overwrite their "
+                    f"save). The pre-write copy is kept at {jsbak_path}. Detail: {exc}",
+                    {
+                        "detail": str(exc),
+                        "rollback_skipped": True,
+                        "reason": "file changed externally after our write",
+                        "jsbak_path": str(jsbak_path),
+                    },
                 ) from exc
             else:
                 jsbak_path.unlink(missing_ok=True)
+
+            external_change_during_write = _installed_fingerprint(original_path) != staged_fingerprint
+            if external_change_during_write:
+                ledger_reason = "the file changed after this write landed; ledger not updated"
+            else:
+                ledger_ok, ledger_reason = write_ledger.record_write(
+                    original_path, staged_fingerprint, staged_revision
+                )
         finally:
             if not tmp_consumed and tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
@@ -696,7 +831,25 @@ def atomic_replace_docx_parts(
     finally:
         release_lock(claim_path)
 
-    return conflict_copy_sweep(original_path, since_ns=since_ns)
+    result = conflict_copy_sweep(original_path, since_ns=since_ns)
+    result["revision_after"] = staged_revision
+    result["external_change_during_write"] = external_change_during_write
+    result["ledger_logged"] = ledger_ok
+    if ledger_reason:
+        result["ledger_reason"] = ledger_reason
+    if pending.get("override"):
+        result["concurrent_editor_override"] = pending["override"]
+    return result
+
+
+def _installed_fingerprint(path: Path) -> str | None:
+    """Fingerprint of what is on disk now, or None if it cannot be read --
+    None never equals a staged fingerprint, so an unreadable file is
+    treated as changed rather than as a match."""
+    try:
+        return projection.compute_package_fingerprint(path)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -711,7 +864,22 @@ def atomic_replace_docx_parts(
 _QUIESCE_INTERVAL_SECONDS = 1.5
 
 
-def _guard_before_write(resolved: Path, revision_before: str | None) -> dict[str, Any]:
+def _guard_before_write(
+    resolved: Path,
+    revision_before: str | None,
+    *,
+    allow_concurrent_editor: bool = False,
+    live_capable: bool = False,
+) -> dict[str, Any]:
+    """Issue #27 additions (after the pre-existing checks, in this order):
+    a stale explicit ``revision_before`` is ``REVISION_CONFLICT`` and is
+    never bypassed; then a recent divergence from this server's own last
+    write (or an unreadable ledger record -- fail closed) is
+    ``EXTERNAL_EDITOR_ACTIVE`` unless *allow_concurrent_editor*, which
+    bypasses ONLY that check. *live_capable* says whether the calling tool
+    has a ``write_mode="live"`` route, so the message never recommends a
+    remedy the tool cannot take. What this learned (source fingerprint,
+    override) is stashed for ``atomic_replace_docx_parts``."""
     # Issue #154: a connected Live pane session is checked BEFORE the
     # owner-file/sync-quiesce checks below, not instead of them -- the
     # owner-file signal is unreliable on its own (Word for Mac + a
@@ -728,7 +896,9 @@ def _guard_before_write(resolved: Path, revision_before: str | None) -> dict[str
     # safe and avoids restructuring server.py's existing WP-02/WP-03 code.
     from . import server as _server
 
-    status = _server.execute_lock_status(str(resolved), quiesce_interval=_QUIESCE_INTERVAL_SECONDS)
+    status = _server.execute_lock_status(
+        str(resolved), quiesce_interval=_QUIESCE_INTERVAL_SECONDS, include_external_activity=False
+    )
     if status["owner_file"]["present"]:
         raise _make_error(
             ErrorCode.DOCX_LOCKED,
@@ -739,7 +909,9 @@ def _guard_before_write(resolved: Path, revision_before: str | None) -> dict[str
         already_waited = status["sync_detail"]["interval_seconds"]
         remaining = max(0.0, 10.0 - already_waited)
         time.sleep(remaining)
-        status2 = _server.execute_lock_status(str(resolved), quiesce_interval=_QUIESCE_INTERVAL_SECONDS)
+        status2 = _server.execute_lock_status(
+            str(resolved), quiesce_interval=_QUIESCE_INTERVAL_SECONDS, include_external_activity=False
+        )
         if not status2["sync_quiesced"]:
             raise _make_error(
                 ErrorCode.SYNC_IN_FLIGHT,
@@ -748,12 +920,59 @@ def _guard_before_write(resolved: Path, revision_before: str | None) -> dict[str
             )
 
     current = projection.compute_revision(resolved)
+    source_fingerprint = projection.compute_package_fingerprint(resolved)
     if revision_before is not None and current["token"] != revision_before:
         raise _make_error(
             ErrorCode.REVISION_CONFLICT,
             "revision_before no longer matches the file's current revision.",
             {"revision_before": revision_before, "current_revision": current["token"]},
         )
+
+    activity = write_ledger.external_activity(resolved, current_fingerprint=source_fingerprint)
+    unreadable = activity["ledger"] == write_ledger.LEDGER_UNREADABLE
+    override: dict[str, Any] | None = None
+    if activity["recent"] or unreadable:
+        if not allow_concurrent_editor:
+            if unreadable:
+                why = (
+                    "this server's write-ledger record for the document is unreadable "
+                    f"({activity['ledger_reason']}), so it cannot tell whether another editor changed "
+                    "the file since its last write"
+                )
+            else:
+                why = (
+                    "the file on disk no longer matches what this server last wrote "
+                    f"(first seen {activity['divergence_age_s']:.0f}s ago) -- another writer, "
+                    "plausibly Office Online co-authoring, changed it"
+                )
+            remedies = (
+                'use write_mode="live" with the Live pane open in that editor, or '
+                if live_capable
+                else ""
+            )
+            raise _make_error(
+                ErrorCode.EXTERNAL_EDITOR_ACTIVE,
+                f"{resolved}: {why}. A file-mode write now would likely be silently reverted by that "
+                f"editor's autosave. Either {remedies}have the other editor close the document and "
+                f"wait for the {activity['window_s']:.0f}s observation window to lapse, or pass "
+                "allow_concurrent_editor=True to write anyway. Waiting is a heuristic, not proof "
+                "the editor has gone.",
+                {
+                    "ledger": activity["ledger"],
+                    "ledger_reason": activity["ledger_reason"],
+                    "last_write": activity["last_write"],
+                    "divergence_first_observed_at": activity["divergence_first_observed_at"],
+                    "divergence_age_s": activity["divergence_age_s"],
+                    "window_s": activity["window_s"],
+                    "current_revision": current["token"],
+                },
+            )
+        override = {
+            "ledger": activity["ledger"],
+            "divergence_first_observed_at": activity["divergence_first_observed_at"],
+            "age_s": activity["divergence_age_s"],
+        }
+    _pending_put(resolved, source_fingerprint, override)
     return current
 
 
@@ -1109,13 +1328,24 @@ def _evidence(
 
 
 def execute_replace_body_markdown(
-    path: str, markdown: str, *, revision_before: str | None = None, force: bool = False, track_changes: bool = False
+    path: str,
+    markdown: str,
+    *,
+    revision_before: str | None = None,
+    force: bool = False,
+    allow_concurrent_editor: bool = False,
+    track_changes: bool = False,
 ) -> dict[str, Any]:
     from . import tracked_changes
     from .author import resolve_author_name
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = _guard_before_write(resolved, revision_before)
+    pre_revision = _guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=False,
+    )
 
     document_root, raw_xml = _load_document(resolved)
     body = _find_body(document_root)
@@ -1193,7 +1423,7 @@ def execute_replace_body_markdown(
 
     conflict_sweep = _write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     after_text, _, _ = projection.read_document_markdown(resolved)
     evidence = _evidence(
         applied=True,
@@ -1225,6 +1455,7 @@ def execute_replace_range_markdown(
     *,
     revision_before: str | None = None,
     force: bool = False,
+    allow_concurrent_editor: bool = False,
     track_changes: bool = False,
 ) -> dict[str, Any]:
     from . import tracked_changes
@@ -1256,7 +1487,12 @@ def execute_replace_range_markdown(
             "tool (there is no write path for it yet).",
             {"section_key": section_key, "available_textbox_keys": sorted(textbox_keys)},
         )
-    pre_revision = _guard_before_write(resolved, revision_before)
+    pre_revision = _guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=False,
+    )
 
     document_root, raw_xml = _load_document(resolved)
     body = _find_body(document_root)
@@ -1336,7 +1572,7 @@ def execute_replace_range_markdown(
 
     conflict_sweep = _write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     final_document_root, _ = _load_document(resolved)
     final_body = _find_body(final_document_root)
     final_body_children, _ = _split_body(final_body)
@@ -1370,7 +1606,13 @@ def execute_replace_range_markdown(
 
 
 def execute_append_markdown(
-    path: str, markdown: str, *, revision_before: str | None = None, force: bool = False, track_changes: bool = False
+    path: str,
+    markdown: str,
+    *,
+    revision_before: str | None = None,
+    force: bool = False,
+    allow_concurrent_editor: bool = False,
+    track_changes: bool = False,
 ) -> dict[str, Any]:
     # force/hazard-scanning is a no-op for append (nothing existing is
     # removed) but the parameter is kept for signature symmetry with the
@@ -1381,7 +1623,12 @@ def execute_append_markdown(
 
     own_author = resolve_author_name()
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = _guard_before_write(resolved, revision_before)
+    pre_revision = _guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=False,
+    )
 
     document_root, raw_xml = _load_document(resolved)
     body = _find_body(document_root)
@@ -1436,7 +1683,7 @@ def execute_append_markdown(
 
     conflict_sweep = _write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     after_text, _, _ = projection.read_document_markdown(resolved)
 
     evidence = _evidence(

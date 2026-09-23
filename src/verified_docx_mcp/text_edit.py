@@ -979,6 +979,7 @@ def execute_replace_text(
     *,
     revision_before: str | None = None,
     force: bool = False,
+    allow_concurrent_editor: bool = False,
     track_changes: bool = False,
     write_mode: str = "auto",
     within_row_containing: str | None = None,
@@ -996,7 +997,12 @@ def execute_replace_text(
         )
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = mutations._guard_before_write(resolved, revision_before)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=True,
+    )
 
     document_root, raw_xml = mutations._load_document(resolved)
     proj = projection.project_document_root(document_root)
@@ -1032,7 +1038,7 @@ def execute_replace_text(
 
     conflict_sweep = _serialize_and_write(resolved, document_root, raw_xml, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     evidence = _evidence(
         applied=True,
         match_count=locate_result.match_count,
@@ -1219,6 +1225,7 @@ def execute_format_text(
     *,
     revision_before: str | None = None,
     force: bool = False,
+    allow_concurrent_editor: bool = False,
     track_changes: bool = False,
     write_mode: str = "auto",
     within_row_containing: str | None = None,
@@ -1237,7 +1244,12 @@ def execute_format_text(
         )
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = mutations._guard_before_write(resolved, revision_before)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=True,
+    )
 
     document_root, raw_xml = mutations._load_document(resolved)
     proj = projection.project_document_root(document_root)
@@ -1300,7 +1312,7 @@ def execute_format_text(
 
     conflict_sweep = _serialize_and_write(resolved, document_root, raw_xml, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     evidence = _evidence(
         applied=True,
         match_count=locate_result.match_count,
@@ -1520,10 +1532,16 @@ def execute_apply_style(
     *,
     revision_before: str | None = None,
     force: bool = False,
+    allow_concurrent_editor: bool = False,
     track_changes: bool = False,
 ) -> dict[str, Any]:
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = mutations._guard_before_write(resolved, revision_before)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=False,
+    )
 
     style_records = projection.list_styles_impl(resolved)
     styles_by_style_id = {s["style_id"]: s for s in style_records if s["style_id"]}
@@ -1676,7 +1694,7 @@ def execute_apply_style(
 
     conflict_sweep = _serialize_and_write(resolved, document_root, raw_xml, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     evidence = _evidence(
         applied=True,
         match_count=locate_result.match_count,

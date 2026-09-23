@@ -541,6 +541,42 @@ def _walk_blocks(tokens: list[Any], ctx: StyleContext) -> list[Any]:
     return elements
 
 
+def parse_paragraph_runs(markdown_text: str) -> list[list[RunSpec]]:
+    """Context-free subset parse for the live cell edit (issue #27):
+    top-level paragraphs only, each returned as its list of ``RunSpec``
+    (bold / italic / link / hard break).
+
+    Needs no ``StyleContext`` -- live mode has no local package to build
+    one from (``StyleContext.build`` reads styles/numbering/rels out of a
+    .docx) and edits the open document through Word's own object model,
+    which owns styles, numbering, and relationships. Anything that WOULD
+    need them (headings, lists, tables, blockquotes, code blocks, rules,
+    images, raw HTML) is refused with ``INVALID_INPUT`` naming the
+    construct, rather than degraded the way ``render_blocks`` degrades
+    it: a silent flattening is acceptable when writing a file the caller
+    can re-read, not when the edit lands in a co-author's open document.
+    """
+    tokens = _MD.parse(markdown_text)
+    paragraphs: list[list[RunSpec]] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.type == "paragraph_open":
+            inline_tok = tokens[i + 1] if i + 1 < len(tokens) and tokens[i + 1].type == "inline" else None
+            paragraphs.append(_inline_runs(inline_tok, None))  # type: ignore[arg-type]  # ctx is unused
+            i += 3
+        else:
+            construct = tok.type.removesuffix("_open").removesuffix("_close")
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"live cell edits support paragraphs with bold/italic/links only; the markdown contains "
+                f"{construct!r}. Use write_mode='file' (close the document in Word first) for lists, "
+                "headings, tables, and other block structure.",
+                {"unsupported_block": tok.type},
+            )
+    return paragraphs
+
+
 def render_blocks(markdown_text: str, ctx: StyleContext) -> list[Any]:
     """Parse *markdown_text* and return a list of ``w:p``/``w:tbl``
     Elements in document order. Mutates *ctx* (numbering/relationship

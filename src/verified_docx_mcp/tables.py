@@ -58,6 +58,8 @@ from xml.etree import ElementTree as ET
 from . import audit, locate, markdown_to_ooxml, mutations, paths, projection, tracked_changes
 from .author import resolve_author_name
 from .errors import ErrorCode, _make_error
+from .live import write_mode as live_write_mode
+from .live.session import LiveDisconnected, LiveOpFailed, LiveStale
 from .projection import DEFAULT_PART, W_NS, TableBoundaryEvent
 
 _CELL_CONTENT_TAGS = frozenset({"p", "tbl", "sdt"})
@@ -390,11 +392,17 @@ def execute_replace_table_row(
     *,
     revision_before: str | None = None,
     force: bool = False,
+    allow_concurrent_editor: bool = False,
     track_changes: bool = False,
 ) -> dict[str, Any]:
     own_author = resolve_author_name()
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = mutations._guard_before_write(resolved, revision_before)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=False,
+    )
 
     document_root, raw_xml = mutations._load_document(resolved)
     tbl = _find_table_element(document_root, table_id)
@@ -467,7 +475,7 @@ def execute_replace_table_row(
 
     conflict_sweep = mutations._write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     after_text = "\t".join(intended_after_cells)
     evidence = _evidence(
         applied=True,
@@ -501,11 +509,30 @@ def execute_replace_cell_markdown(
     *,
     revision_before: str | None = None,
     force: bool = False,
+    allow_concurrent_editor: bool = False,
     track_changes: bool = False,
+    write_mode: str = "auto",
 ) -> dict[str, Any]:
+    mode = live_write_mode.resolve_write_mode(path, write_mode)
+    if mode == "live":
+        return execute_replace_cell_markdown_live(
+            path,
+            table_id,
+            row_index,
+            cell_index,
+            markdown,
+            revision_before=revision_before,
+            track_changes=track_changes,
+        )
+
     own_author = resolve_author_name()
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = mutations._guard_before_write(resolved, revision_before)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=True,
+    )
 
     document_root, raw_xml = mutations._load_document(resolved)
     tbl = _find_table_element(document_root, table_id)
@@ -569,7 +596,7 @@ def execute_replace_cell_markdown(
 
     conflict_sweep = mutations._write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     evidence = _evidence(
         applied=True,
         match_count=1,
@@ -586,6 +613,143 @@ def execute_replace_cell_markdown(
     logged, _ = audit.append_audit(path=str(resolved), tool="replace_cell_markdown", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
+
+
+# ---------------------------------------------------------------------------
+# Live mode (issue #27): replace_cell_markdown over the WSS ops channel.
+#
+# Why this exists: a file-mode write to a document a co-author has open in
+# Office Online is silently reverted by that editor's autosave, and
+# raise_if_live_session_active/EXTERNAL_EDITOR_ACTIVE can only refuse it.
+# Routing the edit through the pane makes it a co-authoring edit instead of
+# a race against one. Same shape as text_edit.execute_replace_text_live.
+# ---------------------------------------------------------------------------
+
+_CELL_EDIT_CAPABILITY = "cell_edit"
+
+
+def _live_cell_request(session: Any, op: str, payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    try:
+        return session.request_threadsafe(op, payload, **kwargs)
+    except LiveStale as exc:
+        raise _make_error(
+            ErrorCode.LIVE_STALE, str(exc), {"expected": exc.expected, "actual": exc.actual}
+        ) from exc
+    except LiveOpFailed as exc:
+        raise _make_error(
+            live_write_mode.classify_op_failed(exc), exc.message, {"pane_code": exc.code}
+        ) from exc
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+
+
+def _runs_to_wire(paragraphs: list[list[markdown_to_ooxml.RunSpec]]) -> list[list[dict[str, Any]]]:
+    return [
+        [
+            {
+                "text": run.text,
+                "bold": run.bold,
+                "italic": run.italic,
+                "link": run.link,
+                "hard_break": run.hard_break,
+            }
+            for run in paragraph
+        ]
+        for paragraph in paragraphs
+    ]
+
+
+def _intended_cell_text(paragraphs: list[list[markdown_to_ooxml.RunSpec]]) -> str:
+    return "\n".join(
+        "".join("\n" if run.hard_break else run.text for run in paragraph) for paragraph in paragraphs
+    )
+
+
+def execute_replace_cell_markdown_live(
+    path: str,
+    table_id: int,
+    row_index: int,
+    cell_index: int,
+    markdown: str,
+    *,
+    revision_before: str | None = None,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    """Live-mode ``replace_cell_markdown`` (issue #27).
+
+    Flow: parse the markdown (paragraphs with bold/italic/links only --
+    ``INVALID_INPUT`` otherwise, BEFORE anything is sent) -> capability
+    check (``"cell_edit"``) -> ``describe`` (pre body hash + ``LIVE_STALE``
+    check) -> ``cell_get`` (the cell's current text) -> ``cell_set`` as a
+    compare-and-set against that text, so a co-author's edit landing in
+    between is refused by the pane instead of overwritten -> an
+    INDEPENDENT second ``cell_get`` (not the pane's own reply) compared
+    with the intended text modulo whitespace -> live evidence envelope.
+
+    ``force`` has no live analogue and is not accepted; ``before``/
+    ``after`` in the evidence are the cell's plain text (Word's own
+    ``body.text``), not markdown. Nothing to roll back on a verification
+    failure -- Word, not this server, owns the document.
+    """
+    paragraphs = markdown_to_ooxml.parse_paragraph_runs(markdown)
+    intended = _intended_cell_text(paragraphs)
+
+    session = live_write_mode.live_session_for(path)
+    live_write_mode.require_capability(
+        session, _CELL_EDIT_CAPABILITY, feature_description="live table cell edits"
+    )
+    document_name = session.document_name
+    address = {"table_index": table_id, "row_index": row_index, "cell_index": cell_index}
+
+    try:
+        pre_hash = session.request_threadsafe("describe")["bodySha256"]
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+    live_write_mode.check_not_stale(revision_before, pre_hash)
+
+    before_text = _live_cell_request(session, "cell_get", address)["text"]
+    result = _live_cell_request(
+        session,
+        "cell_set",
+        {
+            **address,
+            "paragraphs": _runs_to_wire(paragraphs),
+            "expected_before_text": before_text,
+            "track_changes": track_changes,
+        },
+        expected_body_sha256=pre_hash,
+    )
+    if not result.get("applied"):
+        raise _make_error(
+            ErrorCode.VERIFICATION_FAILED,
+            "live cell edit did not verify: the pane did not report applied=true. Nothing to roll "
+            "back in live mode -- Word, not this server, owns the document.",
+            {"applied": result.get("applied")},
+        )
+
+    after_text = _live_cell_request(session, "cell_get", address)["text"]
+    diff = mutations._diff_modulo_whitespace(intended, after_text)
+    if diff:
+        raise _make_error(
+            ErrorCode.VERIFICATION_FAILED,
+            "live cell edit did not verify: re-reading the cell does not match the intended text "
+            f"modulo whitespace: {diff}. Nothing to roll back in live mode -- Word, not this "
+            "server, owns the document.",
+            {"intended": intended, "actual": after_text},
+        )
+
+    return live_write_mode.live_evidence(
+        applied=True,
+        match_count=1,
+        rung=3,
+        before=before_text,
+        after=after_text,
+        pre_body_sha256=pre_hash,
+        post_body_sha256=result.get("post", pre_hash),
+        document_name=document_name,
+        tool="replace_cell_markdown",
+        path=path,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1050,11 +1214,17 @@ def execute_insert_table(
     anchor: dict[str, Any] | None = None,
     revision_before: str | None = None,
     force: bool = False,
+    allow_concurrent_editor: bool = False,
     track_changes: bool = False,
 ) -> dict[str, Any]:
     own_author = resolve_author_name()
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    pre_revision = mutations._guard_before_write(resolved, revision_before)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=False,
+    )
 
     if not rows or any(len(r) == 0 for r in rows):
         raise _make_error(
@@ -1212,7 +1382,7 @@ def execute_insert_table(
 
     conflict_sweep = mutations._write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
-    post_revision = projection.compute_revision(resolved)
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token, never a re-read of the file
     after_text = "\n".join("\t".join(row) for row in intended_rows)
     merged_cells = sum(1 for row in norm_rows for cell in row if cell["span"] > 1 or cell["v_merge"] is not None)
     evidence = _evidence(

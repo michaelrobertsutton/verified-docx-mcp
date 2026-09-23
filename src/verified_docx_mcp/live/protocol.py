@@ -134,13 +134,46 @@ pane must honor.
                      Word calls: ``comment.resolved = payload.resolved``.
                      Reply result: ``{"resolved": <bool>}``.
 
+  cell_get        -- ``CellGetPayload`` (table_index, row_index, cell_index;
+                     all 1-based, table_index numbered exactly like
+                     ``list_tables``' ``table_id``). Issue #27; REQUIRES
+                     the pane's ``"cell_edit"`` capability (checked by
+                     ``live/write_mode.py``'s ``require_capability``
+                     before the op is sent). Word calls:
+                     ``body.tables`` (each ``.load("nestingLevel")``),
+                     ``table.rows`` -> ``row.cells`` -> the addressed
+                     ``TableCell``, ``cell.body.load("text")``. A document
+                     containing a NESTED table is refused (LIVE_OP_FAILED):
+                     ``body.tables`` cannot be mapped onto ``table_id``
+                     numbering once tables nest. Reply result:
+                     ``{"text": <cell body text>}``.
+
+  cell_set        -- ``CellSetPayload`` (table_index, row_index,
+                     cell_index, paragraphs, expected_before_text,
+                     track_changes). Compare-and-set: the pane re-reads the
+                     addressed cell's ``body.text`` and refuses
+                     (LIVE_OP_FAILED) unless it equals
+                     ``expected_before_text``, so a co-author's edit
+                     between ``cell_get`` and this op is never silently
+                     overwritten. ``paragraphs`` is a list of paragraphs,
+                     each a list of runs ``{text, bold, italic, link,
+                     hard_break}``. Word calls: ``cell.body.clear()``, then
+                     per paragraph ``paragraph.insertText(run.text,
+                     "End")`` with ``range.font.bold``/``.italic`` and
+                     ``range.hyperlink`` set per run, under the same
+                     optional ``changeTrackingMode`` toggle as ``replace``.
+                     Reply result: ``{applied, before, after, pre, post}``
+                     -- ``before``/``after`` are the cell's own
+                     ``body.text`` read before/after; ``pre``/``post`` are
+                     the whole-body SHA-256 as for ``replace``.
+
   save            -- no payload. Word calls: ``context.document.save()``.
                      Reply result: ``{"saved": true}``.
 
 Staleness (``expected_body_sha256``)
 -------------------------------------
-``search``/``replace``/``format``/``comment_add`` payloads carry an
-optional ``expected_body_sha256``. The pane does not act on it -- it is
+``search``/``replace``/``format``/``comment_add``/``cell_set`` payloads
+carry an optional ``expected_body_sha256``. The pane does not act on it -- it is
 read by ``live/session.py``'s ``LiveSession.request`` after the reply
 comes back: if the caller supplied one and the reply's ``result["pre"]``
 (the pane's body hash *before* it ran the op) differs, the caller gets
@@ -170,6 +203,8 @@ VALID_OPS: frozenset[str] = frozenset(
         "comment_add",
         "comment_reply",
         "comment_resolve",
+        "cell_get",
+        "cell_set",
         "save",
     }
 )
@@ -663,6 +698,75 @@ class CommentResolvePayload:
         if not comment_id:
             raise ProtocolError("'comment_id' must not be empty")
         return cls(comment_id=comment_id, resolved=_require(obj, "resolved", bool))
+
+
+def _require_index(obj: dict[str, Any], key: str) -> int:
+    value = _require(obj, key, int)
+    if value < 1:
+        raise ProtocolError(f"{key!r} must be >= 1 (1-based)")
+    return value
+
+
+@dataclasses.dataclass(frozen=True)
+class CellGetPayload:
+    table_index: int
+    row_index: int
+    cell_index: int
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "table_index": self.table_index,
+            "row_index": self.row_index,
+            "cell_index": self.cell_index,
+        }
+
+    @classmethod
+    def from_json(cls, obj: dict[str, Any]) -> CellGetPayload:
+        return cls(
+            table_index=_require_index(obj, "table_index"),
+            row_index=_require_index(obj, "row_index"),
+            cell_index=_require_index(obj, "cell_index"),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class CellSetPayload:
+    table_index: int
+    row_index: int
+    cell_index: int
+    paragraphs: list[list[dict[str, Any]]]
+    expected_before_text: str
+    track_changes: bool = False
+    expected_body_sha256: str | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "table_index": self.table_index,
+            "row_index": self.row_index,
+            "cell_index": self.cell_index,
+            "paragraphs": self.paragraphs,
+            "expected_before_text": self.expected_before_text,
+            "track_changes": self.track_changes,
+        }
+        if self.expected_body_sha256 is not None:
+            out["expectedBodySha256"] = self.expected_body_sha256
+        return out
+
+    @classmethod
+    def from_json(cls, obj: dict[str, Any]) -> CellSetPayload:
+        paragraphs = _require(obj, "paragraphs", list)
+        for paragraph in paragraphs:
+            if not isinstance(paragraph, list) or not all(isinstance(run, dict) for run in paragraph):
+                raise ProtocolError("'paragraphs' must be a list of lists of run objects")
+        return cls(
+            table_index=_require_index(obj, "table_index"),
+            row_index=_require_index(obj, "row_index"),
+            cell_index=_require_index(obj, "cell_index"),
+            paragraphs=paragraphs,
+            expected_before_text=_require(obj, "expected_before_text", str),
+            track_changes=_optional(obj, "track_changes", bool, default=False),
+            expected_body_sha256=_optional(obj, "expectedBodySha256", str, default=None),
+        )
 
 
 @dataclasses.dataclass(frozen=True)

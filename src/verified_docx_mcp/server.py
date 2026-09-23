@@ -61,6 +61,7 @@ from . import (
     tables,
     text_edit,
     tracked_changes,
+    write_ledger,
 )
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
@@ -560,12 +561,17 @@ def execute_lock_status(
     *,
     quiesce_interval: float = 1.5,
     sleep=time.sleep,
+    include_external_activity: bool = True,
 ) -> dict[str, Any]:
     """Report owner-file and sync-quiesce state for *path*, as data only.
 
     Never refuses (core/document-backend-protocol.md §4: DOCX_LOCKED gates
     writes only, and that gate lives in the write guard landing in
     WP-04/WP-10 — lock_status itself only reports what it observed).
+
+    *include_external_activity* (issue #27): the write guard passes False
+    because it computes ``write_ledger.external_activity`` itself, with
+    the fingerprint it also hands to the write window.
     """
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     directory = resolved.parent
@@ -580,7 +586,7 @@ def execute_lock_status(
 
     sync_quiesced = sample_1 == sample_2 and not tmp_siblings
 
-    return {
+    result: dict[str, Any] = {
         "path": str(resolved),
         "owner_file": owner_file,
         "sync_quiesced": sync_quiesced,
@@ -591,6 +597,11 @@ def execute_lock_status(
             "tmp_siblings": tmp_siblings,
         },
     }
+    if include_external_activity:
+        # Issue #27. Observing a divergence persists its first-seen time
+        # (best-effort), so this read tool has a small state side effect.
+        result["external_activity"] = write_ledger.external_activity(resolved)
+    return result
 
 
 @mcp.tool()
@@ -608,7 +619,21 @@ def lock_status(path: str) -> dict[str, Any]:
 
     Returns path, owner_file ({present, path, format, owner_name}),
     sync_quiesced, sync_detail ({sample_1, sample_2, interval_seconds,
-    tmp_siblings}).
+    tmp_siblings}), and external_activity (issue #27): how the file on
+    disk compares with what THIS server last wrote --
+    {ledger: "ok"|"none"|"unreadable", ledger_reason, last_write
+    ({token, written_at}), still_current (null with no ledger),
+    divergent, divergence_first_observed_at, divergence_age_s, recent,
+    unattributed_recent_mtime, window_s, note}. This is the after-the-fact
+    durability check for a co-authoring editor such as Office Online, which
+    writes no owner file and registers no Live session: call it once a
+    write has had time to sync -- still_current false means another
+    writer changed the package since, i.e. this server's edits may have
+    been overwritten. It shows another writer changed the bytes, not that
+    an editor is still open; no divergence is not proof of safety, and a
+    file this server never wrote reports ledger "none" (with
+    unattributed_recent_mtime as an informational hint only). Reading it
+    persists the divergence's first-seen time (a small state write).
 
     Errors:
       INVALID_INPUT - path does not exist or is outside the allowed roots
@@ -1085,7 +1110,12 @@ def list_styles(path: str) -> dict[str, Any]:
 
 @mcp.tool()
 def replace_body_markdown(
-    path: str, markdown: str, revision_before: str | None = None, force: bool = False, track_changes: bool = False
+    path: str,
+    markdown: str,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Replace an entire document body's content with markdown, atomically.
 
@@ -1108,7 +1138,23 @@ def replace_body_markdown(
     temp file exists. An owner file present -> DOCX_LOCKED (report the
     owner, no retry). Not sync-quiesced -> one bounded wait (<=10s total)
     then SYNC_IN_FLIGHT. A revision_before that no longer matches the
-    file's current revision -> REVISION_CONFLICT. If the CURRENT body
+    file's current revision -> REVISION_CONFLICT (never bypassed by
+    anything below). Then (issue #27) a file that no longer matches what
+    this server last wrote -- another writer, plausibly Office Online
+    co-authoring, changed it within the observation window (default 600s,
+    VERIFIED_DOCX_MCP_EXTERNAL_EDIT_WINDOW_S), or this server's own
+    write-ledger record for it is unreadable -> EXTERNAL_EDITOR_ACTIVE,
+    because that editor's autosave would likely silently revert this
+    write. `allow_concurrent_editor=True` bypasses ONLY that check (not
+    REVISION_CONFLICT, DOCX_LOCKED, or LIVE_SESSION_ACTIVE) and records
+    the override in the evidence (concurrent_editor_override). The window
+    is measured from when this server first observed the divergence;
+    waiting it out is a heuristic, not proof the editor has gone, and a
+    file this server never wrote has no ledger entry to compare against
+    (lock_status reports it as ledger "none"). Also, after a write
+    returns, call lock_status once edits have had time to sync:
+    external_activity.still_current false means something overwrote them.
+    If the CURRENT body
     contains comment anchors or tracked changes, the call refuses
     (COMMENT_ANCHORS_IN_RANGE / TRACKED_CHANGES_PRESENT) unless
     force=True; with force, they are removed and their comment ids are
@@ -1155,16 +1201,26 @@ def replace_body_markdown(
     Errors:
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
       DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard (see above)
-      REVISION_CONFLICT                 - revision_before is stale
+      REVISION_CONFLICT                 - revision_before is stale, or the file changed while
+                                          this edit was being prepared (nothing written)
+      EXTERNAL_EDITOR_ACTIVE            - issue #27: see above; override with
+                                          allow_concurrent_editor=True
       COMMENT_ANCHORS_IN_RANGE          - comment anchors present, no force
       TRACKED_CHANGES_PRESENT           - w:ins/w:del present, no force
       STYLE_NOT_FOUND                   - a heading level has no style
       OPC_INVALID                       - the rendered .docx failed OPC validation
-      VERIFICATION_FAILED               - post-write verification failed; rolled back
+      VERIFICATION_FAILED               - post-write verification failed; rolled back (or, when
+                                          another writer changed the file after this write
+                                          landed, NOT rolled back: details.rollback_skipped)
     """
     try:
         return mutations.execute_replace_body_markdown(
-            path, markdown, revision_before=revision_before, force=force, track_changes=track_changes
+            path,
+            markdown,
+            revision_before=revision_before,
+            force=force,
+            track_changes=track_changes,
+            allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1178,6 +1234,7 @@ def replace_range_markdown(
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Replace one heading-delimited section (by section_key, from
     find_sections) with markdown, atomically.
@@ -1218,7 +1275,13 @@ def replace_range_markdown(
     """
     try:
         return mutations.execute_replace_range_markdown(
-            path, section_key, markdown, revision_before=revision_before, force=force, track_changes=track_changes
+            path,
+            section_key,
+            markdown,
+            revision_before=revision_before,
+            force=force,
+            track_changes=track_changes,
+            allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1226,7 +1289,12 @@ def replace_range_markdown(
 
 @mcp.tool()
 def append_markdown(
-    path: str, markdown: str, revision_before: str | None = None, force: bool = False, track_changes: bool = False
+    path: str,
+    markdown: str,
+    revision_before: str | None = None,
+    force: bool = False,
+    track_changes: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Append markdown to the end of a document body (before its trailing
     w:sectPr, if any), atomically.
@@ -1260,13 +1328,19 @@ def append_markdown(
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
       DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
       REVISION_CONFLICT                 - revision_before is stale
+      EXTERNAL_EDITOR_ACTIVE            - see replace_body_markdown (issue #27)
       STYLE_NOT_FOUND                   - a heading level has no style
       OPC_INVALID                       - the rendered .docx failed OPC validation
       VERIFICATION_FAILED               - post-write verification failed; rolled back
     """
     try:
         return mutations.execute_append_markdown(
-            path, markdown, revision_before=revision_before, force=force, track_changes=track_changes
+            path,
+            markdown,
+            revision_before=revision_before,
+            force=force,
+            track_changes=track_changes,
+            allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1301,6 +1375,7 @@ def replace_text(
     track_changes: bool = False,
     write_mode: str = "auto",
     within_row_containing: str | None = None,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
 
@@ -1413,6 +1488,12 @@ def replace_text(
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or an empty find
       DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
       REVISION_CONFLICT                 - revision_before is stale
+      EXTERNAL_EDITOR_ACTIVE            - file mode only (issue #27): the file diverged from this
+                                           server's last write within the observation window, e.g.
+                                           Office Online co-authoring. Prefer write_mode="live" with
+                                           the Live pane open in that editor; or
+                                           allow_concurrent_editor=True to write anyway. See
+                                           replace_body_markdown.
       ZERO_MATCH                        - find not located after the full ladder
       MATCH_COUNT_MISMATCH              - the located count != expected_matches
       STRUCTURAL_BOUNDARY               - a match crosses a w:p/w:tbl/w:tc boundary
@@ -1448,6 +1529,7 @@ def replace_text(
             track_changes=track_changes,
             write_mode=write_mode,
             within_row_containing=within_row_containing,
+            allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1464,6 +1546,7 @@ def format_text(
     track_changes: bool = False,
     write_mode: str = "auto",
     within_row_containing: str | None = None,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Apply character styling (bold/italic/underline/strike/color) to a
     matched text span, without touching its content.
@@ -1538,6 +1621,7 @@ def format_text(
             track_changes=track_changes,
             write_mode=write_mode,
             within_row_containing=within_row_containing,
+            allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1702,7 +1786,11 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
 
 @mcp.tool()
 def accept_tracked_changes(
-    path: str, revision_ids: list[str] | None = None, revision_before: str | None = None, force: bool = False
+    path: str,
+    revision_ids: list[str] | None = None,
+    revision_before: str | None = None,
+    force: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Accept tracked changes (w:ins/w:del), atomically -- all of them, or
     only the ids named in revision_ids (from list_open_items'
@@ -1732,13 +1820,18 @@ def accept_tracked_changes(
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path
       DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard
       REVISION_CONFLICT                 - revision_before is stale
+      EXTERNAL_EDITOR_ACTIVE            - see replace_body_markdown (issue #27)
       REVISION_ID_NOT_FOUND             - a named id is not present (available ids listed)
       OPC_INVALID                       - the rendered .docx failed OPC validation
       VERIFICATION_FAILED               - post-write verification failed; rolled back
     """
     try:
         return tracked_changes.execute_accept_tracked_changes(
-            path, revision_ids, revision_before=revision_before, force=force
+            path,
+            revision_ids,
+            revision_before=revision_before,
+            force=force,
+            allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1746,7 +1839,11 @@ def accept_tracked_changes(
 
 @mcp.tool()
 def reject_tracked_changes(
-    path: str, revision_ids: list[str] | None = None, revision_before: str | None = None, force: bool = False
+    path: str,
+    revision_ids: list[str] | None = None,
+    revision_before: str | None = None,
+    force: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Reject tracked changes (w:ins/w:del), atomically -- all of them, or
     only the ids named in revision_ids.
@@ -1763,7 +1860,11 @@ def reject_tracked_changes(
     """
     try:
         return tracked_changes.execute_reject_tracked_changes(
-            path, revision_ids, revision_before=revision_before, force=force
+            path,
+            revision_ids,
+            revision_before=revision_before,
+            force=force,
+            allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1780,7 +1881,12 @@ def reject_tracked_changes(
 
 @mcp.tool()
 def add_anchored_comment(
-    path: str, quote: str, text: str, expected_matches: int, write_mode: str = "auto"
+    path: str,
+    quote: str,
+    text: str,
+    expected_matches: int,
+    write_mode: str = "auto",
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Add a comment anchored to a quoted passage, atomically.
 
@@ -1859,6 +1965,11 @@ def add_anchored_comment(
       INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, or an empty quote
       DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard (file mode only)
       REVISION_CONFLICT                 - revision_before is stale (file mode only)
+      EXTERNAL_EDITOR_ACTIVE            - file mode only (issue #27): the file diverged from this
+                                           server's last write within the observation window, e.g.
+                                           Office Online co-authoring; prefer write_mode="live" with
+                                           the Live pane open, or allow_concurrent_editor=True (see
+                                           replace_body_markdown)
       ZERO_MATCH                        - quote not located (file mode's full ladder; live mode's pane search)
       MATCH_COUNT_MISMATCH              - the located count != expected_matches
       STRUCTURAL_BOUNDARY               - a match crosses a w:p/w:tbl/w:tc boundary (file mode only)
@@ -1877,7 +1988,9 @@ def add_anchored_comment(
         mode = comments_live._resolve_write_mode(path, write_mode)
         if mode == "live":
             return comments_live.execute_add_anchored_comment_live(path, quote, text, expected_matches)
-        return comments.execute_add_anchored_comment(path, quote, text, expected_matches)
+        return comments.execute_add_anchored_comment(
+            path, quote, text, expected_matches, allow_concurrent_editor=allow_concurrent_editor
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -1924,7 +2037,13 @@ def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def reply_to_comment(path: str, comment_id: str, text: str, write_mode: str = "auto") -> dict[str, Any]:
+def reply_to_comment(
+    path: str,
+    comment_id: str,
+    text: str,
+    write_mode: str = "auto",
+    allow_concurrent_editor: bool = False,
+) -> dict[str, Any]:
     """Reply to an existing comment (durableId), atomically -- issue #28
     WP-09.
 
@@ -1989,6 +2108,11 @@ def reply_to_comment(path: str, comment_id: str, text: str, write_mode: str = "a
                          live:<id> handle nor a correlated durableId/w:id
       DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard (file mode only)
       REVISION_CONFLICT                 - revision_before is stale (file mode only)
+      EXTERNAL_EDITOR_ACTIVE            - file mode only (issue #27): the file diverged from this
+                                           server's last write within the observation window, e.g.
+                                           Office Online co-authoring; prefer write_mode="live" with
+                                           the Live pane open, or allow_concurrent_editor=True (see
+                                           replace_body_markdown)
       OPC_INVALID                       - the rendered .docx failed OPC validation (file mode only)
       VERIFICATION_FAILED               - post-write verification failed; rolled back (file mode only)
       LIVE_UNAVAILABLE                  - write_mode="live" requested but no connected pane session
@@ -2004,13 +2128,20 @@ def reply_to_comment(path: str, comment_id: str, text: str, write_mode: str = "a
         mode = comments_live._resolve_write_mode(path, write_mode)
         if mode == "live":
             return comments_live.execute_reply_to_comment_live(path, comment_id, text)
-        return comments.execute_reply_to_comment(path, comment_id, text)
+        return comments.execute_reply_to_comment(
+            path, comment_id, text, allow_concurrent_editor=allow_concurrent_editor
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
 @mcp.tool()
-def resolve_comment(path: str, comment_id: str, write_mode: str = "auto") -> dict[str, Any]:
+def resolve_comment(
+    path: str,
+    comment_id: str,
+    write_mode: str = "auto",
+    allow_concurrent_editor: bool = False,
+) -> dict[str, Any]:
     """Resolve a comment thread (durableId), atomically -- issue #28
     WP-09. Sets w15:done="1" on the comment's own commentsExtended.xml
     entry; list_open_items excludes it afterward (it is no longer an
@@ -2085,6 +2216,11 @@ def resolve_comment(path: str, comment_id: str, write_mode: str = "auto") -> dic
                          handle nor a correlated durableId/w:id
       DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard (file mode only)
       REVISION_CONFLICT                 - revision_before is stale (file mode only)
+      EXTERNAL_EDITOR_ACTIVE            - file mode only (issue #27): the file diverged from this
+                                           server's last write within the observation window, e.g.
+                                           Office Online co-authoring; prefer write_mode="live" with
+                                           the Live pane open, or allow_concurrent_editor=True (see
+                                           replace_body_markdown)
       COMMENT_STILL_OPEN                - the post-write re-read did not confirm the resolve (see this tool's own docstring)
       OPC_INVALID                       - the rendered .docx failed OPC validation (file mode only)
       VERIFICATION_FAILED               - post-write verification failed; rolled back (file mode only)
@@ -2100,7 +2236,9 @@ def resolve_comment(path: str, comment_id: str, write_mode: str = "auto") -> dic
         mode = comments_live._resolve_write_mode(path, write_mode)
         if mode == "live":
             return comments_live.execute_resolve_comment_live(path, comment_id)
-        return comments.execute_resolve_comment(path, comment_id)
+        return comments.execute_resolve_comment(
+            path, comment_id, allow_concurrent_editor=allow_concurrent_editor
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -2175,6 +2313,7 @@ def replace_table_row(
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Replace one table row's cell content wholesale, one markdown string
     per cell (cells must have exactly as many entries as the row has
@@ -2214,7 +2353,14 @@ def replace_table_row(
     """
     try:
         return tables.execute_replace_table_row(
-            path, table_id, row_index, cells, revision_before=revision_before, force=force, track_changes=track_changes
+            path,
+            table_id,
+            row_index,
+            cells,
+            revision_before=revision_before,
+            force=force,
+            track_changes=track_changes,
+            allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -2230,11 +2376,31 @@ def replace_cell_markdown(
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
+    allow_concurrent_editor: bool = False,
+    write_mode: str = "auto",
 ) -> dict[str, Any]:
     """Replace one table cell's content with rendered markdown, leaving
     its own w:tcPr byte-identical -- the only write path safe on a merged
     (w:gridSpan/w:vMerge) cell, and the intended path for an Appendix-A
     style band-and-border table's own cell content.
+
+    `write_mode` (issue #27, "auto" | "file" | "live", default "auto"):
+    "auto" routes through the Live pane when one is connected for this
+    document, else writes the file. This is the supported way to edit a
+    cell in a document a co-author has open in Office Online: a live edit
+    is a co-authoring edit, where a file write races that editor's
+    autosave and is likely to be silently reverted. LIVE MODE IS A SUBSET:
+    paragraphs with bold/italic/links only (lists, headings, tables and
+    other block structure -> INVALID_INPUT, nothing sent); the cell is
+    edited compare-and-set against the text just read, so a co-author's
+    concurrent edit to the same cell is refused (LIVE_OP_FAILED) rather
+    than overwritten; a document containing a NESTED table is refused
+    (the pane cannot map table_id onto nested tables); `force` does not
+    apply; before/after are the cell's plain text, not markdown;
+    revision_before/revision_after are "live:sha256:<hex>" body hashes;
+    and the connected pane must report the "cell_edit" capability
+    (LIVE_CAPABILITY_MISSING otherwise -- reload the pane). Requires the
+    pane on the same machine as this server (docs/live-mode.md).
 
     Supports multi-level bulleted/numbered markdown inside the cell
     (issue #28 WP-16a): rendered through the SAME markdown_to_ooxml
@@ -2255,17 +2421,25 @@ def replace_cell_markdown(
       INVALID_INPUT           - a bad path
       DOCX_LOCKED, SYNC_IN_FLIGHT - the write guard
       REVISION_CONFLICT       - revision_before is stale
+      EXTERNAL_EDITOR_ACTIVE  - issue #27: see replace_body_markdown
       TABLE_NOT_FOUND          - table_id does not match any table
       TABLE_ROW_NOT_FOUND      - row_index out of range for this table
       TABLE_CELL_NOT_FOUND     - cell_index out of range for this row
       COMMENT_ANCHORS_IN_RANGE / TRACKED_CHANGES_PRESENT - a hazard in the cell; force=True to proceed
       OPC_INVALID              - the rendered .docx failed OPC validation
-      VERIFICATION_FAILED      - post-write verification failed (including w:tcPr drift); rolled back
+      VERIFICATION_FAILED      - post-write verification failed (including w:tcPr drift); rolled
+                                 back (file mode), or the pane's read-back did not confirm the
+                                 edit, with nothing to roll back (live mode)
+      LIVE_UNAVAILABLE / LIVE_SESSION_ACTIVE / LIVE_SESSION_MISMATCH / LIVE_DISCONNECTED /
+      LIVE_STALE / LIVE_CAPABILITY_MISSING / LIVE_OP_FAILED - as replace_text (issue #154);
+                                 LIVE_OP_FAILED here also covers a cell whose text changed between
+                                 the read and the write, and a document with nested tables
     """
     try:
         return tables.execute_replace_cell_markdown(
             path, table_id, row_index, cell_index, markdown,
             revision_before=revision_before, force=force, track_changes=track_changes,
+            allow_concurrent_editor=allow_concurrent_editor, write_mode=write_mode,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -2283,6 +2457,7 @@ def insert_table(
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Insert a new table, one markdown string OR cell-spec object per
     cell (issue #100: https://github.com/michaelrobertsutton/JennyStack/issues/100).
@@ -2373,6 +2548,7 @@ def insert_table(
                              header_rows/grid_dxa/anchor
       DOCX_LOCKED, SYNC_IN_FLIGHT - the write guard
       REVISION_CONFLICT   - revision_before is stale
+      EXTERNAL_EDITOR_ACTIVE - issue #27: see replace_body_markdown
       STYLE_NOT_FOUND     - style_id does not name a table style in this document
       SECTION_NOT_FOUND   - anchor.section_key does not match find_sections' output
       TABLE_NOT_FOUND     - anchor.after_table_id does not match any table
@@ -2393,6 +2569,7 @@ def insert_table(
             revision_before=revision_before,
             force=force,
             track_changes=track_changes,
+            allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -2412,6 +2589,7 @@ def insert_image(
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Append a new inline picture at the end of the document body, from a
     LOCAL .png or .svg file (image_path is read natively -- no
@@ -2446,6 +2624,7 @@ def insert_image(
       INVALID_INPUT           - a bad path, image_path is not a regular file, or width_in <= 0
       DOCX_LOCKED, SYNC_IN_FLIGHT - the write guard
       REVISION_CONFLICT       - revision_before is stale
+      EXTERNAL_EDITOR_ACTIVE  - issue #27: see replace_body_markdown
       UNSUPPORTED_IMAGE_FORMAT - image_path is not .png/.svg, or its bytes do not parse as one
       SVG_RASTERIZATION_FAILED - the PNG fallback part could not be produced (macOS `sips` failed/unavailable)
       OPC_INVALID              - the rendered .docx failed OPC validation
@@ -2453,7 +2632,13 @@ def insert_image(
     """
     try:
         return images.execute_insert_image(
-            path, image_path, width_in, revision_before=revision_before, force=force, track_changes=track_changes
+            path,
+            image_path,
+            width_in,
+            revision_before=revision_before,
+            force=force,
+            track_changes=track_changes,
+            allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -2468,6 +2653,7 @@ def apply_style(
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
+    allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Apply a NAMED style (from list_styles) to text located via find --
     the named-style counterpart to format_text's four boolean toggles.
@@ -2542,6 +2728,7 @@ def apply_style(
         return text_edit.execute_apply_style(
             path, find, style_id, expected_matches,
             revision_before=revision_before, force=force, track_changes=track_changes,
+            allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
