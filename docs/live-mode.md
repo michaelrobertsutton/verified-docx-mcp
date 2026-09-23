@@ -219,21 +219,31 @@ to the basename match already performed; it does not fail closed, since
 doing so would disable live mode on exactly the platform this issue is
 about.
 
-**Named, unfixed risk** (issue #22 B3, surfaced while removing the
-requirement that `path` exist locally): two *different* SharePoint/
-OneDrive documents that happen to share a basename (e.g. two people's
-own `Proposal.docx`) are indistinguishable to `SessionRegistry`, which
-keys purely on that basename — `register()` silently overwrites
-whichever session was there before under the same name, with no
-collision check at all. This was already true before B3 (a local stand-
-in file gave `_check_session_identity` something to compare against for
-a *local* document, but never protected the web-URL case, which is the
-one this collision actually describes); B3's `must_exist=False` changes
-don't make it worse, they just remove a workaround that never actually
-covered this scenario either. A real fix needs a stable per-session
-identifier beyond basename — a bigger change to `SessionRegistry`'s own
-keying, deliberately out of scope here rather than folded into this
-already-large fix.
+**Named risk, now surfaced rather than silent** (issue #22 B3, surfaced
+while removing the requirement that `path` exist locally; follow-up
+fix landed after the B3 PR merged): two *different* SharePoint/OneDrive
+documents that happen to share a basename (e.g. two people's own
+`Proposal.docx`) are indistinguishable to `SessionRegistry`, which keys
+purely on that basename. This was already true before B3 (a local
+stand-in file gave `_check_session_identity` something to compare
+against for a *local* document, but never protected the web-URL case,
+which is the one this collision actually describes); B3's
+`must_exist=False` changes didn't make it worse, they just removed a
+workaround that never actually covered this scenario either.
+
+`register()` still does not REFUSE a collision — the common, harmless
+case (the SAME document reconnecting after a network blip) must still
+replace the old `LiveSession` object, not be treated as a hazard, and
+there is no way to tell the two apart from a basename match alone. What
+it does now: record every basename collision (a DIFFERENT
+`document_url` registering under a name another session already holds)
+in a capped rolling log, surfaced via `live_status`'s new
+`session_collisions` key (`SessionRegistry.collisions()`) — empty when
+none have happened. Check this before trusting a live write's routing
+if two people might have a same-named document open at once. A full fix
+(routing on something more specific than basename) still needs a bigger
+change to `SessionRegistry`'s own keying — this is detection, not
+disambiguation.
 
 **Every mutating tool's evidence now states its own `write_mode`**
 (`"file"` or `"live"`) — issue #154 WP-3. Previously only live evidence
