@@ -489,7 +489,14 @@ class FormatTextLiveTests(LiveWriteBridgeTestCase):
 
     async def test_color_and_strike_happy_path(self) -> None:
         # Issue #22: live format_text used to silently drop strike, and
-        # had no color key at all.
+        # had no color key at all. Also a regression guard (found via a
+        # real Word sideload, not caught by this suite until fake_pane.py
+        # was fixed to match): Word's own font.color GETTER always
+        # returns a "#"-prefixed hex string, so this call's own
+        # requested_color ("3B3838", no "#") only matches fake_pane.py's
+        # read-back ("#3B3838") because execute_format_text_live strips
+        # the "#" before comparing -- remove that strip and this test
+        # fails with VERIFICATION_FAILED.
         doc = FakeDocument(text="alpha beta")
         await self.connect_pane(doc)
 
