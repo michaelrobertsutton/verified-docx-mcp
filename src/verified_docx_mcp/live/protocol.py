@@ -53,11 +53,24 @@ pane must honor.
                      ``{"matches": [SearchMatch, ...]}``.
 
   replace         -- ``ReplacePayload`` (find, expected_matches, replace,
-                     track_changes). Word calls: ``body.search(find, ...)``;
-                     if the match count != expected_matches, no edit is
-                     made and the pane replies ok=false (LIVE_OP_FAILED,
-                     not a protocol error) with the actual count in
-                     ``error.message``. Otherwise, for each match range:
+                     track_changes, rowAnchor). rowAnchor (issue #22 B2,
+                     optional -- REQUIRES the pane report the "row_scope"
+                     capability in its own hello, checked by
+                     ``live/write_mode.py``'s ``require_capability``
+                     BEFORE this op is ever sent, so an old pane can never
+                     silently ignore it and run an unscoped op instead):
+                     the pane first resolves rowAnchor's own table row
+                     (``range.parentTableCellOrNullObject.parentTableCellOrNullObject``
+                     null -> LIVE_OP_FAILED "rowAnchor is not in a table
+                     cell"), then scopes `find`'s own
+                     ``body.search``/count-gate/edit to that row's own
+                     ``Range`` (``row.getRange()``) instead of the whole
+                     body. Word calls (unscoped case): ``body.search(find,
+                     ...)``; if the match count != expected_matches, no
+                     edit is made and the pane replies ok=false
+                     (LIVE_OP_FAILED, not a protocol error) with the
+                     actual count in ``error.message``. Otherwise, for
+                     each match range:
                      optionally ``document.changeTrackingMode =
                      Word.ChangeTrackingMode.trackAll`` for the duration,
                      then ``range.insertText(payload.replace,
@@ -69,16 +82,28 @@ pane must honor.
                      before and after the whole op).
 
   format          -- ``FormatPayload`` (find, expected_matches, bold,
-                     italic, underline, track_changes). Same
-                     search-and-count-gate as replace; on a match, Word
-                     calls: ``range.font.bold``/``.italic``/``.underline``
-                     assignment for whichever of the three are not
-                     ``None``, under the same optional
-                     ``changeTrackingMode`` toggle. Reply result: same
-                     shape as ``ReplaceResult`` (before/after are the
-                     matched text, unchanged by a format-only op, so the
-                     evidence is the pre/post body hash plus
-                     match_count).
+                     italic, underline, strike, color, track_changes,
+                     rowAnchor). rowAnchor is the same row-scoping/
+                     capability-gated mechanism ``replace`` documents
+                     above. Same search-and-count-gate as replace; on a match,
+                     Word calls: ``range.font.bold``/``.italic``/
+                     ``.underline``/``.strikeThrough`` assignment for
+                     whichever of the four are not ``None``, and
+                     ``range.font.color = "#RRGGBB"`` when ``color`` is
+                     given, under the same optional ``changeTrackingMode``
+                     toggle. After ``context.sync()``, the pane RE-LOADS
+                     ``range.font.color``/``.strikeThrough`` per match and
+                     includes the read-back values in the reply
+                     (``colorAfter``/``strikeAfter`` on each match) --
+                     issue #22: a caller checks these against what it
+                     asked for, rather than trusting an echo of the
+                     request, so a write that silently didn't take (a
+                     protected range, a stale object reference) is
+                     detectable. Reply result: same shape as
+                     ``ReplaceResult`` (before/after are the matched text,
+                     unchanged by a format-only op, so the evidence is
+                     the pre/post body hash plus match_count) plus the
+                     two read-back fields above on each match.
 
   comments_list   -- no payload. Word calls: ``body.getComments()``,
                      ``comment.load(["id","content","authorName",
@@ -205,6 +230,24 @@ class HelloMessage:
     derives it from ``document_url`` (the basename) when it keys the
     session, per the plan's "keyed by document file name from
     documentUrl".
+
+    ``capabilities`` (issue #22 B2, optional -- defaults to ``[]``):
+    op-level feature names THIS pane build implements beyond the
+    baseline op set, e.g. ``"row_scope"`` (``rowAnchor`` on
+    ``replace``/``format``). Distinct from ``requirement_sets``
+    (WordApi version support the HOST reports) -- a pane can run on a
+    WordApi version new enough for a feature's underlying Office JS
+    calls while still running an OLDER BUILD of ``taskpane.js`` that
+    never implements the wire-level payload field for it. An
+    already-connected pane from before a capability existed sends no
+    ``capabilities`` field at all (a real gap this defends against: an
+    old pane silently ignoring an unknown payload key and running an
+    UNSCOPED op instead of refusing) -- ``from_json`` defaults it to
+    ``[]`` rather than requiring it, so that pane still connects; a
+    caller that needs a specific capability checks for its presence
+    before sending an op that depends on it
+    (``live/write_mode.py``'s ``require_capability``), rather than the
+    hello parse itself refusing.
     """
 
     document_url: str
@@ -212,6 +255,7 @@ class HelloMessage:
     platform: str
     requirement_sets: dict[str, Any]
     body_sha256: str
+    capabilities: frozenset[str] = frozenset()
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -221,6 +265,7 @@ class HelloMessage:
             "platform": self.platform,
             "requirementSets": self.requirement_sets,
             "bodySha256": self.body_sha256,
+            "capabilities": sorted(self.capabilities),
         }
 
     @classmethod
@@ -229,12 +274,14 @@ class HelloMessage:
         msg_type = _require(obj, "type", str)
         if msg_type != "hello":
             raise ProtocolError(f"expected type 'hello', got {msg_type!r}")
+        capabilities_raw = _optional(obj, "capabilities", list, default=[])
         return cls(
             document_url=_require(obj, "documentUrl", str),
             host=_require(obj, "host", str),
             platform=_require(obj, "platform", str),
             requirement_sets=_require(obj, "requirementSets", dict),
             body_sha256=_require(obj, "bodySha256", str),
+            capabilities=frozenset(capabilities_raw),
         )
 
 
@@ -404,6 +451,7 @@ class ReplacePayload:
     replace: str
     track_changes: bool = False
     expected_body_sha256: str | None = None
+    row_anchor: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -414,6 +462,8 @@ class ReplacePayload:
         }
         if self.expected_body_sha256 is not None:
             out["expectedBodySha256"] = self.expected_body_sha256
+        if self.row_anchor is not None:
+            out["rowAnchor"] = self.row_anchor
         return out
 
     @classmethod
@@ -430,6 +480,7 @@ class ReplacePayload:
             replace=_require(obj, "replace", str),
             track_changes=_optional(obj, "track_changes", bool, default=False),
             expected_body_sha256=_optional(obj, "expectedBodySha256", str, default=None),
+            row_anchor=_optional(obj, "rowAnchor", str, default=None),
         )
 
 
@@ -440,8 +491,11 @@ class FormatPayload:
     bold: bool | None = None
     italic: bool | None = None
     underline: bool | None = None
+    strike: bool | None = None
+    color: str | None = None
     track_changes: bool = False
     expected_body_sha256: str | None = None
+    row_anchor: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -450,10 +504,14 @@ class FormatPayload:
             "bold": self.bold,
             "italic": self.italic,
             "underline": self.underline,
+            "strike": self.strike,
+            "color": self.color,
             "track_changes": self.track_changes,
         }
         if self.expected_body_sha256 is not None:
             out["expectedBodySha256"] = self.expected_body_sha256
+        if self.row_anchor is not None:
+            out["rowAnchor"] = self.row_anchor
         return out
 
     @classmethod
@@ -467,16 +525,21 @@ class FormatPayload:
         bold = _optional(obj, "bold", bool, default=None)
         italic = _optional(obj, "italic", bool, default=None)
         underline = _optional(obj, "underline", bool, default=None)
-        if bold is None and italic is None and underline is None:
-            raise ProtocolError("at least one of bold/italic/underline must be set")
+        strike = _optional(obj, "strike", bool, default=None)
+        color = _optional(obj, "color", str, default=None)
+        if bold is None and italic is None and underline is None and strike is None and color is None:
+            raise ProtocolError("at least one of bold/italic/underline/strike/color must be set")
         return cls(
             find=find,
             expected_matches=expected_matches,
             bold=bold,
             italic=italic,
             underline=underline,
+            strike=strike,
+            color=color,
             track_changes=_optional(obj, "track_changes", bool, default=False),
             expected_body_sha256=_optional(obj, "expectedBodySha256", str, default=None),
+            row_anchor=_optional(obj, "rowAnchor", str, default=None),
         )
 
 

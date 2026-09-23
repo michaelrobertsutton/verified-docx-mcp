@@ -189,6 +189,10 @@ const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 const OP_LOG_LIMIT = 20;
 
+// issue #22 B2: sent in `hello`; see the capabilities comment at the send
+// site (connectOpsSocket's onopen) for what this defends against.
+const PANE_CAPABILITIES = ["row_scope"];
+
 let opsSocket = null;
 let heartbeatTimer = null;
 let reconnectTimer = null;
@@ -311,6 +315,17 @@ function connectOpsSocket() {
           platform: Office.context.platform,
           requirementSets: requirementSets(),
           bodySha256: hash,
+          // issue #22 B2: op-level feature names THIS pane build
+          // implements, independent of WordApi version support
+          // (requirementSets above) -- a pane can run on a WordApi
+          // version new enough for row_scope's own Office JS calls while
+          // still running an OLDER BUILD of this exact file that never
+          // learned the rowAnchor wire field. The server's
+          // live/write_mode.py require_capability refuses BEFORE sending
+          // an op that depends on a capability not listed here, rather
+          // than risk this pane silently ignoring an unknown payload key
+          // and running an unscoped op instead.
+          capabilities: PANE_CAPABILITIES,
         })
       );
       setWsStatus("connected");
@@ -494,6 +509,64 @@ async function opSearch(payload) {
 
 // -- replace / format ---------------------------------------------------
 
+// issue #22 (Codex review): both ops toggle changeTrackingMode for the
+// duration of the mutation and must restore it afterward even if the
+// mutation's own context.sync() throws -- a plain sequential restore (the
+// pre-issue-#22 shape) left the document stuck on trackAll on that path.
+// Both now restore in a finally block.
+
+// issue #22 B2: resolves payload.rowAnchor's own table row and returns
+// its cells, for `find` to be searched within (Body.search per cell,
+// merged) instead of the whole document body. Uses only well-documented,
+// stable WordApi 1.3 members (Range.parentTableCellOrNullObject,
+// TableCell.parentRow, TableRow.cells, TableCell.body) rather than a
+// single combined "row range" -- there is no directly analogous
+// TableRow.getRange() call in the Word JS API to get one Range spanning
+// every cell in a row, so this searches cell-by-cell and merges the
+// results instead. Manual sideload verification against a real
+// duplicate-cell table (docs/live-mode.md) still needed -- fake_pane.py's
+// own row model (a text delimiter) cannot exercise this actual object
+// graph, only the server's own rowAnchor plumbing around it.
+async function resolveRowCells(context, rowAnchorText) {
+  const anchorResults = context.document.body.search(rowAnchorText, { matchCase: true, matchWholeWord: false });
+  anchorResults.load("items");
+  await context.sync();
+  if (anchorResults.items.length !== 1) {
+    throw refusalError(
+      `rowAnchor ${JSON.stringify(rowAnchorText)} must be unique in the document, found ${anchorResults.items.length}`
+    );
+  }
+  const cell = anchorResults.items[0].parentTableCellOrNullObject;
+  cell.load("isNullObject");
+  await context.sync();
+  if (cell.isNullObject) {
+    throw refusalError(`rowAnchor ${JSON.stringify(rowAnchorText)} does not resolve to a table cell`);
+  }
+  const row = cell.parentRow;
+  const rowCells = row.cells;
+  rowCells.load("items");
+  await context.sync();
+  return rowCells.items;
+}
+
+async function searchScoped(context, payload) {
+  if (payload.rowAnchor === null || payload.rowAnchor === undefined) {
+    const results = context.document.body.search(payload.find, { matchCase: true, matchWholeWord: false });
+    results.load("text");
+    await context.sync();
+    return results.items;
+  }
+  const rowCells = await resolveRowCells(context, payload.rowAnchor);
+  const perCellResults = rowCells.map((cell) =>
+    cell.body.search(payload.find, { matchCase: true, matchWholeWord: false })
+  );
+  perCellResults.forEach((r) => r.load("text"));
+  await context.sync();
+  const merged = [];
+  perCellResults.forEach((r) => merged.push(...r.items));
+  return merged;
+}
+
 async function opReplace(payload) {
   const expectedMatches = payload.expected_matches;
   return Word.run(async (context) => {
@@ -502,13 +575,11 @@ async function opReplace(payload) {
     await context.sync();
     const preHash = await sha256Hex(body.text || "");
 
-    const results = body.search(payload.find, { matchCase: true, matchWholeWord: false });
-    results.load("text");
-    await context.sync();
+    const matchItems = await searchScoped(context, payload);
 
-    if (results.items.length !== expectedMatches) {
+    if (matchItems.length !== expectedMatches) {
       throw refusalError(
-        `expected ${expectedMatches} match(es) for ${JSON.stringify(payload.find)}, found ${results.items.length}`
+        `expected ${expectedMatches} match(es) for ${JSON.stringify(payload.find)}, found ${matchItems.length}`
       );
     }
 
@@ -520,13 +591,15 @@ async function opReplace(payload) {
       context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
     }
 
-    const matches = results.items.map((range) => ({ before: range.text, after: payload.replace }));
-    results.items.forEach((range) => range.insertText(payload.replace, Word.InsertLocation.replace));
-    await context.sync();
-
-    if (previousMode !== null) {
-      context.document.changeTrackingMode = previousMode;
+    const matches = matchItems.map((range) => ({ before: range.text, after: payload.replace }));
+    try {
+      matchItems.forEach((range) => range.insertText(payload.replace, Word.InsertLocation.replace));
       await context.sync();
+    } finally {
+      if (previousMode !== null) {
+        context.document.changeTrackingMode = previousMode;
+        await context.sync();
+      }
     }
 
     const postBody = context.document.body;
@@ -534,7 +607,7 @@ async function opReplace(payload) {
     await context.sync();
     const postHash = await sha256Hex(postBody.text || "");
 
-    return { applied: true, match_count: results.items.length, matches, pre: preHash, post: postHash };
+    return { applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
   });
 }
 
@@ -546,13 +619,11 @@ async function opFormat(payload) {
     await context.sync();
     const preHash = await sha256Hex(body.text || "");
 
-    const results = body.search(payload.find, { matchCase: true, matchWholeWord: false });
-    results.load("text");
-    await context.sync();
+    const matchItems = await searchScoped(context, payload);
 
-    if (results.items.length !== expectedMatches) {
+    if (matchItems.length !== expectedMatches) {
       throw refusalError(
-        `expected ${expectedMatches} match(es) for ${JSON.stringify(payload.find)}, found ${results.items.length}`
+        `expected ${expectedMatches} match(es) for ${JSON.stringify(payload.find)}, found ${matchItems.length}`
       );
     }
 
@@ -564,27 +635,45 @@ async function opFormat(payload) {
       context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
     }
 
-    const matches = results.items.map((range) => ({ before: range.text, after: range.text }));
-    results.items.forEach((range) => {
-      if (payload.bold !== null && payload.bold !== undefined) range.font.bold = payload.bold;
-      if (payload.italic !== null && payload.italic !== undefined) range.font.italic = payload.italic;
-      if (payload.underline !== null && payload.underline !== undefined) {
-        range.font.underline = payload.underline ? Word.UnderlineType.single : Word.UnderlineType.none;
-      }
-    });
-    await context.sync();
-
-    if (previousMode !== null) {
-      context.document.changeTrackingMode = previousMode;
+    const matches = matchItems.map((range) => ({ before: range.text, after: range.text }));
+    try {
+      matchItems.forEach((range) => {
+        if (payload.bold !== null && payload.bold !== undefined) range.font.bold = payload.bold;
+        if (payload.italic !== null && payload.italic !== undefined) range.font.italic = payload.italic;
+        if (payload.underline !== null && payload.underline !== undefined) {
+          range.font.underline = payload.underline ? Word.UnderlineType.single : Word.UnderlineType.none;
+        }
+        // issue #22: strike/color, the two format_text gained for the
+        // proposal-lead incident (marking edits in a font color; strike
+        // was silently dropped in live mode before this).
+        if (payload.strike !== null && payload.strike !== undefined) range.font.strikeThrough = payload.strike;
+        if (payload.color !== null && payload.color !== undefined) range.font.color = payload.color;
+      });
       await context.sync();
+    } finally {
+      if (previousMode !== null) {
+        context.document.changeTrackingMode = previousMode;
+        await context.sync();
+      }
     }
+
+    // issue #22: re-load font.color/strikeThrough per match AFTER sync,
+    // rather than echoing the request back -- lets the server detect a
+    // write that didn't actually take (a protected range, a stale
+    // object reference) instead of trusting an unconfirmed "applied".
+    matchItems.forEach((range) => range.font.load(["color", "strikeThrough"]));
+    await context.sync();
+    matchItems.forEach((range, i) => {
+      matches[i].colorAfter = range.font.color;
+      matches[i].strikeAfter = range.font.strikeThrough;
+    });
 
     const postBody = context.document.body;
     postBody.load("text");
     await context.sync();
     const postHash = await sha256Hex(postBody.text || "");
 
-    return { applied: true, match_count: results.items.length, matches, pre: preHash, post: postHash };
+    return { applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
   });
 }
 

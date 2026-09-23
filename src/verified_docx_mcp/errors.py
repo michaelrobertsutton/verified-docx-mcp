@@ -129,6 +129,16 @@ class ErrorCode(Enum):
     LIVE_SESSION_ACTIVE = "LIVE_SESSION_ACTIVE"  # mutations._guard_before_write refused a FILE-MODE write because a pane session is connected for this document -- use write_mode="live" (where the tool has one), or save and close the document in Word (not just the pane) and retry
     LIVE_SESSION_MISMATCH = "LIVE_SESSION_MISMATCH"  # live/write_mode.py's auto/live routing found a session matching this document's basename, but that session's own document_url resolves to a different local file -- refusing rather than risk mutating the wrong document
 
+    # Issue #22 B2: within_row_containing/rowAnchor requires the connected
+    # pane to have reported the "row_scope" capability in its own hello --
+    # an already-connected OLD pane (from before this feature existed)
+    # would otherwise silently ignore an unrecognized rowAnchor payload
+    # key and run an UNSCOPED op instead of refusing, which is exactly the
+    # "wrote to all N identical cells" bug this feature exists to prevent,
+    # just moved onto the wire instead of fixed. live/write_mode.py's
+    # require_capability raises this BEFORE the op is ever sent.
+    LIVE_CAPABILITY_MISSING = "LIVE_CAPABILITY_MISSING"  # the connected pane did not report a capability this call requires (live/write_mode.py require_capability)
+
 
 # Which codes signal a transient condition worth a single retry by the
 # caller. Empty for now — WP-02 has no revision-stamped write to race

@@ -556,5 +556,60 @@ class WriteModeResolutionTests(LiveCommentsTestCase):
         self.assertEqual(doc.comments, [])  # the fake pane received no op either
 
 
+class NoLocalFileLiveTests(LiveCommentsTestCase):
+    """Issue #22 B3: every live comment tool must work when `path` names
+    NO local file at all -- the real incident's own shape (a SharePoint/
+    OneDrive document with no local sync). asyncSetUp's base class copies
+    the fixture to self.target first (so document_url's basename still
+    matches what a real pane would report); this class deletes it right
+    after, before connecting any pane, so every call below genuinely has
+    no local file to fall back to."""
+
+    fixture_name = "frag.docx"
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.target.unlink()
+        self.assertFalse(self.target.exists())
+
+    async def test_list_open_items_live_reports_file_side_unavailable(self):
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        await self.connect_pane(document=doc)
+
+        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        self.assertEqual(result["source"], "live")
+        self.assertIsNone(result["pending_suggestions"])
+        self.assertFalse(result["file_side_available"])
+        self.assertEqual(result["correlation"], [])
+
+    async def test_add_reply_resolve_all_work_via_live_handle_with_no_local_file(self):
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        await self.connect_pane(document=doc)
+
+        added = await self.call(
+            comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "x", 1
+        )
+        self.assertTrue(added["applied"])
+        live_id = added["comment_id"]
+
+        reply = await self.call(comments_live.execute_reply_to_comment_live, str(self.target), live_id, "a reply")
+        self.assertTrue(reply["applied"])
+
+        resolved = await self.call(comments_live.execute_resolve_comment_live, str(self.target), live_id)
+        self.assertTrue(resolved["applied"])
+
+    async def test_durable_id_resolution_fails_closed_with_no_local_file(self):
+        # Without a local file there is no file-side correlation table at
+        # all -- a durableId/w:id handle (as opposed to a live:<id> one)
+        # can never resolve, and must say so rather than silently
+        # matching the wrong thing.
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        await self.connect_pane(document=doc)
+
+        with self.assertRaises(VerifyError) as cm:
+            await self.call(comments_live.execute_reply_to_comment_live, str(self.target), "58A3F864", "x")
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+
 if __name__ == "__main__":
     unittest.main()

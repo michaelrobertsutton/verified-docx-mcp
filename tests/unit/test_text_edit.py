@@ -24,7 +24,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 
-from verified_docx_mcp import mutations, paths, projection, text_edit, tracked_changes
+from verified_docx_mcp import mutations, paths, projection, tables, text_edit, tracked_changes
 from verified_docx_mcp.errors import ErrorCode, VerifyError
 from verified_docx_mcp.middleware import MUTATING_TOOLS
 
@@ -158,6 +158,98 @@ class StructuralBoundaryRefusalTests(_TempFixtureCase):
         self.assertEqual(projection.read_document_text(self.target), before_text, "a refused match must not write")
 
 
+class RowScopedEditTests(_TempFixtureCase):
+    """Issue #22 B2: within_row_containing on replace_text/format_text
+    (file mode), against tables.docx's real Word-authored 2x2 table with
+    two cells given IDENTICAL text -- the exact "eleven identical cells"
+    shape from the real incident, at 2 rows instead of 11."""
+
+    fixture_name = "tables.docx"
+
+    def setUp(self):
+        super().setUp()
+        # R1C1/R2C1 both get "Duplicate"; R1C2/R2C2 are each row's own
+        # unique anchor. 1-based row/cell indices, per tables.py's own
+        # _find_row/_find_cell contract.
+        tables.execute_replace_cell_markdown(str(self.target), 1, 1, 1, "Duplicate")
+        tables.execute_replace_cell_markdown(str(self.target), 1, 1, 2, "AnchorRow1")
+        tables.execute_replace_cell_markdown(str(self.target), 1, 2, 1, "Duplicate")
+        tables.execute_replace_cell_markdown(str(self.target), 1, 2, 2, "AnchorRow2")
+
+    def test_replace_text_edits_only_the_anchored_row(self):
+        text_edit.execute_replace_text(
+            str(self.target), "Duplicate", "Changed", 1, within_row_containing="AnchorRow1"
+        )
+        self.assertEqual(
+            projection.read_document_text(self.target),
+            "Before the table.\nChanged\nAnchorRow1\nDuplicate\nAnchorRow2\nAfter the table.",
+        )
+
+    def test_format_text_touches_only_the_anchored_row(self):
+        text_edit.execute_format_text(
+            str(self.target), "Duplicate", {"bold": True}, 1, within_row_containing="AnchorRow2"
+        )
+        runs = [r for r in projection.read_document_runs(self.target) if r.get("text") == "Duplicate"]
+        self.assertEqual([r["rPr"]["bold"] for r in runs], [False, True])
+
+    def test_anchor_not_unique_in_document_raises_match_count_mismatch(self):
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_replace_text(
+                str(self.target), "Duplicate", "X", 1, within_row_containing="Duplicate"
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.MATCH_COUNT_MISMATCH)
+
+    def test_anchor_not_in_a_table_raises_invalid_input(self):
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_replace_text(
+                str(self.target), "Duplicate", "X", 1, within_row_containing="Before the table."
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    def test_anchor_not_found_raises_zero_match(self):
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_replace_text(
+                str(self.target), "Duplicate", "X", 1, within_row_containing="NoSuchAnchor"
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.ZERO_MATCH)
+
+
+class SpanFilterOutOfScopeBoundaryTests(_TempFixtureCase):
+    """Issue #22 (Codex review): locate()'s span_filter is applied BEFORE
+    the STRUCTURAL_BOUNDARY check and rung selection, not after -- an
+    out-of-scope match that crosses a boundary must never raise, and must
+    never suppress an in-scope match at a later rung."""
+
+    fixture_name = "tables.docx"
+
+    def test_out_of_scope_boundary_crossing_match_does_not_raise(self):
+        proj = projection.project_document_root(mutations._load_document(self.target)[0])
+        # "R1C1\nR1C2" crosses a cell boundary (STRUCTURAL_BOUNDARY territory)
+        # and is the ONLY occurrence of this needle -- filtering it OUT of
+        # scope entirely (span_filter always False) must make this call
+        # behave as ZERO_MATCH, never STRUCTURAL_BOUNDARY.
+        with self.assertRaises(VerifyError) as cm:
+            from verified_docx_mcp.locate import locate
+
+            locate("R1C1\nR1C2", proj, 1, span_filter=lambda s, e: False)
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.ZERO_MATCH)
+
+    def test_in_scope_match_at_a_later_rung_is_not_shadowed_by_an_out_of_scope_exact_match(self):
+        # "R1C1" matches exactly once (in scope, at rung "exact"). A
+        # span_filter that excludes it must fall through the ladder to
+        # ZERO_MATCH rather than the exact rung ever being considered
+        # "found" for count/boundary purposes.
+        proj = projection.project_document_root(mutations._load_document(self.target)[0])
+        from verified_docx_mcp.locate import locate
+
+        with self.assertRaises(VerifyError) as cm:
+            locate("R1C1", proj, 1, span_filter=lambda s, e: False)
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.ZERO_MATCH)
+        diagnostics = cm.exception.envelope.diagnostics
+        self.assertIn("ladder_report", diagnostics)
+        self.assertTrue(any(entry.get("matches_outside_span_filter") for entry in diagnostics["ladder_report"]))
+
+
 class FormatTextTests(_TempFixtureCase):
     def test_bold_whole_phrase_evidence_shape_and_runs(self):
         evidence = text_edit.execute_format_text(
@@ -201,6 +293,93 @@ class FormatTextTests(_TempFixtureCase):
         with self.assertRaises(VerifyError) as cm:
             text_edit.execute_format_text(str(self.target), "brown", {}, 1)
         self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+
+class FormatTextColorTests(_TempFixtureCase):
+    """Issue #22: format_text's color key (file mode)."""
+
+    def _rpr_snippet(self) -> str:
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        idx = xml.find("brown")
+        return xml[max(0, idx - 250) : idx]
+
+    def test_sets_color_normalized_uppercase_with_leading_hash_accepted(self):
+        evidence = text_edit.execute_format_text(str(self.target), "brown", {"color": "#3b3838"}, 1)
+        self.assertEqual(evidence["runs_after"][0][0]["color"], "3B3838")
+        self.assertIn('<w:color w:val="3B3838"', self._rpr_snippet())
+
+    def test_bad_hex_color_rejected(self):
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_format_text(str(self.target), "brown", {"color": "not-a-color"}, 1)
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    def test_noop_when_color_already_matches(self):
+        text_edit.execute_format_text(str(self.target), "brown", {"color": "3B3838"}, 1)
+        evidence = text_edit.execute_format_text(str(self.target), "brown", {"color": "3B3838"}, 1)
+        self.assertEqual(evidence["revision_before"], evidence["revision_after"])
+
+    def test_color_insertion_respects_schema_order_against_unlisted_trailing_children(self):
+        # Hand-inject w:sz/w:lang (not in ANY narrow allowlist) after the
+        # existing w:b on "brown"'s rPr -- format_text's new w:i/w:color
+        # must land BEFORE them, matching CT_RPrBase's fixed order, not
+        # wherever a blind append would put them.
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        xml2 = xml.replace(
+            "<w:rPr><w:b/></w:rPr>",
+            '<w:rPr><w:b/><w:sz w:val="28"/><w:lang w:val="en-US"/></w:rPr>',
+            1,
+        )
+        self.assertNotEqual(xml, xml2, "fixture's rPr shape changed -- update this test's replace target")
+        with zipfile.ZipFile(self.target) as zin:
+            names = zin.namelist()
+            datas = {n: (xml2.encode("utf-8") if n == "word/document.xml" else zin.read(n)) for n in names}
+        os.remove(self.target)
+        with zipfile.ZipFile(self.target, "w", zipfile.ZIP_DEFLATED) as zout:
+            for n in names:
+                zout.writestr(n, datas[n])
+
+        text_edit.execute_format_text(str(self.target), "brown", {"italic": True, "color": "3B3838"}, 1)
+        snippet = self._rpr_snippet()
+        self.assertIn('<w:b /><w:i /><w:color w:val="3B3838" /><w:sz w:val="28" /><w:lang w:val="en-US" />', snippet)
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
+
+    def test_explicit_color_clears_theme_attributes(self):
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        xml2 = xml.replace(
+            "<w:rPr><w:b/></w:rPr>",
+            '<w:rPr><w:b/><w:color w:val="1F4E79" w:themeColor="accent1" w:themeShade="BF"/></w:rPr>',
+            1,
+        )
+        self.assertNotEqual(xml, xml2)
+        with zipfile.ZipFile(self.target) as zin:
+            names = zin.namelist()
+            datas = {n: (xml2.encode("utf-8") if n == "word/document.xml" else zin.read(n)) for n in names}
+        os.remove(self.target)
+        with zipfile.ZipFile(self.target, "w", zipfile.ZIP_DEFLATED) as zout:
+            for n in names:
+                zout.writestr(n, datas[n])
+
+        text_edit.execute_format_text(str(self.target), "brown", {"color": "3B3838"}, 1)
+        snippet = self._rpr_snippet()
+        self.assertIn('<w:color w:val="3B3838" />', snippet)
+        self.assertNotIn("themeColor", snippet)
+        self.assertNotIn("themeShade", snippet)
+
+    def test_tracked_color_change_produces_rprchange_and_no_double_nesting_on_repeat(self):
+        with mock.patch("verified_docx_mcp.text_edit.resolve_author_name", return_value="Jane Reviewer"):
+            first = text_edit.execute_format_text(str(self.target), "brown", {"color": "3B3838"}, 1, track_changes=True)
+            second = text_edit.execute_format_text(str(self.target), "brown", {"color": "FF0000"}, 1, track_changes=True)
+        self.assertEqual(len(first["revision_ids"]), 1)
+        self.assertEqual(second["revision_ids"], [])  # same author, same run -- reused, not stacked
+        snippet = self._rpr_snippet()
+        self.assertEqual(snippet.count("<w:rPrChange "), 1)
+        self.assertIn('<w:color w:val="FF0000" />', snippet)
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
 
 
 class WarningsSurfaceOnEvidenceTests(_TempFixtureCase):

@@ -18,12 +18,19 @@ editing engine):
     the real pane's `document.changeTrackingMode` assignment) but does
     not synthesize `w:ins`/`w:del`-equivalent revision marks -- there is
     no OOXML here at all, just a Python string.
-  - `format`'s bold/italic/underline payload fields are accepted and
-    validated but not stored against a run model (this fake has no
-    run/style model); the op still enforces the same
+  - `format`'s bold/italic/underline/strike/color payload fields are
+    accepted and validated but not stored against a run model (this fake
+    has no run/style model); the op still enforces the same
     search-and-count-gate and returns the same result shape
     (`ReplaceResult`-shaped: applied, match_count, matches, pre, post)
-    the real pane does.
+    the real pane does. `colorAfter`/`strikeAfter` (issue #22: the real
+    pane's read-back-after-sync fields, so a caller can tell a write that
+    didn't take from one that did) are present on every match for shape
+    parity, but this fake ECHOES the request rather than reading anything
+    back -- it cannot prove the real Office JS `font.color`/
+    `.strikeThrough` read-back path works, only that the server correctly
+    checks whatever the pane sends. A real pane sideload (docs/live-mode.md)
+    is the only thing that exercises the actual Word object-model path.
   - A comment's `anchor_text` is captured once, at `comment_add` time,
     rather than tracked live against a `Word.Range` that could shift as
     later edits land -- good enough for the WP-2 fixture scenarios, which
@@ -120,6 +127,18 @@ class FakeComment:
         }
 
 
+# Issue #22 B2: the fake's row model. A real Word table has no analogue
+# in this fake's flat-string document, so a test that wants row-scoping
+# embeds this delimiter between "rows" in its own initial text -- e.g.
+# FakeDocument(f"AnchorRow1{ROW_DELIMITER}DuplicateA{ROW_DELIMITER}"
+# f"AnchorRow2{ROW_DELIMITER}DuplicateB"). Enough to test the SERVER's own
+# rowAnchor plumbing (payload shape, the capability gate, the count-gate
+# scoped to a sub-range); it proves nothing about the real Office JS
+# parentTableCellOrNullObject/row.getRange() path -- see the module
+# docstring's fidelity notes.
+ROW_DELIMITER = "\x1e"
+
+
 class FakeDocument:
     """The in-memory "document" every op below reads and writes."""
 
@@ -141,6 +160,32 @@ class FakeDocument:
 
     def sha256(self) -> str:
         return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+
+    def _row_bounds(self, row_anchor: str) -> tuple[int, int]:
+        """(start, end) absolute offsets of the ROW_DELIMITER-bounded
+        segment containing row_anchor's own (single) occurrence. Mirrors
+        the real pane's own "resolve rowAnchor's row, then scope find to
+        it" two-step -- the row-not-found/anchor-not-unique refusals are
+        the same shape a real pane's LIVE_OP_FAILED would carry."""
+        positions = _find_all(self.text, row_anchor)
+        if len(positions) != 1:
+            raise OpRefused(
+                "LIVE_OP_FAILED",
+                f"rowAnchor {row_anchor!r} must be unique in the document, found {len(positions)}",
+            )
+        anchor_start, anchor_end = positions[0]
+        start = self.text.rfind(ROW_DELIMITER, 0, anchor_start)
+        start = 0 if start == -1 else start + len(ROW_DELIMITER)
+        end = self.text.find(ROW_DELIMITER, anchor_end)
+        end = len(self.text) if end == -1 else end
+        return start, end
+
+    def _scoped_positions(self, find: str, row_anchor: str | None) -> list[tuple[int, int]]:
+        if row_anchor is None:
+            return _find_all(self.text, find)
+        row_start, row_end = self._row_bounds(row_anchor)
+        local = _find_all(self.text[row_start:row_end], find)
+        return [(row_start + s, row_start + e) for s, e in local]
 
     # -- ops ---------------------------------------------------------
 
@@ -172,9 +217,17 @@ class FakeDocument:
             )
         return results
 
-    def replace(self, find: str, expected_matches: int, replace: str, *, track_changes: bool = False) -> dict[str, Any]:
+    def replace(
+        self,
+        find: str,
+        expected_matches: int,
+        replace: str,
+        *,
+        track_changes: bool = False,
+        row_anchor: str | None = None,
+    ) -> dict[str, Any]:
         pre = self.sha256()
-        positions = _find_all(self.text, find)
+        positions = self._scoped_positions(find, row_anchor)
         if len(positions) != expected_matches:
             raise OpRefused(
                 "LIVE_OP_FAILED",
@@ -207,10 +260,13 @@ class FakeDocument:
         bold: bool | None = None,
         italic: bool | None = None,
         underline: bool | None = None,
+        strike: bool | None = None,
+        color: str | None = None,
         track_changes: bool = False,
+        row_anchor: str | None = None,
     ) -> dict[str, Any]:
         pre = self.sha256()
-        positions = _find_all(self.text, find)
+        positions = self._scoped_positions(find, row_anchor)
         if len(positions) != expected_matches:
             raise OpRefused(
                 "LIVE_OP_FAILED",
@@ -223,7 +279,17 @@ class FakeDocument:
             # Formatting never changes body text in this fake (no run
             # model to mutate) -- see the module docstring's fidelity
             # notes. before == after == the matched text itself.
-            matches_result = [{"before": find, "after": find} for _ in positions]
+            # issue #22: colorAfter/strikeAfter mirror the real pane's
+            # read-back contract in SHAPE (present on every match), but
+            # this fake has no run/style model to read back from -- it
+            # echoes the request, same limitation the module docstring
+            # already names for bold/italic/underline. A test that needs
+            # to prove the real Office JS read-back path (not just that
+            # the server checks whatever the pane sends) uses a real pane
+            # sideload instead -- see docs/live-mode.md.
+            matches_result = [
+                {"before": find, "after": find, "colorAfter": color, "strikeAfter": strike} for _ in positions
+            ]
         finally:
             self.change_tracking_mode = previous_mode
         return {
@@ -309,6 +375,7 @@ class FakePane:
         platform: str = "Mac",
         requirement_sets: dict[str, Any] | None = None,
         heartbeat_interval: float = 5.0,
+        capabilities: list[str] | None = None,
     ) -> None:
         self.document = document if document is not None else FakeDocument()
         self.document_url = document_url
@@ -316,6 +383,11 @@ class FakePane:
         self.platform = platform
         self.requirement_sets = requirement_sets or {"1.4": True, "1.5": True, "1.6": True}
         self.heartbeat_interval = heartbeat_interval
+        # issue #22 B2: defaults to a CURRENT pane build (reports
+        # "row_scope"); pass capabilities=[] to simulate an old,
+        # already-connected pane predating the capability, for
+        # LIVE_CAPABILITY_MISSING coverage.
+        self.capabilities = ["row_scope"] if capabilities is None else list(capabilities)
         # Ops named here are received but never answered -- lets a test
         # simulate an unresponsive pane (for LIVE_DISCONNECTED-by-timeout)
         # without needing a full socket-level failure injection.
@@ -336,6 +408,7 @@ class FakePane:
                     "platform": self.platform,
                     "requirementSets": self.requirement_sets,
                     "bodySha256": self.document.sha256(),
+                    "capabilities": self.capabilities,
                 }
             )
         )
@@ -411,6 +484,7 @@ class FakePane:
                 int(payload["expected_matches"]),
                 payload["replace"],
                 track_changes=bool(payload.get("track_changes", False)),
+                row_anchor=payload.get("rowAnchor"),
             )
         if op == "format":
             return doc.format(
@@ -419,7 +493,10 @@ class FakePane:
                 bold=payload.get("bold"),
                 italic=payload.get("italic"),
                 underline=payload.get("underline"),
+                strike=payload.get("strike"),
+                color=payload.get("color"),
                 track_changes=bool(payload.get("track_changes", False)),
+                row_anchor=payload.get("rowAnchor"),
             )
         if op == "comments_list":
             return doc.comments_list()

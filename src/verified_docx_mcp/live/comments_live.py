@@ -118,9 +118,24 @@ _LIVE_HANDLE_PREFIX = "live:"
 
 
 def _document_name_and_path(path: str) -> tuple[Any, str]:
+    """(resolved_path, basename) for *path* -- the basename is what a
+    connected pane's session is keyed by; *resolved_path* is used for
+    audit-log/evidence ``path`` strings, not to read the file.
+
+    Issue #22 B3: resolved with ``must_exist=False`` -- the real incident
+    this fixes is a document that lives only on SharePoint/OneDrive, with
+    no local sync at all, so the caller used to have to fabricate a
+    same-named local stand-in file in an allowed root just so this call
+    (and therefore every live comment tool, which all go through it)
+    would not raise before any live routing even happened. The
+    allowlist/denylist floor is unaffected -- *path* must still name
+    something inside an allowed root. Reading the file's actual content
+    (when it exists) stays a SEPARATE, explicit step --
+    ``_file_comments_and_suggestions`` below checks existence itself and
+    returns ``None`` rather than raising when there is nothing to read."""
     from .. import paths as _paths
 
-    resolved = _paths.resolve_allowed_docx_path(path, must_exist=True)
+    resolved = _paths.resolve_allowed_docx_path(path, must_exist=False)
     return resolved, resolved.name
 
 
@@ -387,11 +402,21 @@ def _resolve_comment_handle(comment_id: str, correlation: list[dict[str, Any]]) 
 # ---------------------------------------------------------------------------
 
 
-def _file_comments_and_suggestions(path: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _file_comments_and_suggestions(path: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """(file_comments, pending_suggestions) read from the local file at
+    *path*, or ``None`` (issue #22 B3) when *path* does not exist locally
+    -- e.g. a SharePoint/OneDrive document with no local sync. ``None``
+    here, not an empty tuple: an empty tuple would look identical to "the
+    file exists and genuinely has no comments/suggestions," and callers
+    (``_live_state``, ``execute_list_open_items_live``) must be able to
+    tell those two cases apart rather than silently reporting the second
+    when it's really the first."""
     from .. import mutations, projection, tracked_changes
     from .. import server as _server
 
     resolved, _name = _document_name_and_path(path)
+    if not resolved.is_file():
+        return None
     local_path, is_temp = _server._read_local_copy(resolved)
     try:
         proj = projection.project_part(local_path)
@@ -435,10 +460,19 @@ def _live_state(path: str, session: LiveSession) -> tuple[list[dict[str, Any]], 
     """(raw_live_comments, correlation) for every comment the pane
     currently reports (resolved included) -- callers filter resolved
     themselves per their own needs (list_open_items excludes it;
-    handle resolution does not care)."""
+    handle resolution does not care).
+
+    Issue #22 B3: when there is no local file to correlate against
+    (``_file_comments_and_suggestions`` returns ``None``), correlation is
+    simply ``[]`` -- durableId/w_id-based comment_id resolution
+    (``_resolve_comment_handle``) degrades to "no ids available" rather
+    than raising here; a caller can still address any comment by its
+    ``live:<id>`` handle directly (from this same call's own
+    ``raw_comments``), which needs no file-side correlation at all."""
     result = _request(session, "comments_list")
     raw_comments = result.get("comments") or []
-    file_comments, _suggestions = _file_comments_and_suggestions(path)
+    file_result = _file_comments_and_suggestions(path)
+    file_comments = file_result[0] if file_result is not None else []
     correlation = correlate_comments(raw_comments, file_comments)
     return raw_comments, correlation
 
@@ -452,7 +486,14 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
     resolved, _name = _document_name_and_path(path)
     session = _session_for(path)
     raw_comments, correlation = _live_state(path, session)
-    _file_comments, suggestions = _file_comments_and_suggestions(path)
+    file_result = _file_comments_and_suggestions(path)
+    # Issue #22 B3: pending_suggestions is None (never []) when there is
+    # no local file to read w:ins/w:del from -- e.g. a SharePoint/
+    # OneDrive document with no local sync. [] would silently claim
+    # "nothing pending," which is not knowable without the file;
+    # file_side_available names the reason explicitly rather than making
+    # a caller guess from pending_suggestions being empty.
+    suggestions = file_result[1] if file_result is not None else None
 
     # list_open_items filters resolved the same way file mode does (an
     # "open item" is, by definition, not a resolved one) -- but the pane
@@ -466,6 +507,7 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
         "source": "live",
         "comments": [_live_comment_record(c) for c in open_raw],
         "pending_suggestions": suggestions,
+        "file_side_available": file_result is not None,
         "correlation": [entry for entry in correlation if entry["live_comment_id"] in open_ids],
     }
 

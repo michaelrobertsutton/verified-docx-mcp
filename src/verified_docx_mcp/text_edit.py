@@ -72,13 +72,15 @@ over the same span before any accept/reject in between.
 from __future__ import annotations
 
 import copy
+import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from . import audit, mutations, paths, projection, tracked_changes
+from . import audit, mutations, paths, projection, tables, tracked_changes
 from .author import resolve_author_name
-from .errors import ErrorCode, _make_error
+from .errors import ErrorCode, VerifyError, _make_error
 from .live import write_mode as live_write_mode
 from .live.session import LiveDisconnected, LiveOpFailed, LiveStale
 from .locate import LocateResult, locate
@@ -95,20 +97,50 @@ def _w(name: str) -> str:
 # Style allowlist (format_text) -- our own rPr model carries strike in
 # addition to Google's bold/italic/underline (projection._run_properties
 # already reads/writes all four), so this server's format_text supports one
-# more field than the Google original.
+# more field than the Google original. Issue #22 adds "color" (a 6-hex
+# string, not a bool) -- the proposal-lead incident that opened that issue
+# had no way to mark inserted text in a font color.
 # ---------------------------------------------------------------------------
 
-_STYLE_ALLOWLIST = ("bold", "italic", "underline", "strike")
+_STYLE_ALLOWLIST = ("bold", "italic", "underline", "strike", "color")
+_BOOL_STYLE_KEYS = ("bold", "italic", "underline", "strike")
 _BOOL_TOGGLE_TAGS = {"bold": "b", "italic": "i", "strike": "strike"}
 
 _EXCERPT_RADIUS = 200
 
+_HEX_COLOR_RE = re.compile(r"^#?([0-9A-Fa-f]{6})$")
 
-def _validate_style(style: Any) -> dict[str, bool]:
+# Full CT_RPrBase child order (ECMA-376 5th ed. Part 1 §17.3.2.1), scoped
+# to THIS module rather than reusing tables._RPR_CHILD_ORDER -- that list
+# was built only for insert_table's cells, which are always FRESHLY BUILT
+# runs that never carry a child outside its own narrow subset (rStyle/b/
+# bCs/i/iCs/color). format_text/apply_style operate on ARBITRARY
+# Word-authored runs, which routinely carry w:rFonts/w:sz/w:lang/etc. that
+# tables.py's own list has never had to account for -- reusing it as-is
+# here would silently misplace a new w:b/w:color relative to those
+# unlisted siblings (verified: this is exactly the ordering bug a plain
+# `ET.SubElement(rpr, tag)` append, THIS module's own pre-issue-#22 code,
+# already had for any run whose rPr carried a trailing child -- just never
+# exercised, since no caller combined color/sz with a boolean toggle
+# before now). w:rPrChange is pinned LAST -- it must always stay rPr's
+# final child (tracked_changes.apply_rpr_change appends to it directly,
+# never through this ordered-insert path, but a NEW toggle/color on a run
+# that already carries one must still land BEFORE it, never after).
+_RPR_CHILD_ORDER = [
+    "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike",
+    "outline", "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden",
+    "color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight", "u", "effect",
+    "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout",
+    "specVanish", "oMath", "rPrChange",
+]
+
+
+def _validate_style(style: Any) -> dict[str, bool | str]:
     if not isinstance(style, dict):
         raise _make_error(
             ErrorCode.INVALID_INPUT,
-            "style must be an object mapping bold/italic/underline/strike to true/false",
+            "style must be an object mapping bold/italic/underline/strike (true/false) and/or "
+            "color (a 6-hex-digit string) to a value",
             {"style": repr(style)},
         )
     if not style:
@@ -120,14 +152,25 @@ def _validate_style(style: Any) -> dict[str, bool]:
             f"unknown style key(s): {unknown}; allowed: {list(_STYLE_ALLOWLIST)}",
             {"unknown_keys": unknown},
         )
-    non_bool = {k: repr(v) for k, v in style.items() if type(v) is not bool}
+    non_bool = {k: repr(v) for k in _BOOL_STYLE_KEYS if k in style for v in [style[k]] if type(v) is not bool}
     if non_bool:
         raise _make_error(
             ErrorCode.INVALID_INPUT,
             f"style values must be true/false booleans, got: {non_bool}",
             {"invalid_values": non_bool},
         )
-    return style
+    result: dict[str, bool | str] = dict(style)
+    if "color" in result:
+        raw = result["color"]
+        match = _HEX_COLOR_RE.match(raw) if isinstance(raw, str) else None
+        if match is None:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f'style["color"] must be a 6-hex-digit color string (e.g. "3B3838" or "#3B3838"), got {raw!r}',
+                {"color": raw},
+            )
+        result["color"] = match.group(1).upper()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +204,7 @@ def _run_dict(event: RunEvent, clip_start: int, clip_end: int, node_start: int) 
         "italic": bool(event.rpr.get("italic", False)),
         "underline": bool(event.rpr.get("underline")),
         "strike": bool(event.rpr.get("strike", False)),
+        "color": event.rpr.get("color"),
     }
 
 
@@ -177,7 +221,7 @@ def _collect_style_runs(proj: projection.Projection, spans: list[tuple[int, int]
     return result
 
 
-def _style_matches(runs_before: list[list[dict[str, Any]]], style: dict[str, bool]) -> bool:
+def _style_matches(runs_before: list[list[dict[str, Any]]], style: dict[str, bool | str]) -> bool:
     return all(
         run.get(field) == value
         for span_runs in runs_before
@@ -240,7 +284,14 @@ def _index_of(parent: Any, elem: Any) -> int | None:
     return None
 
 
-def _toggle_style(r_elem: Any, style: dict[str, bool]) -> None:
+def _toggle_style(r_elem: Any, style: dict[str, bool | str]) -> None:
+    """Apply every field in *style* to r_elem's own w:rPr (creating one if
+    absent). Issue #22: every insertion now goes through
+    tables._insert_ordered against this module's own full _RPR_CHILD_ORDER
+    (see that list's own comment) -- fixes a latent ordering bug this
+    function already had for b/i/strike/u against a run whose rPr carries
+    a trailing child outside the four booleans (e.g. sz, or now color),
+    not just a new bug color would have introduced on its own."""
     rpr = None
     for child in r_elem:
         if projection._ln(child) == "rPr":
@@ -251,6 +302,29 @@ def _toggle_style(r_elem: Any, style: dict[str, bool]) -> None:
         r_elem.insert(0, rpr)
 
     for field, value in style.items():
+        if field == "color":
+            existing = None
+            for child in rpr:
+                if projection._ln(child) == "color":
+                    existing = child
+                    break
+            if existing is None:
+                existing = ET.Element(_w("color"))
+                tables._insert_ordered(rpr, existing, _RPR_CHILD_ORDER)
+            existing.set(_w("val"), value)
+            # Issue #22 (Codex review): a themeColor-based color takes
+            # visual precedence over w:val in Word's own rendering -- an
+            # explicit RGB set here without clearing the theme attributes
+            # would silently keep displaying the OLD theme color, making
+            # this write look applied (val is correct) while Word shows
+            # something else. Clear all three whenever an explicit val is
+            # set.
+            for theme_attr in ("themeColor", "themeTint", "themeShade"):
+                attr_name = _w(theme_attr)
+                if attr_name in existing.attrib:
+                    del existing.attrib[attr_name]
+            continue
+
         if field == "underline":
             existing = None
             for child in rpr:
@@ -259,7 +333,8 @@ def _toggle_style(r_elem: Any, style: dict[str, bool]) -> None:
                     break
             if value:
                 if existing is None:
-                    ET.SubElement(rpr, _w("u"), {_w("val"): "single"})
+                    new_u = ET.Element(_w("u"), {_w("val"): "single"})
+                    tables._insert_ordered(rpr, new_u, _RPR_CHILD_ORDER)
                 else:
                     existing.set(_w("val"), "single")
             elif existing is not None:
@@ -274,7 +349,8 @@ def _toggle_style(r_elem: Any, style: dict[str, bool]) -> None:
                 break
         if value:
             if existing is None:
-                ET.SubElement(rpr, _w(tag))
+                new_child = ET.Element(_w(tag))
+                tables._insert_ordered(rpr, new_child, _RPR_CHILD_ORDER)
             else:
                 for key in list(existing.attrib):
                     del existing.attrib[key]
@@ -282,7 +358,7 @@ def _toggle_style(r_elem: Any, style: dict[str, bool]) -> None:
             rpr.remove(existing)
 
 
-def _apply_style_to_run(r_elem: Any, style: dict[str, bool], *, track: _TrackContext | None) -> None:
+def _apply_style_to_run(r_elem: Any, style: dict[str, bool | str], *, track: _TrackContext | None) -> None:
     """_toggle_style, plus (when tracking) recording the PRE-change rPr in
     a w:rPrChange (issue #28 plan WP-07b-a: "formatting changes use
     w:rPrChange"). The snapshot is taken BEFORE _toggle_style mutates
@@ -450,7 +526,7 @@ def _remove_if_present(parent: Any, elem: Any) -> None:
 def _apply_format_span(
     start: int,
     end: int,
-    style: dict[str, bool],
+    style: dict[str, bool | str],
     atoms: list[tuple[int, int, RunEvent]],
     *,
     track: _TrackContext | None = None,
@@ -682,6 +758,9 @@ def _live_describe(session, path: str, revision_before: str | None) -> str:
     return pre_hash
 
 
+_ROW_SCOPE_CAPABILITY = "row_scope"
+
+
 def execute_replace_text_live(
     path: str,
     find: str,
@@ -690,6 +769,7 @@ def execute_replace_text_live(
     *,
     revision_before: str | None = None,
     track_changes: bool = False,
+    within_row_containing: str | None = None,
 ) -> dict[str, Any]:
     """Live-mode ``replace_text`` (issue #106 WP-3): sends a ``replace``
     op over the pane's WSS ops channel instead of editing the .docx file.
@@ -707,20 +787,34 @@ def execute_replace_text_live(
     override uses ``write_mode="file"`` with the file's own ``force``
     instead.
 
+    ``within_row_containing`` (issue #22 B2): sent as the ``replace`` op's
+    ``rowAnchor`` field -- requires the connected pane to report the
+    ``"row_scope"`` capability in its own ``hello``
+    (``live_write_mode.require_capability``, checked BEFORE this op is
+    sent), or ``LIVE_CAPABILITY_MISSING``. See ``text_edit.py``'s own
+    ``_resolve_row_span_filter`` docstring (the file-mode equivalent) for
+    the anchor-uniqueness contract; the pane resolves the SAME contract
+    against the live document instead of a projection.
+
     Raises ``LIVE_UNAVAILABLE``/``LIVE_DISCONNECTED``/``LIVE_STALE`` (see
     ``live/session.py``'s exceptions of the same names), ``ZERO_MATCH``/
     ``MATCH_COUNT_MISMATCH``/``LIVE_OP_FAILED`` (the pane refused the
     ``expected_matches`` gate -- see ``live/write_mode.py``'s
-    ``classify_op_failed``), or ``VERIFICATION_FAILED`` (the pane's own
-    read-back after the op did not confirm the intended change -- nothing
-    to roll back in live mode, since Word, not this server, owns the
-    file; the diagnostics say so explicitly).
+    ``classify_op_failed``), ``LIVE_CAPABILITY_MISSING`` (see above), or
+    ``VERIFICATION_FAILED`` (the pane's own read-back after the op did
+    not confirm the intended change -- nothing to roll back in live mode,
+    since Word, not this server, owns the file; the diagnostics say so
+    explicitly).
     """
     if not find:
         raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty")
 
     session = live_write_mode.live_session_for(path)
     document_name = session.document_name
+    if within_row_containing:
+        live_write_mode.require_capability(
+            session, _ROW_SCOPE_CAPABILITY, feature_description="within_row_containing"
+        )
 
     try:
         pre_hash = _live_describe(session, path, revision_before)
@@ -733,6 +827,8 @@ def execute_replace_text_live(
         "replace": replace,
         "track_changes": track_changes,
     }
+    if within_row_containing:
+        payload["rowAnchor"] = within_row_containing
     try:
         result = session.request_threadsafe("replace", payload, expected_body_sha256=pre_hash)
     except LiveStale as exc:
@@ -787,6 +883,90 @@ def execute_replace_text_live(
 
 
 # ---------------------------------------------------------------------------
+# Row-scoped edit (issue #22 B2): within_row_containing on replace_text/
+# format_text (file mode). Chosen over a bare nth-occurrence index because
+# a caller that already found ONE cell's own unique text (the real
+# incident's own workaround: "put the program name at the front of the
+# unique Evidence cell") already has a usable anchor -- an index would
+# force counting matches blind instead. Contract, precisely: the anchor
+# must be unique in the WHOLE DOCUMENT (the same guarantee locate() gives
+# any needle already; no new per-row uniqueness logic invented) and must
+# resolve to a table cell. Two cells in the SAME target row with
+# identical `find` text remain inseparable -- a named, documented
+# limitation (see server.py's docstrings), not solved here.
+# ---------------------------------------------------------------------------
+
+
+def _paragraph_by_ref(proj: projection.Projection) -> dict[str, projection.ParagraphMeta]:
+    return {p.para_ref: p for p in proj.paragraphs}
+
+
+def _innermost_table_row(para_meta: projection.ParagraphMeta | None) -> tuple[int, int] | None:
+    """(table_id, row) from *para_meta*'s own container_chain -- the
+    INNERMOST table a paragraph sits in (a nested table's row, not its
+    host table's), or None if *para_meta* is None or not inside any
+    table at all."""
+    if para_meta is None or not para_meta.container_chain:
+        return None
+    last = para_meta.container_chain[-1]
+    table_id = last.get("table_id")
+    row = last.get("row")
+    if table_id is None or row is None:
+        return None
+    return table_id, row
+
+
+def _row_key_for_span(
+    proj: projection.Projection, para_map: dict[str, projection.ParagraphMeta], start: int
+) -> tuple[int, int] | None:
+    located = proj.locate_offset(start)
+    if located is None:
+        return None
+    para_ref, _run_ref, _run_offset = located
+    return _innermost_table_row(para_map.get(para_ref))
+
+
+def _resolve_row_span_filter(proj: projection.Projection, within_row_containing: str) -> Callable[[int, int], bool]:
+    """Locate *within_row_containing* (globally unique, per locate()'s own
+    contract -- no filter of its own) and return a span_filter scoped to
+    that match's own table row, for a second locate() call over `find`.
+
+    Raises ZERO_MATCH/MATCH_COUNT_MISMATCH (re-labeled to name
+    within_row_containing as the failing needle, not `find`) if the
+    anchor itself doesn't resolve uniquely, or INVALID_INPUT if it
+    resolves but not inside any table cell.
+    """
+    try:
+        anchor_result = locate(within_row_containing, proj, 1)
+    except VerifyError as exc:
+        if exc.envelope.error_code in (ErrorCode.ZERO_MATCH, ErrorCode.MATCH_COUNT_MISMATCH):
+            raise _make_error(
+                exc.envelope.error_code,
+                f"within_row_containing={within_row_containing!r} must be unique in the whole "
+                f"document (it is the anchor locate() call that failed, not the main `find`): "
+                f"{exc.envelope.message}",
+                {**exc.envelope.diagnostics, "within_row_containing": within_row_containing},
+            ) from exc
+        raise
+
+    para_map = _paragraph_by_ref(proj)
+    anchor_start, _anchor_end = anchor_result.spans[0]
+    row_key = _row_key_for_span(proj, para_map, anchor_start)
+    if row_key is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"within_row_containing={within_row_containing!r} does not resolve to a table cell "
+            "(it must be unique text located inside a table row).",
+            {"within_row_containing": within_row_containing},
+        )
+
+    def _span_filter(start: int, _end: int) -> bool:
+        return _row_key_for_span(proj, para_map, start) == row_key
+
+    return _span_filter
+
+
+# ---------------------------------------------------------------------------
 # Tool 1: replace_text
 # ---------------------------------------------------------------------------
 
@@ -801,6 +981,7 @@ def execute_replace_text(
     force: bool = False,
     track_changes: bool = False,
     write_mode: str = "auto",
+    within_row_containing: str | None = None,
 ) -> dict[str, Any]:
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
@@ -811,6 +992,7 @@ def execute_replace_text(
             expected_matches,
             revision_before=revision_before,
             track_changes=track_changes,
+            within_row_containing=within_row_containing,
         )
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
@@ -819,7 +1001,8 @@ def execute_replace_text(
     document_root, raw_xml = mutations._load_document(resolved)
     proj = projection.project_document_root(document_root)
 
-    locate_result: LocateResult = locate(find, proj, expected_matches)
+    span_filter = _resolve_row_span_filter(proj, within_row_containing) if within_row_containing else None
+    locate_result: LocateResult = locate(find, proj, expected_matches, span_filter=span_filter)
     own_author = resolve_author_name()
     _check_tracked_changes_guard(proj, locate_result, force, own_author)
 
@@ -873,11 +1056,12 @@ def execute_replace_text(
 def execute_format_text_live(
     path: str,
     find: str,
-    style: dict[str, bool],
+    style: dict[str, bool | str],
     expected_matches: int,
     *,
     revision_before: str | None = None,
     track_changes: bool = False,
+    within_row_containing: str | None = None,
 ) -> dict[str, Any]:
     """Live-mode ``format_text`` (issue #106 WP-3): sends a ``format`` op
     over the pane's WSS ops channel instead of editing the .docx file.
@@ -895,6 +1079,19 @@ def execute_format_text_live(
     still equals its own ``before`` text (format changes styling, never
     content -- a match whose text changed anyway is a real verification
     failure, not a false alarm).
+
+    Issue #22: ``style`` may also carry ``strike``/``color`` (a 6-hex
+    string). The pane's reply carries a read-back ``colorAfter``/
+    ``strikeAfter`` per match (the pane's own ``font.color``/
+    ``.strikeThrough`` re-loaded AFTER ``context.sync()``, not an echo of
+    the request) -- when either was requested, this function checks the
+    read-back value against what was asked for, so a write that silently
+    didn't take on the real Word object model is a verification failure,
+    not a false "applied: true".
+
+    ``within_row_containing`` (issue #22 B2): same ``rowAnchor``/
+    ``"row_scope"``-capability contract as
+    ``execute_replace_text_live`` -- see that function's own docstring.
     """
     style = _validate_style(style)
     if not find:
@@ -902,6 +1099,10 @@ def execute_format_text_live(
 
     session = live_write_mode.live_session_for(path)
     document_name = session.document_name
+    if within_row_containing:
+        live_write_mode.require_capability(
+            session, _ROW_SCOPE_CAPABILITY, feature_description="within_row_containing"
+        )
 
     try:
         pre_hash = _live_describe(session, path, revision_before)
@@ -914,8 +1115,12 @@ def execute_format_text_live(
         "bold": style.get("bold"),
         "italic": style.get("italic"),
         "underline": style.get("underline"),
+        "strike": style.get("strike"),
+        "color": style.get("color"),
         "track_changes": track_changes,
     }
+    if within_row_containing:
+        payload["rowAnchor"] = within_row_containing
     try:
         result = session.request_threadsafe("format", payload, expected_body_sha256=pre_hash)
     except LiveStale as exc:
@@ -950,6 +1155,26 @@ def execute_format_text_live(
                 "roll back in live mode -- Word, not this server, owns the document.",
                 {"matches": matches},
             )
+        requested_color = style.get("color")
+        if requested_color is not None and (m.get("colorAfter") or "").upper() != requested_color:
+            raise _make_error(
+                ErrorCode.VERIFICATION_FAILED,
+                "live format did not verify: the pane's read-back font.color "
+                f"({m.get('colorAfter')!r}) does not equal the requested color "
+                f"({requested_color!r}) after context.sync(). Nothing to roll back in live mode "
+                "-- Word, not this server, owns the document.",
+                {"matches": matches, "requested_color": requested_color},
+            )
+        requested_strike = style.get("strike")
+        if requested_strike is not None and bool(m.get("strikeAfter")) != bool(requested_strike):
+            raise _make_error(
+                ErrorCode.VERIFICATION_FAILED,
+                "live format did not verify: the pane's read-back font.strikeThrough "
+                f"({m.get('strikeAfter')!r}) does not equal the requested strike "
+                f"({requested_strike!r}) after context.sync(). Nothing to roll back in live mode "
+                "-- Word, not this server, owns the document.",
+                {"matches": matches, "requested_strike": requested_strike},
+            )
 
     before_text = "\n".join(m.get("before", "") for m in matches)
     after_text = "\n".join(m.get("after", "") for m in matches)
@@ -976,13 +1201,14 @@ def execute_format_text_live(
 def execute_format_text(
     path: str,
     find: str,
-    style: dict[str, bool],
+    style: dict[str, bool | str],
     expected_matches: int,
     *,
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
     write_mode: str = "auto",
+    within_row_containing: str | None = None,
 ) -> dict[str, Any]:
     style = _validate_style(style)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
@@ -994,6 +1220,7 @@ def execute_format_text(
             expected_matches,
             revision_before=revision_before,
             track_changes=track_changes,
+            within_row_containing=within_row_containing,
         )
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
@@ -1002,7 +1229,8 @@ def execute_format_text(
     document_root, raw_xml = mutations._load_document(resolved)
     proj = projection.project_document_root(document_root)
 
-    locate_result: LocateResult = locate(find, proj, expected_matches)
+    span_filter = _resolve_row_span_filter(proj, within_row_containing) if within_row_containing else None
+    locate_result: LocateResult = locate(find, proj, expected_matches, span_filter=span_filter)
     own_author = resolve_author_name()
     _check_tracked_changes_guard(proj, locate_result, force, own_author)
     _check_foreign_rpr_change(proj, locate_result.spans, force, own_author)
@@ -1483,6 +1711,14 @@ def execute_live_save(path: str) -> dict[str, Any]:
     caller's own job afterward, via the existing read tools
     (``read_document``/``find_sections``/``diff_body_vs_file``/etc.) --
     this tool only confirms the save itself, not the file's contents.
+    Those read tools remain FILE-ONLY (issue #22 B3 does not add a live
+    read path for them) -- when there is no local file at all (see
+    below), that follow-up verification simply isn't available.
+
+    Issue #22 B3: ``file_revision`` is ``None`` when *path* names no
+    local file -- e.g. a SharePoint/OneDrive document with no local sync
+    (Word's own save just went there, not to anything this server could
+    read). This call no longer requires *path* to exist locally at all.
 
     Errors:
       LIVE_UNAVAILABLE   - no connected pane session for this document
@@ -1515,8 +1751,14 @@ def execute_live_save(path: str) -> dict[str, Any]:
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
     post_hash = describe_result["bodySha256"]
 
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    file_revision = projection.compute_revision(resolved)["token"]
+    # Issue #22 B3: must_exist=False -- Word's own save just went to
+    # wherever the live document actually lives (a SharePoint/OneDrive
+    # document with no local sync saves there, never to a path this
+    # server could read). file_revision is None when there is nothing
+    # local to compute it from, rather than this call raising right
+    # after a save that just succeeded.
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=False)
+    file_revision = projection.compute_revision(resolved)["token"] if resolved.is_file() else None
 
     evidence: dict[str, Any] = {
         "applied": True,
