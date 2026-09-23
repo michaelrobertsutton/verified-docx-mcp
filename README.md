@@ -40,7 +40,11 @@ Tools implemented so far:
   specific sections via `section_keys` — see the tool's own docstring for
   the default-mode-degrades-vs-explicit-mode-raises verification contract.
 - **`lock_status(path)`** — report Word/LibreOffice owner-file presence
-  and sync-quiesce state, as data only. Never refuses.
+  and sync-quiesce state, as data only. Never refuses. Also reports
+  `external_activity` (issue #27): whether the file on disk still matches
+  what this server last wrote — the after-the-fact check for a
+  co-authoring editor (Office Online) that leaves no owner file and no
+  Live session. See [Live mode](#live-mode).
 - **`list_parts(path)`**, **`read_document(path, format, part)`**,
   **`find_sections(path, part)`**, **`list_page_sections(path, part)`**,
   **`list_styles(path)`** — read a `.docx` part as markdown/text/runs,
@@ -384,8 +388,21 @@ file, `list_open_items(source="live")`'s `pending_suggestions` is `null`
 `read_document`/`list_parts`/`find_sections`/etc. remain file-only — this
 does not add a live read path for the structural read tools.
 
+Issue #27: `replace_cell_markdown` also takes `write_mode` — a live edit is
+compare-and-set against the cell's current text and read back
+independently, limited to paragraphs with bold/italic/links (anything
+structural is refused before it is sent). File-mode writes also guard
+against a co-author the server cannot otherwise see (Office Online): if
+the file no longer matches what this server last wrote, the write refuses
+with `EXTERNAL_EDITOR_ACTIVE` unless `allow_concurrent_editor=True`, and
+`revision_after` is now the token of the bytes actually written, so an
+overwrite landing right after a write can't hide inside it. This is
+detection after the fact, not prevention — read the limits, and the
+unverified Word-for-the-web section, in
+[`docs/live-mode.md`](docs/live-mode.md#office-online--word-for-the-web-co-authoring-issue-27).
+
 Issue #154: every OTHER mutating tool — `apply_style`, `insert_table`,
-`insert_image`, `replace_table_row`, `replace_cell_markdown`,
+`insert_image`, `replace_table_row`,
 `replace_range_markdown`, `replace_body_markdown`, `append_markdown`,
 `accept_tracked_changes`, `reject_tracked_changes` — has no `write_mode`
 parameter and always takes the file path, but now **refuses**

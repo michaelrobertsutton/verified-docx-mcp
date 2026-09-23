@@ -182,11 +182,12 @@ The fix has two parts:
    sufficient on its own, matching the rule the read-side
    `list_open_items(source="auto")` already used
    (`comments_live._resolve_source`).
-2. **Every file-mode mutating write** — including the ten tools that
+2. **Every file-mode mutating write** — including the tools that
    have no `write_mode` parameter at all (`apply_style`, `insert_table`,
-   `insert_image`, `replace_table_row`, `replace_cell_markdown`,
+   `insert_image`, `replace_table_row`,
    `replace_range_markdown`, `replace_body_markdown`, `append_markdown`,
-   `accept_tracked_changes`, `reject_tracked_changes`) — now refuses with
+   `accept_tracked_changes`, `reject_tracked_changes`; issue #27 gave
+   `replace_cell_markdown` a `write_mode` — see the section below) — now refuses with
    `LIVE_SESSION_ACTIVE` when a pane session is connected for that
    document, via `mutations._guard_before_write` (checked once, well
    before the write; and again, immediately before
@@ -327,6 +328,150 @@ parameter at all; `LIVE_SESSION_MISMATCH` on a session naming a
 different local file, and the SharePoint-web-URL fallback that still
 matches by basename; and a no-bridge test confirming an ordinary
 file-mode write never calls `start_in_background`.
+
+## Office Online / Word for the web co-authoring (issue #27)
+
+`LIVE_SESSION_ACTIVE` (above) only fires when a Word-desktop Live pane
+session is registered. A teammate co-editing the same document in
+**Office Online** (SharePoint's browser editor) registers nothing here:
+no pane session, no `~$*` owner file, no sync activity at write time, no
+conflict copy. A real incident: 34 `replace_cell_markdown` calls each
+returned `applied: true` with clean revision tokens; about three minutes
+later Office Online's autosave wrote its stale in-memory copy back over
+the file and every cell was back to its original value. Nothing in the
+tool's own output or `audit.jsonl` said so.
+
+The server cannot see that editor. It CAN see that the package on disk no
+longer matches what it last wrote. This issue adds that signal, closes two
+bugs in the write window that made the incident invisible, and adds a live
+route for the tool the incident used.
+
+### What changed
+
+1. **`revision_after` is the token of the bytes this call staged**, not a
+   re-read of the file afterwards. Previously an external write landing
+   between `os.replace` and the re-read was folded into the token the tool
+   returned, so the caller's next `revision_before` matched it and
+   `REVISION_CONFLICT` never fired (this is why a comments-hash change
+   went unnoticed in the incident's second pass).
+2. **The source is rechecked under the `.jsclaim` claim**, twice (before
+   building the replacement, and immediately before `os.replace`), against
+   the package fingerprint the guard saw. A mismatch is `REVISION_CONFLICT`
+   with nothing written. `.jsclaim` is a mutex against other calls into
+   *this server*; **Office Online does not honor it**, so this narrows the
+   window, it does not close it.
+3. **Rollback no longer clobbers a co-author.** On a `VERIFICATION_FAILED`
+   the `.jsbak` is restored only if the installed file is still the one
+   this call staged. Otherwise the file is left alone, `.jsbak` is kept,
+   and the error carries `rollback_skipped: true`.
+4. **A per-document write ledger** (`write_ledger.py`, under
+   `~/.local/state/verified-docx-mcp/ledger/`, one record per document)
+   stores a full-package fingerprint (sha256 over every zip entry, not the
+   32-bit `revision` token) after every file-mode write.
+5. **`EXTERNAL_EDITOR_ACTIVE`**: the write guard refuses a file-mode write
+   when the package has diverged from the ledger within the observation
+   window (default 600s, `VERIFIED_DOCX_MCP_EXTERNAL_EDIT_WINDOW_S`), or
+   when the ledger record exists but is unreadable (fail closed).
+   `allow_concurrent_editor=True` bypasses **only** this check, never
+   `REVISION_CONFLICT`, `DOCX_LOCKED`, or `LIVE_SESSION_ACTIVE`, and the
+   override is recorded in the evidence (`concurrent_editor_override`). The
+   message names `write_mode="live"` only on tools that have one.
+6. **`lock_status` gains `external_activity`** (data only, never refuses):
+   `ledger` (`ok` / `none` / `unreadable`), `still_current`, `divergent`,
+   `divergence_first_observed_at`, `divergence_age_s`, `recent`,
+   `unattributed_recent_mtime`, `window_s`, `note`. This is the durability
+   check after the fact: call it once edits have had time to sync, and
+   `still_current: false` means something overwrote them.
+7. **`replace_cell_markdown(write_mode="auto"|"file"|"live")`** with new
+   `cell_get`/`cell_set` ops and a `"cell_edit"` pane capability (below).
+
+### Limits, stated plainly
+
+- **Detection is after the fact.** A file this server never wrote has no
+  ledger entry, so the *first* writes to it are never refused;
+  `unattributed_recent_mtime` is reported for information only. In the
+  incident's exact shape (34 writes, then a revert three minutes later)
+  the ledger cannot stop those 34 writes; it makes the revert visible
+  (`lock_status.external_activity`) and refuses write 35 unless
+  overridden.
+- **Divergence is not "an editor is open."** A completed edit, a restore,
+  or another machine's server all diverge the same way, and an external
+  A -> B -> A between two looks is invisible. The signal establishes that
+  another writer changed the bytes, nothing more.
+- **The window is a heuristic.** Age counts from when this server first
+  *observed* the divergence (`divergence_first_observed_at`), not from the
+  file's mtime, because a downloaded file can carry an old mtime and a
+  skewed clock a future one. Waiting it out does not prove the editor has
+  gone.
+- **Your own saves look the same.** A hand edit you saved and closed in
+  Word desktop, or a `live_save` after live edits (live writes are not in
+  the ledger, since Word owns the file), diverges from the ledger exactly
+  like a co-author's overwrite. The next file-mode write is refused until
+  the window lapses (counted from the first time this server sees it). If
+  you know the editor is gone, pass `allow_concurrent_editor=True`; the
+  override is what that flag is for.
+- Reading `lock_status` persists the divergence's first-seen time (a
+  small state write). If the state directory is unwritable, writes still
+  succeed and report `ledger_logged: false`; that is protection silently
+  off, so watch for it.
+
+### The supported way to co-edit: live cell edits
+
+A live edit is a co-authoring edit, where a file write races the editor's
+autosave. `replace_cell_markdown` with `write_mode="live"` (or `"auto"`
+with a pane connected) sends `cell_get` then `cell_set` over the ops
+channel:
+
+- **Subset**: paragraphs with bold/italic/links only. Lists, headings,
+  tables, quotes and code are refused with `INVALID_INPUT` before anything
+  is sent. Use `write_mode="file"` (with the document closed) for those.
+- **Compare-and-set**: `cell_set` carries the text `cell_get` just read;
+  the pane refuses (`LIVE_OP_FAILED`) if the cell changed in between, so
+  a co-author typing in the same cell is not overwritten.
+- **Independent read-back**: after `cell_set` the server calls `cell_get`
+  again and compares it with the intended text (modulo whitespace); it
+  does not trust the pane's own `applied: true`.
+- **Nested tables are refused.** `table_id` numbers nested tables in
+  document order; the pane cannot map `body.tables` onto that reliably.
+- `force` does not apply; `before`/`after` are plain text, not markdown;
+  `revision_*` are `"live:sha256:<hex>"` body hashes.
+- The pane must report `"cell_edit"` (reload it after upgrading), else
+  `LIVE_CAPABILITY_MISSING`.
+
+The other table tools (`replace_table_row`, `insert_table`) still have no
+live route; on them `EXTERNAL_EDITOR_ACTIVE` can only be waited out or
+overridden. Tracked in a follow-up issue.
+
+### Running the pane in Word for the web: UNVERIFIED
+
+The manifest declares the `Document` host, so the same pane *may* load in
+Word for the web and register a session there. Nothing has confirmed it.
+Two hard constraints even if it loads: the bridge listens on
+`localhost:53135/53136`, so the browser and the MCP server must be on the
+same machine; and the browser must trust the local certificate.
+
+Web-URL identity has the same caveat as any SharePoint document (see
+"Session identity" above): with a web `document_url` there is no local path
+to compare, so routing falls back to a basename match. Two people's
+same-named documents open at once can misroute; check
+`live_status.session_collisions`.
+
+**Manual verification (record the result here when done)**:
+
+1. Sideload the manifest in Word for the web (Insert > Add-ins > Upload My
+   Add-in), open the pane, and call `live_status`: the document should
+   appear in `sessions`.
+2. With a second person (or window) editing the same document, call
+   `replace_cell_markdown(path, 1, 1, 1, "test", write_mode="auto")` and
+   confirm `write_mode: "live"` in the evidence.
+3. **Wait 5+ minutes**, then re-open the document from SharePoint (not the
+   local sync copy) and confirm the edit is still there. Registration and
+   routing alone prove nothing: the incident was a write that looked
+   successful and later vanished.
+4. Try a cell the second editor is typing in and confirm the call is
+   refused, not merged silently.
+
+Result: _not yet run._
 
 ## WP-1 result (2026-09-16, Word for Mac 16.112.4)
 
