@@ -296,12 +296,32 @@ def _dump(obj: dict[str, Any]) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
+_MAX_COLLISION_LOG = 20
+
+
 class SessionRegistry:
     """Thread-safe map of document name -> ``LiveSession``, plus stale
     eviction. One instance per running bridge (``bridge.start_in_background``
     owns it); ``live_status`` and (from WP-3 onward) the live write path
     both go through this registry rather than holding a session reference
     of their own.
+
+    Named risk (issue #22 B3, still true after that fix): keying is
+    basename-only, deliberately (a synced folder's absolute path differs
+    per machine, and a SharePoint/OneDrive document has no local path at
+    all) -- so two DIFFERENT documents sharing a file name are
+    indistinguishable by name alone. ``register()`` cannot refuse a
+    collision outright without breaking the common, harmless case (the
+    SAME document reconnecting after a network blip gets a new
+    ``LiveSession`` object with the same ``document_url``, which must
+    replace the old one, not be treated as a hazard). What it CAN do
+    without changing the addressing model is make a genuine collision
+    (a DIFFERENT ``document_url`` under the same name) visible instead of
+    silent -- see ``collisions()`` -- so a caller checking ``live_status``
+    can catch it before a write goes to the wrong document, rather than
+    finding out after. A real fix (routing on something more specific
+    than basename) is a bigger change to this class's own keying,
+    deliberately out of scope here.
     """
 
     def __init__(
@@ -314,11 +334,36 @@ class SessionRegistry:
         self.missed_heartbeats = missed_heartbeats
         self.stale_after = heartbeat_interval * missed_heartbeats
         self._sessions: dict[str, LiveSession] = {}
+        self._collisions: list[dict[str, Any]] = []
         self._lock = threading.Lock()
 
     def register(self, session: LiveSession) -> None:
         with self._lock:
+            existing = self._sessions.get(session.document_name)
+            if existing is not None and existing.document_url != session.document_url:
+                # A DIFFERENT document under the same basename -- see this
+                # class's own docstring. Recorded, not refused: the new
+                # session still takes over routing for this name (the
+                # existing behavior a caller may already depend on), but
+                # now there is somewhere to see it happened.
+                self._collisions.append(
+                    {
+                        "document_name": session.document_name,
+                        "displaced_document_url": existing.document_url,
+                        "new_document_url": session.document_url,
+                        "at": time.time(),
+                    }
+                )
+                self._collisions = self._collisions[-_MAX_COLLISION_LOG:]
             self._sessions[session.document_name] = session
+
+    def collisions(self) -> list[dict[str, Any]]:
+        """Every basename collision recorded since the bridge started
+        (most recent last, capped at the last 20) -- see this class's own
+        docstring. Never cleared by reading it; a caller that wants "only
+        new since last check" tracks its own cursor into this list."""
+        with self._lock:
+            return list(self._collisions)
 
     def unregister(self, document_name: str) -> None:
         with self._lock:

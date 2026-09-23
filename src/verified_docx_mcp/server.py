@@ -666,6 +666,14 @@ def execute_live_status() -> dict[str, Any]:
         "port": port,
         "ops_port": ops_port,
         "sessions": sessions,
+        # Issue #22 B3 follow-up: SessionRegistry keys purely on basename
+        # (deliberate -- see that class's own docstring), so two DIFFERENT
+        # documents sharing a file name are indistinguishable by name
+        # alone. Never refused (the common, harmless case is the SAME
+        # document reconnecting under a new LiveSession object), but every
+        # such basename collision is recorded here so it is visible
+        # rather than a silent misroute -- empty when none have happened.
+        "session_collisions": registry.collisions(),
     }
 
 
@@ -687,7 +695,15 @@ def live_status() -> dict[str, Any]:
     ``ops_port`` (the WSS ``/ops`` channel), ``sessions`` (list of
     ``{document_name, document_url, connected_since,
     last_heartbeat_age_s, body_sha256, requirement_sets}`` -- one per
-    connected pane, ``[]`` before any pane connects).
+    connected pane, ``[]`` before any pane connects), and
+    ``session_collisions`` (issue #22 B3 follow-up: every basename
+    collision the registry has seen -- two DIFFERENT documents (different
+    ``document_url``) connecting under the same file name, which the
+    registry's own basename-only keying cannot tell apart -- each entry
+    is ``{document_name, displaced_document_url, new_document_url, at}``;
+    ``[]`` when none have happened. Never itself a refusal; check this
+    before trusting a live write's routing if two people might have a
+    same-named document open at once).
 
     Errors:
       LIVE_UNAVAILABLE - the bridge itself failed to start (e.g. no
