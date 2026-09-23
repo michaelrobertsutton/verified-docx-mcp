@@ -283,12 +283,24 @@ class FakeDocument:
             # read-back contract in SHAPE (present on every match), but
             # this fake has no run/style model to read back from -- it
             # echoes the request, same limitation the module docstring
-            # already names for bold/italic/underline. A test that needs
-            # to prove the real Office JS read-back path (not just that
-            # the server checks whatever the pane sends) uses a real pane
-            # sideload instead -- see docs/live-mode.md.
+            # already names for bold/italic/underline. The "#" prefix on
+            # colorAfter is NOT a guess: a real Word sideload confirmed
+            # Office.js's own font.color GETTER always returns one (even
+            # when the SETTER was given a bare "RRGGBB" and Word silently
+            # tolerated it) -- the first version of this fake echoed the
+            # request bare, which meant a real bug in the server's own
+            # comparison (never stripping "#" before comparing) went
+            # uncaught by this whole suite until an actual sideload
+            # surfaced it. Kept "#"-prefixed here so that specific
+            # regression stays caught by the fast test suite from now on.
             matches_result = [
-                {"before": find, "after": find, "colorAfter": color, "strikeAfter": strike} for _ in positions
+                {
+                    "before": find,
+                    "after": find,
+                    "colorAfter": f"#{color.lstrip('#')}" if color else color,
+                    "strikeAfter": strike,
+                }
+                for _ in positions
             ]
         finally:
             self.change_tracking_mode = previous_mode
