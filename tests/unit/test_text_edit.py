@@ -376,10 +376,141 @@ class ApplyStyleParagraphTests(_TempFixtureCase):
             projection.read_document_text(self.target), "The quick brown fox jumps over the lazy dog."
         )
 
-    def test_track_changes_on_paragraph_style_refuses(self):
-        with self.assertRaises(VerifyError) as cm:
-            text_edit.execute_apply_style(str(self.target), "brown", "Heading2", 1, track_changes=True)
-        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+    def test_track_changes_writes_rprchange_shaped_pprchange(self):
+        # frag.docx's own paragraph has no explicit w:pPr at all before
+        # this call -- the same starting shape as the real Word-authored
+        # fixture (tests/fixtures/revision/pstyle-tracked.docx), so the
+        # produced XML should match it structurally: w:pPrChange as
+        # w:pPr's LAST child, right after w:pStyle, with an empty
+        # <w:pPr/> snapshot.
+        evidence = text_edit.execute_apply_style(str(self.target), "brown", "Heading2", 1, track_changes=True)
+        self.assertTrue(evidence["track_changes"])
+        self.assertEqual(len(evidence["revision_ids"]), 1)
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        self.assertIn('<w:pStyle w:val="Heading2" /><w:pPrChange ', xml)
+        self.assertIn("<w:pPr />", xml)
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
+
+
+class ApplyStyleParagraphTrackedTests(_TempFixtureCase):
+    """issue #7: w:pPrChange for apply_style(track_changes=True) on a
+    paragraph style, verified against real Word-authored fixtures
+    (tests/fixtures/revision/pstyle-tracked*.docx) rather than an assumed
+    shape -- see tests/fixtures/README.md for how they were produced."""
+
+    fixture_name = "sections.docx"
+
+    def _pprchange_xml_around(self, needle: str) -> str:
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        idx = xml.find(needle)
+        self.assertNotEqual(idx, -1, f"{needle!r} not found in document.xml")
+        return xml[max(0, idx - 400) : idx + len(needle) + 40]
+
+    def test_pprchange_shape_matches_word_authored_fixture(self):
+        evidence = text_edit.execute_apply_style(
+            str(self.target), "Background text.", "Heading2", 1, track_changes=True
+        )
+        self.assertEqual(evidence["revision_ids"], ["1"])
+        snippet = self._pprchange_xml_around("Background text.")
+        self.assertIn('<w:pStyle w:val="Heading2" />', snippet)
+        self.assertIn("<w:pPrChange ", snippet)
+        self.assertIn("<w:pPr />", snippet)
+        # w:pPrChange is pPr's LAST child, right after w:pStyle -- same
+        # order the real Word-authored fixture uses.
+        self.assertIn('<w:pPr><w:pStyle w:val="Heading2" /><w:pPrChange', snippet)
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
+
+    def test_noop_when_style_already_matches_writes_no_pprchange(self):
+        # "Overview" already carries an explicit w:pStyle val="Heading1".
+        evidence = text_edit.execute_apply_style(str(self.target), "Overview", "Heading1", 1, track_changes=True)
+        self.assertEqual(evidence["revision_ids"], [])
+        self.assertEqual(evidence["revision_before"], evidence["revision_after"])
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        self.assertNotIn("pPrChange", xml)
+
+    def test_second_tracked_edit_reuses_existing_pprchange(self):
+        # Real Word behavior (tests/fixtures/revision/pstyle-tracked-twice.docx):
+        # a second same-author tracked style change on the same paragraph,
+        # before any accept/reject, updates pStyle in place and leaves the
+        # FIRST change record's id/date/snapshot untouched.
+        first = text_edit.execute_apply_style(
+            str(self.target), "Background text.", "Heading2", 1, track_changes=True
+        )
+        second = text_edit.execute_apply_style(
+            str(self.target), "Background text.", "Heading1", 1, track_changes=True
+        )
+        self.assertEqual(first["revision_ids"], ["1"])
+        self.assertEqual(second["revision_ids"], [])  # no NEW id consumed -- reused
+        snippet = self._pprchange_xml_around("Background text.")
+        self.assertIn('<w:pStyle w:val="Heading1" />', snippet)
+        self.assertIn('<w:pPrChange w:id="1" w:author="Michael Sutton"', snippet)
+        self.assertIn("<w:pPr />", snippet)  # original (pre-first-edit) snapshot, unchanged
+        self.assertEqual(snippet.count("<w:pPrChange "), 1)  # never stacked/nested
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
+
+    def test_foreign_author_pprchange_refuses_and_force_overrides(self):
+        # Real Word does NOT itself protect a foreign author's pending
+        # pPrChange here (tests/fixtures/revision/pstyle-tracked-foreign.docx
+        # -- a second Word session under a different user name silently
+        # overwrites it) -- this tool's own, stricter safety policy does.
+        text_edit.execute_apply_style(str(self.target), "Background text.", "Heading2", 1, track_changes=True)
+        with mock.patch("verified_docx_mcp.text_edit.resolve_author_name", return_value="Jordan Author"):
+            with self.assertRaises(VerifyError) as cm:
+                text_edit.execute_apply_style(str(self.target), "Background text.", "Heading1", 1, track_changes=True)
+            self.assertEqual(cm.exception.envelope.error_code, ErrorCode.TRACKED_CHANGES_PRESENT)
+
+            forced = text_edit.execute_apply_style(
+                str(self.target), "Background text.", "Heading1", 1, track_changes=True, force=True
+            )
+        self.assertEqual(forced["revision_ids"], ["2"])
+        snippet = self._pprchange_xml_around("Background text.")
+        self.assertIn('w:author="Jordan Author"', snippet)
+        self.assertEqual(snippet.count("<w:pPrChange "), 1)  # the foreign one was replaced, not stacked
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
+
+    def test_revision_id_allocator_sees_existing_change_record_ids(self):
+        # Regression for the RevisionIdAllocator fix: a fresh id must not
+        # collide with an existing w:rPrChange/w:pPrChange id already in
+        # the package. Simulate by tracking a run-level format_text
+        # change first (consumes id "1"), then a paragraph-style change
+        # (must allocate "2", not reuse "1").
+        run_evidence = text_edit.execute_format_text(
+            str(self.target), "Overview", {"bold": True}, 1, track_changes=True
+        )
+        para_evidence = text_edit.execute_apply_style(
+            str(self.target), "Background text.", "Heading2", 1, track_changes=True
+        )
+        self.assertEqual(run_evidence["revision_ids"], ["1"])
+        self.assertEqual(para_evidence["revision_ids"], ["2"])
+
+    def test_no_nested_change_record_on_repeated_run_level_edit(self):
+        # Pre-existing defect this issue also fixes: two consecutive
+        # track_changes=True format_text calls on the same run, same
+        # author, must produce exactly ONE w:rPrChange (via the same
+        # own-author-reuse rule _apply_style_to_run now applies -- see
+        # its docstring), never a second, doubly-nested one. A FOREIGN-
+        # author repeat (apply_rpr_change's own remove-existing-record
+        # safety net, exercised via force=True) is covered by the
+        # paragraph-level equivalent above
+        # (test_foreign_author_pprchange_refuses_and_force_overrides) --
+        # same underlying tracked_changes.apply_rpr_change/apply_ppr_change
+        # mechanism, only the element tag differs.
+        text_edit.execute_format_text(str(self.target), "Overview", {"bold": True}, 1, track_changes=True)
+        text_edit.execute_format_text(str(self.target), "Overview", {"italic": True}, 1, track_changes=True)
+        with zipfile.ZipFile(self.target) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        idx = xml.find("Overview")
+        snippet = xml[max(0, idx - 400) : idx]
+        self.assertEqual(snippet.count("<w:rPrChange "), 1)
+        valid, problems = mutations.opc_valid(self.target)
+        self.assertTrue(valid, problems)
 
 
 if __name__ == "__main__":
