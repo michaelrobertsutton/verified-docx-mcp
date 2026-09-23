@@ -2425,17 +2425,42 @@ def apply_style(
     STRUCTURAL_BOUNDARY contract, same run-splitting rule, same
     track_changes=True support via w:rPrChange). A PARAGRAPH style
     (w:type="paragraph") applies w:pStyle to every paragraph CONTAINING a
-    matched run (the whole paragraph, not just the matched substring) --
-    but does NOT support track_changes=True: WP-07b-a's contract defines
-    w:rPrChange for run formatting only, never a paragraph-level tracked
-    change, so a paragraph-style call with track_changes=True raises
-    INVALID_INPUT naming this gap rather than silently applying it
-    untracked or inventing an untested w:pPrChange shape.
+    matched run (the whole paragraph, not just the matched substring).
+
+    Issue #7: track_changes=True on a paragraph style now records a real
+    w:pPrChange -- built from a Word-authored fixture (Track Changes on,
+    one paragraph style change, saved: tests/fixtures/revision/
+    pstyle-tracked.docx), not guessed. Placement/shape match Word's own
+    output exactly: w:pPrChange lands as w:pPr's LAST child; a paragraph
+    with no prior w:pPr records an empty <w:pPr/> snapshot. A SECOND
+    tracked style change on the same paragraph (before any accept/
+    reject) reuses the existing change record -- updates the live
+    w:pStyle only, leaves the original id/date/snapshot untouched --
+    exactly matching real Word (verified: tests/fixtures/revision/
+    pstyle-tracked-twice.docx). A paragraph whose w:pPr already carries a
+    w:pPrChange authored by someone OTHER than the configured author
+    refuses TRACKED_CHANGES_PRESENT unless force=True -- a deliberate
+    safety policy this tool adds; Word's own desktop UI does NOT itself
+    enforce this (verified: tests/fixtures/revision/
+    pstyle-tracked-foreign.docx -- a second Word session under a
+    different user name silently overwrites the live style and leaves
+    the FIRST author's change record untouched). The identical foreign-
+    author gap already exists today for run-level w:rPrChange (never
+    checked before this issue, only w:ins/w:del ancestry was) -- fixed
+    here too, for both format_text and apply_style's character path
+    (see _check_foreign_rpr_change in text_edit.py).
+
+    Out of scope, same as w:rPrChange today: accept_tracked_changes/
+    reject_tracked_changes/list_open_items only handle w:ins/w:del, never
+    w:rPrChange/w:pPrChange -- accepting or rejecting a tracked style
+    change is not yet exposed by any tool.
 
     Returns the eight evidence keys, plus runs_before/runs_after (as
     format_text), style_id, style_type ("paragraph"/"character"),
-    `warnings` when non-empty, and (character style, track_changes=True
-    only) revision_ids/track_changes.
+    `warnings` when non-empty, and (track_changes=True only) revision_ids/
+    track_changes -- revision_ids is empty when every touched
+    run/paragraph reused an existing own-authored change record rather
+    than allocating a new id (see above).
 
     Errors: as format_text's file-mode errors ONLY (this tool has no
     write_mode parameter, so it never itself goes live -- the
@@ -2443,7 +2468,9 @@ def apply_style(
     docstring lists do not apply here), plus:
       STYLE_NOT_FOUND        - style_id is not a style in this document's styles.xml
       UNSUPPORTED_STYLE_TYPE - style_id names neither a paragraph nor a character style
-      INVALID_INPUT          - track_changes=True on a paragraph style (see above)
+      TRACKED_CHANGES_PRESENT - a matched run/paragraph already carries a w:rPrChange/
+                               w:pPrChange authored by someone other than the configured
+                               author; force=True to proceed (see above)
       LIVE_SESSION_ACTIVE    - a pane session IS connected for this document; use
                                format_text/replace_text(write_mode="live") for a live edit, or
                                save and close the document in Word, then retry (issue #154)

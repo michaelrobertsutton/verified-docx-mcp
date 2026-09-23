@@ -165,10 +165,13 @@ Tools implemented so far:
   a NAMED style (from `list_styles`) to text located via `find`, the
   named-style counterpart to `format_text`'s boolean toggles. A
   character style applies to the matched run(s) exactly like
-  `format_text` (including `track_changes=True`); a paragraph style
-  applies `w:pStyle` to every paragraph containing a matched run, but
-  does not support `track_changes=True` (no `w:pPrChange`-style tracked
-  change exists yet — named explicitly rather than silently ignored).
+  `format_text` (including `track_changes=True`, `w:rPrChange`); a
+  paragraph style applies `w:pStyle` to every paragraph containing a
+  matched run, including `track_changes=True` (`w:pPrChange`, built from
+  a real Word-authored fixture — see `text_edit.py`'s docstrings for the
+  own-author-reuse and foreign-author-refusal rules Word's own behavior
+  informed). `accept_tracked_changes`/`reject_tracked_changes` still only
+  handle `w:ins`/`w:del`, never `w:rPrChange`/`w:pPrChange`.
 - **`read_header_footer(path)`** — read every header/footer part's
   content as markdown in one call. Never refuses on a locked file.
 

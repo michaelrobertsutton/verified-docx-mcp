@@ -286,11 +286,25 @@ def _apply_style_to_run(r_elem: Any, style: dict[str, bool], *, track: _TrackCon
     """_toggle_style, plus (when tracking) recording the PRE-change rPr in
     a w:rPrChange (issue #28 plan WP-07b-a: "formatting changes use
     w:rPrChange"). The snapshot is taken BEFORE _toggle_style mutates
-    anything, per apply_rpr_change's own contract."""
+    anything, per apply_rpr_change's own contract.
+
+    Issue #7: if this run already carries an rPrChange from *track.author*
+    (a still-pending change from an earlier track_changes=True call on
+    this same run, before any accept/reject), this is a no-op on the
+    change record itself -- only the live style is updated, exactly as
+    real Word does (verified: tests/fixtures/revision/
+    pstyle-tracked-twice.docx, the paragraph-style analogue of this same
+    behavior). A FOREIGN-authored existing rPrChange is refused before
+    this function is ever called (_check_foreign_rpr_change), UNLESS
+    force=True let it through -- in that case apply_rpr_change's own
+    remove-existing-record safety net replaces it rather than producing
+    invalid, doubly-nested XML."""
     old_rpr = _own_rpr(r_elem)
-    old_rpr_snapshot = copy.deepcopy(old_rpr) if (track and old_rpr is not None) else None
+    existing_author = tracked_changes.existing_change_author(old_rpr, "rPrChange") if track else None
+    reuse = bool(track) and existing_author == track.author
+    old_rpr_snapshot = copy.deepcopy(old_rpr) if (track and not reuse and old_rpr is not None) else None
     _toggle_style(r_elem, style)
-    if track:
+    if track and not reuse:
         new_rpr = _own_rpr(r_elem)
         rid = track.next_id()
         tracked_changes.apply_rpr_change(new_rpr, old_rpr_elem=old_rpr_snapshot, rid=rid, author=track.author, date=track.date)
@@ -585,6 +599,65 @@ def _check_tracked_changes_guard(
                     "warnings": locate_result.warnings,
                     "own_author": own_author,
                 },
+            )
+
+
+def _check_foreign_rpr_change(proj: projection.Projection, spans: list[tuple[int, int]], force: bool, own_author: str) -> None:
+    """New for issue #7: a match whose run already carries a w:rPrChange
+    (a pending FORMATTING change, distinct from _check_tracked_changes_guard's
+    w:ins/w:del check above) authored by someone other than *own_author*
+    refuses TRACKED_CHANGES_PRESENT unless force=True.
+
+    Unlike the w:ins/w:del case, this is NOT mirroring a rule Word itself
+    enforces: verified against a real Word-authored fixture
+    (tests/fixtures/revision/pstyle-tracked-foreign.docx -- the paragraph-
+    style analogue, same underlying rPrChange/pPrChange model), Word's own
+    desktop UI silently updates the live property and leaves the FIRST
+    author's change record completely untouched even when a second Word
+    session under a different user name edits the same run/paragraph
+    before any accept/reject. This check is a deliberate safety policy
+    this tool adds on top of that -- an automated caller should not
+    silently touch another author's still-pending formatting change
+    without at least an explicit force=True acknowledgment, even though
+    Word's own UI would let it."""
+    if force:
+        return
+    for start, end in spans:
+        for _s, _e, event in _atoms_for_span(proj, start, end):
+            existing_author = tracked_changes.existing_change_author(_own_rpr(event.r_elem), "rPrChange")
+            if existing_author is not None and existing_author != own_author:
+                raise _make_error(
+                    ErrorCode.TRACKED_CHANGES_PRESENT,
+                    "The matched text's run already carries a w:rPrChange (a pending formatting "
+                    f"change) authored by someone other than {own_author!r}; accept or reject it "
+                    "first, or pass force=True.",
+                    {"start": start, "end": end, "existing_author": existing_author, "own_author": own_author},
+                )
+
+
+def _check_foreign_ppr_change(paragraphs: list[Any], force: bool, own_author: str) -> None:
+    """New for issue #7: the paragraph-level analogue of
+    _check_foreign_rpr_change (see that function's docstring for the
+    verified Word behavior this policy is deliberately stricter than). A
+    paragraph whose w:pPr already carries a w:pPrChange authored by
+    someone other than *own_author* refuses TRACKED_CHANGES_PRESENT
+    unless force=True."""
+    if force:
+        return
+    for p_elem in paragraphs:
+        ppr = None
+        for child in p_elem:
+            if projection._ln(child) == "pPr":
+                ppr = child
+                break
+        existing_author = tracked_changes.existing_change_author(ppr, "pPrChange")
+        if existing_author is not None and existing_author != own_author:
+            raise _make_error(
+                ErrorCode.TRACKED_CHANGES_PRESENT,
+                "A paragraph in the matched range already carries a w:pPrChange (a pending "
+                f"paragraph-style change) authored by someone other than {own_author!r}; accept or "
+                "reject it first, or pass force=True.",
+                {"existing_author": existing_author, "own_author": own_author},
             )
 
 
@@ -932,6 +1005,7 @@ def execute_format_text(
     locate_result: LocateResult = locate(find, proj, expected_matches)
     own_author = resolve_author_name()
     _check_tracked_changes_guard(proj, locate_result, force, own_author)
+    _check_foreign_rpr_change(proj, locate_result.spans, force, own_author)
 
     before_first = locate_result.spans[0]
     before_excerpt = _excerpt(proj.text, before_first[0], before_first[1])
@@ -1015,19 +1089,20 @@ def execute_format_text(
 # _own_rpr, _build_run, _index_of, _TrackContext, and
 # _check_tracked_changes_guard directly.
 #
-# Scope limit, documented rather than silently mishandled: a CHARACTER
-# style (w:type="character") applies to the matched run(s) exactly like
-# format_text, including track_changes=True support (w:rPrChange, per
-# WP-07b-a's own contract, which names rPrChange for "formatting
-# changes"). A PARAGRAPH style (w:type="paragraph") applies to every
-# paragraph CONTAINING a matched run (the whole paragraph, not just the
-# matched substring -- w:pStyle has no sub-paragraph granularity) but
-# does NOT support track_changes=True: WP-07b-a's contract defines
-# w:rPrChange only, never a w:pPrChange-style paragraph-formatting
-# tracked-change shape, and inventing one untested is out of this WP's
-# scope -- apply_style(..., track_changes=True) on a paragraph style
-# raises INVALID_INPUT naming this gap explicitly rather than silently
-# applying it untracked or guessing at an unspecified w:pPrChange shape.
+# A CHARACTER style (w:type="character") applies to the matched run(s)
+# exactly like format_text, including track_changes=True support
+# (w:rPrChange, per WP-07b-a's own contract, which names rPrChange for
+# "formatting changes"). A PARAGRAPH style (w:type="paragraph") applies to
+# every paragraph CONTAINING a matched run (the whole paragraph, not just
+# the matched substring -- w:pStyle has no sub-paragraph granularity).
+#
+# Issue #7: track_changes=True on a paragraph style now writes a real
+# w:pPrChange (tracked_changes.apply_ppr_change), built from a Word-
+# authored fixture (tests/fixtures/revision/pstyle-tracked.docx --
+# Track Changes on, one paragraph style change, saved) rather than
+# guessed -- this used to raise INVALID_INPUT naming the gap; see
+# _apply_paragraph_style's own docstring for the exact shape and the
+# own-author-reuse rule the twice/foreign fixtures informed.
 # ---------------------------------------------------------------------------
 
 _SUPPORTED_STYLE_TYPES = frozenset({"paragraph", "character"})
@@ -1038,9 +1113,13 @@ def _set_run_style(r_elem: Any, style_id: str, *, track: _TrackContext | None) -
     (creating one if absent; w:rStyle must be rPr's FIRST child per the
     OOXML schema's fixed element order). Tracked the same way
     _apply_style_to_run tracks a boolean toggle: a w:rPrChange recording
-    the PRE-change rPr, snapshotted before anything is mutated."""
+    the PRE-change rPr, snapshotted before anything is mutated -- same
+    own-author-reuse rule as _apply_style_to_run (issue #7; see that
+    function's docstring)."""
     old_rpr = _own_rpr(r_elem)
-    old_rpr_snapshot = copy.deepcopy(old_rpr) if (track and old_rpr is not None) else None
+    existing_author = tracked_changes.existing_change_author(old_rpr, "rPrChange") if track else None
+    reuse = bool(track) and existing_author == track.author
+    old_rpr_snapshot = copy.deepcopy(old_rpr) if (track and not reuse and old_rpr is not None) else None
     rpr = old_rpr
     if rpr is None:
         rpr = ET.Element(_w("rPr"))
@@ -1055,7 +1134,7 @@ def _set_run_style(r_elem: Any, style_id: str, *, track: _TrackContext | None) -
         rpr.insert(0, rstyle)
     else:
         existing.set(_w("val"), style_id)
-    if track:
+    if track and not reuse:
         new_rpr = _own_rpr(r_elem)
         rid = track.next_id()
         tracked_changes.apply_rpr_change(new_rpr, old_rpr_elem=old_rpr_snapshot, rid=rid, author=track.author, date=track.date)
@@ -1126,10 +1205,37 @@ def _enclosing_paragraph(parent_map: dict[int, Any], elem: Any | None) -> Any | 
     return None
 
 
-def _apply_paragraph_style(p_elem: Any, style_id: str) -> None:
+def _apply_paragraph_style(p_elem: Any, style_id: str, *, track: _TrackContext | None) -> bool:
     """Set/replace <w:pStyle w:val=style_id> on p_elem's own w:pPr
-    (creating one if absent; w:pStyle must be pPr's FIRST child). Never
-    tracked -- see this section's own module-level scope-limit comment."""
+    (creating one if absent; w:pStyle must be pPr's FIRST child).
+    Returns True if the paragraph's own style actually changed (False for
+    a no-op re-application of the style it already carries) -- the
+    caller uses this to build the "paragraphs to verify carry a
+    w:pPrChange" list precisely, rather than every touched paragraph
+    (issue #7: a no-op must not require one).
+
+    Issue #7, track_changes=True: records a w:pPrChange with the
+    PRE-change pPr snapshot -- shape taken directly from a real
+    Word-authored fixture (tests/fixtures/revision/pstyle-tracked.docx:
+    Track Changes on, one paragraph style change, saved), not guessed.
+    w:pPrChange lands as pPr's LAST child, right after w:pStyle; when the
+    paragraph had no w:pPr at all before, the snapshot is an empty
+    <w:pPr/> (mirrors apply_rpr_change's own "no explicit properties"
+    convention for a run with no prior w:rPr).
+
+    Own-author reuse (verified: tests/fixtures/revision/
+    pstyle-tracked-twice.docx -- a SECOND tracked style change on the
+    same paragraph, same Word session, before any accept/reject): Word
+    updates pStyle in place and leaves the FIRST pPrChange's id/date/
+    snapshot completely untouched, rather than stacking a second one.
+    Mirrored here: if the paragraph already carries a pPrChange from
+    *track.author*, this call only updates the live pStyle: it does not
+    consume a new id and does not touch the existing change record. A
+    FOREIGN-authored existing pPrChange is refused before this function
+    is ever called (_check_foreign_ppr_change), unless force=True let it
+    through -- in that case apply_ppr_change's own remove-existing-record
+    safety net replaces it rather than producing invalid XML.
+    """
     ppr = None
     for child in p_elem:
         if projection._ln(child) == "pPr":
@@ -1143,11 +1249,26 @@ def _apply_paragraph_style(p_elem: Any, style_id: str) -> None:
         if projection._ln(child) == "pStyle":
             existing = child
             break
+    current_val = projection._attr(existing, "val") if existing is not None else None
+    if current_val == style_id:
+        return False
+
+    existing_author = tracked_changes.existing_change_author(ppr, "pPrChange") if track else None
+    reuse = bool(track) and existing_author == track.author
+    old_ppr_snapshot = copy.deepcopy(ppr) if (track and not reuse) else None
+    if old_ppr_snapshot is not None:
+        tracked_changes._remove_change_record(old_ppr_snapshot, "pPrChange")
+
     if existing is None:
         pstyle = ET.Element(_w("pStyle"), {_w("val"): style_id})
         ppr.insert(0, pstyle)
     else:
         existing.set(_w("val"), style_id)
+
+    if track and not reuse:
+        rid = track.next_id()
+        tracked_changes.apply_ppr_change(ppr, old_ppr_elem=old_ppr_snapshot, rid=rid, author=track.author, date=track.date)
+    return True
 
 
 def execute_apply_style(
@@ -1180,15 +1301,6 @@ def execute_apply_style(
             "styles only.",
             {"style_id": style_id, "type": style_type},
         )
-    if style_type == "paragraph" and track_changes:
-        raise _make_error(
-            ErrorCode.INVALID_INPUT,
-            "apply_style(track_changes=True) is not supported for a paragraph style: WP-07b-a's track_changes "
-            "contract defines w:rPrChange for run/character formatting only, not a paragraph-level "
-            "w:pPrChange-style tracked change. Apply the paragraph style directly (track_changes=False), or use "
-            "a character style if a tracked change is required.",
-            {"style_id": style_id, "type": style_type},
-        )
 
     document_root, raw_xml = mutations._load_document(resolved)
     proj = projection.project_document_root(document_root)
@@ -1204,6 +1316,7 @@ def execute_apply_style(
     track = _TrackContext(document_root, author=own_author) if track_changes else None
 
     if style_type == "character":
+        _check_foreign_rpr_change(proj, locate_result.spans, force, own_author)
         for start, end in locate_result.spans:
             atoms = _atoms_for_span(proj, start, end)
             _apply_named_style_span(start, end, style_id, atoms, track=track)
@@ -1211,14 +1324,55 @@ def execute_apply_style(
         parent_map = _build_parent_map(document_root)
         touched_ids: set[int] = set()
         touched_paragraphs: list[Any] = []
+        span_paragraph_id: dict[tuple[int, int], int] = {}
         for start, end in locate_result.spans:
-            for _s, _e, event in _atoms_for_span(proj, start, end):
-                p_elem = _enclosing_paragraph(parent_map, event.r_elem)
-                if p_elem is not None and id(p_elem) not in touched_ids:
+            atoms = _atoms_for_span(proj, start, end)
+            p_elem = _enclosing_paragraph(parent_map, atoms[0][2].r_elem) if atoms else None
+            if p_elem is not None:
+                span_paragraph_id[(start, end)] = id(p_elem)
+                if id(p_elem) not in touched_ids:
                     touched_ids.add(id(p_elem))
                     touched_paragraphs.append(p_elem)
+        _check_foreign_ppr_change(touched_paragraphs, force, own_author)
+        changed_by_pid: dict[int, bool] = {}
         for p_elem in touched_paragraphs:
-            _apply_paragraph_style(p_elem, style_id)
+            changed_by_pid[id(p_elem)] = _apply_paragraph_style(p_elem, style_id, track=track)
+        # span_changed (issue #7): per-span "did this span's enclosing
+        # paragraph's style actually change" -- used by _post_verify below
+        # to check for a w:pPrChange ONLY on a paragraph that changed, per
+        # the no-op rule (a paragraph already at style_id must not gain
+        # one). Keyed by span, not by paragraph object identity, because
+        # _post_verify re-parses the written XML into a BRAND NEW tree
+        # (fresh Element objects, same spans/positions) to verify against.
+        span_changed = {span: changed_by_pid.get(pid, False) for span, pid in span_paragraph_id.items()}
+
+        # No-op check (issue #7): when EVERY touched paragraph already
+        # carried style_id, _apply_paragraph_style mutated nothing at all
+        # -- skip the write entirely rather than re-serializing an
+        # unchanged tree, which (like format_text's own identical no-op
+        # rationale) would otherwise still shift the revision token on
+        # ElementTree round-trip formatting alone (e.g. self-closing tag
+        # spacing) despite no semantic change.
+        if touched_paragraphs and not any(changed_by_pid.values()):
+            evidence = _evidence(
+                applied=True,
+                match_count=locate_result.match_count,
+                rung=locate_result.rung,
+                before=before_excerpt,
+                after=before_excerpt,
+                revision_before=pre_revision["token"],
+                revision_after=pre_revision["token"],
+                audit_logged=False,
+                runs_before=runs_before,
+                runs_after=runs_before,
+                warnings=locate_result.warnings,
+                track=track,
+            )
+            evidence["style_id"] = style_id
+            evidence["style_type"] = style_type
+            logged, _ = audit.append_audit(path=str(resolved), tool="apply_style", evidence=evidence)
+            evidence["audit_logged"] = logged
+            return evidence
 
     # format_text never changes character counts, and neither does
     # apply_style (a style id is metadata, not content) -- spans are
@@ -1255,14 +1409,29 @@ def execute_apply_style(
                     p_elem = _enclosing_paragraph(new_parent_map, event.r_elem)
                     if p_elem is None:
                         raise ValueError("re-read match has no enclosing paragraph")
+                    ppr_elem = None
                     pstyle_val = None
                     for child in p_elem:
                         if projection._ln(child) == "pPr":
+                            ppr_elem = child
                             for gc in child:
                                 if projection._ln(gc) == "pStyle":
                                     pstyle_val = projection._attr(gc, "val")
                     if pstyle_val != style_id:
                         raise ValueError(f"re-read paragraph does not carry w:pStyle val={style_id!r} (got {pstyle_val!r})")
+                    # Issue #7: only a paragraph whose style ACTUALLY
+                    # changed (span_changed, computed before mutation) must
+                    # carry a w:pPrChange -- a no-op re-application of the
+                    # same style must not gain one, matching the no-op rule
+                    # above (and format_text's own identical rule).
+                    if track_changes and span_changed.get((start, end), False):
+                        change_author = tracked_changes.existing_change_author(ppr_elem, "pPrChange")
+                        if change_author != own_author:
+                            raise ValueError(
+                                f"re-read paragraph does not carry a w:pPrChange authored by {own_author!r} "
+                                f"despite track_changes=True (got author={change_author!r})"
+                            )
+                    break  # one enclosing paragraph per span (structural boundary guarantee)
 
     conflict_sweep = _serialize_and_write(resolved, document_root, raw_xml, post_verify=_post_verify)
 
