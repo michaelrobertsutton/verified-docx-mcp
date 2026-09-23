@@ -647,7 +647,16 @@ async function opFormat(payload) {
         // proposal-lead incident (marking edits in a font color; strike
         // was silently dropped in live mode before this).
         if (payload.strike !== null && payload.strike !== undefined) range.font.strikeThrough = payload.strike;
-        if (payload.color !== null && payload.color !== undefined) range.font.color = payload.color;
+        // issue #22: send an explicit "#RRGGBB" -- the documented Office
+        // JS convention for font.color, and what its own GETTER always
+        // returns (verified against a real Word sideload: font.color
+        // read back as "#3B3838" even when the SETTER was given a bare
+        // "3B3838" with no "#" -- Word tolerated it, but relying on that
+        // leniency instead of matching the getter's own format is not
+        // worth it now that it's been checked).
+        if (payload.color !== null && payload.color !== undefined) {
+          range.font.color = payload.color.startsWith("#") ? payload.color : `#${payload.color}`;
+        }
       });
       await context.sync();
     } finally {

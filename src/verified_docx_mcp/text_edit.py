@@ -1156,15 +1156,28 @@ def execute_format_text_live(
                 {"matches": matches},
             )
         requested_color = style.get("color")
-        if requested_color is not None and (m.get("colorAfter") or "").upper() != requested_color:
-            raise _make_error(
-                ErrorCode.VERIFICATION_FAILED,
-                "live format did not verify: the pane's read-back font.color "
-                f"({m.get('colorAfter')!r}) does not equal the requested color "
-                f"({requested_color!r}) after context.sync(). Nothing to roll back in live mode "
-                "-- Word, not this server, owns the document.",
-                {"matches": matches, "requested_color": requested_color},
-            )
+        if requested_color is not None:
+            # Word's own Office.js font.color GETTER returns a "#"-prefixed
+            # CSS hex string (e.g. "#3B3838") even though the SETTER
+            # tolerates a bare one -- verified against a real Word
+            # sideload (issue #22), not assumed: the first version of this
+            # check compared the read-back value directly against
+            # style["color"] (never "#"-prefixed, since _validate_style
+            # strips a leading "#" on the way in), so a color that WAS
+            # correctly applied still raised VERIFICATION_FAILED on every
+            # single live color call. fake_pane.py's own echo-the-request
+            # model never had a "#" to strip, so this never surfaced
+            # against the fake pane -- only a real sideload caught it.
+            color_after = (m.get("colorAfter") or "").upper().lstrip("#")
+            if color_after != requested_color:
+                raise _make_error(
+                    ErrorCode.VERIFICATION_FAILED,
+                    "live format did not verify: the pane's read-back font.color "
+                    f"({m.get('colorAfter')!r}) does not equal the requested color "
+                    f"({requested_color!r}) after context.sync(). Nothing to roll back in live mode "
+                    "-- Word, not this server, owns the document.",
+                    {"matches": matches, "requested_color": requested_color},
+                )
         requested_strike = style.get("strike")
         if requested_strike is not None and bool(m.get("strikeAfter")) != bool(requested_strike):
             raise _make_error(
