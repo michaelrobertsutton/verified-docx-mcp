@@ -77,6 +77,33 @@ class HelloMessageTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             HelloMessage.from_json("{not json")
 
+    def test_capabilities_round_trips(self):
+        msg = HelloMessage(
+            document_url="/x.docx",
+            host="Word",
+            platform="Mac",
+            requirement_sets={"1.4": True},
+            body_sha256="a" * 64,
+            capabilities=frozenset({"row_scope"}),
+        )
+        self.assertEqual(HelloMessage.from_json(msg.to_json()), msg)
+
+    def test_missing_capabilities_defaults_to_empty_set(self):
+        # Issue #22 B2: an old pane connecting from before this field
+        # existed must still parse -- capabilities defaults to empty
+        # rather than raising, so require_capability can fail closed on
+        # it instead of the hello parse itself refusing the connection.
+        obj = {
+            "type": "hello",
+            "documentUrl": "/x.docx",
+            "host": "Word",
+            "platform": "Mac",
+            "requirementSets": {},
+            "bodySha256": "a" * 64,
+        }
+        msg = HelloMessage.from_json(obj)
+        self.assertEqual(msg.capabilities, frozenset())
+
     def test_top_level_not_object_raises_protocol_error(self):
         with self.assertRaises(ProtocolError):
             HelloMessage.from_json("[1, 2, 3]")
@@ -198,6 +225,13 @@ class ReplacePayloadTests(unittest.TestCase):
         payload = ReplacePayload(find="a", expected_matches=1, replace="b")
         self.assertNotIn("expectedBodySha256", payload.to_json())
 
+    def test_row_anchor_round_trips_and_omitted_when_none(self):
+        payload = ReplacePayload(find="a", expected_matches=1, replace="b", row_anchor="AnchorCell")
+        obj = payload.to_json()
+        self.assertEqual(obj["rowAnchor"], "AnchorCell")
+        self.assertEqual(ReplacePayload.from_json(obj), payload)
+        self.assertNotIn("rowAnchor", ReplacePayload(find="a", expected_matches=1, replace="b").to_json())
+
 
 class FormatPayloadTests(unittest.TestCase):
     def test_round_trip(self):
@@ -211,6 +245,27 @@ class FormatPayloadTests(unittest.TestCase):
     def test_expected_matches_must_be_positive(self):
         with self.assertRaises(ProtocolError):
             FormatPayload.from_json({"find": "a", "expected_matches": 0, "bold": True})
+
+    def test_strike_only_round_trips(self):
+        # Issue #22: live format_text used to silently drop strike -- it
+        # must round-trip on its own, without bold/italic/underline/color.
+        payload = FormatPayload(find="alpha", expected_matches=1, strike=True)
+        self.assertEqual(FormatPayload.from_json(payload.to_json()), payload)
+
+    def test_color_only_round_trips(self):
+        payload = FormatPayload(find="alpha", expected_matches=1, color="3B3838")
+        self.assertEqual(FormatPayload.from_json(payload.to_json()), payload)
+
+    def test_color_alone_satisfies_the_at_least_one_requirement(self):
+        parsed = FormatPayload.from_json({"find": "a", "expected_matches": 1, "color": "3B3838"})
+        self.assertEqual(parsed.color, "3B3838")
+
+    def test_row_anchor_round_trips_and_omitted_when_none(self):
+        payload = FormatPayload(find="a", expected_matches=1, bold=True, row_anchor="AnchorCell")
+        obj = payload.to_json()
+        self.assertEqual(obj["rowAnchor"], "AnchorCell")
+        self.assertEqual(FormatPayload.from_json(obj), payload)
+        self.assertNotIn("rowAnchor", FormatPayload(find="a", expected_matches=1, bold=True).to_json())
 
 
 class ReplaceMatchResultTests(unittest.TestCase):

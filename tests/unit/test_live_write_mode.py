@@ -37,7 +37,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fake_pane import FakeDocument, FakePane
+from fake_pane import ROW_DELIMITER, FakeDocument, FakePane
 
 from verified_docx_mcp import mutations, paths, projection, tables, text_edit
 from verified_docx_mcp.errors import ErrorCode, VerifyError
@@ -487,6 +487,152 @@ class FormatTextLiveTests(LiveWriteBridgeTestCase):
         self.assertEqual(evidence["revision_before"], evidence["revision_after"])
         self.assertEqual(doc.text, "alpha beta")
 
+    async def test_color_and_strike_happy_path(self) -> None:
+        # Issue #22: live format_text used to silently drop strike, and
+        # had no color key at all.
+        doc = FakeDocument(text="alpha beta")
+        await self.connect_pane(doc)
+
+        evidence = await asyncio.to_thread(
+            text_edit.execute_format_text,
+            str(self.target),
+            "beta",
+            {"strike": True, "color": "3B3838"},
+            1,
+            write_mode="live",
+        )
+        self.assertTrue(evidence["applied"])
+        self.assertEqual(evidence["write_mode"], "live")
+
+    async def test_color_mismatch_after_sync_raises_verification_failed(self) -> None:
+        # The pane's read-back (colorAfter) is what gets checked, not an
+        # echo of the request -- simulate a pane whose write silently
+        # didn't take by overriding FakeDocument.format's own echo.
+        class _StaleColorDocument(FakeDocument):
+            def format(self, *args, **kwargs):
+                result = super().format(*args, **kwargs)
+                for m in result["matches"]:
+                    m["colorAfter"] = "000000"
+                return result
+
+        doc = _StaleColorDocument(text="alpha beta")
+        await self.connect_pane(doc)
+
+        with self.assertRaises(VerifyError) as cm:
+            await asyncio.to_thread(
+                text_edit.execute_format_text,
+                str(self.target),
+                "beta",
+                {"color": "3B3838"},
+                1,
+                write_mode="live",
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.VERIFICATION_FAILED)
+
+    async def test_strike_mismatch_after_sync_raises_verification_failed(self) -> None:
+        class _StaleStrikeDocument(FakeDocument):
+            def format(self, *args, **kwargs):
+                result = super().format(*args, **kwargs)
+                for m in result["matches"]:
+                    m["strikeAfter"] = False
+                return result
+
+        doc = _StaleStrikeDocument(text="alpha beta")
+        await self.connect_pane(doc)
+
+        with self.assertRaises(VerifyError) as cm:
+            await asyncio.to_thread(
+                text_edit.execute_format_text,
+                str(self.target),
+                "beta",
+                {"strike": True},
+                1,
+                write_mode="live",
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.VERIFICATION_FAILED)
+
+
+class RowScopedLiveTests(LiveWriteBridgeTestCase):
+    """Issue #22 B2: within_row_containing over the live path, against
+    fake_pane.py's ROW_DELIMITER-bounded row model (see that module's own
+    fidelity notes -- this proves the server's rowAnchor plumbing and the
+    capability gate, not the real Office JS row-navigation path)."""
+
+    def _duplicate_cell_doc(self) -> FakeDocument:
+        # ROW_DELIMITER separates ROWS, not cells within a row -- each row
+        # here concatenates its own anchor cell and its own duplicate
+        # cell, the way a real Word row's own getRange().text would.
+        return FakeDocument(text=f"AnchorRow1 Duplicate{ROW_DELIMITER}AnchorRow2 Duplicate")
+
+    async def test_row_scoped_replace_edits_only_the_anchored_row(self) -> None:
+        doc = self._duplicate_cell_doc()
+        await self.connect_pane(doc)
+
+        evidence = await asyncio.to_thread(
+            text_edit.execute_replace_text,
+            str(self.target),
+            "Duplicate",
+            "Changed",
+            1,
+            write_mode="live",
+            within_row_containing="AnchorRow1",
+        )
+        self.assertTrue(evidence["applied"])
+        self.assertEqual(doc.text, f"AnchorRow1 Changed{ROW_DELIMITER}AnchorRow2 Duplicate")
+
+    async def test_row_scoped_format_touches_only_the_anchored_row(self) -> None:
+        doc = self._duplicate_cell_doc()
+        await self.connect_pane(doc)
+
+        evidence = await asyncio.to_thread(
+            text_edit.execute_format_text,
+            str(self.target),
+            "Duplicate",
+            {"bold": True},
+            1,
+            write_mode="live",
+            within_row_containing="AnchorRow2",
+        )
+        self.assertTrue(evidence["applied"])
+
+    async def test_old_pane_without_row_scope_capability_raises_live_capability_missing(self) -> None:
+        doc = self._duplicate_cell_doc()
+        await self.connect_pane(doc, capabilities=[])  # simulates a pane build predating this feature
+
+        with self.assertRaises(VerifyError) as cm:
+            await asyncio.to_thread(
+                text_edit.execute_replace_text,
+                str(self.target),
+                "Duplicate",
+                "Changed",
+                1,
+                write_mode="live",
+                within_row_containing="AnchorRow1",
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.LIVE_CAPABILITY_MISSING)
+        self.assertEqual(doc.text, self._duplicate_cell_doc().text)  # nothing sent, nothing changed
+
+    async def test_ambiguous_row_anchor_refuses(self) -> None:
+        # "Duplicate" itself occurs twice -- not a valid rowAnchor. The
+        # pane's own refusal message names "found 2", which
+        # classify_op_failed maps to MATCH_COUNT_MISMATCH (not a generic
+        # LIVE_OP_FAILED) -- same diagnostic precision as any other
+        # expected_matches gate failure.
+        doc = self._duplicate_cell_doc()
+        await self.connect_pane(doc)
+
+        with self.assertRaises(VerifyError) as cm:
+            await asyncio.to_thread(
+                text_edit.execute_replace_text,
+                str(self.target),
+                "Duplicate",
+                "Changed",
+                1,
+                write_mode="live",
+                within_row_containing="Duplicate",
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.MATCH_COUNT_MISMATCH)
+
 
 class LiveSaveTests(LiveWriteBridgeTestCase):
     async def test_returns_both_revisions(self) -> None:
@@ -515,6 +661,21 @@ class LiveSaveTests(LiveWriteBridgeTestCase):
             evidence["file_revision"],
             projection.compute_revision(self.target)["token"],
         )
+
+    async def test_file_revision_is_none_with_no_local_file(self) -> None:
+        # Issue #22 B3: a SharePoint/OneDrive document with no local sync
+        # -- Word's own save went there, not to anything this server
+        # could read. Must not raise; file_revision degrades to None.
+        self.target.unlink()
+        doc = FakeDocument(text="alpha")
+        doc.saved = False
+        await self.connect_pane(doc)
+
+        evidence = await asyncio.to_thread(text_edit.execute_live_save, str(self.target))
+
+        self.assertTrue(evidence["applied"])
+        self.assertTrue(evidence["saved"])
+        self.assertIsNone(evidence["file_revision"])
 
     async def test_live_unavailable_with_no_session(self) -> None:
         with self.assertRaises(VerifyError) as ctx:

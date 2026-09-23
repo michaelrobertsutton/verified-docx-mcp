@@ -81,10 +81,21 @@ def _document_name(path: str) -> str:
     """The file name a connected pane would report for *path* -- the same
     basename ``live/session.py``'s ``document_name_from_url`` derives
     from the pane's own ``hello.documentUrl``, and the same key
-    ``SessionRegistry`` uses. Requires the file to exist (a live session
-    can only ever exist for a file Word already has open, which by
-    definition already exists on disk)."""
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    ``SessionRegistry`` uses.
+
+    Issue #22 B3: resolved with ``must_exist=False`` -- a live session's
+    document does NOT need to exist locally (a SharePoint/OneDrive
+    document with no local sync is the real incident this fixes: the
+    caller previously had to fabricate a same-named local stand-in file
+    in an allowed root just so this call would not raise, before any
+    live routing even happened). The allowlist/denylist floor
+    ``resolve_allowed_docx_path`` enforces is unaffected -- *path* must
+    still name something inside an allowed root, it just doesn't have to
+    exist there. Only used from the live-routing branches of
+    ``resolve_write_mode``/``live_session_for`` (never from a file-mode
+    path, which still requires the file to exist via its own
+    ``resolve_allowed_docx_path(path, must_exist=True)`` call)."""
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=False)
     return resolved.name
 
 
@@ -124,7 +135,13 @@ def _check_session_identity(path: str, session: LiveSession) -> None:
     session_local = _session_url_local_path(session.document_url)
     if session_local is None:
         return
-    target_resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    # Issue #22 B3: must_exist=False -- path.resolve(strict=False) still
+    # normalizes to a comparable absolute path for a document that
+    # genuinely has no local file (this check's own job is comparing
+    # paths, not reading one), and requiring existence here would refuse
+    # every live call for such a document before this function even gets
+    # to compare anything.
+    target_resolved = paths.resolve_allowed_docx_path(path, must_exist=False)
     try:
         session_real = session_local.resolve()
     except OSError:
@@ -263,6 +280,31 @@ def live_session_for(path: str) -> LiveSession:
         )
     _check_session_identity(path, session)
     return session
+
+
+def require_capability(session: LiveSession, capability: str, *, feature_description: str) -> None:
+    """Issue #22 B2: raise ``LIVE_CAPABILITY_MISSING`` unless *session*'s
+    own ``hello.capabilities`` reported *capability*.
+
+    Called BEFORE an op that depends on a wire-level payload field a pane
+    build might not implement (e.g. ``rowAnchor``) is ever sent. An
+    already-connected pane that predates the capability sends no
+    ``capabilities`` field at all (``HelloMessage.from_json`` defaults it
+    to an empty ``frozenset`` -- see that class's own docstring), so this
+    always fails closed for it: a stale pane can never silently ignore
+    the new payload key and run an unscoped op instead of refusing, which
+    is the exact failure mode this function exists to close off on the
+    wire, not just in this server's own Python.
+    """
+    if capability in session.hello.capabilities:
+        return
+    raise _make_error(
+        ErrorCode.LIVE_CAPABILITY_MISSING,
+        f"the connected pane for {session.document_name!r} did not report the {capability!r} "
+        f"capability, required for {feature_description}. Reload the Live pane in Word (it may be "
+        "running a build from before this feature existed) and retry.",
+        {"document_name": session.document_name, "capability": capability, "feature": feature_description},
+    )
 
 
 def check_not_stale(revision_before: str | None, current_body_sha256: str) -> None:

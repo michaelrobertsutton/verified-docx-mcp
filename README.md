@@ -59,8 +59,14 @@ Tools implemented so far:
   targeted text edits located via a normalization ladder (exact ->
   curly/straight quotes -> NBSP/whitespace collapse -> soft-hyphen
   strip), with run splitting that clones a boundary run's original
-  `w:rPr` verbatim onto every surviving piece. Both take a `write_mode:
-  "auto" | "file" | "live"` parameter (default `"auto"`): `"auto"` edits
+  `w:rPr` verbatim onto every surviving piece. `format_text`'s `style`
+  accepts `bold`/`italic`/`underline`/`strike` (booleans) and `color` (a
+  6-hex string) — an explicit color clears any theme-color attributes on
+  the run, so Word doesn't keep rendering a stale theme color over it.
+  Both take `within_row_containing` (scope `find` to one table row,
+  identified by a second unique anchor in that row — for a table with
+  several cells reading identical text) and a `write_mode: "auto" |
+  "file" | "live"` parameter (default `"auto"`): `"auto"` edits
   through a connected Word task pane instead of the file whenever a Live
   pane is connected for that document, otherwise the file path — see
   [Live mode](#live-mode) below. `apply_style(path, find, style_id,
@@ -363,6 +369,16 @@ that document, otherwise the file path. `live_save(path)` asks the pane to save.
 `list_open_items(source="live")` carries a `correlation` list bridging
 a live comment's own id back to the durableId/w:id file mode reports (Office.js's
 `Comment.id` is unrelated to either).
+
+Issue #22 B3: none of the live comment tools (or `live_save`) require
+`path` to name a file that exists locally anymore — a SharePoint/OneDrive
+document with no local sync now works directly, without fabricating a
+same-named local stand-in file first. When there's genuinely no local
+file, `list_open_items(source="live")`'s `pending_suggestions` is `null`
+(never `[]`, which would look like "nothing pending") and it carries
+`file_side_available: false`; `live_save`'s `file_revision` is `null`.
+`read_document`/`list_parts`/`find_sections`/etc. remain file-only — this
+does not add a live read path for the structural read tools.
 
 Issue #154: every OTHER mutating tool — `apply_style`, `insert_table`,
 `insert_image`, `replace_table_row`, `replace_cell_markdown`,
