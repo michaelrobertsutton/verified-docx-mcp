@@ -24,7 +24,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 
-from verified_docx_mcp import mutations, paths, projection, text_edit, tracked_changes
+from verified_docx_mcp import mutations, paths, projection, tables, text_edit, tracked_changes
 from verified_docx_mcp.errors import ErrorCode, VerifyError
 from verified_docx_mcp.middleware import MUTATING_TOOLS
 
@@ -156,6 +156,98 @@ class StructuralBoundaryRefusalTests(_TempFixtureCase):
             text_edit.execute_replace_text(str(self.target), "R1C1\nR1C2", "X", 1)
         self.assertEqual(cm.exception.envelope.error_code, ErrorCode.STRUCTURAL_BOUNDARY)
         self.assertEqual(projection.read_document_text(self.target), before_text, "a refused match must not write")
+
+
+class RowScopedEditTests(_TempFixtureCase):
+    """Issue #22 B2: within_row_containing on replace_text/format_text
+    (file mode), against tables.docx's real Word-authored 2x2 table with
+    two cells given IDENTICAL text -- the exact "eleven identical cells"
+    shape from the real incident, at 2 rows instead of 11."""
+
+    fixture_name = "tables.docx"
+
+    def setUp(self):
+        super().setUp()
+        # R1C1/R2C1 both get "Duplicate"; R1C2/R2C2 are each row's own
+        # unique anchor. 1-based row/cell indices, per tables.py's own
+        # _find_row/_find_cell contract.
+        tables.execute_replace_cell_markdown(str(self.target), 1, 1, 1, "Duplicate")
+        tables.execute_replace_cell_markdown(str(self.target), 1, 1, 2, "AnchorRow1")
+        tables.execute_replace_cell_markdown(str(self.target), 1, 2, 1, "Duplicate")
+        tables.execute_replace_cell_markdown(str(self.target), 1, 2, 2, "AnchorRow2")
+
+    def test_replace_text_edits_only_the_anchored_row(self):
+        text_edit.execute_replace_text(
+            str(self.target), "Duplicate", "Changed", 1, within_row_containing="AnchorRow1"
+        )
+        self.assertEqual(
+            projection.read_document_text(self.target),
+            "Before the table.\nChanged\nAnchorRow1\nDuplicate\nAnchorRow2\nAfter the table.",
+        )
+
+    def test_format_text_touches_only_the_anchored_row(self):
+        text_edit.execute_format_text(
+            str(self.target), "Duplicate", {"bold": True}, 1, within_row_containing="AnchorRow2"
+        )
+        runs = [r for r in projection.read_document_runs(self.target) if r.get("text") == "Duplicate"]
+        self.assertEqual([r["rPr"]["bold"] for r in runs], [False, True])
+
+    def test_anchor_not_unique_in_document_raises_match_count_mismatch(self):
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_replace_text(
+                str(self.target), "Duplicate", "X", 1, within_row_containing="Duplicate"
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.MATCH_COUNT_MISMATCH)
+
+    def test_anchor_not_in_a_table_raises_invalid_input(self):
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_replace_text(
+                str(self.target), "Duplicate", "X", 1, within_row_containing="Before the table."
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    def test_anchor_not_found_raises_zero_match(self):
+        with self.assertRaises(VerifyError) as cm:
+            text_edit.execute_replace_text(
+                str(self.target), "Duplicate", "X", 1, within_row_containing="NoSuchAnchor"
+            )
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.ZERO_MATCH)
+
+
+class SpanFilterOutOfScopeBoundaryTests(_TempFixtureCase):
+    """Issue #22 (Codex review): locate()'s span_filter is applied BEFORE
+    the STRUCTURAL_BOUNDARY check and rung selection, not after -- an
+    out-of-scope match that crosses a boundary must never raise, and must
+    never suppress an in-scope match at a later rung."""
+
+    fixture_name = "tables.docx"
+
+    def test_out_of_scope_boundary_crossing_match_does_not_raise(self):
+        proj = projection.project_document_root(mutations._load_document(self.target)[0])
+        # "R1C1\nR1C2" crosses a cell boundary (STRUCTURAL_BOUNDARY territory)
+        # and is the ONLY occurrence of this needle -- filtering it OUT of
+        # scope entirely (span_filter always False) must make this call
+        # behave as ZERO_MATCH, never STRUCTURAL_BOUNDARY.
+        with self.assertRaises(VerifyError) as cm:
+            from verified_docx_mcp.locate import locate
+
+            locate("R1C1\nR1C2", proj, 1, span_filter=lambda s, e: False)
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.ZERO_MATCH)
+
+    def test_in_scope_match_at_a_later_rung_is_not_shadowed_by_an_out_of_scope_exact_match(self):
+        # "R1C1" matches exactly once (in scope, at rung "exact"). A
+        # span_filter that excludes it must fall through the ladder to
+        # ZERO_MATCH rather than the exact rung ever being considered
+        # "found" for count/boundary purposes.
+        proj = projection.project_document_root(mutations._load_document(self.target)[0])
+        from verified_docx_mcp.locate import locate
+
+        with self.assertRaises(VerifyError) as cm:
+            locate("R1C1", proj, 1, span_filter=lambda s, e: False)
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.ZERO_MATCH)
+        diagnostics = cm.exception.envelope.diagnostics
+        self.assertIn("ladder_report", diagnostics)
+        self.assertTrue(any(entry.get("matches_outside_span_filter") for entry in diagnostics["ladder_report"]))
 
 
 class FormatTextTests(_TempFixtureCase):

@@ -112,6 +112,46 @@ on every `replace_text`/`format_text` call today) must never bind the
 bridge's real ports as a side effect; only `live_status`, or an already-
 connected pane, brings the bridge up.
 
+### Issue #22 additions: font color, row-scoped edit, live capabilities
+
+- **`format_text`'s `style`** now accepts `color` (a 6-hex string) in
+  addition to `bold`/`italic`/`underline`/`strike`, in both file and live
+  mode. Live mode also gained `strike` (it was silently dropped before —
+  never sent to the pane at all). The pane's `format` reply carries
+  read-back `colorAfter`/`strikeAfter` per match (re-loaded from
+  `range.font` AFTER `context.sync()`, not an echo of the request), and
+  `execute_format_text_live` checks these against what was asked for —
+  a write that silently didn't take is now `VERIFICATION_FAILED`, not a
+  false `applied: true`.
+- **`within_row_containing`** (both tools, file and live): scopes `find`
+  to one table row, identified by a second, unique piece of text in that
+  same row (`within_row_containing`). Solves the actual incident this
+  issue opened with — eleven table cells reading identical text,
+  impossible to edit one at a time. The anchor must be unique in the
+  WHOLE document (the same guarantee `locate()` already gives any
+  needle) and must resolve to a table cell; two cells in the SAME
+  anchored row with identical `find` text remain inseparable — a named
+  limitation, not solved by this feature.
+- **Pane capabilities** (`hello.capabilities`, e.g. `["row_scope"]`):
+  distinct from `requirementSets` (WordApi version support) — a
+  capability names an OP-LEVEL wire feature this exact pane BUILD
+  implements. `within_row_containing`'s live path checks for
+  `"row_scope"` before ever sending an op with a `rowAnchor` field,
+  raising `LIVE_CAPABILITY_MISSING` otherwise — an already-connected pane
+  from before this feature existed would otherwise silently ignore the
+  unrecognized field and run an UNSCOPED op instead of refusing, which is
+  the exact "wrote to all N identical cells" bug this feature exists to
+  prevent, just moved onto the wire. An old pane reports no
+  `capabilities` field at all; `HelloMessage.from_json` defaults it to
+  empty rather than refusing the connection.
+- **Live mode without a local file** (comment tools only — see
+  `list_open_items`'s own docstring): `write_mode.py`'s document-name
+  resolution and every `comments_live.py` session lookup now tolerate a
+  `path` that does not exist locally, using its basename to find a
+  connected session by name. `read_document`/`list_parts`/`find_sections`
+  and the other structural read tools remain file-only — this does not
+  add a live read path for them.
+
 **Why a document open in Word is now writable.** Before this WP, a desktop
 Word owner file on the target path only ever showed up as data
 (`lock_status`) or as `DOCX_LOCKED` on a file-mode write guard. `auto`

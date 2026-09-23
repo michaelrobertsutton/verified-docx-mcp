@@ -1284,6 +1284,7 @@ def replace_text(
     force: bool = False,
     track_changes: bool = False,
     write_mode: str = "auto",
+    within_row_containing: str | None = None,
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
 
@@ -1366,6 +1367,21 @@ def replace_text(
     validated before the original is touched, .jsbak-backed post-write
     verification) -- see that tool's docstring.
 
+    within_row_containing (issue #22, optional): scope `find` to one
+    table row, identified by a SECOND, unique piece of text located
+    inside that row. Solves editing a single cell among many identical
+    ones (e.g. a table where 11 cells read "No approved proof on file")
+    without expected_matches=1 refusing (find matches every such cell)
+    or expected_matches=N rewriting all of them. Contract: the anchor
+    itself must be unique in the WHOLE document (the same guarantee
+    locate() already gives any needle -- no separate per-row uniqueness
+    rule) and must resolve to a table cell; `find` is then located (and
+    its own expected_matches enforced) only within that row. Named
+    limitation, not solved by this: two cells in the SAME anchored row
+    with identical `find` text remain inseparable. In live mode, requires
+    the connected pane report the "row_scope" capability -- see
+    LIVE_CAPABILITY_MISSING below.
+
     Returns the eight evidence keys (before/after are ±200-character
     excerpts around the first match, not the whole document), plus
     runs_before/runs_after (each match's overlapping run(s), clipped to the
@@ -1401,6 +1417,9 @@ def replace_text(
       LIVE_DISCONNECTED                 - the pane's socket closed, or an op timed out, mid-call
       LIVE_STALE                        - a "live:sha256:..." revision_before no longer matches the
                                            pane's current body hash
+      LIVE_CAPABILITY_MISSING           - within_row_containing given, live mode, but the connected
+                                           pane did not report the "row_scope" capability (an old
+                                           pane build predating this feature) -- reload the pane
     """
     try:
         return text_edit.execute_replace_text(
@@ -1412,6 +1431,7 @@ def replace_text(
             force=force,
             track_changes=track_changes,
             write_mode=write_mode,
+            within_row_containing=within_row_containing,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1427,9 +1447,10 @@ def format_text(
     force: bool = False,
     track_changes: bool = False,
     write_mode: str = "auto",
+    within_row_containing: str | None = None,
 ) -> dict[str, Any]:
-    """Apply character styling (bold/italic/underline/strike) to a matched
-    text span, without touching its content.
+    """Apply character styling (bold/italic/underline/strike/color) to a
+    matched text span, without touching its content.
 
     `write_mode` (issue #106 WP-3, "auto" | "file" | "live", default
     "auto"): identical rule and evidence differences to `replace_text`'s
@@ -1444,11 +1465,18 @@ def format_text(
     structural-verification-after-`live_save` note, which applies here
     identically.
 
-    style maps any of "bold"/"italic"/"underline"/"strike" to true/false;
-    every requested field's value is applied verbatim (including false, so
-    {"bold": false} actually clears bold). Same locate()/expected_matches
-    contract as replace_text (see that tool's docstring for the
-    normalization ladder and STRUCTURAL_BOUNDARY refusal).
+    style maps any of "bold"/"italic"/"underline"/"strike" to true/false,
+    and/or "color" to a 6-hex-digit string (an optional leading "#" is
+    accepted and stripped; normalized to uppercase) -- issue #22: a
+    proposal lead marking edits in a font color, with no way to do so
+    before this. Every requested field's value is applied verbatim
+    (including false, so {"bold": false} actually clears bold). Setting
+    an explicit color clears any w:themeColor/themeTint/themeShade on the
+    run -- Word renders the THEME color over a stale val otherwise, which
+    would leave this write looking applied while Word displays something
+    else. Same locate()/expected_matches contract as replace_text (see
+    that tool's docstring for the normalization ladder,
+    STRUCTURAL_BOUNDARY refusal, and within_row_containing).
 
     Idempotent: if every located run already carries every requested
     field's value, the call skips the write entirely (revision_before ==
@@ -1480,7 +1508,8 @@ def format_text(
 
     Errors: as replace_text, plus:
       INVALID_INPUT - style is empty, not an object, names an unknown key,
-                       or a value is not a literal true/false boolean
+                       a boolean value is not a literal true/false, or
+                       "color" is not a 6-hex-digit string
     """
     try:
         return text_edit.execute_format_text(
@@ -1492,6 +1521,7 @@ def format_text(
             force=force,
             track_changes=track_changes,
             write_mode=write_mode,
+            within_row_containing=within_row_containing,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)

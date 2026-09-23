@@ -265,6 +265,31 @@ def live_session_for(path: str) -> LiveSession:
     return session
 
 
+def require_capability(session: LiveSession, capability: str, *, feature_description: str) -> None:
+    """Issue #22 B2: raise ``LIVE_CAPABILITY_MISSING`` unless *session*'s
+    own ``hello.capabilities`` reported *capability*.
+
+    Called BEFORE an op that depends on a wire-level payload field a pane
+    build might not implement (e.g. ``rowAnchor``) is ever sent. An
+    already-connected pane that predates the capability sends no
+    ``capabilities`` field at all (``HelloMessage.from_json`` defaults it
+    to an empty ``frozenset`` -- see that class's own docstring), so this
+    always fails closed for it: a stale pane can never silently ignore
+    the new payload key and run an unscoped op instead of refusing, which
+    is the exact failure mode this function exists to close off on the
+    wire, not just in this server's own Python.
+    """
+    if capability in session.hello.capabilities:
+        return
+    raise _make_error(
+        ErrorCode.LIVE_CAPABILITY_MISSING,
+        f"the connected pane for {session.document_name!r} did not report the {capability!r} "
+        f"capability, required for {feature_description}. Reload the Live pane in Word (it may be "
+        "running a build from before this feature existed) and retry.",
+        {"document_name": session.document_name, "capability": capability, "feature": feature_description},
+    )
+
+
 def check_not_stale(revision_before: str | None, current_body_sha256: str) -> None:
     """``LIVE_STALE`` pre-flight check, run before an op is sent.
 

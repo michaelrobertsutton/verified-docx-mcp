@@ -73,13 +73,14 @@ from __future__ import annotations
 
 import copy
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
 from . import audit, mutations, paths, projection, tables, tracked_changes
 from .author import resolve_author_name
-from .errors import ErrorCode, _make_error
+from .errors import ErrorCode, VerifyError, _make_error
 from .live import write_mode as live_write_mode
 from .live.session import LiveDisconnected, LiveOpFailed, LiveStale
 from .locate import LocateResult, locate
@@ -757,6 +758,9 @@ def _live_describe(session, path: str, revision_before: str | None) -> str:
     return pre_hash
 
 
+_ROW_SCOPE_CAPABILITY = "row_scope"
+
+
 def execute_replace_text_live(
     path: str,
     find: str,
@@ -765,6 +769,7 @@ def execute_replace_text_live(
     *,
     revision_before: str | None = None,
     track_changes: bool = False,
+    within_row_containing: str | None = None,
 ) -> dict[str, Any]:
     """Live-mode ``replace_text`` (issue #106 WP-3): sends a ``replace``
     op over the pane's WSS ops channel instead of editing the .docx file.
@@ -782,20 +787,34 @@ def execute_replace_text_live(
     override uses ``write_mode="file"`` with the file's own ``force``
     instead.
 
+    ``within_row_containing`` (issue #22 B2): sent as the ``replace`` op's
+    ``rowAnchor`` field -- requires the connected pane to report the
+    ``"row_scope"`` capability in its own ``hello``
+    (``live_write_mode.require_capability``, checked BEFORE this op is
+    sent), or ``LIVE_CAPABILITY_MISSING``. See ``text_edit.py``'s own
+    ``_resolve_row_span_filter`` docstring (the file-mode equivalent) for
+    the anchor-uniqueness contract; the pane resolves the SAME contract
+    against the live document instead of a projection.
+
     Raises ``LIVE_UNAVAILABLE``/``LIVE_DISCONNECTED``/``LIVE_STALE`` (see
     ``live/session.py``'s exceptions of the same names), ``ZERO_MATCH``/
     ``MATCH_COUNT_MISMATCH``/``LIVE_OP_FAILED`` (the pane refused the
     ``expected_matches`` gate -- see ``live/write_mode.py``'s
-    ``classify_op_failed``), or ``VERIFICATION_FAILED`` (the pane's own
-    read-back after the op did not confirm the intended change -- nothing
-    to roll back in live mode, since Word, not this server, owns the
-    file; the diagnostics say so explicitly).
+    ``classify_op_failed``), ``LIVE_CAPABILITY_MISSING`` (see above), or
+    ``VERIFICATION_FAILED`` (the pane's own read-back after the op did
+    not confirm the intended change -- nothing to roll back in live mode,
+    since Word, not this server, owns the file; the diagnostics say so
+    explicitly).
     """
     if not find:
         raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty")
 
     session = live_write_mode.live_session_for(path)
     document_name = session.document_name
+    if within_row_containing:
+        live_write_mode.require_capability(
+            session, _ROW_SCOPE_CAPABILITY, feature_description="within_row_containing"
+        )
 
     try:
         pre_hash = _live_describe(session, path, revision_before)
@@ -808,6 +827,8 @@ def execute_replace_text_live(
         "replace": replace,
         "track_changes": track_changes,
     }
+    if within_row_containing:
+        payload["rowAnchor"] = within_row_containing
     try:
         result = session.request_threadsafe("replace", payload, expected_body_sha256=pre_hash)
     except LiveStale as exc:
@@ -862,6 +883,90 @@ def execute_replace_text_live(
 
 
 # ---------------------------------------------------------------------------
+# Row-scoped edit (issue #22 B2): within_row_containing on replace_text/
+# format_text (file mode). Chosen over a bare nth-occurrence index because
+# a caller that already found ONE cell's own unique text (the real
+# incident's own workaround: "put the program name at the front of the
+# unique Evidence cell") already has a usable anchor -- an index would
+# force counting matches blind instead. Contract, precisely: the anchor
+# must be unique in the WHOLE DOCUMENT (the same guarantee locate() gives
+# any needle already; no new per-row uniqueness logic invented) and must
+# resolve to a table cell. Two cells in the SAME target row with
+# identical `find` text remain inseparable -- a named, documented
+# limitation (see server.py's docstrings), not solved here.
+# ---------------------------------------------------------------------------
+
+
+def _paragraph_by_ref(proj: projection.Projection) -> dict[str, projection.ParagraphMeta]:
+    return {p.para_ref: p for p in proj.paragraphs}
+
+
+def _innermost_table_row(para_meta: projection.ParagraphMeta | None) -> tuple[int, int] | None:
+    """(table_id, row) from *para_meta*'s own container_chain -- the
+    INNERMOST table a paragraph sits in (a nested table's row, not its
+    host table's), or None if *para_meta* is None or not inside any
+    table at all."""
+    if para_meta is None or not para_meta.container_chain:
+        return None
+    last = para_meta.container_chain[-1]
+    table_id = last.get("table_id")
+    row = last.get("row")
+    if table_id is None or row is None:
+        return None
+    return table_id, row
+
+
+def _row_key_for_span(
+    proj: projection.Projection, para_map: dict[str, projection.ParagraphMeta], start: int
+) -> tuple[int, int] | None:
+    located = proj.locate_offset(start)
+    if located is None:
+        return None
+    para_ref, _run_ref, _run_offset = located
+    return _innermost_table_row(para_map.get(para_ref))
+
+
+def _resolve_row_span_filter(proj: projection.Projection, within_row_containing: str) -> Callable[[int, int], bool]:
+    """Locate *within_row_containing* (globally unique, per locate()'s own
+    contract -- no filter of its own) and return a span_filter scoped to
+    that match's own table row, for a second locate() call over `find`.
+
+    Raises ZERO_MATCH/MATCH_COUNT_MISMATCH (re-labeled to name
+    within_row_containing as the failing needle, not `find`) if the
+    anchor itself doesn't resolve uniquely, or INVALID_INPUT if it
+    resolves but not inside any table cell.
+    """
+    try:
+        anchor_result = locate(within_row_containing, proj, 1)
+    except VerifyError as exc:
+        if exc.envelope.error_code in (ErrorCode.ZERO_MATCH, ErrorCode.MATCH_COUNT_MISMATCH):
+            raise _make_error(
+                exc.envelope.error_code,
+                f"within_row_containing={within_row_containing!r} must be unique in the whole "
+                f"document (it is the anchor locate() call that failed, not the main `find`): "
+                f"{exc.envelope.message}",
+                {**exc.envelope.diagnostics, "within_row_containing": within_row_containing},
+            ) from exc
+        raise
+
+    para_map = _paragraph_by_ref(proj)
+    anchor_start, _anchor_end = anchor_result.spans[0]
+    row_key = _row_key_for_span(proj, para_map, anchor_start)
+    if row_key is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"within_row_containing={within_row_containing!r} does not resolve to a table cell "
+            "(it must be unique text located inside a table row).",
+            {"within_row_containing": within_row_containing},
+        )
+
+    def _span_filter(start: int, _end: int) -> bool:
+        return _row_key_for_span(proj, para_map, start) == row_key
+
+    return _span_filter
+
+
+# ---------------------------------------------------------------------------
 # Tool 1: replace_text
 # ---------------------------------------------------------------------------
 
@@ -876,6 +981,7 @@ def execute_replace_text(
     force: bool = False,
     track_changes: bool = False,
     write_mode: str = "auto",
+    within_row_containing: str | None = None,
 ) -> dict[str, Any]:
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
@@ -886,6 +992,7 @@ def execute_replace_text(
             expected_matches,
             revision_before=revision_before,
             track_changes=track_changes,
+            within_row_containing=within_row_containing,
         )
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
@@ -894,7 +1001,8 @@ def execute_replace_text(
     document_root, raw_xml = mutations._load_document(resolved)
     proj = projection.project_document_root(document_root)
 
-    locate_result: LocateResult = locate(find, proj, expected_matches)
+    span_filter = _resolve_row_span_filter(proj, within_row_containing) if within_row_containing else None
+    locate_result: LocateResult = locate(find, proj, expected_matches, span_filter=span_filter)
     own_author = resolve_author_name()
     _check_tracked_changes_guard(proj, locate_result, force, own_author)
 
@@ -953,6 +1061,7 @@ def execute_format_text_live(
     *,
     revision_before: str | None = None,
     track_changes: bool = False,
+    within_row_containing: str | None = None,
 ) -> dict[str, Any]:
     """Live-mode ``format_text`` (issue #106 WP-3): sends a ``format`` op
     over the pane's WSS ops channel instead of editing the .docx file.
@@ -979,6 +1088,10 @@ def execute_format_text_live(
     read-back value against what was asked for, so a write that silently
     didn't take on the real Word object model is a verification failure,
     not a false "applied: true".
+
+    ``within_row_containing`` (issue #22 B2): same ``rowAnchor``/
+    ``"row_scope"``-capability contract as
+    ``execute_replace_text_live`` -- see that function's own docstring.
     """
     style = _validate_style(style)
     if not find:
@@ -986,6 +1099,10 @@ def execute_format_text_live(
 
     session = live_write_mode.live_session_for(path)
     document_name = session.document_name
+    if within_row_containing:
+        live_write_mode.require_capability(
+            session, _ROW_SCOPE_CAPABILITY, feature_description="within_row_containing"
+        )
 
     try:
         pre_hash = _live_describe(session, path, revision_before)
@@ -1002,6 +1119,8 @@ def execute_format_text_live(
         "color": style.get("color"),
         "track_changes": track_changes,
     }
+    if within_row_containing:
+        payload["rowAnchor"] = within_row_containing
     try:
         result = session.request_threadsafe("format", payload, expected_body_sha256=pre_hash)
     except LiveStale as exc:
@@ -1089,6 +1208,7 @@ def execute_format_text(
     force: bool = False,
     track_changes: bool = False,
     write_mode: str = "auto",
+    within_row_containing: str | None = None,
 ) -> dict[str, Any]:
     style = _validate_style(style)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
@@ -1100,6 +1220,7 @@ def execute_format_text(
             expected_matches,
             revision_before=revision_before,
             track_changes=track_changes,
+            within_row_containing=within_row_containing,
         )
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
@@ -1108,7 +1229,8 @@ def execute_format_text(
     document_root, raw_xml = mutations._load_document(resolved)
     proj = projection.project_document_root(document_root)
 
-    locate_result: LocateResult = locate(find, proj, expected_matches)
+    span_filter = _resolve_row_span_filter(proj, within_row_containing) if within_row_containing else None
+    locate_result: LocateResult = locate(find, proj, expected_matches, span_filter=span_filter)
     own_author = resolve_author_name()
     _check_tracked_changes_guard(proj, locate_result, force, own_author)
     _check_foreign_rpr_change(proj, locate_result.spans, force, own_author)

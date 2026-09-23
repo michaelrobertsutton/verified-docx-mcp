@@ -99,6 +99,7 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import re
+from collections.abc import Callable
 from typing import Any
 
 from .errors import ErrorCode, _make_error
@@ -378,13 +379,19 @@ class LocateResult:
     warnings: list[str]  # "crosses_comment_range" / "crosses_revision" / "touches_field_result"
 
 
-def locate(needle: str, proj: Projection, expected_matches: int) -> LocateResult:
+def locate(
+    needle: str,
+    proj: Projection,
+    expected_matches: int,
+    *,
+    span_filter: Callable[[int, int], bool] | None = None,
+) -> LocateResult:
     """Find every occurrence of *needle* in *proj*, returning codepoint spans.
 
-    Normalization ladder (stops at first rung with >=1 match; this is
-    locate()'s own MATCH ladder, distinct from core/document-backend-
-    protocol.md's unrelated 4-rung EDIT ladder -- see this module's header
-    comment):
+    Normalization ladder (stops at first rung with >=1 IN-SCOPE match --
+    see *span_filter* below; this is locate()'s own MATCH ladder, distinct
+    from core/document-backend-protocol.md's unrelated 4-rung EDIT ladder
+    -- see this module's header comment):
         1. exact
         2. curly/straight quote equivalence
         3. NBSP and whitespace-run collapse (stacked on rung 2)
@@ -396,11 +403,24 @@ def locate(needle: str, proj: Projection, expected_matches: int) -> LocateResult
     (see this module's header comment for why a literal RUNG_FIELD rung, as
     the issue #28 plan text names it, was not built).
 
+    span_filter (issue #22, optional): a predicate over a raw match's own
+    (start, end) codepoint span, applied to each rung's matches BEFORE
+    everything downstream -- rung selection ("at least one match" now
+    means "at least one IN-SCOPE match"), the STRUCTURAL_BOUNDARY check,
+    and the expected_matches count. This is NOT a post-hoc filter bolted
+    onto the return value: applying it any later would let an
+    OUT-OF-SCOPE match raise STRUCTURAL_BOUNDARY for a boundary crossing
+    the caller never asked about, or let the ladder settle on a rung
+    whose only matches are out of scope while a later rung would have had
+    an in-scope one. text_edit.py's row-scoped replace_text/format_text
+    (`within_row_containing`) is the only caller today, filtering to
+    spans inside one located table row.
+
     Raises VerifyError on:
         INVALID_INPUT          - empty needle
-        ZERO_MATCH              - all rungs exhausted; near-miss in diagnostics
-        MATCH_COUNT_MISMATCH    - match count != expected_matches; every span listed
-        STRUCTURAL_BOUNDARY     - any match crosses a w:p/w:tbl/w:tc boundary
+        ZERO_MATCH              - all rungs exhausted (after span_filter); near-miss in diagnostics
+        MATCH_COUNT_MISMATCH    - in-scope match count != expected_matches; every in-scope span listed
+        STRUCTURAL_BOUNDARY     - an in-scope match crosses a w:p/w:tbl/w:tc boundary
 
     D4 (issue #28 plan, this server only): expected_matches is REQUIRED, no
     default -- every caller must say how many matches it expects.
@@ -446,6 +466,15 @@ def locate(needle: str, proj: Projection, expected_matches: int) -> LocateResult
             orig_start = orig_pos[npos]
             orig_end = orig_pos[npos + len(norm_needle)]
             spans.append((orig_start, orig_end))
+
+        raw_match_count = len(spans)
+        if span_filter is not None:
+            spans = [(s, e) for s, e in spans if span_filter(s, e)]
+            if not spans:
+                ladder_report.append(
+                    {"rung": rung_label, "matches": 0, "matches_outside_span_filter": raw_match_count}
+                )
+                continue
 
         for s, e in spans:
             kinds = _boundary_kinds(proj, s, e)

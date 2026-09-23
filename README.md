@@ -59,8 +59,14 @@ Tools implemented so far:
   targeted text edits located via a normalization ladder (exact ->
   curly/straight quotes -> NBSP/whitespace collapse -> soft-hyphen
   strip), with run splitting that clones a boundary run's original
-  `w:rPr` verbatim onto every surviving piece. Both take a `write_mode:
-  "auto" | "file" | "live"` parameter (default `"auto"`): `"auto"` edits
+  `w:rPr` verbatim onto every surviving piece. `format_text`'s `style`
+  accepts `bold`/`italic`/`underline`/`strike` (booleans) and `color` (a
+  6-hex string) — an explicit color clears any theme-color attributes on
+  the run, so Word doesn't keep rendering a stale theme color over it.
+  Both take `within_row_containing` (scope `find` to one table row,
+  identified by a second unique anchor in that row — for a table with
+  several cells reading identical text) and a `write_mode: "auto" |
+  "file" | "live"` parameter (default `"auto"`): `"auto"` edits
   through a connected Word task pane instead of the file whenever a Live
   pane is connected for that document, otherwise the file path — see
   [Live mode](#live-mode) below. `apply_style(path, find, style_id,
