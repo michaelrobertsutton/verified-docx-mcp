@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 import uuid
@@ -38,6 +39,38 @@ from .protocol import VALID_OPS, HelloMessage, OpError, OpReply, OpRequest
 DEFAULT_HEARTBEAT_INTERVAL = 5.0
 DEFAULT_MISSED_HEARTBEATS = 3
 DEFAULT_REQUEST_TIMEOUT = 15.0
+
+# Read ops that walk every comment get more headroom than writes (issue #31:
+# ~100 comments on a co-authored SharePoint doc blew the 15 s default).
+OP_TIMEOUTS: dict[str, float] = {"comments_list": 60.0}
+
+TIMEOUT_ENV = "VERIFIED_DOCX_LIVE_TIMEOUT_S"
+
+
+def _env_seconds(name: str) -> float | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def resolve_timeout(op: str) -> float:
+    """Seconds to wait for ``op``'s reply. Precedence: the per-op env var
+    ``VERIFIED_DOCX_LIVE_TIMEOUT_<OP>_S`` (e.g. ``..._COMMENTS_LIST_S``),
+    then the global ``VERIFIED_DOCX_LIVE_TIMEOUT_S``, then ``OP_TIMEOUTS``,
+    then ``DEFAULT_REQUEST_TIMEOUT``. Unset, non-numeric or non-positive
+    env values are ignored."""
+    per_op = _env_seconds(f"VERIFIED_DOCX_LIVE_TIMEOUT_{op.upper()}_S")
+    if per_op is not None:
+        return per_op
+    global_value = _env_seconds(TIMEOUT_ENV)
+    if global_value is not None:
+        return global_value
+    return OP_TIMEOUTS.get(op, DEFAULT_REQUEST_TIMEOUT)
 
 
 class LiveError(Exception):
@@ -181,7 +214,7 @@ class LiveSession:
         op: str,
         payload: dict[str, Any] | None = None,
         *,
-        timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        timeout: float | None = None,
         expected_body_sha256: str | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
@@ -195,6 +228,7 @@ class LiveSession:
         Returns the reply's ``result`` dict (``{}`` if the pane sent
         none, e.g. a bare ``ping``).
         """
+        timeout = resolve_timeout(op) if timeout is None else timeout
         coro = self._request_on_loop(
             op, payload, timeout=timeout, expected_body_sha256=expected_body_sha256, request_id=request_id
         )
@@ -208,13 +242,14 @@ class LiveSession:
         op: str,
         payload: dict[str, Any] | None = None,
         *,
-        timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        timeout: float | None = None,
         expected_body_sha256: str | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
         """Synchronous counterpart to ``request()`` for a plain (non-
         async) caller -- see the block comment above. Blocks the calling
         thread; do not call from ``self.loop``'s own thread."""
+        timeout = resolve_timeout(op) if timeout is None else timeout
         coro = self._request_on_loop(
             op, payload, timeout=timeout, expected_body_sha256=expected_body_sha256, request_id=request_id
         )
@@ -226,7 +261,7 @@ class LiveSession:
         op: str,
         payload: dict[str, Any] | None = None,
         *,
-        timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        timeout: float | None = None,
         expected_body_sha256: str | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
@@ -236,6 +271,8 @@ class LiveSession:
         class."""
         if op not in VALID_OPS:
             raise ValueError(f"unknown op {op!r}; must be one of {sorted(VALID_OPS)}")
+        if timeout is None:
+            timeout = resolve_timeout(op)
         if self._closed:
             raise LiveDisconnected(f"session for {self.document_name!r} is already closed")
 
@@ -408,7 +445,7 @@ class SessionRegistry:
         op: str,
         payload: dict[str, Any] | None = None,
         *,
-        timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        timeout: float | None = None,
         expected_body_sha256: str | None = None,
     ) -> dict[str, Any]:
         """Convenience: look up ``document_name`` and forward to its
@@ -428,7 +465,7 @@ class SessionRegistry:
         op: str,
         payload: dict[str, Any] | None = None,
         *,
-        timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        timeout: float | None = None,
         expected_body_sha256: str | None = None,
     ) -> dict[str, Any]:
         """Synchronous counterpart to ``request()`` -- see

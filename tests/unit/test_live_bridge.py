@@ -180,7 +180,7 @@ class TaskpaneApiUsageTests(unittest.TestCase):
 
     def test_replies_is_a_property_not_a_method(self):
         self.assertNotIn("getReplies(", self.js)
-        self.assertIn("match.replies", self.js)
+        self.assertIn("comment.replies", self.js)
 
     def test_by_id_lookups_load_items_id(self):
         self.assertNotIn('comments.load("items");\n  await context.sync();\n  const match', self.js)
@@ -256,6 +256,23 @@ class ServeOnlyTests(unittest.TestCase):
         self.assertEqual(body["ok"], True)
         self.assertEqual(body["server"], "verified-docx-mcp")
         self.assertIn("time", body)
+
+    def test_responses_are_not_cacheable(self):
+        """Issue #31: Word's WebView kept a stale taskpane.js across pane reopens."""
+        for path in ("/taskpane.js", "/taskpane.html", "/ping"):
+            resp = self._get(path)
+            self.assertEqual(resp.status, 200, path)
+            self.assertIn("no-store", resp.getheader("Cache-Control") or "", path)
+            resp.read()
+
+    def test_taskpane_js_served_with_version_query(self):
+        resp = self._get("/taskpane.js?v=31")
+        self.assertEqual(resp.status, 200)
+        self.assertIn(b"opCommentsList", resp.read())
+
+    def test_taskpane_html_loads_versioned_script(self):
+        html = (ADDIN_DIR / "taskpane.html").read_text(encoding="utf-8")
+        self.assertRegex(html, r'src="taskpane\.js\?v=\w+"')
 
     def test_taskpane_html_served(self):
         resp = self._get("/taskpane.html")
