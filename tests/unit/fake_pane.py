@@ -372,8 +372,15 @@ class FakeDocument:
             "post": self.sha256(),
         }
 
-    def comments_list(self) -> dict[str, Any]:
-        return {"comments": [c.to_dict() for c in self.comments]}
+    def comments_list(self, ids: list[str] | None = None, include_anchor: bool = True) -> dict[str, Any]:
+        picked = [c for c in self.comments if ids is None or c.id in ids]
+        out = []
+        for c in picked:
+            d = c.to_dict()
+            if not include_anchor:
+                d.pop("anchorText", None)
+            out.append(d)
+        return {"comments": out}
 
     def comment_add(self, find: str, expected_matches: int, text: str) -> dict[str, Any]:
         pre = self.sha256()
@@ -459,7 +466,12 @@ class FakePane:
         # "row_scope"); pass capabilities=[] to simulate an old,
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
-        self.capabilities = ["row_scope", "cell_edit"] if capabilities is None else list(capabilities)
+        self.capabilities = (
+            ["row_scope", "cell_edit", "comments_by_id"] if capabilities is None else list(capabilities)
+        )
+        # Every comments_list payload received, in order (issue #31 tests
+        # assert reply/resolve send an ids-filtered one).
+        self.comments_list_payloads: list[dict[str, Any]] = []
         # Ops named here are received but never answered -- lets a test
         # simulate an unresponsive pane (for LIVE_DISCONNECTED-by-timeout)
         # without needing a full socket-level failure injection.
@@ -571,7 +583,8 @@ class FakePane:
                 row_anchor=payload.get("rowAnchor"),
             )
         if op == "comments_list":
-            return doc.comments_list()
+            self.comments_list_payloads.append(dict(payload))
+            return doc.comments_list(payload.get("ids"), payload.get("include_anchor", True))
         if op == "comment_add":
             return doc.comment_add(payload["find"], int(payload["expected_matches"]), payload["text"])
         if op == "comment_reply":

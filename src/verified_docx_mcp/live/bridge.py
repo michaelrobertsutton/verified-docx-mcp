@@ -142,6 +142,14 @@ class _AddinRequestHandler(http.server.SimpleHTTPRequestHandler):
         self._report_dir = report_dir
         super().__init__(*args, directory=str(addin_dir), **kwargs)
 
+    def end_headers(self) -> None:  # stdlib override name
+        # Issue #31: Word's WebView kept serving a cached taskpane.js after a
+        # pane reopen, so an edited addin/*.js never reached the pane. Every
+        # response (static, /ping, /report) opts out of caching.
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        super().end_headers()
+
     def do_POST(self) -> None:  # stdlib override name
         """`POST /report` (WP-1 convenience): the pane hands its JSON report
         straight to the bridge, so the lead never has to copy it out of Word

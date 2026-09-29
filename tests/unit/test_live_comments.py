@@ -613,3 +613,48 @@ class NoLocalFileLiveTests(LiveCommentsTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TargetedVerifyTests(LiveCommentsTestCase):
+    """Issue #31: reply/resolve must not re-list every comment."""
+
+    fixture_name = "frag.docx"
+
+    async def _two_comments(self, **pane_kwargs):
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        pane = await self.connect_pane(document=doc, **pane_kwargs)
+        first = await self.call(comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "x", 1)
+        await self.call(comments_live.execute_add_anchored_comment_live, str(self.target), "lazy dog", "y", 1)
+        pane.comments_list_payloads.clear()
+        return doc, pane, first["comment_id"]
+
+    async def test_reply_with_live_handle_only_asks_for_the_target(self):
+        _doc, pane, live_id = await self._two_comments()
+        evidence = await self.call(comments_live.execute_reply_to_comment_live, str(self.target), live_id, "r")
+        raw_id = live_id.split(":", 1)[1]
+        self.assertEqual(
+            pane.comments_list_payloads,
+            [
+                {"ids": [raw_id], "include_anchor": True},  # pre: parent anchor for evidence
+                {"ids": [raw_id], "include_anchor": False},  # post: verify
+            ],
+        )
+        self.assertEqual(evidence["before"], "brown fox")
+        self.assertNotIn("pane_note", evidence)
+
+    async def test_resolve_with_live_handle_only_verifies_the_target(self):
+        doc, pane, live_id = await self._two_comments()
+        evidence = await self.call(comments_live.execute_resolve_comment_live, str(self.target), live_id)
+        raw_id = live_id.split(":", 1)[1]
+        self.assertEqual(pane.comments_list_payloads, [{"ids": [raw_id], "include_anchor": False}])
+        self.assertTrue(doc.comments[0].resolved)
+        self.assertNotIn("pane_note", evidence)
+
+    async def test_pane_without_capability_falls_back_and_flags_stale_pane(self):
+        doc, pane, live_id = await self._two_comments(capabilities=["row_scope"])
+        reply = await self.call(comments_live.execute_reply_to_comment_live, str(self.target), live_id, "r")
+        resolve = await self.call(comments_live.execute_resolve_comment_live, str(self.target), live_id)
+        self.assertTrue(all("ids" not in p for p in pane.comments_list_payloads))
+        self.assertIn("close and reopen", reply["pane_note"])
+        self.assertIn("close and reopen", resolve["pane_note"])
+        self.assertTrue(doc.comments[0].resolved)

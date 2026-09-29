@@ -347,3 +347,60 @@ class LiveStatusShapeTests(LiveBridgeTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResolveTimeoutTests(unittest.TestCase):
+    """Issue #31: per-op default plus env overrides."""
+
+    ENV = (
+        "VERIFIED_DOCX_LIVE_TIMEOUT_S",
+        "VERIFIED_DOCX_LIVE_TIMEOUT_COMMENTS_LIST_S",
+        "VERIFIED_DOCX_LIVE_TIMEOUT_REPLACE_S",
+    )
+
+    def setUp(self):
+        import os
+
+        self._saved = {k: os.environ.pop(k, None) for k in self.ENV}
+
+    def tearDown(self):
+        import os
+
+        for k, v in self._saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+    def test_defaults(self):
+        from verified_docx_mcp.live.session import DEFAULT_REQUEST_TIMEOUT, resolve_timeout
+
+        self.assertEqual(resolve_timeout("replace"), DEFAULT_REQUEST_TIMEOUT)
+        self.assertEqual(resolve_timeout("comments_list"), 60.0)
+
+    def test_global_env_overrides_defaults(self):
+        import os
+
+        from verified_docx_mcp.live.session import resolve_timeout
+
+        os.environ["VERIFIED_DOCX_LIVE_TIMEOUT_S"] = "90"
+        self.assertEqual(resolve_timeout("replace"), 90.0)
+        self.assertEqual(resolve_timeout("comments_list"), 90.0)
+
+    def test_per_op_env_beats_global(self):
+        import os
+
+        from verified_docx_mcp.live.session import resolve_timeout
+
+        os.environ["VERIFIED_DOCX_LIVE_TIMEOUT_S"] = "90"
+        os.environ["VERIFIED_DOCX_LIVE_TIMEOUT_COMMENTS_LIST_S"] = "120"
+        self.assertEqual(resolve_timeout("comments_list"), 120.0)
+        self.assertEqual(resolve_timeout("replace"), 90.0)
+
+    def test_invalid_values_fall_back(self):
+        import os
+
+        from verified_docx_mcp.live.session import DEFAULT_REQUEST_TIMEOUT, resolve_timeout
+
+        for bad in ("abc", "0", "-5", ""):
+            os.environ["VERIFIED_DOCX_LIVE_TIMEOUT_S"] = bad
+            self.assertEqual(resolve_timeout("replace"), DEFAULT_REQUEST_TIMEOUT, bad)

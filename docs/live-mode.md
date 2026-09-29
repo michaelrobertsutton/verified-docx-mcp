@@ -796,6 +796,34 @@ placeholder — the same token shape `replace_text`/`format_text`/
 read equal, since neither a reply nor a resolve edits body text
 (mirrors `format_text`'s own `revision_before == revision_after` case).
 
+### Large comment loads and timeouts (issue #31)
+
+On a co-authored doc with ~100 comments, `comments_list` used to exceed the
+fixed 15 s reply timeout, which also broke live reply/resolve (both
+re-listed every comment to verify). What changed:
+
+- **Per-op timeouts.** `comments_list` now waits 60 s; every other op keeps
+  15 s. Override with `VERIFIED_DOCX_LIVE_TIMEOUT_S` (all ops) or
+  `VERIFIED_DOCX_LIVE_TIMEOUT_<OP>_S`, e.g.
+  `VERIFIED_DOCX_LIVE_TIMEOUT_COMMENTS_LIST_S=120`. A per-op value beats the
+  global one; unset, non-numeric or non-positive values are ignored.
+- **Batched pane read.** `comments_list` loads comments, anchors and replies
+  in 2 `context.sync()`s regardless of comment count. Its reply now carries
+  `timing_ms: {total}` so a slow list can be measured.
+- **Targeted verify.** `comments_list` accepts optional `ids: [...]` (only
+  those comments) and `include_anchor: false` (skip the per-comment
+  `getRange()`), advertised as the `"comments_by_id"` pane capability.
+  `reply_to_comment`/`resolve_comment` re-read only the target comment, and
+  skip the pre-op full listing when given a `live:<id>` handle. A pane
+  without the capability gets the old full listing, and the evidence
+  carries a `pane_note` saying to reopen the pane.
+- **No pane caching.** The bridge sends `Cache-Control: no-store` on every
+  response and `taskpane.html` loads `taskpane.js?v=31`, so closing and
+  reopening the pane picks up an edited `addin/*.js`. If a pane still
+  behaves like an old build, check `live_status` for `comments_by_id` in its
+  capabilities; bump the `?v=` value in `taskpane.html` when you change
+  `taskpane.js` and suspect a cached copy.
+
 ## What could block this, and the fix
 
 **Untrusted cert.** Word (or the OS WebView) refuses to load

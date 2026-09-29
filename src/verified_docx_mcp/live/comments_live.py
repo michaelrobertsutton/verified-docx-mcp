@@ -236,6 +236,26 @@ def _request(session: LiveSession, op: str, payload: dict[str, Any] | None = Non
         raise  # unreachable; _raise_from_live_error always raises
 
 
+COMMENTS_BY_ID_CAPABILITY = "comments_by_id"
+
+STALE_PANE_NOTE = (
+    "the connected pane did not report the 'comments_by_id' capability, so the whole comment list was "
+    "re-read instead of just the target comment (slow on documents with many comments). It is running "
+    "an older taskpane.js: close and reopen the Live pane in Word."
+)
+
+
+def _comments_for_handle(session: LiveSession, live_handle: str, *, include_anchor: bool) -> tuple[list[dict[str, Any]], bool]:
+    """(comments, targeted). Ask the pane for just *live_handle* when it
+    reports ``comments_by_id``; an older pane gets the full list (and
+    ``targeted`` is False so the caller can flag it). Issue #31: re-listing
+    every comment after each reply/resolve timed out on ~100-comment docs."""
+    if COMMENTS_BY_ID_CAPABILITY in session.hello.capabilities:
+        payload = {"ids": [live_handle], "include_anchor": include_anchor}
+        return _request(session, "comments_list", payload).get("comments") or [], True
+    return _request(session, "comments_list").get("comments") or [], False
+
+
 # ---------------------------------------------------------------------------
 # Correlation.
 # ---------------------------------------------------------------------------
@@ -617,16 +637,23 @@ def execute_reply_to_comment_live(path: str, comment_id: str, text: str) -> dict
 
     pre_body_sha256 = _request(session, "describe").get("bodySha256")
 
-    raw_comments, correlation = _live_state(path, session)
-    live_handle, resolved_via = _resolve_comment_handle(comment_id, correlation)
+    if comment_id.startswith(_LIVE_HANDLE_PREFIX):
+        # A live handle needs no file correlation, so skip the full listing.
+        live_handle, resolved_via = _resolve_comment_handle(comment_id, [])
+        raw_comments, pre_targeted = _comments_for_handle(session, live_handle, include_anchor=True)
+    else:
+        raw_comments, correlation = _live_state(path, session)
+        live_handle, resolved_via = _resolve_comment_handle(comment_id, correlation)
+        pre_targeted = True
     parent_raw = next((c for c in raw_comments if c.get("id") == live_handle), None)
     parent_anchor = (parent_raw or {}).get("anchorText", "")
 
     _request(session, "comment_reply", {"comment_id": live_handle, "text": text})
 
     # Verify by re-listing rather than trusting the op's own ok=true --
-    # same discipline as file mode's own post-write re-read.
-    after_raw = _request(session, "comments_list").get("comments") or []
+    # same discipline as file mode's own post-write re-read. Only the target
+    # comment is re-read when the pane supports it (issue #31).
+    after_raw, post_targeted = _comments_for_handle(session, live_handle, include_anchor=False)
     parent_after = next((c for c in after_raw if c.get("id") == live_handle), None)
     reply_found = bool(parent_after) and any(
         r.get("content") == text for r in (parent_after.get("replies") or [])
@@ -659,6 +686,8 @@ def execute_reply_to_comment_live(path: str, comment_id: str, text: str) -> dict
         "document_name": document_name,
         "author": "word-signed-in-user",
     }
+    if not (pre_targeted and post_targeted):
+        evidence["pane_note"] = STALE_PANE_NOTE
     logged, _reason = audit.append_audit(path=str(resolved), tool="reply_to_comment", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
@@ -678,14 +707,18 @@ def execute_resolve_comment_live(path: str, comment_id: str) -> dict[str, Any]:
 
     pre_body_sha256 = _request(session, "describe").get("bodySha256")
 
-    _raw_comments, correlation = _live_state(path, session)
-    live_handle, resolved_via = _resolve_comment_handle(comment_id, correlation)
+    if comment_id.startswith(_LIVE_HANDLE_PREFIX):
+        live_handle, resolved_via = _resolve_comment_handle(comment_id, [])
+    else:
+        _raw_comments, correlation = _live_state(path, session)
+        live_handle, resolved_via = _resolve_comment_handle(comment_id, correlation)
 
     _request(session, "comment_resolve", {"comment_id": live_handle, "resolved": True})
 
     # Independent post-op re-read -- the pane's own reply is not trusted
-    # on its own, same discipline as file mode's own resolve_comment.
-    after_raw = _request(session, "comments_list").get("comments") or []
+    # on its own, same discipline as file mode's own resolve_comment. Only
+    # the target comment is re-read when the pane supports it (issue #31).
+    after_raw, post_targeted = _comments_for_handle(session, live_handle, include_anchor=False)
     parent_after = next((c for c in after_raw if c.get("id") == live_handle), None)
     if parent_after is None or not parent_after.get("resolved", False):
         raise _make_error(
@@ -712,6 +745,8 @@ def execute_resolve_comment_live(path: str, comment_id: str) -> dict[str, Any]:
         "document_name": document_name,
         "author": "word-signed-in-user",
     }
+    if not post_targeted:
+        evidence["pane_note"] = STALE_PANE_NOTE
     logged, _reason = audit.append_audit(path=str(resolved), tool="resolve_comment", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence

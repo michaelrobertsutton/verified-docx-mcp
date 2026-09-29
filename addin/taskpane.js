@@ -53,29 +53,57 @@ function requirementSets() {
   return sets;
 }
 
-async function collectComments(context) {
-  const body = context.document.body;
-  const comments = body.getComments();
-  comments.load("items");
+// Two syncs regardless of comment count: (1) the collection with each
+// comment's scalar fields, (2) the per-comment extras the caller asked for.
+// options.ids       -- only these comment ids (others get no extras loaded)
+// options.anchors   -- also load each comment's anchor text (getRange().text);
+//                      default true, the expensive part on big docs
+// options.replies   -- also load each comment's replies; default false
+async function collectComments(context, options) {
+  const opts = options || {};
+  const wantAnchors = opts.anchors !== false;
+  const wantReplies = !!opts.replies;
+  const idFilter = Array.isArray(opts.ids) ? new Set(opts.ids) : null;
+
+  const comments = context.document.body.getComments();
+  comments.load("items/id,items/content,items/authorName,items/creationDate,items/resolved");
   await context.sync();
 
-  const results = [];
-  for (const comment of comments.items) {
-    comment.load(["id", "content", "authorName", "creationDate", "resolved"]);
-    const range = comment.getRange();
-    range.load("text");
-    results.push({ comment, range });
-  }
-  await context.sync();
+  const picked = idFilter ? comments.items.filter((c) => idFilter.has(c.id)) : comments.items;
+  const extras = picked.map((comment) => {
+    let range = null;
+    if (wantAnchors) {
+      range = comment.getRange();
+      range.load("text");
+    }
+    let replies = null;
+    if (wantReplies) {
+      replies = comment.replies; // CommentReplyCollection is a property, not a method
+      replies.load("items/id,items/content,items/authorName,items/creationDate");
+    }
+    return { comment, range, replies };
+  });
+  if (wantAnchors || wantReplies) await context.sync();
 
-  return results.map(({ comment, range }) => ({
-    id: comment.id,
-    content: comment.content,
-    authorName: comment.authorName,
-    creationDate: comment.creationDate,
-    resolved: comment.resolved,
-    anchorText: range.text,
-  }));
+  return extras.map(({ comment, range, replies }) => {
+    const out = {
+      id: comment.id,
+      content: comment.content,
+      authorName: comment.authorName,
+      creationDate: comment.creationDate,
+      resolved: comment.resolved,
+    };
+    if (wantAnchors) out.anchorText = range.text;
+    if (wantReplies) {
+      out.replies = replies.items.map((r) => ({
+        id: r.id,
+        content: r.content,
+        authorName: r.authorName,
+        creationDate: r.creationDate,
+      }));
+    }
+    return out;
+  });
 }
 
 async function buildReport() {
@@ -194,7 +222,8 @@ const OP_LOG_LIMIT = 20;
 // issue #27: "cell_edit" = the cell_get/cell_set ops below (live table-cell
 // edits). Reported only by builds that implement them, so a server never
 // sends cell_set to a pane that would answer "unknown op".
-const PANE_CAPABILITIES = ["row_scope", "cell_edit"];
+// issue #31: "comments_by_id" = comments_list accepts `ids` / `include_anchor`.
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id"];
 
 let opsSocket = null;
 let heartbeatTimer = null;
@@ -430,7 +459,7 @@ async function dispatchOp(op, payload) {
     case "format":
       return opFormat(payload);
     case "comments_list":
-      return opCommentsList();
+      return opCommentsList(payload);
     case "comment_add":
       return opCommentAdd(payload);
     case "comment_reply":
@@ -826,37 +855,20 @@ async function opCellSet(payload) {
 
 // -- comments -------------------------------------------------------------
 
-async function opCommentsList() {
+// payload (all optional, added in issue #31): `ids` restricts the result to
+// those comment ids; `include_anchor: false` skips the per-comment
+// getRange() (used by reply/resolve verification, which never reads it).
+// `timing_ms` lets a caller see where a slow list went.
+async function opCommentsList(payload) {
+  const p = payload || {};
+  const started = Date.now();
   return Word.run(async (context) => {
-    const summaries = await collectComments(context); // WP-1 helper: id, content, authorName, creationDate, resolved, anchorText
-    const comments = [];
-    for (const summary of summaries) {
-      // eslint-disable-next-line no-await-in-loop -- each comment's replies
-      // collection must be loaded and synced before the next comment's.
-      comments.push(await withReplies(context, summary));
-    }
-    return { comments };
-  });
-}
-
-async function withReplies(context, commentSummary) {
-  const comments = context.document.body.getComments();
-  comments.load("items/id");
-  await context.sync();
-  const match = comments.items.find((c) => c.id === commentSummary.id);
-  if (!match) return Object.assign({}, commentSummary, { replies: [] });
-  const replies = match.replies; // CommentReplyCollection is a property, not a method
-  replies.load("items");
-  await context.sync();
-  replies.items.forEach((r) => r.load(["id", "content", "authorName", "creationDate"]));
-  await context.sync();
-  return Object.assign({}, commentSummary, {
-    replies: replies.items.map((r) => ({
-      id: r.id,
-      content: r.content,
-      authorName: r.authorName,
-      creationDate: r.creationDate,
-    })),
+    const comments = await collectComments(context, {
+      ids: p.ids,
+      anchors: p.include_anchor !== false,
+      replies: true,
+    });
+    return { comments, timing_ms: { total: Date.now() - started } };
   });
 }
 
