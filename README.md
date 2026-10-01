@@ -78,7 +78,8 @@ Tools implemented so far:
   "file" | "live"` parameter (default `"auto"`): `"auto"` edits
   through a connected Word task pane instead of the file whenever a Live
   pane is connected for that document, otherwise the file path — see
-  [Live mode](#live-mode) below. `apply_style(path, find, style_id,
+  [Live mode](#live-mode) below. In live mode they also take `scope` to
+  reach text boxes (issue #35). `apply_style(path, find, style_id,
   expected_matches, ...)` has no `write_mode` parameter and always takes
   the file path — including refusing (`LIVE_SESSION_ACTIVE`) while a Live
   pane is connected for that document, same as every other write_mode-less
@@ -400,6 +401,16 @@ can't be sure the pane holds this document. A live read never falls back
 to the file after it fails. In a live read `revision` is
 `live:sha256:<body hash>`; images are not included. Details:
 [docs/live-mode.md](docs/live-mode.md#live-reads-issue-33).
+
+Issue #35: in live mode `replace_text`/`format_text` take
+`scope="body"|"textboxes"|"all"|"shape:<id>"` to reach floating text boxes
+and callout shapes, which a body search never sees, and `list_textboxes`
+lists them (with the Word `shape_id` a write can target). Each write is
+checked against the box's text before it is sent, compared with the exact
+expected text afterwards, and confirmed by a second independent read. Needs
+WordApiDesktop 1.2 (Word for Mac 16.94+ / Windows Microsoft 365 2502+), live
+only. Read the limits and the sideload checklist in
+[`docs/live-mode.md`](docs/live-mode.md#text-boxes-issue-35).
 
 Issue #27: `replace_cell_markdown` also takes `write_mode` — a live edit is
 compare-and-set against the cell's current text and read back

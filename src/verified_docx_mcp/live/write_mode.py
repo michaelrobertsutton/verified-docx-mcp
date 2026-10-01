@@ -381,9 +381,15 @@ def live_evidence(
     document_name: str,
     tool: str,
     path: str,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build + audit-log the live-mode evidence envelope for one mutating
     live op, and return it.
+
+    ``extra`` (issue #35) is merged into the envelope BEFORE the audit entry
+    is appended, so what it carries (scope, shape ids, per-shape text
+    hashes) reaches the audit log and not only the caller's response. It
+    cannot override the standard keys.
 
     Carries the same eight keys file-mode evidence always carries
     (``applied``, ``match_count``, ``rung``, ``before``, ``after``,
@@ -430,6 +436,9 @@ def live_evidence(
         "track_changes_author": "word-signed-in-user",
         "orphaned_comment_ids": [],
     }
+    if extra:
+        for key, value in extra.items():
+            evidence.setdefault(key, value)
     logged, _ = audit.append_audit(path=path, tool=tool, evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence

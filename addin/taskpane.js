@@ -50,7 +50,25 @@ function requirementSets() {
       sets[version] = `error: ${err && err.message ? err.message : String(err)}`;
     }
   }
+  // issue #35: WordApiDesktop 1.2 (Body.shapes / Shape.body) gates the
+  // text-box ops. Informational here; textBoxApiAvailable() is the gate.
+  try {
+    sets["WordApiDesktop1.2"] = Office.context.requirements.isSetSupported("WordApiDesktop", "1.2");
+  } catch (err) {
+    sets["WordApiDesktop1.2"] = `error: ${err && err.message ? err.message : String(err)}`;
+  }
   return sets;
+}
+
+// issue #35: Body.shapes, Shape.body, Shape.shapeGroup and Shape.canvas are
+// WordApiDesktop 1.2 (Word for Mac 16.94+, Windows Microsoft 365 2502+; not
+// Word on the web, not perpetual-license Office).
+function textBoxApiAvailable() {
+  try {
+    return !!Office.context.requirements.isSetSupported("WordApiDesktop", "1.2");
+  } catch (err) {
+    return false;
+  }
 }
 
 // Two syncs regardless of comment count: (1) the collection with each
@@ -225,7 +243,16 @@ const OP_LOG_LIMIT = 20;
 // issue #31: "comments_by_id" = comments_list accepts `ids` / `include_anchor`.
 // issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
 // find_sections / list_tables / get_table).
+// issue #35: "textbox_scope" = the textbox_list op and the `scope`/`expect`
+// payload fields on replace/format. Added at hello time by paneCapabilities()
+// only when WordApiDesktop 1.2 is present, so it is not in this static list.
 const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "body_ooxml"];
+
+function paneCapabilities() {
+  const caps = PANE_CAPABILITIES.slice();
+  if (textBoxApiAvailable()) caps.push("textbox_scope");
+  return caps;
+}
 
 // issue #33: the largest body_ooxml reply (UTF-8 bytes of its JSON) the pane
 // will send. Kept below the bridge's 64 MiB websocket max_size so an
@@ -366,7 +393,7 @@ function connectOpsSocket() {
           // an op that depends on a capability not listed here, rather
           // than risk this pane silently ignoring an unknown payload key
           // and running an unscoped op instead.
-          capabilities: PANE_CAPABILITIES,
+          capabilities: paneCapabilities(),
         })
       );
       setWsStatus("connected");
@@ -452,6 +479,7 @@ function summarizeResult(op, result) {
   if (op === "comment_add") return `comment_id=${result.comment_id}`;
   if (op === "cell_get") return `${(result.text || "").length} char(s)`;
   if (op === "cell_set") return `applied=${result.applied}`;
+  if (op === "textbox_list") return `${(result.textboxes || []).length} text box(es)`;
   return "";
 }
 
@@ -481,6 +509,8 @@ async function dispatchOp(op, payload) {
       return opCellGet(payload);
     case "cell_set":
       return opCellSet(payload);
+    case "textbox_list":
+      return opTextboxList();
     case "save":
       return opSave();
     default:
@@ -666,6 +696,8 @@ async function searchScoped(context, payload) {
 }
 
 async function opReplace(payload) {
+  const scopeSpec = parseScope(payload.scope);
+  if (scopeSpec.kind !== "body") return opScopedWrite("replace", payload, scopeSpec);
   const expectedMatches = payload.expected_matches;
   return Word.run(async (context) => {
     const body = context.document.body;
@@ -710,6 +742,8 @@ async function opReplace(payload) {
 }
 
 async function opFormat(payload) {
+  const scopeSpec = parseScope(payload.scope);
+  if (scopeSpec.kind !== "body") return opScopedWrite("format", payload, scopeSpec);
   const expectedMatches = payload.expected_matches;
   return Word.run(async (context) => {
     const body = context.document.body;
@@ -768,11 +802,16 @@ async function opFormat(payload) {
     // rather than echoing the request back -- lets the server detect a
     // write that didn't actually take (a protected range, a stale
     // object reference) instead of trusting an unconfirmed "applied".
-    matchItems.forEach((range) => range.font.load(["color", "strikeThrough"]));
+    // issue #35: bold/italic/underline are read back too (previously only
+    // color/strike were), so the server can verify every property asked for.
+    matchItems.forEach((range) => range.font.load(["color", "strikeThrough", "bold", "italic", "underline"]));
     await context.sync();
     matchItems.forEach((range, i) => {
       matches[i].colorAfter = range.font.color;
       matches[i].strikeAfter = range.font.strikeThrough;
+      matches[i].boldAfter = range.font.bold;
+      matches[i].italicAfter = range.font.italic;
+      matches[i].underlineAfter = range.font.underline;
     });
 
     const postBody = context.document.body;
@@ -781,6 +820,293 @@ async function opFormat(payload) {
     const postHash = await sha256Hex(postBody.text || "");
 
     return { applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
+  });
+}
+
+// -- text boxes / shapes (issue #35) --------------------------------------
+//
+// Floating callout boxes are Word shapes, not body paragraphs, so
+// body.search() never reaches them. Everything below goes through ONE
+// traversal (collectTextShapes) so listing, searching and verifying always
+// agree on which shapes exist. Shapes are addressed by Word's own Shape.id,
+// never by position: file mode's textbox-<n> numbers w:txbxContent in XML
+// order and nothing proves Word's shape order matches it.
+//
+// Manual sideload verification (docs/live-mode.md "Text boxes") is still
+// needed: tests/unit/js/textbox_harness.mjs runs this code against stubbed
+// shapes, which cannot prove what a real Word returns for body.shapes.
+
+const TEXT_SHAPE_TYPES = new Set(["textbox", "geometricshape"]);
+const MAX_SHAPE_DEPTH = 8;
+
+function parseScope(scope) {
+  if (scope === undefined || scope === null || scope === "body") return { kind: "body" };
+  if (scope === "textboxes") return { kind: "textboxes" };
+  if (scope === "all") return { kind: "all" };
+  if (typeof scope === "string" && scope.startsWith("shape:") && scope.length > "shape:".length) {
+    return { kind: "shape", id: scope.slice("shape:".length) };
+  }
+  throw refusalError(`invalid scope ${JSON.stringify(scope)}; must be "body", "textboxes", "all" or "shape:<id>"`);
+}
+
+function requireTextBoxApi() {
+  if (!textBoxApiAvailable()) {
+    throw refusalError(
+      "text-box operations need WordApiDesktop 1.2 (Word for Mac 16.94+ or Windows Microsoft 365 2502+); " +
+        "this Word does not report it",
+      "capability_missing"
+    );
+  }
+}
+
+// Every text-bearing shape in the body, depth-first through groups and
+// canvases. A shape whose body cannot be read, a duplicated Shape.id (it
+// could not be addressed unambiguously) or nesting past MAX_SHAPE_DEPTH goes
+// in `incomplete`, which blocks exhaustive scopes. Pictures and other
+// non-text types go in `skipped` (informational only).
+async function collectTextShapes(context) {
+  const found = [];
+  const incomplete = [];
+  const skipped = [];
+  const idCounts = new Map();
+
+  async function walk(shapes, groupPath, depth) {
+    shapes.load("items/id,items/type");
+    await context.sync();
+    for (const shape of shapes.items) {
+      const id = String(shape.id);
+      const type = String(shape.type).toLowerCase();
+      idCounts.set(id, (idCounts.get(id) || 0) + 1);
+      if (type === "group" || type === "canvas") {
+        if (depth >= MAX_SHAPE_DEPTH) {
+          incomplete.push({ shape_id: id, type, reason: `nested deeper than ${MAX_SHAPE_DEPTH} levels` });
+          continue;
+        }
+        try {
+          const children = type === "group" ? shape.shapeGroup.shapes : shape.canvas.shapes;
+          await walk(children, groupPath.concat(id), depth + 1);
+        } catch (err) {
+          incomplete.push({ shape_id: id, type, reason: `children not readable: ${err && err.message}` });
+        }
+      } else if (TEXT_SHAPE_TYPES.has(type)) {
+        found.push({ shape, id, type, groupPath });
+      } else {
+        skipped.push({ shape_id: id, type });
+      }
+    }
+  }
+
+  await walk(context.document.body.shapes, [], 0);
+
+  const shapes = [];
+  for (const entry of found) {
+    if (idCounts.get(entry.id) > 1) {
+      incomplete.push({ shape_id: entry.id, type: entry.type, reason: "duplicate shape id" });
+      continue;
+    }
+    try {
+      entry.shape.body.load("text");
+      entry.shape.body.paragraphs.load("items");
+      await context.sync();
+      const text = entry.shape.body.text || "";
+      shapes.push(
+        Object.assign({}, entry, {
+          text,
+          textSha256: await sha256Hex(text),
+          paragraphCount: entry.shape.body.paragraphs.items.length,
+        })
+      );
+    } catch (err) {
+      incomplete.push({ shape_id: entry.id, type: entry.type, reason: `body not readable: ${err && err.message}` });
+    }
+  }
+  return { shapes, incomplete, skipped };
+}
+
+async function opTextboxList() {
+  requireTextBoxApi();
+  return Word.run(async (context) => {
+    const { shapes, incomplete, skipped } = await collectTextShapes(context);
+    return {
+      textboxes: shapes.map((s) => ({
+        shape_id: s.id,
+        type: s.type,
+        group_path: s.groupPath,
+        text: s.text,
+        text_sha256: s.textSha256,
+        paragraph_count: s.paragraphCount,
+      })),
+      incomplete,
+      skipped,
+    };
+  });
+}
+
+// Resolves the scope to shapes, runs the compare-and-set against
+// payload.expect ({shape_id: text_sha256} from the server's own textbox_list
+// read) BEFORE anything is written, then searches every target and applies
+// the expected_matches gate over the total. Throws a refusalError for every
+// failure, so nothing has been mutated when it does.
+async function resolveScopedTargets(context, payload, scopeSpec) {
+  requireTextBoxApi();
+  const { shapes, incomplete } = await collectTextShapes(context);
+  let targets;
+  if (scopeSpec.kind === "shape") {
+    targets = shapes.filter((s) => s.id === scopeSpec.id);
+    if (targets.length === 0) {
+      throw refusalError(
+        `no readable text shape with id ${scopeSpec.id}; present: ${shapes.map((s) => s.id).join(", ") || "(none)"}`,
+        "stale_target"
+      );
+    }
+  } else {
+    if (incomplete.length > 0) {
+      throw refusalError(
+        `text-shape coverage is incomplete (${JSON.stringify(incomplete)}); use scope "shape:<id>" to target one box`,
+        "incomplete_coverage"
+      );
+    }
+    targets = shapes;
+  }
+
+  const expect = payload.expect;
+  if (!expect || typeof expect !== "object" || Object.keys(expect).length === 0) {
+    throw refusalError("a text-box write must carry `expect` (shape id -> text sha256 from textbox_list)");
+  }
+  const targetIds = new Set(targets.map((t) => t.id));
+  for (const id of Object.keys(expect)) {
+    if (!targetIds.has(id)) {
+      throw refusalError(`shape ${id} was listed but is no longer present; nothing was written`, "stale_target");
+    }
+  }
+  for (const t of targets) {
+    if (expect[t.id] !== t.textSha256) {
+      throw refusalError(
+        `shape ${t.id} changed since it was read (another editor may be working in it); nothing was written`,
+        "stale_target"
+      );
+    }
+  }
+
+  const searchOpts = { matchCase: true, matchWholeWord: false };
+  const perTarget = targets.map((t) => {
+    const r = t.shape.body.search(payload.find, searchOpts);
+    r.load("text");
+    return r;
+  });
+  let bodyResults = null;
+  if (scopeSpec.kind === "all") {
+    bodyResults = context.document.body.search(payload.find, searchOpts);
+    bodyResults.load("text");
+  }
+  await context.sync();
+
+  const resolved = targets.map((t, i) => ({
+    id: t.id,
+    shape: t.shape,
+    preText: t.text,
+    ranges: perTarget[i].items,
+  }));
+  const bodyRanges = bodyResults ? bodyResults.items : [];
+  const total = resolved.reduce((n, t) => n + t.ranges.length, 0) + bodyRanges.length;
+  if (total !== payload.expected_matches) {
+    throw refusalError(
+      `expected ${payload.expected_matches} match(es) for ${JSON.stringify(payload.find)}, found ${total}`
+    );
+  }
+  return { targets: resolved, bodyRanges };
+}
+
+async function opScopedWrite(kind, payload, scopeSpec) {
+  return Word.run(async (context) => {
+    const body = context.document.body;
+    body.load("text");
+    await context.sync();
+    const preHash = await sha256Hex(body.text || "");
+
+    const { targets, bodyRanges } = await resolveScopedTargets(context, payload, scopeSpec);
+
+    // Flat list of every range to touch, remembering which shape (or the
+    // body) it came from.
+    const work = [];
+    targets.forEach((t) => t.ranges.forEach((range) => work.push({ range, shapeId: t.id, before: range.text })));
+    bodyRanges.forEach((range) => work.push({ range, shapeId: null, before: range.text }));
+
+    let previousMode = null;
+    if (payload.track_changes) {
+      context.document.load("changeTrackingMode");
+      await context.sync();
+      previousMode = context.document.changeTrackingMode;
+      context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
+    }
+
+    // What was actually written is read back from the ranges Word reports,
+    // not echoed from the request.
+    let readBack;
+    try {
+      if (kind === "replace") {
+        readBack = work.map((w) => w.range.insertText(payload.replace, Word.InsertLocation.replace));
+        readBack.forEach((r) => r.load("text"));
+      } else {
+        work.forEach((w) => {
+          const font = w.range.font;
+          if (payload.bold !== null && payload.bold !== undefined) font.bold = payload.bold;
+          if (payload.italic !== null && payload.italic !== undefined) font.italic = payload.italic;
+          if (payload.underline !== null && payload.underline !== undefined) {
+            font.underline = payload.underline ? Word.UnderlineType.single : Word.UnderlineType.none;
+          }
+          if (payload.strike !== null && payload.strike !== undefined) font.strikeThrough = payload.strike;
+          if (payload.color !== null && payload.color !== undefined) {
+            font.color = payload.color.startsWith("#") ? payload.color : `#${payload.color}`;
+          }
+        });
+        readBack = work.map((w) => w.range);
+        readBack.forEach((r) => {
+          r.load("text");
+          r.font.load(["color", "strikeThrough", "bold", "italic", "underline"]);
+        });
+      }
+      await context.sync();
+    } finally {
+      if (previousMode !== null) {
+        context.document.changeTrackingMode = previousMode;
+        await context.sync();
+      }
+    }
+
+    targets.forEach((t) => t.shape.body.load("text"));
+    const postBody = context.document.body;
+    postBody.load("text");
+    await context.sync();
+    const postHash = await sha256Hex(postBody.text || "");
+
+    const matches = work.map((w, i) => {
+      const m = { before: w.before, after: readBack[i].text, shape_id: w.shapeId };
+      if (kind === "format") {
+        const font = readBack[i].font;
+        m.colorAfter = font.color;
+        m.strikeAfter = font.strikeThrough;
+        m.boldAfter = font.bold;
+        m.italicAfter = font.italic;
+        m.underlineAfter = font.underline;
+      }
+      return m;
+    });
+
+    return {
+      applied: true,
+      match_count: work.length,
+      matches,
+      body_match_count: bodyRanges.length,
+      shapes: targets.map((t) => ({
+        shape_id: t.id,
+        match_count: t.ranges.length,
+        pre_text: t.preText,
+        post_text: t.shape.body.text || "",
+      })),
+      pre: preHash,
+      post: postHash,
+    };
   });
 }
 

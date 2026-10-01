@@ -1484,7 +1484,8 @@ def execute_replace_range_markdown(
             f"section_key {section_key!r} names a text box, not a heading-delimited body "
             "section. replace_range_markdown only rewrites body ranges found by "
             "find_sections' heading scan; a text box's content is out of scope for this "
-            "tool (there is no write path for it yet).",
+            "tool (there is no write path for it yet; in live mode, replace_text/format_text "
+            "accept scope='textboxes' or 'shape:<id>' for text-level edits).",
             {"section_key": section_key, "available_textbox_keys": sorted(textbox_keys)},
         )
     pre_revision = _guard_before_write(

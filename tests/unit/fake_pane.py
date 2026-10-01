@@ -143,6 +143,25 @@ class FakeComment:
 ROW_DELIMITER = "\x1e"
 
 
+@dataclass
+class FakeShape:
+    """A text box (issue #35). Lives OUTSIDE ``FakeDocument.text`` and is
+    excluded from ``sha256()``, matching real Word where ``body.text`` does
+    not include shape text -- so a text-box edit leaves the body hash alone.
+    ``formatting`` is real stored state (unlike the body ``format``, which
+    echoes the request), so a dropped format write reads back unchanged."""
+
+    id: str
+    text: str
+    type: str = "textbox"
+    group_path: list[str] = field(default_factory=list)
+    formatting: dict[str, Any] = field(default_factory=dict)
+
+
+def _text_sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 class FakeDocument:
     """The in-memory "document" every op below reads and writes."""
 
@@ -178,6 +197,19 @@ class FakeDocument:
         # fake's analogue of a write Word dropped, for the server's
         # independent read-back to catch.
         self.dropped_cell_writes: set[tuple[int, int, int]] = set()
+        # Issue #35: text boxes, plus the listing's `incomplete`/`skipped`
+        # lists, and fault knobs. `dropped_shape_writes`: shape ids whose
+        # replace/format is accepted but silently does not take.
+        # `before_shape_write` runs right before the compare-and-set (lets a
+        # test edit a box between the server's list and its write).
+        # `track_changes_keeps_deleted` models Word leaving tracked-deleted
+        # text in the box text.
+        self.shapes: list[FakeShape] = []
+        self.incomplete_shapes: list[dict[str, Any]] = []
+        self.skipped_shapes: list[dict[str, Any]] = []
+        self.dropped_shape_writes: set[str] = set()
+        self.before_shape_write: Any = None
+        self.track_changes_keeps_deleted = False
 
     def sha256(self) -> str:
         payload = self.text
@@ -194,9 +226,13 @@ class FakeDocument:
             )
         t, r, c = (int(payload[k]) - 1 for k in ("table_index", "row_index", "cell_index"))
         if not 0 <= t < len(self.tables):
-            raise OpRefused("LIVE_OP_FAILED", f"no table {t + 1} (the document has {len(self.tables)})")
+            raise OpRefused(
+                "LIVE_OP_FAILED", f"no table {t + 1} (the document has {len(self.tables)})"
+            )
         if not 0 <= r < len(self.tables[t]):
-            raise OpRefused("LIVE_OP_FAILED", f"row_index {r + 1} is out of range for table {t + 1}")
+            raise OpRefused(
+                "LIVE_OP_FAILED", f"row_index {r + 1} is out of range for table {t + 1}"
+            )
         if not 0 <= c < len(self.tables[t][r]):
             raise OpRefused("LIVE_OP_FAILED", f"cell_index {c + 1} is out of range for row {r + 1}")
         return t, r, c
@@ -223,7 +259,148 @@ class FakeDocument:
                 for runs in payload["paragraphs"]
             ]
             self.tables[t][r][c] = "\n".join(paragraphs)
-        return {"applied": True, "before": before, "after": self.tables[t][r][c], "pre": pre, "post": self.sha256()}
+        return {
+            "applied": True,
+            "before": before,
+            "after": self.tables[t][r][c],
+            "pre": pre,
+            "post": self.sha256(),
+        }
+
+    # -- text boxes (issue #35) -----------------------------------------
+
+    def textbox_list(self) -> dict[str, Any]:
+        return {
+            "textboxes": [
+                {
+                    "shape_id": s.id,
+                    "type": s.type,
+                    "group_path": list(s.group_path),
+                    "text": s.text,
+                    "text_sha256": _text_sha(s.text),
+                    "paragraph_count": len(s.text.split("\r")),
+                }
+                for s in self.shapes
+            ],
+            "incomplete": list(self.incomplete_shapes),
+            "skipped": list(self.skipped_shapes),
+        }
+
+    def scoped_write(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        pre = self.sha256()
+        scope = payload["scope"]
+        if self.before_shape_write is not None:
+            self.before_shape_write()
+        if scope.startswith("shape:"):
+            wanted = scope[len("shape:") :]
+            targets = [s for s in self.shapes if s.id == wanted]
+            if not targets:
+                raise OpRefused("stale_target", f"no readable text shape with id {wanted}")
+        else:
+            if self.incomplete_shapes:
+                raise OpRefused(
+                    "incomplete_coverage",
+                    f"text-shape coverage is incomplete: {self.incomplete_shapes}",
+                )
+            targets = list(self.shapes)
+        expect = payload.get("expect") or {}
+        if not expect:
+            raise OpRefused("LIVE_OP_FAILED", "a text-box write must carry `expect`")
+        target_ids = {t.id for t in targets}
+        for shape_id in expect:
+            if shape_id not in target_ids:
+                raise OpRefused(
+                    "stale_target", f"shape {shape_id} is no longer present; nothing was written"
+                )
+        for t in targets:
+            if expect.get(t.id) != _text_sha(t.text):
+                raise OpRefused(
+                    "stale_target", f"shape {t.id} changed since it was read; nothing was written"
+                )
+
+        find = payload["find"]
+        per_shape = {t.id: _find_all(t.text, find) for t in targets}
+        body_positions = _find_all(self.text, find) if scope == "all" else []
+        total = sum(len(p) for p in per_shape.values()) + len(body_positions)
+        if total != int(payload["expected_matches"]):
+            raise OpRefused(
+                "LIVE_OP_FAILED",
+                f"expected {payload['expected_matches']} match(es) for {find!r}, found {total}",
+            )
+
+        tracked = bool(payload.get("track_changes", False))
+        pre_texts = {t.id: t.text for t in targets}
+        matches: list[dict[str, Any]] = []
+        if kind == "replace":
+            replace = payload["replace"]
+            for t in targets:
+                positions = per_shape[t.id]
+                if positions and t.id not in self.dropped_shape_writes:
+                    new_text = t.text
+                    for start, end in reversed(positions):
+                        kept = find if (tracked and self.track_changes_keeps_deleted) else ""
+                        new_text = new_text[:start] + replace + kept + new_text[end:]
+                    t.text = new_text
+                matches += [{"before": find, "after": replace, "shape_id": t.id} for _ in positions]
+            if body_positions:
+                new_body = self.text
+                for start, end in reversed(body_positions):
+                    new_body = new_body[:start] + replace + new_body[end:]
+                self.text = new_body
+                matches += [
+                    {"before": find, "after": replace, "shape_id": None} for _ in body_positions
+                ]
+        else:
+            for t in targets:
+                if per_shape[t.id] and t.id not in self.dropped_shape_writes:
+                    for key in ("bold", "italic", "underline", "strike", "color"):
+                        if payload.get(key) is not None:
+                            t.formatting[key] = payload[key]
+                fmt = t.formatting
+                color = fmt.get("color")
+                matches += [
+                    {
+                        "before": find,
+                        "after": find,
+                        "shape_id": t.id,
+                        "colorAfter": f"#{color.lstrip('#')}" if color else "#000000",
+                        "strikeAfter": bool(fmt.get("strike", False)),
+                        "boldAfter": bool(fmt.get("bold", False)),
+                        "italicAfter": bool(fmt.get("italic", False)),
+                        "underlineAfter": "Single" if fmt.get("underline") else "None",
+                    }
+                    for _ in per_shape[t.id]
+                ]
+            for _ in body_positions:
+                matches.append(
+                    {
+                        "before": find,
+                        "after": find,
+                        "shape_id": None,
+                        "colorAfter": payload.get("color"),
+                        "strikeAfter": payload.get("strike"),
+                        "boldAfter": payload.get("bold"),
+                        "italicAfter": payload.get("italic"),
+                        "underlineAfter": "Single" if payload.get("underline") else "None",
+                    }
+                )
+        return {
+            "applied": True,
+            "match_count": total,
+            "matches": matches,
+            "body_match_count": len(body_positions),
+            "shapes": [
+                {
+                    "shape_id": t.id,
+                    "match_count": len(per_shape[t.id]),
+                    "pre_text": pre_texts[t.id],
+                    "post_text": t.text,
+                }
+                for t in targets
+            ],
+            "pre": pre,
+            "post": self.sha256(),
+        }
 
     def _row_bounds(self, row_anchor: str) -> tuple[int, int]:
         """(start, end) absolute offsets of the ROW_DELIMITER-bounded
@@ -261,7 +438,9 @@ class FakeDocument:
             "saved": self.saved,
         }
 
-    def search(self, find: str, *, match_case: bool = False, match_whole_word: bool = False) -> list[dict[str, Any]]:
+    def search(
+        self, find: str, *, match_case: bool = False, match_whole_word: bool = False
+    ) -> list[dict[str, Any]]:
         import re
 
         flags = 0 if match_case else re.IGNORECASE
@@ -363,6 +542,13 @@ class FakeDocument:
                     "after": find,
                     "colorAfter": f"#{color.lstrip('#')}" if color else color,
                     "strikeAfter": strike,
+                    # issue #35: bold/italic/underline read-back keys (echoes,
+                    # like the rest of this body-format model).
+                    "boldAfter": bold,
+                    "italicAfter": italic,
+                    "underlineAfter": ("Single" if underline else "None")
+                    if underline is not None
+                    else None,
                 }
                 for _ in positions
             ]
@@ -376,7 +562,9 @@ class FakeDocument:
             "post": self.sha256(),
         }
 
-    def comments_list(self, ids: list[str] | None = None, include_anchor: bool = True) -> dict[str, Any]:
+    def comments_list(
+        self, ids: list[str] | None = None, include_anchor: bool = True
+    ) -> dict[str, Any]:
         picked = [c for c in self.comments if ids is None or c.id in ids]
         out = []
         for c in picked:
@@ -415,7 +603,12 @@ class FakeDocument:
         comment = self._find_comment(comment_id)
         seq = self._next_reply_seq.get(comment_id, 0) + 1
         self._next_reply_seq[comment_id] = seq
-        reply = FakeReply(id=f"{comment_id}-r{seq}", content=text, author_name=self.author_name, creation_date=_now_iso())
+        reply = FakeReply(
+            id=f"{comment_id}-r{seq}",
+            content=text,
+            author_name=self.author_name,
+            creation_date=_now_iso(),
+        )
         comment.replies.append(reply)
         return {"reply_id": reply.id}
 
@@ -479,8 +672,14 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "comments_by_id", "body_ooxml"] if capabilities is None else list(capabilities)
+            ["row_scope", "cell_edit", "comments_by_id", "body_ooxml", "textbox_scope"]
+            if capabilities is None
+            else list(capabilities)
         )
+        # issue #35: textbox_list calls received, and a knob to answer one
+        # with a malformed reply.
+        self.textbox_list_requests = 0
+        self.malformed_textbox_list = False
         # Every comments_list payload received, in order (issue #31 tests
         # assert reply/resolve send an ids-filtered one).
         self.comments_list_payloads: list[dict[str, Any]] = []
@@ -516,7 +715,13 @@ class FakePane:
         the automatic `heartbeat_interval` loop, for tests that want
         precise control over heartbeat timing."""
         await self._ws.send(
-            json.dumps({"type": "heartbeat", "documentUrl": self.document_url, "bodySha256": self.document.sha256()})
+            json.dumps(
+                {
+                    "type": "heartbeat",
+                    "documentUrl": self.document_url,
+                    "bodySha256": self.document.sha256(),
+                }
+            )
         )
 
     async def close(self) -> None:
@@ -556,7 +761,12 @@ class FakePane:
         try:
             result = self._dispatch(op, payload)
         except OpRefused as exc:
-            return {"type": "reply", "request_id": request_id, "ok": False, "error": {"code": exc.code, "message": exc.message}}
+            return {
+                "type": "reply",
+                "request_id": request_id,
+                "ok": False,
+                "error": {"code": exc.code, "message": exc.message},
+            }
         return {"type": "reply", "request_id": request_id, "ok": True, "result": result}
 
     def _dispatch(self, op: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -584,6 +794,17 @@ class FakePane:
                 match_whole_word=bool(payload.get("matchWholeWord", False)),
             )
             return {"matches": matches}
+        if op in ("replace", "format") and payload.get("scope", "body") != "body":
+            if "textbox_scope" not in self.capabilities:
+                raise OpRefused("capability_missing", "this pane has no textbox_scope capability")
+            return doc.scoped_write(op, payload)
+        if op == "textbox_list":
+            if "textbox_scope" not in self.capabilities:
+                raise OpRefused("capability_missing", "this pane has no textbox_scope capability")
+            self.textbox_list_requests += 1
+            if self.malformed_textbox_list:
+                return {"textboxes": "not-a-list"}
+            return doc.textbox_list()
         if op == "replace":
             return doc.replace(
                 payload["find"],
@@ -608,7 +829,9 @@ class FakePane:
             self.comments_list_payloads.append(dict(payload))
             return doc.comments_list(payload.get("ids"), payload.get("include_anchor", True))
         if op == "comment_add":
-            return doc.comment_add(payload["find"], int(payload["expected_matches"]), payload["text"])
+            return doc.comment_add(
+                payload["find"], int(payload["expected_matches"]), payload["text"]
+            )
         if op == "comment_reply":
             return doc.comment_reply(payload["comment_id"], payload["text"])
         if op == "comment_resolve":
@@ -639,8 +862,14 @@ def docx_to_flat_opc(docx_path: Path | str, *, prefix: str = "pkg") -> str:
     ns = "http://schemas.microsoft.com/office/2006/xmlPackage"
     with zipfile.ZipFile(docx_path) as zf:
         content_types = ET.fromstring(zf.read("[Content_Types].xml"))
-        overrides = {o.get("PartName"): o.get("ContentType") for o in content_types.findall(f"{_CT_NS}Override")}
-        defaults = {d.get("Extension"): d.get("ContentType") for d in content_types.findall(f"{_CT_NS}Default")}
+        overrides = {
+            o.get("PartName"): o.get("ContentType")
+            for o in content_types.findall(f"{_CT_NS}Override")
+        }
+        defaults = {
+            d.get("Extension"): d.get("ContentType")
+            for d in content_types.findall(f"{_CT_NS}Default")
+        }
         parts = []
         for info in zf.infolist():
             if info.is_dir() or info.filename == "[Content_Types].xml":

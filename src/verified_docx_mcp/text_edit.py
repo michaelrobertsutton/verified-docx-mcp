@@ -81,6 +81,7 @@ from xml.etree import ElementTree as ET
 from . import audit, mutations, paths, projection, tables, tracked_changes
 from .author import resolve_author_name
 from .errors import ErrorCode, VerifyError, _make_error
+from .live import textboxes_live
 from .live import write_mode as live_write_mode
 from .live.session import LiveDisconnected, LiveOpFailed, LiveStale
 from .locate import LocateResult, locate
@@ -983,9 +984,21 @@ def execute_replace_text(
     track_changes: bool = False,
     write_mode: str = "auto",
     within_row_containing: str | None = None,
+    scope: str = "body",
 ) -> dict[str, Any]:
+    scope = textboxes_live.validate_scope(scope, within_row_containing)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
+        if scope != "body":
+            return textboxes_live.execute_replace_text_scoped(
+                path,
+                find,
+                replace,
+                expected_matches,
+                scope=scope,
+                revision_before=revision_before,
+                track_changes=track_changes,
+            )
         return execute_replace_text_live(
             path,
             find,
@@ -995,6 +1008,7 @@ def execute_replace_text(
             track_changes=track_changes,
             within_row_containing=within_row_containing,
         )
+    textboxes_live.refuse_in_file_mode(scope)
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(
@@ -1194,6 +1208,24 @@ def execute_format_text_live(
                 "-- Word, not this server, owns the document.",
                 {"matches": matches, "requested_strike": requested_strike},
             )
+        # issue #35: bold/italic/underline are read back too. A pane build
+        # from before that sends no read-back key, so a missing key is
+        # skipped here (text-box scope, which needs a current pane, requires it).
+        for style_key, read_key in (("bold", "boldAfter"), ("italic", "italicAfter"), ("underline", "underlineAfter")):
+            requested = style.get(style_key)
+            if requested is None or read_key not in m:
+                continue
+            observed = (
+                textboxes_live._underline_on(m[read_key]) if style_key == "underline" else bool(m[read_key])
+            )
+            if observed != bool(requested):
+                raise _make_error(
+                    ErrorCode.VERIFICATION_FAILED,
+                    f"live format did not verify: the pane's read-back {style_key} ({m[read_key]!r}) "
+                    f"does not equal the requested {style_key} ({requested!r}) after context.sync(). "
+                    "Nothing to roll back in live mode -- Word, not this server, owns the document.",
+                    {"matches": matches, f"requested_{style_key}": requested},
+                )
 
     before_text = "\n".join(m.get("before", "") for m in matches)
     after_text = "\n".join(m.get("after", "") for m in matches)
@@ -1229,10 +1261,22 @@ def execute_format_text(
     track_changes: bool = False,
     write_mode: str = "auto",
     within_row_containing: str | None = None,
+    scope: str = "body",
 ) -> dict[str, Any]:
     style = _validate_style(style)
+    scope = textboxes_live.validate_scope(scope, within_row_containing)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
+        if scope != "body":
+            return textboxes_live.execute_format_text_scoped(
+                path,
+                find,
+                style,
+                expected_matches,
+                scope=scope,
+                revision_before=revision_before,
+                track_changes=track_changes,
+            )
         return execute_format_text_live(
             path,
             find,
@@ -1242,6 +1286,7 @@ def execute_format_text(
             track_changes=track_changes,
             within_row_containing=within_row_containing,
         )
+    textboxes_live.refuse_in_file_mode(scope)
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(

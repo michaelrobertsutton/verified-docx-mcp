@@ -819,7 +819,7 @@ re-listed every comment to verify). What changed:
   without the capability gets the old full listing, and the evidence
   carries a `pane_note` saying to reopen the pane.
 - **No pane caching.** The bridge sends `Cache-Control: no-store` on every
-  response and `taskpane.html` loads `taskpane.js?v=33`, so closing and
+  response and `taskpane.html` loads `taskpane.js?v=35`, so closing and
   reopening the pane picks up an edited `addin/*.js`. If a pane still
   behaves like an old build, check `live_status` for `comments_by_id` in its
   capabilities; bump the `?v=` value in `taskpane.html` when you change
@@ -885,6 +885,105 @@ refuses with `too_large` above 48 MiB; the ops socket accepts messages up to
 64 MiB (`PANE_MAX_MESSAGE_BYTES`; the websockets default of 1 MiB would
 drop the pane's connection on a real proposal). `body_ooxml` waits 60 s;
 override with `VERIFIED_DOCX_LIVE_TIMEOUT_BODY_OOXML_S`.
+
+### Text boxes (issue #35)
+
+Floating callout boxes are Word shapes, not body paragraphs, so a live
+`replace_text`/`format_text` searching the body never saw them (a box-only
+`find` came back `ZERO_MATCH`, and callers fell back to an unverified
+AppleScript write with no read-back or audit). Both tools now take
+`scope="body"|"textboxes"|"all"|"shape:<id>"` (default `"body"`, unchanged),
+and `list_textboxes` shows what is there.
+
+- **Scopes.** `textboxes` searches every text box, `all` the body plus every
+  text box, `shape:<id>` one box. `expected_matches` gates the **total**
+  across everything searched, so `scope="textboxes"` with a unique `find` and
+  `expected_matches=1` needs no id lookup. Live only: file mode refuses a
+  non-body scope with `INVALID_INPUT` (file-mode `replace_text` only walks the
+  main body). Not combinable with `within_row_containing`.
+- **Requirement.** `Body.shapes` / `Shape.body` are **WordApiDesktop 1.2**:
+  Word for Mac 16.94+ or Windows Microsoft 365 2502+. Not Word on the web, not
+  perpetual-license Office. The pane reports the `textbox_scope` capability
+  only when `isSetSupported("WordApiDesktop", "1.2")` is true; both
+  `list_textboxes` and a scoped write refuse with `LIVE_CAPABILITY_MISSING`
+  otherwise (also for a pane from before this feature: reload it).
+  `live_status` shows `WordApiDesktop1.2` under `requirement_sets`.
+- **Targets are shape ids, not `textbox-<n>`.** File mode numbers
+  `w:txbxContent` in XML order; nothing shows Word's shape order matches it, so
+  a positional key could hit the wrong box. `shape_id` is Word's `Shape.id`,
+  valid for that Word session only. `list_textboxes` returns `{shape_id, type,
+  group_path, text, text_sha256, paragraph_count}` per box, plus `incomplete`
+  and `skipped`.
+- **What counts as a text box.** One traversal (list, search and verify all
+  use it): `body.shapes`, recursing into groups and canvases up to 8 levels,
+  keeping `textBox` and `geometricShape` shapes (a callout is not always a
+  `textBox`). Pictures and other non-text shapes are `skipped`
+  (informational). A shape whose body can't be read, a duplicated shape id, or
+  nesting past the cap goes in `incomplete`: while that is non-empty,
+  `textboxes`/`all` refuse (`LIVE_OP_FAILED`) rather than silently skip a box.
+  Use `shape:<id>` for a box that is listed. Text boxes anchored in
+  headers/footers are not covered.
+- **Compare-and-set before the write.** The server lists the boxes first and
+  sends `expect` ({shape_id: text_sha256}) with the write; the pane re-reads
+  every target and refuses **before writing** (`LIVE_STALE`) if one changed or
+  vanished. The session layer's own staleness check compares the reply's body
+  hash after the pane has already written, and a body hash does not include
+  text boxes, so it cannot protect these writes.
+- **Verification.** The pane returns, per match, the text read back from the
+  range Word reports (not an echo of the request) and, per box, its text before
+  and after. The server checks every box against the exact expected text
+  (`pre.replace(find, replace)` -- so a partial write, `cat` -> `cats`, or a
+  deletion cannot pass on a changed hash alone), checks the match counts agree
+  everywhere, then does a second, independent `textbox_list` and requires it to
+  agree. `format_text` reads back every requested property (bold, italic,
+  underline, strike, color) and confirms the text did not change. Body-scope
+  `format_text` now verifies bold/italic/underline read-back too (when the
+  pane sends it).
+- **Track changes.** Tracked deletions can stay in a box's text, so with
+  `track_changes=True` exact equality can't be required; the check relaxes to
+  "differs from the original and contains the replacement" for edited boxes
+  (untouched boxes are still compared exactly) and the evidence says
+  `verification: "relaxed_track_changes"`.
+- **Evidence and audit.** The usual live evidence plus `scope`, `textbox_ids`,
+  per-box before/after `text_sha256` (hashes only, never text) and
+  `verification`, in the audit entry as well as the response. An outcome that
+  is uncertain after the write was sent (disconnect, malformed reply, failed
+  verification) raises with "the write may have been applied -- call
+  `list_textboxes` before retrying" and writes an `applied: "unknown"` audit
+  entry.
+- **Known limit.** An Office.js batch is not a document lock: a co-author who
+  edits a box in the instant between the pane's check and its write, inside one
+  `Word.run`, can still be overwritten.
+
+#### Sideload checklist (needs real Word: the fakes can't prove this)
+
+`tests/unit/js/textbox_harness.mjs` runs the real pane code against stubbed
+shapes, and `fake_pane.py` has a shape model; neither proves what Word returns
+for `body.shapes`. Before trusting this, on Word for Mac 16.94+ (and Windows
+Microsoft 365 2502+ if available) with a copy of a real proposal that has
+callout boxes, plus `tests/fixtures/textbox.docx`:
+
+1. Reload the pane (cache-buster `taskpane.js?v=35`); `live_status` shows
+   `textbox_scope` in the session's capabilities and `WordApiDesktop1.2: true`.
+2. `list_textboxes`: every visible callout is listed. Record each `type`
+   (`textBox` vs `geometricShape`) and whether any box lands in `incomplete`
+   or `skipped`.
+3. `replace_text(scope="textboxes", find=<text only in a box>,
+   expected_matches=1)` verifies; the box text changed in Word; the default
+   scope still returns `ZERO_MATCH` for that text.
+4. `format_text(scope="textboxes", ..., style={"color": "C00000", "bold": true})`
+   verifies and the box shows it.
+5. With `track_changes=True`, check what a tracked replace leaves in the box
+   text (this decides whether the relaxed check is needed as written).
+6. Type in one box mid-call (or between `list_textboxes` and the write): the
+   write refuses with `LIVE_STALE`.
+7. A grouped callout and a document with a picture-only shape behave as the
+   traversal rules above say.
+8. On Word without WordApiDesktop 1.2 (older build, or Word on the web) the
+   tools return `LIVE_CAPABILITY_MISSING`.
+
+Report anything that differs; step 2's types and step 5's behavior are the two
+places the implementation is assuming rather than observing.
 
 ## What could block this, and the fix
 

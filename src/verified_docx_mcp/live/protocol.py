@@ -177,6 +177,39 @@ pane must honor.
                      ``body.text`` read before/after; ``pre``/``post`` are
                      the whole-body SHA-256 as for ``replace``.
 
+  textbox_list    -- no payload (issue #35). Needs the pane's
+                     ``"textbox_scope"`` capability (WordApiDesktop 1.2).
+                     One traversal -- ``body.shapes``, recursing into
+                     ``shapeGroup``/``canvas`` children to a depth cap,
+                     deduplicated by ``Shape.id`` -- keeps ``textBox`` and
+                     ``geometricShape`` shapes and reads each ``shape.body``.
+                     Reply result (an OBJECT, see ``TextboxListResult``):
+                     ``{"textboxes": [{shape_id, type, group_path, text,
+                     text_sha256, paragraph_count}], "incomplete": [...],
+                     "skipped": [...]}``. ``incomplete`` (unreadable body,
+                     duplicate id, nesting past the cap) makes an exhaustive
+                     scope refuse; ``skipped`` is informational. ``shape_id``
+                     is valid only for this Word session and is NOT a
+                     file-mode ``textbox-<n>`` key.
+
+  replace/format with ``scope`` (issue #35) -- ``scope`` is ``"body"``
+                     (default; neither new key is sent), ``"textboxes"``,
+                     ``"all"`` (body + text boxes) or ``"shape:<id>"``.
+                     A non-body scope requires ``expect`` ({shape_id:
+                     text_sha256} from the server's own ``textbox_list``):
+                     the pane re-reads every target and refuses with
+                     ``stale_target`` BEFORE writing if any hash differs or
+                     a shape is missing, and with ``incomplete_coverage``
+                     for an exhaustive scope whose enumeration was
+                     incomplete. Reply adds ``body_match_count`` and
+                     ``shapes: [{shape_id, match_count, pre_text,
+                     post_text}]``; every match carries ``shape_id`` (null
+                     for the body) and ``after`` read back from the range
+                     Word reports (replace) or the re-loaded range text and
+                     ``colorAfter``/``strikeAfter``/``boldAfter``/
+                     ``italicAfter``/``underlineAfter`` (format).
+                     ``expected_matches`` gates the TOTAL across targets.
+
   save            -- no payload. Word calls: ``context.document.save()``.
                      Reply result: ``{"saved": true}``.
 
@@ -216,6 +249,7 @@ VALID_OPS: frozenset[str] = frozenset(
         "comment_resolve",
         "cell_get",
         "cell_set",
+        "textbox_list",
         "save",
     }
 )
@@ -236,6 +270,24 @@ OP_ERROR_MATCH_COUNT_MISMATCH = "match_count_mismatch"
 # websocket frame even with binaries stripped. Same lowercase convention.
 OP_ERROR_TOO_LARGE = "too_large"
 
+# `replace`/`format` with a non-body `scope` (issue #35): the compare-and-set
+# against `expect` failed (a shape changed or vanished since the server's
+# textbox_list read) -- nothing was written. Mapped to LIVE_STALE.
+OP_ERROR_STALE_TARGET = "stale_target"
+# ... the shape set could not be enumerated completely (unreadable body,
+# duplicate shape id, nesting past the depth cap), so an exhaustive scope
+# ("textboxes"/"all") is refused rather than silently partial.
+OP_ERROR_INCOMPLETE_COVERAGE = "incomplete_coverage"
+# ... the host lacks WordApiDesktop 1.2.
+OP_ERROR_CAPABILITY_MISSING = "capability_missing"
+
+# Scopes a `replace`/`format` payload may carry (issue #35). "shape:<id>" is
+# also valid; <id> is Word's Shape.id from `textbox_list`.
+SCOPE_BODY = "body"
+SCOPE_TEXTBOXES = "textboxes"
+SCOPE_ALL = "all"
+SCOPE_SHAPE_PREFIX = "shape:"
+
 
 def _require(obj: dict[str, Any], key: str, expected_type: type | tuple[type, ...]) -> Any:
     if key not in obj:
@@ -246,7 +298,9 @@ def _require(obj: dict[str, Any], key: str, expected_type: type | tuple[type, ..
     return value
 
 
-def _optional(obj: dict[str, Any], key: str, expected_type: type | tuple[type, ...], default: Any = None) -> Any:
+def _optional(
+    obj: dict[str, Any], key: str, expected_type: type | tuple[type, ...], default: Any = None
+) -> Any:
     if key not in obj or obj[key] is None:
         return default
     value = obj[key]
@@ -343,7 +397,11 @@ class HeartbeatMessage:
     body_sha256: str
 
     def to_json(self) -> dict[str, Any]:
-        return {"type": "heartbeat", "documentUrl": self.document_url, "bodySha256": self.body_sha256}
+        return {
+            "type": "heartbeat",
+            "documentUrl": self.document_url,
+            "bodySha256": self.body_sha256,
+        }
 
     @classmethod
     def from_json(cls, raw: str | bytes | dict[str, Any]) -> HeartbeatMessage:
@@ -373,7 +431,12 @@ class OpRequest:
             raise ProtocolError(f"unknown op {self.op!r}; must be one of {sorted(VALID_OPS)}")
 
     def to_json(self) -> dict[str, Any]:
-        return {"type": "request", "request_id": self.request_id, "op": self.op, "payload": self.payload}
+        return {
+            "type": "request",
+            "request_id": self.request_id,
+            "op": self.op,
+            "payload": self.payload,
+        }
 
     @classmethod
     def from_json(cls, raw: str | bytes | dict[str, Any]) -> OpRequest:
@@ -494,6 +557,39 @@ class SearchMatch:
         )
 
 
+def valid_scope(scope: str) -> bool:
+    """True for "body", "textboxes", "all" or "shape:<non-empty id>"."""
+    if scope in (SCOPE_BODY, SCOPE_TEXTBOXES, SCOPE_ALL):
+        return True
+    return scope.startswith(SCOPE_SHAPE_PREFIX) and len(scope) > len(SCOPE_SHAPE_PREFIX)
+
+
+def _scope_to_json(out: dict[str, Any], scope: str, expect: dict[str, str] | None) -> None:
+    # Body scope sends neither key, so the body wire shape is unchanged.
+    if scope != SCOPE_BODY:
+        out["scope"] = scope
+    if expect is not None:
+        out["expect"] = expect
+
+
+def _scope_from_json(obj: dict[str, Any]) -> str:
+    scope = _optional(obj, "scope", str, default=SCOPE_BODY)
+    if not valid_scope(scope):
+        raise ProtocolError(
+            f"'scope' must be 'body', 'textboxes', 'all' or 'shape:<id>', got {scope!r}"
+        )
+    return scope
+
+
+def _expect_from_json(obj: dict[str, Any]) -> dict[str, str] | None:
+    expect = _optional(obj, "expect", dict, default=None)
+    if expect is not None and not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in expect.items()
+    ):
+        raise ProtocolError("'expect' must map shape id strings to text sha256 strings")
+    return expect
+
+
 @dataclasses.dataclass(frozen=True)
 class ReplacePayload:
     find: str
@@ -502,6 +598,8 @@ class ReplacePayload:
     track_changes: bool = False
     expected_body_sha256: str | None = None
     row_anchor: str | None = None
+    scope: str = SCOPE_BODY
+    expect: dict[str, str] | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -514,6 +612,7 @@ class ReplacePayload:
             out["expectedBodySha256"] = self.expected_body_sha256
         if self.row_anchor is not None:
             out["rowAnchor"] = self.row_anchor
+        _scope_to_json(out, self.scope, self.expect)
         return out
 
     @classmethod
@@ -531,6 +630,8 @@ class ReplacePayload:
             track_changes=_optional(obj, "track_changes", bool, default=False),
             expected_body_sha256=_optional(obj, "expectedBodySha256", str, default=None),
             row_anchor=_optional(obj, "rowAnchor", str, default=None),
+            scope=_scope_from_json(obj),
+            expect=_expect_from_json(obj),
         )
 
 
@@ -546,6 +647,8 @@ class FormatPayload:
     track_changes: bool = False
     expected_body_sha256: str | None = None
     row_anchor: str | None = None
+    scope: str = SCOPE_BODY
+    expect: dict[str, str] | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -562,6 +665,7 @@ class FormatPayload:
             out["expectedBodySha256"] = self.expected_body_sha256
         if self.row_anchor is not None:
             out["rowAnchor"] = self.row_anchor
+        _scope_to_json(out, self.scope, self.expect)
         return out
 
     @classmethod
@@ -577,7 +681,13 @@ class FormatPayload:
         underline = _optional(obj, "underline", bool, default=None)
         strike = _optional(obj, "strike", bool, default=None)
         color = _optional(obj, "color", str, default=None)
-        if bold is None and italic is None and underline is None and strike is None and color is None:
+        if (
+            bold is None
+            and italic is None
+            and underline is None
+            and strike is None
+            and color is None
+        ):
             raise ProtocolError("at least one of bold/italic/underline/strike/color must be set")
         return cls(
             find=find,
@@ -590,6 +700,8 @@ class FormatPayload:
             track_changes=_optional(obj, "track_changes", bool, default=False),
             expected_body_sha256=_optional(obj, "expectedBodySha256", str, default=None),
             row_anchor=_optional(obj, "rowAnchor", str, default=None),
+            scope=_scope_from_json(obj),
+            expect=_expect_from_json(obj),
         )
 
 
@@ -771,7 +883,9 @@ class CellSetPayload:
     def from_json(cls, obj: dict[str, Any]) -> CellSetPayload:
         paragraphs = _require(obj, "paragraphs", list)
         for paragraph in paragraphs:
-            if not isinstance(paragraph, list) or not all(isinstance(run, dict) for run in paragraph):
+            if not isinstance(paragraph, list) or not all(
+                isinstance(run, dict) for run in paragraph
+            ):
                 raise ProtocolError("'paragraphs' must be a list of lists of run objects")
         return cls(
             table_index=_require_index(obj, "table_index"),
@@ -781,6 +895,50 @@ class CellSetPayload:
             expected_before_text=_require(obj, "expected_before_text", str),
             track_changes=_optional(obj, "track_changes", bool, default=False),
             expected_body_sha256=_optional(obj, "expectedBodySha256", str, default=None),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class TextboxInfo:
+    shape_id: str
+    type: str
+    group_path: list[str]
+    text: str
+    text_sha256: str
+    paragraph_count: int
+
+    @classmethod
+    def from_json(cls, obj: dict[str, Any]) -> TextboxInfo:
+        return cls(
+            shape_id=_require(obj, "shape_id", str),
+            type=_require(obj, "type", str),
+            group_path=list(_optional(obj, "group_path", list, default=[])),
+            text=_require(obj, "text", str),
+            text_sha256=_require(obj, "text_sha256", str),
+            paragraph_count=_require(obj, "paragraph_count", int),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class TextboxListResult:
+    """``textbox_list`` reply: an OBJECT (``OpReply`` requires one), never a
+    bare array. ``incomplete`` entries make an exhaustive scope refuse;
+    ``skipped`` (pictures and other non-text shapes) is informational."""
+
+    textboxes: list[TextboxInfo]
+    incomplete: list[dict[str, Any]]
+    skipped: list[dict[str, Any]]
+
+    @classmethod
+    def from_json(cls, obj: dict[str, Any]) -> TextboxListResult:
+        raw = _require(obj, "textboxes", list)
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ProtocolError("'textboxes' must be a list of objects")
+        return cls(
+            textboxes=[TextboxInfo.from_json(item) for item in raw],
+            incomplete=list(_optional(obj, "incomplete", list, default=[])),
+            skipped=list(_optional(obj, "skipped", list, default=[])),
         )
 
 

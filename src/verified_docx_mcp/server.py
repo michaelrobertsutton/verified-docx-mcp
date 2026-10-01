@@ -66,7 +66,7 @@ from . import (
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .live import bridge as live_bridge
-from .live import comments_live, reads_live
+from .live import comments_live, reads_live, textboxes_live
 from .middleware import EvidenceEnforcementMiddleware
 
 mcp = FastMCP(
@@ -683,6 +683,9 @@ def execute_live_status() -> dict[str, Any]:
                 "last_heartbeat_age_s": session.heartbeat_age(),
                 "body_sha256": session.last_body_sha256,
                 "requirement_sets": session.hello.requirement_sets,
+                # Which op-level features this pane build implements (issue
+                # #35 made this visible: a stale pane lacks "textbox_scope").
+                "capabilities": sorted(session.hello.capabilities),
             }
         )
 
@@ -719,7 +722,7 @@ def live_status() -> dict[str, Any]:
     Returns ``bridge_running``, ``port`` (the static HTTPS pane server),
     ``ops_port`` (the WSS ``/ops`` channel), ``sessions`` (list of
     ``{document_name, document_url, connected_since,
-    last_heartbeat_age_s, body_sha256, requirement_sets}`` -- one per
+    last_heartbeat_age_s, body_sha256, requirement_sets, capabilities}`` -- one per
     connected pane, ``[]`` before any pane connects), and
     ``session_collisions`` (issue #22 B3 follow-up: every basename
     collision the registry has seen -- two DIFFERENT documents (different
@@ -1412,6 +1415,7 @@ def replace_text(
     write_mode: str = "auto",
     within_row_containing: str | None = None,
     allow_concurrent_editor: bool = False,
+    scope: str = "body",
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
 
@@ -1509,6 +1513,27 @@ def replace_text(
     the connected pane report the "row_scope" capability -- see
     LIVE_CAPABILITY_MISSING below.
 
+    scope (issue #35, "body" | "textboxes" | "all" | "shape:<id>", default
+    "body"): where `find` is searched. "body" is today's behavior,
+    unchanged. The others are LIVE-ONLY (file mode refuses them with
+    INVALID_INPUT) and reach floating text boxes / callout shapes, which
+    the body search never sees: "textboxes" searches every text box,
+    "all" the body plus every text box, "shape:<id>" one box by Word's own
+    Shape.id (from `list_textboxes`; not a file-mode `textbox-<n>` key).
+    `expected_matches` gates the TOTAL across everything searched, so
+    scope="textboxes" with a unique `find` and expected_matches=1 needs no
+    id lookup. Needs the pane's "textbox_scope" capability (Word for Mac
+    16.94+ / Windows Microsoft 365 2502+, WordApiDesktop 1.2). Verified,
+    not echoed: the pane refuses before writing if a box changed since it
+    was read (LIVE_STALE), each touched box is compared with the exact
+    expected text, and a second independent read must agree; the evidence
+    adds scope, textbox_ids and per-box text hashes. With track_changes the
+    exact-text comparison is relaxed (tracked deletions stay in the text)
+    and the evidence says so. Exhaustive scopes refuse (LIVE_OP_FAILED) if
+    some shape could not be read; use "shape:<id>" then. Cannot be combined
+    with within_row_containing. A co-author editing a box in the instant
+    between the pane's check and its write can still be overwritten.
+
     Returns the eight evidence keys (before/after are ±200-character
     excerpts around the first match, not the whole document), plus
     runs_before/runs_after (each match's overlapping run(s), clipped to the
@@ -1566,6 +1591,7 @@ def replace_text(
             write_mode=write_mode,
             within_row_containing=within_row_containing,
             allow_concurrent_editor=allow_concurrent_editor,
+            scope=scope,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1583,9 +1609,16 @@ def format_text(
     write_mode: str = "auto",
     within_row_containing: str | None = None,
     allow_concurrent_editor: bool = False,
+    scope: str = "body",
 ) -> dict[str, Any]:
     """Apply character styling (bold/italic/underline/strike/color) to a
     matched text span, without touching its content.
+
+    `scope` (issue #35, live-only unless "body"): same values and
+    semantics as `replace_text`'s `scope` -- see that tool's docstring. In
+    a text box the pane reads back every requested property (bold, italic,
+    underline, strike, color) and the server verifies each, then re-reads
+    the box text to confirm it did not change.
 
     `write_mode` (issue #106 WP-3, "auto" | "file" | "live", default
     "auto"): identical rule and evidence differences to `replace_text`'s
@@ -1658,7 +1691,43 @@ def format_text(
             write_mode=write_mode,
             within_row_containing=within_row_containing,
             allow_concurrent_editor=allow_concurrent_editor,
+            scope=scope,
         )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tool: list_textboxes (issue #35)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_textboxes(path: str) -> dict[str, Any]:
+    """List the floating text boxes / callout shapes in the LIVE Word
+    document, so a box can be found before and re-checked after a
+    `replace_text`/`format_text` call with `scope`.
+
+    Live-only: it asks the connected Word pane (the file-mode equivalent is
+    `find_sections` / `read_document` with a `textbox-<n>` key, which reads
+    the local file, not Word). Needs the pane's "textbox_scope" capability
+    (WordApiDesktop 1.2: Word for Mac 16.94+ / Windows Microsoft 365 2502+).
+    Read-only: starts no write and never falls back to the file.
+
+    Returns `textboxes`: [{shape_id, type, group_path, text, text_sha256,
+    paragraph_count}], `incomplete` (shapes that could not be read or
+    addressed -- while non-empty, scope="textboxes"/"all" refuse; use
+    "shape:<id>"), `skipped` (non-text shapes, informational), `revision`
+    ("live:sha256:<hex>") and `notes`. `shape_id` is Word's Shape.id: valid
+    for this Word session only and NOT a file-mode `textbox-<n>` key. Only
+    the document body is covered, not headers/footers.
+
+    Errors: LIVE_UNAVAILABLE (no connected pane), LIVE_SESSION_MISMATCH,
+    LIVE_CAPABILITY_MISSING (old pane or Word without WordApiDesktop 1.2),
+    LIVE_DISCONNECTED, LIVE_OP_FAILED.
+    """
+    try:
+        return textboxes_live.list_textboxes_live(path)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
