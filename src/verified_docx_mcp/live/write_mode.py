@@ -362,6 +362,14 @@ def classify_op_failed(exc: LiveOpFailed) -> ErrorCode:
         return ErrorCode.ZERO_MATCH
     if pane_code == "match_count_mismatch":
         return ErrorCode.MATCH_COUNT_MISMATCH
+    # Issue #34: the pane refused before writing (body hash moved / unknown
+    # table style).
+    if pane_code == "stale":
+        return ErrorCode.LIVE_STALE
+    if pane_code == "style_not_found":
+        return ErrorCode.STYLE_NOT_FOUND
+    if pane_code == "table_not_found":
+        return ErrorCode.TABLE_NOT_FOUND
 
     match = _FOUND_COUNT_RE.search(exc.message or "")
     if match:
@@ -433,3 +441,35 @@ def live_evidence(
     logged, _ = audit.append_audit(path=path, tool=tool, evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
+
+
+def audit_live_failure(
+    *,
+    tool: str,
+    path: str,
+    document_name: str,
+    pre_body_sha256: str,
+    post_body_sha256: str | None,
+    reason: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Audit-log a live write that LANDED but then failed its independent
+    read-back (issue #34). ``live_evidence`` only runs on success, so
+    without this a mutation that reached a co-author's open document and
+    then raised ``VERIFICATION_FAILED`` would leave no audit trail at all.
+    Best-effort, like every audit write: never raises.
+    """
+    evidence: dict[str, Any] = {
+        "applied": True,
+        "verified": False,
+        "write_mode": "live",
+        "verified_via": "word-addin",
+        "document_name": document_name,
+        "revision_before": f"{_LIVE_REVISION_PREFIX}{pre_body_sha256}",
+        "revision_after": (
+            f"{_LIVE_REVISION_PREFIX}{post_body_sha256}" if post_body_sha256 is not None else None
+        ),
+        "verification_failure": reason,
+        "detail": detail or {},
+    }
+    audit.append_audit(path=path, tool=f"{tool}:verification_failed", evidence=evidence)

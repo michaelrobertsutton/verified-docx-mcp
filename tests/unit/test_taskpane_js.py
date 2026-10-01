@@ -49,3 +49,35 @@ class OpCommentsListTests(unittest.TestCase):
     def test_include_anchor_false_skips_get_range(self):
         self.assertEqual(self.out["noAnchorGetRange"], 0)
         self.assertFalse(self.out["noAnchorHasAnchorText"])
+
+
+TABLES_HARNESS = Path(__file__).resolve().parent / "js" / "tables_harness.mjs"
+
+
+@unittest.skipUnless(NODE, "node not found on PATH")
+class LiveTableOpsTests(unittest.TestCase):
+    """Issue #34: table_get / table_insert / cells_set (and the refactored
+    cell_set) against a MOCK Word object model that enforces load()+sync()
+    ordering, ClientResult.value-after-sync and queued writes. Real Word is
+    still unverified (docs/live-mode.md)."""
+
+    @classmethod
+    def setUpClass(cls):
+        proc = subprocess.run(
+            [NODE, str(TABLES_HARNESS), str(REPO / "addin" / "taskpane.js")],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"tables harness failed:\n{proc.stderr}")
+        cls.results = json.loads(proc.stdout.strip().splitlines()[-1])["results"]
+
+    def test_harness_ran_every_scenario(self):
+        self.assertGreaterEqual(len(self.results), 50)
+
+    def test_every_check_passes(self):
+        for result in self.results:
+            with self.subTest(result["name"]):
+                self.assertTrue(result["pass"], result["detail"])

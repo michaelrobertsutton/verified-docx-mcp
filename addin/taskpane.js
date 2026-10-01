@@ -223,7 +223,8 @@ const OP_LOG_LIMIT = 20;
 // edits). Reported only by builds that implement them, so a server never
 // sends cell_set to a pane that would answer "unknown op".
 // issue #31: "comments_by_id" = comments_list accepts `ids` / `include_anchor`.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id"];
+// issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit"];
 
 let opsSocket = null;
 let heartbeatTimer = null;
@@ -443,6 +444,9 @@ function summarizeResult(op, result) {
   if (op === "comment_add") return `comment_id=${result.comment_id}`;
   if (op === "cell_get") return `${(result.text || "").length} char(s)`;
   if (op === "cell_set") return `applied=${result.applied}`;
+  if (op === "table_get") return `${(result.rows || []).length} row(s)`;
+  if (op === "table_insert") return `table_index=${result.table_index}`;
+  if (op === "cells_set") return `applied=${result.applied}`;
   return "";
 }
 
@@ -470,6 +474,12 @@ async function dispatchOp(op, payload) {
       return opCellGet(payload);
     case "cell_set":
       return opCellSet(payload);
+    case "table_get":
+      return opTableGet(payload);
+    case "table_insert":
+      return opTableInsert(payload);
+    case "cells_set":
+      return opCellsSet(payload);
     case "save":
       return opSave();
     default:
@@ -743,7 +753,7 @@ async function opFormat(payload) {
 // continuation cell is still a cell of its row). Manual sideload
 // verification against a real table (docs/live-mode.md) is still needed --
 // fake_pane.py's table model cannot exercise this object graph.
-async function resolveTableCell(context, payload) {
+async function loadTopLevelTables(context) {
   const tables = context.document.body.tables;
   tables.load("items");
   await context.sync();
@@ -754,9 +764,14 @@ async function resolveTableCell(context, payload) {
       "the document contains a nested table; table numbering cannot be mapped reliably, so live cell edits are refused"
     );
   }
-  const table = tables.items[payload.table_index - 1];
+  return tables.items;
+}
+
+async function resolveTableCell(context, payload) {
+  const tableItems = await loadTopLevelTables(context);
+  const table = tableItems[payload.table_index - 1];
   if (!table) {
-    throw refusalError(`no table ${payload.table_index} (the document has ${tables.items.length})`);
+    throw refusalError(`no table ${payload.table_index} (the document has ${tableItems.length})`);
   }
   const rows = table.rows;
   rows.load("items");
@@ -776,6 +791,30 @@ async function resolveTableCell(context, payload) {
     );
   }
   return cell;
+}
+
+// Queues (does not sync) the clear + per-run writes for one cell. Shared by
+// cell_set, cells_set and table_insert so a cell is always written one way.
+function writeCellParagraphs(cell, paragraphs) {
+  cell.body.clear();
+  paragraphs.forEach((runs, i) => {
+    // After clear() the cell holds one empty paragraph: fill it first,
+    // append the rest.
+    const paragraph =
+      i === 0 ? cell.body.paragraphs.getFirst() : cell.body.insertParagraph("", Word.InsertLocation.end);
+    (runs || []).forEach((run) => {
+      if (run.hard_break) {
+        paragraph.insertBreak(Word.BreakType.line, Word.InsertLocation.end);
+        return;
+      }
+      const range = paragraph.insertText(run.text, Word.InsertLocation.end);
+      range.font.bold = !!run.bold;
+      range.font.italic = !!run.italic;
+      if (run.link) {
+        range.hyperlink = run.link;
+      }
+    });
+  });
 }
 
 async function opCellGet(payload) {
@@ -815,26 +854,7 @@ async function opCellSet(payload) {
     }
 
     try {
-      cell.body.clear();
-      const paragraphs = payload.paragraphs || [];
-      paragraphs.forEach((runs, i) => {
-        // After clear() the cell holds one empty paragraph: fill it first,
-        // append the rest.
-        const paragraph =
-          i === 0 ? cell.body.paragraphs.getFirst() : cell.body.insertParagraph("", Word.InsertLocation.end);
-        (runs || []).forEach((run) => {
-          if (run.hard_break) {
-            paragraph.insertBreak(Word.BreakType.line, Word.InsertLocation.end);
-            return;
-          }
-          const range = paragraph.insertText(run.text, Word.InsertLocation.end);
-          range.font.bold = !!run.bold;
-          range.font.italic = !!run.italic;
-          if (run.link) {
-            range.hyperlink = run.link;
-          }
-        });
-      });
+      writeCellParagraphs(cell, payload.paragraphs || []);
       await context.sync();
     } finally {
       if (previousMode !== null) {
@@ -850,6 +870,336 @@ async function opCellSet(payload) {
     const postHash = await sha256Hex(postBody.text || "");
 
     return { applied: true, before, after: cell.body.text || "", pre: preHash, post: postHash };
+  });
+}
+
+// -- live tables (issue #34) ------------------------------------------------
+
+// Server vocabulary <-> Word enum names. Word's TableCell.horizontalAlignment
+// takes "Centered"/"Justified", not the "center"/"both" the tool exposes.
+const H_ALIGN_TO_WORD = { left: "Left", center: "Centered", right: "Right", both: "Justified" };
+const H_ALIGN_FROM_WORD = { Left: "left", Centered: "center", Right: "right", Justified: "both" };
+const V_ALIGN_TO_WORD = { top: "Top", center: "Center", bottom: "Bottom" };
+const V_ALIGN_FROM_WORD = { Top: "top", Center: "center", Bottom: "bottom" };
+
+function withHash(hex) {
+  return hex.startsWith("#") ? hex : `#${hex}`;
+}
+
+// Same normalization as the server's tables._texts_match_ladder: straight
+// quotes, no soft hyphens, collapsed whitespace, trimmed.
+// Built from code points (not literals) so no invisible character lives in the source.
+const charClass = (codes) => new RegExp(`[${codes.map((c) => String.fromCharCode(c)).join("")}]`, "g");
+const SMART_SINGLE_QUOTES = charClass([0x2018, 0x2019, 0x201a, 0x201b]);
+const SMART_DOUBLE_QUOTES = charClass([0x201c, 0x201d, 0x201e, 0x201f]);
+const SOFT_HYPHEN = charClass([0x00ad]);
+
+function normalizeAnchorText(text) {
+  return String(text || "")
+    .replace(SMART_SINGLE_QUOTES, "'")
+    .replace(SMART_DOUBLE_QUOTES, '"')
+    .replace(SOFT_HYPHEN, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Runs fn with change tracking forced to trackAll when `on`, and restores the
+// previous mode in a finally (a throwing sync must not leave the document
+// stuck on trackAll -- same rule as replace/format).
+async function withTracking(context, on, fn) {
+  let previousMode = null;
+  if (on) {
+    context.document.load("changeTrackingMode");
+    await context.sync();
+    previousMode = context.document.changeTrackingMode;
+    context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
+  }
+  try {
+    return await fn();
+  } finally {
+    if (previousMode !== null) {
+      context.document.changeTrackingMode = previousMode;
+      await context.sync();
+    }
+  }
+}
+
+// Reads the body hash and refuses (code "stale") BEFORE any write if the
+// caller's expectedBodySha256 no longer matches. The session's own check
+// compares result.pre only after the op has already run, which cannot undo a
+// write that landed.
+async function requireFreshBody(context, expectedHash) {
+  const body = context.document.body;
+  body.load("text");
+  await context.sync();
+  const preHash = await sha256Hex(body.text || "");
+  if (expectedHash && expectedHash !== preHash) {
+    throw refusalError(
+      "the document changed since it was read (body hash mismatch); nothing was written. Re-read and retry.",
+      "stale"
+    );
+  }
+  return preHash;
+}
+
+async function loadRowsAndCells(context, table) {
+  const rows = table.rows;
+  rows.load("items");
+  await context.sync();
+  rows.items.forEach((row) => row.cells.load("items"));
+  await context.sync();
+  return rows.items.map((row) => row.cells.items);
+}
+
+// The table's own part of its flat-OPC XML, so a style definition elsewhere in
+// the package cannot be mistaken for a merged cell.
+function documentPartXml(flatOpc) {
+  const start = flatOpc.indexOf('pkg:name="/word/document.xml"');
+  if (start < 0) return flatOpc;
+  const end = flatOpc.indexOf("</pkg:part>", start);
+  return end < 0 ? flatOpc.slice(start) : flatOpc.slice(start, end);
+}
+
+async function opTableGet(payload) {
+  return Word.run(async (context) => {
+    const tableItems = await loadTopLevelTables(context);
+    const table = tableItems[payload.table_index - 1];
+    if (!table) {
+      throw refusalError(
+        `no table ${payload.table_index} (the document has ${tableItems.length})`,
+        "table_not_found"
+      );
+    }
+    table.load(["style", "headerRowCount"]);
+    const ooxml = table.getRange().getOoxml();
+    await context.sync();
+    const grid = await loadRowsAndCells(context, table);
+    grid.forEach((cells) =>
+      cells.forEach((cell) => {
+        cell.load(["shadingColor", "horizontalAlignment", "verticalAlignment", "columnWidth"]);
+        cell.body.load("text");
+        cell.body.font.load(["bold", "color", "size"]);
+      })
+    );
+    await context.sync();
+    const part = documentPartXml(ooxml.value || "");
+    return {
+      style: table.style || "",
+      headerRowCount: table.headerRowCount,
+      merged: /<w:gridSpan[\s/>]/.test(part) || /<w:vMerge[\s/>]/.test(part),
+      rows: grid.map((cells) =>
+        cells.map((cell) => ({
+          text: cell.body.text || "",
+          fill: cell.shadingColor || "",
+          align: H_ALIGN_FROM_WORD[cell.horizontalAlignment] || String(cell.horizontalAlignment),
+          valign: V_ALIGN_FROM_WORD[cell.verticalAlignment] || String(cell.verticalAlignment),
+          width: cell.columnWidth,
+          bold: cell.body.font.bold,
+          color: cell.body.font.color || "",
+          size: cell.body.font.size,
+        }))
+      ),
+    };
+  });
+}
+
+// Resolves the style to apply BEFORE anything is inserted, so a bad style never
+// leaves a stray table behind (an insert-then-delete "rollback" is not one).
+// Returns {style} or {styleBuiltIn}.
+async function resolveInsertStyle(context, payload, tableItems) {
+  if (payload.style_from_table_index) {
+    const source = tableItems[payload.style_from_table_index - 1];
+    if (!source) {
+      throw refusalError(
+        `style_from_table_index ${payload.style_from_table_index} is out of range (the document has ${tableItems.length})`,
+        "style_not_found"
+      );
+    }
+    source.load("style");
+    await context.sync();
+    if (!source.style) {
+      throw refusalError(`table ${payload.style_from_table_index} has no table style to copy`, "style_not_found");
+    }
+    return { style: source.style };
+  }
+  if (payload.style_builtin) {
+    const enumValues = Word.BuiltInStyleName || {};
+    const value = enumValues[payload.style_builtin] || Object.values(enumValues).find((v) => v === payload.style_builtin);
+    if (!value) {
+      throw refusalError(`${JSON.stringify(payload.style_builtin)} is not a Word built-in style name`, "style_not_found");
+    }
+    return { styleBuiltIn: value };
+  }
+  if (payload.style) {
+    tableItems.forEach((t) => t.load("style"));
+    await context.sync();
+    if (tableItems.some((t) => t.style === payload.style)) return { style: payload.style };
+    if (Office.context.requirements.isSetSupported("WordApi", "1.5")) {
+      const found = context.document.getStyles().getByNameOrNullObject(payload.style);
+      found.load("isNullObject");
+      await context.sync();
+      if (!found.isNullObject) return { style: payload.style };
+    }
+    throw refusalError(
+      `table style ${JSON.stringify(payload.style)} was not found (it is not used by an existing table and the ` +
+        "document's style list does not name it); use style_from_table_id or a built-in style",
+      "style_not_found"
+    );
+  }
+  return {};
+}
+
+function findAnchorParagraph(paragraphItems, anchor) {
+  const wanted = normalizeAnchorText(anchor.paragraph_text);
+  const matches = paragraphItems.filter((p) => p.tableNestingLevel === 0 && normalizeAnchorText(p.text) === wanted);
+  if (matches.length !== 1) {
+    throw refusalError(
+      `expected 1 top-level paragraph matching ${JSON.stringify(anchor.paragraph_text)}, found ${matches.length}`,
+      matches.length === 0 ? "zero_match" : "match_count_mismatch"
+    );
+  }
+  return matches[0];
+}
+
+async function opTableInsert(payload) {
+  const rowCount = payload.rows.length;
+  const colCount = payload.rows[0].length;
+  return Word.run(async (context) => {
+    const preHash = await requireFreshBody(context, payload.expectedBodySha256);
+    const tableItems = await loadTopLevelTables(context);
+    const styleChoice = await resolveInsertStyle(context, payload, tableItems);
+
+    const anchor = payload.anchor || null;
+    let paragraphItems = null;
+    if (anchor && anchor.paragraph_text !== undefined) {
+      const paragraphs = context.document.body.paragraphs;
+      paragraphs.load("items/text,items/tableNestingLevel");
+      await context.sync();
+      paragraphItems = paragraphs.items;
+    }
+    let target = null;
+    if (anchor && anchor.paragraph_text !== undefined) {
+      target = findAnchorParagraph(paragraphItems, anchor);
+    } else if (anchor && anchor.after_table_index !== undefined) {
+      target = tableItems[anchor.after_table_index - 1];
+      if (!target) {
+        throw refusalError(
+          `after_table_index ${anchor.after_table_index} is out of range (the document has ${tableItems.length})`,
+          "table_not_found"
+        );
+      }
+    }
+
+    const emptyValues = payload.rows.map((row) => row.map(() => ""));
+    let newTable = null;
+    await withTracking(context, payload.track_changes, async () => {
+      if (target && anchor.paragraph_text !== undefined) {
+        newTable = target.insertTable(rowCount, colCount, anchor.position === "before" ? "Before" : "After", emptyValues);
+      } else if (target) {
+        newTable = target.insertTable(rowCount, colCount, "After", emptyValues);
+      } else {
+        newTable = context.document.body.insertTable(rowCount, colCount, "End", emptyValues);
+      }
+      if (styleChoice.style) newTable.style = styleChoice.style;
+      if (styleChoice.styleBuiltIn) newTable.styleBuiltIn = styleChoice.styleBuiltIn;
+      newTable.headerRowCount = payload.header_rows || 0;
+      const grid = await loadRowsAndCells(context, newTable);
+      payload.rows.forEach((row, r) =>
+        row.forEach((spec, c) => {
+          const cell = grid[r][c];
+          writeCellParagraphs(cell, spec.paragraphs || []);
+          if (spec.bold) cell.body.font.bold = true;
+          if (spec.color) cell.body.font.color = withHash(spec.color);
+          if (spec.fill) cell.shadingColor = withHash(spec.fill);
+          if (spec.align) cell.horizontalAlignment = H_ALIGN_TO_WORD[spec.align];
+          if (spec.valign) cell.verticalAlignment = V_ALIGN_TO_WORD[spec.valign];
+          if (payload.column_widths_pt) cell.columnWidth = payload.column_widths_pt[c];
+        })
+      );
+      if (payload.font_size_pt) newTable.font.size = payload.font_size_pt;
+      await context.sync();
+    });
+
+    // The new table's own 1-based index (list_tables numbering): compare each
+    // top-level table's range with the new one. compareLocationWith returns a
+    // ClientResult, so .value is only readable after the sync.
+    const allTables = context.document.body.tables;
+    allTables.load("items");
+    await context.sync();
+    const relations = allTables.items.map((t) => t.getRange().compareLocationWith(newTable.getRange()));
+    await context.sync();
+    const position = relations.findIndex((rel) => rel.value === "Equal");
+    if (position < 0) {
+      throw refusalError(
+        "the table was inserted but its position could not be determined; call list_tables to find it. Nothing was rolled back."
+      );
+    }
+
+    const postBody = context.document.body;
+    postBody.load("text");
+    await context.sync();
+    const postHash = await sha256Hex(postBody.text || "");
+    return { applied: true, table_index: position + 1, pre: preHash, post: postHash };
+  });
+}
+
+async function opCellsSet(payload) {
+  return Word.run(async (context) => {
+    const preHash = await requireFreshBody(context, payload.expectedBodySha256);
+    const tableItems = await loadTopLevelTables(context);
+
+    const gridByTable = new Map();
+    for (const spec of payload.cells) {
+      const table = tableItems[spec.table_index - 1];
+      if (!table) {
+        throw refusalError(
+          `no table ${spec.table_index} (the document has ${tableItems.length})`,
+          "table_not_found"
+        );
+      }
+      if (!gridByTable.has(spec.table_index)) {
+        // eslint-disable-next-line no-await-in-loop -- one table at a time keeps the batch small
+        gridByTable.set(spec.table_index, await loadRowsAndCells(context, table));
+      }
+    }
+    const cells = payload.cells.map((spec) => {
+      const grid = gridByTable.get(spec.table_index);
+      const row = grid[spec.row_index - 1];
+      if (!row) throw refusalError(`row_index ${spec.row_index} is out of range for table ${spec.table_index}`);
+      const cell = row[spec.cell_index - 1];
+      if (!cell) throw refusalError(`cell_index ${spec.cell_index} is out of range for row ${spec.row_index}`);
+      return cell;
+    });
+
+    // Word batches are not transactions. Narrow the window as far as the API
+    // allows: compare every cell, then read them ALL again immediately before
+    // queuing the writes, and refuse (writing nothing) on any difference.
+    const readAll = async () => {
+      cells.forEach((cell) => cell.body.load("text"));
+      await context.sync();
+      return cells.map((cell) => cell.body.text || "");
+    };
+    const mismatch = (texts) => payload.cells.findIndex((spec, i) => texts[i] !== spec.expected_before_text);
+    const before = await readAll();
+    let bad = mismatch(before);
+    if (bad < 0) bad = mismatch(await readAll());
+    if (bad >= 0) {
+      throw refusalError(
+        `cell ${bad + 1} of ${payload.cells.length} changed since it was read (another editor may be working in it); nothing was written`
+      );
+    }
+
+    await withTracking(context, payload.track_changes, async () => {
+      payload.cells.forEach((spec, i) => writeCellParagraphs(cells[i], spec.paragraphs || []));
+      await context.sync();
+    });
+
+    const after = await readAll();
+    const postBody = context.document.body;
+    postBody.load("text");
+    await context.sync();
+    const postHash = await sha256Hex(postBody.text || "");
+    return { applied: true, before, after, pre: preHash, post: postHash };
   });
 }
 

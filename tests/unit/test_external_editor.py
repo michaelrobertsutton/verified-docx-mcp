@@ -129,11 +129,9 @@ class LedgerAndGuardTests(_Base):
         # ...but a file-mode tool with no live route must not recommend it.
         envelope = self.assertRefused(
             ErrorCode.EXTERNAL_EDITOR_ACTIVE,
-            tables.execute_replace_table_row,
+            mutations.execute_append_markdown,
             str(self.target),
-            1,
-            1,
-            ["a", "b"],
+            "appended",
         )
         self.assertNotIn('write_mode="live"', envelope.message)
         self.assertIn("allow_concurrent_editor=True", envelope.message)
