@@ -438,9 +438,87 @@ channel:
 - The pane must report `"cell_edit"` (reload it after upgrading), else
   `LIVE_CAPABILITY_MISSING`.
 
-The other table tools (`replace_table_row`, `insert_table`) still have no
-live route; on them `EXTERNAL_EDITOR_ACTIVE` can only be waited out or
-overridden. Tracked in a follow-up issue.
+## Live tables (issue #34)
+
+`insert_table`, `replace_table_row` (`write_mode`) and `get_table`
+(`source`) now have a live route, so a table can be added to or edited in a
+document a co-author has open. All three need the pane to report
+`"table_edit"` (reload the pane after upgrading), else
+`LIVE_CAPABILITY_MISSING`. New ops: `table_get`, `table_insert`, `cells_set`
+(see `live/protocol.py`); table ops get a longer reply timeout than the 15 s
+default so a slow success is not reported as a disconnect and retried into a
+duplicate table.
+
+**`insert_table(write_mode="live")` is a subset of file mode.**
+
+- Cells are paragraphs with bold/italic/links. `fill`, `color`, `bold`,
+  `align`, `valign` work. Merged cells (`span`, `v_merge`) and `cant_split`
+  are refused with `INVALID_INPUT` (Word's JavaScript API cannot do them).
+- **Anchor**: `{"paragraph_text": ..., "position": "after"|"before"}` (a
+  unique top-level paragraph; 0 matches `ZERO_MATCH`, more than 1
+  `MATCH_COUNT_MISMATCH`; text is matched modulo whitespace, smart quotes and
+  soft hyphens), `{"after_table_id": n}`, or none to append at the end.
+  `section_key` anchors are file-mode only: they come from the saved file,
+  which lags a co-authored document.
+- **Style** is validated before anything is inserted, so there is no
+  insert-then-delete rollback. `style_id` is a Word table style *name* in live
+  mode; it must already be used by a table in the document, or (WordApi 1.5+)
+  be in the document's style list. `style_from_table_id` copies an existing
+  table's style. `style_builtin` takes a Word built-in style name
+  (`GridTable4_Accent1`). All three are optional in live mode.
+- `table_id` in the result is read back from Word, not counted.
+- `grid_dxa` becomes column widths in points; `font_size_pt` sets the table
+  font size.
+
+**Safety, and its limit.**
+
+- The pane compares the caller's body hash with its own *before* writing and
+  refuses with `LIVE_STALE` if the document moved. (The older ops only compare
+  after the write; see the note in `live/session.py`.)
+- After the write the server re-reads the table (`table_get`) and compares
+  every requested property: text, fill, color, bold, alignment, widths, font
+  size, header rows, style. A mismatch is `VERIFICATION_FAILED`, and because
+  the table has already landed, **a failure record is written to the audit
+  log first** (`tool: "insert_table:verification_failed"`). The table stays in
+  the document for you to fix or delete.
+- `replace_table_row` writes the whole row as **one Word batch** guarded by
+  the body hash and a re-read of every cell just before the write. Word
+  batches are not transactions, so a cell edited in the last instant can still
+  be overwritten. It refuses a table containing a merged cell
+  (`MERGED_OR_NESTED_TABLE`; the pane reads this from the table's OOXML).
+- `get_table(source="live")` reads the main body only (a non-default `part`
+  is `INVALID_INPUT`; `"auto"` falls back to the file for it), returns Word's
+  plain text rather than markdown, and cannot report per-cell
+  `grid_span`/`v_merge` (use the table-level `has_merged_cells`).
+- Nested-table documents are refused, as for live cell edits.
+
+### Live tables: UNVERIFIED in real Word
+
+The server side and the pane logic are tested (a fake pane; a Node harness
+over a mock Word object model that enforces load/sync ordering and
+`ClientResult` rules). The real Office.js behaviour is **not** verified. Run
+this once and record the result:
+
+1. Reload the pane (it must report `table_edit`), open a copy of a real
+   proposal section, call `live_status`.
+2. `insert_table(path, rows=[["**Metric**","**Value**"],["Uptime","99.9%"]],
+   style_from_table_id=1, header_rows=1, grid_dxa=[2400,6960], font_size_pt=10,
+   anchor={"paragraph_text": "<a unique paragraph>", "position": "after"},
+   write_mode="live")`. Confirm the table appears where expected, `table_id`
+   matches `get_table(source="live")`, the style, header shading, widths and
+   bold match, and `verified_via: "word-addin"` is in the evidence.
+3. Things most likely to differ from the mock: whether a style *name* from
+   `style_id` is accepted (try both a name already in use and one that is only
+   in the style list), whether `style_builtin` yields the expected look,
+   whether column widths survive Word's page-width clamping (the read-back
+   allows 1.5 pt), and `getOoxml()` merged-cell detection on a real merged
+   table.
+4. `replace_table_row(path, 1, 2, ["a", "b"], write_mode="live")` on the new
+   table, then edit a cell by hand and retry to see the compare-and-set
+   refusal.
+5. Wait 5+ minutes, reopen from SharePoint, confirm the table is still there.
+
+Result: _not yet run._
 
 ### Running the pane in Word for the web: UNVERIFIED
 

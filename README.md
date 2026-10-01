@@ -147,7 +147,8 @@ Tools implemented so far:
   `w:ilvl`, the same machinery `replace_body_markdown`/`append_markdown`
   already use.
 - **`insert_table(path, rows, style_id, header_rows=0, grid_dxa=None,
-  cant_split=False, anchor=None, ...)`** — insert a new table, one
+  cant_split=False, anchor=None, write_mode="auto", style_from_table_id=None,
+  style_builtin=None, font_size_pt=None, ...)`** — insert a new table, one
   markdown string OR cell-spec object (`{"markdown", "span", "v_merge",
   "fill", "color", "bold", "align", "valign"}`) per cell — a spanning
   (`w:gridSpan`) or vertically merged (`w:vMerge`) title/header row,
@@ -401,8 +402,18 @@ detection after the fact, not prevention — read the limits, and the
 unverified Word-for-the-web section, in
 [`docs/live-mode.md`](docs/live-mode.md#office-online--word-for-the-web-co-authoring-issue-27).
 
-Issue #154: every OTHER mutating tool — `apply_style`, `insert_table`,
-`insert_image`, `replace_table_row`,
+Issue #34: `insert_table` and `replace_table_row` also take `write_mode`, and
+`get_table` takes `source`, so a table can be added to or edited in a document
+a co-author has open. Live `insert_table` is a subset of file mode (no merged
+cells; a paragraph-text or `after_table_id` anchor; style by name, copied from
+another table, or a built-in) and every requested property is re-read from
+Word and verified; a table that lands but fails that check is audit-logged
+before the error is raised. The pane logic is tested against a mock only; see
+[`docs/live-mode.md`](docs/live-mode.md#live-tables-issue-34) for the limits
+and the manual runbook.
+
+Issue #154: every OTHER mutating tool — `apply_style`,
+`insert_image`,
 `replace_range_markdown`, `replace_body_markdown`, `append_markdown`,
 `accept_tracked_changes`, `reject_tracked_changes` — has no `write_mode`
 parameter and always takes the file path, but now **refuses**

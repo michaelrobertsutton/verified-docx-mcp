@@ -521,6 +521,86 @@ class InsertTableTests(_TempFixtureCase):
         self.assertIn("<w:ins ", xml)
 
 
+class InsertTableStyleSourceAndFontSizeTests(_TempFixtureCase):
+    """Issue #34 parameter parity: style_from_table_id, style_builtin (live
+    only), font_size_pt."""
+
+    fixture_name = "tables.docx"
+
+    def _tbl(self, table_id: int):
+        with zipfile.ZipFile(self.target) as zf:
+            root = ET.fromstring(zf.read(projection.DEFAULT_PART))
+        return tables._find_table_element(root, table_id)
+
+    def _refused(self, code: ErrorCode, *args, **kwargs):
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(str(self.target), *args, **kwargs)
+        self.assertEqual(ctx.exception.envelope.error_code, code, ctx.exception.envelope.message)
+
+    def test_style_from_table_id_copies_the_tbl_style(self):
+        tables.execute_insert_table(str(self.target), [["a"]], "TableNormal")
+        evidence = tables.execute_insert_table(
+            str(self.target), [["b"]], None, style_from_table_id=2
+        )
+        self.assertEqual(evidence["table_id"], 3)
+        tblpr = next(c for c in self._tbl(3) if projection._ln(c) == "tblPr")
+        style = next(c for c in tblpr if projection._ln(c) == "tblStyle")
+        self.assertEqual(projection._attr(style, "val"), "TableNormal")
+
+    def test_style_from_table_id_without_a_style_or_table(self):
+        # the fixture's own table 1 has no w:tblStyle
+        self._refused(ErrorCode.STYLE_NOT_FOUND, [["x"]], None, style_from_table_id=1)
+        self._refused(ErrorCode.TABLE_NOT_FOUND, [["x"]], None, style_from_table_id=99)
+
+    def test_style_source_combinations(self):
+        self._refused(ErrorCode.INVALID_INPUT, [["x"]], "TableNormal", style_from_table_id=1)
+        self._refused(ErrorCode.INVALID_INPUT, [["x"]], None)  # neither
+        self._refused(ErrorCode.INVALID_INPUT, [["x"]], None, style_builtin="GridTable4_Accent1")
+        self._refused(ErrorCode.INVALID_INPUT, [["x"]], "TableNormal", style_builtin="GridTable4_Accent1")
+
+    def test_font_size_half_points_rounding(self):
+        for pt, expected in [(10, 20), (10.5, 21), (10.25, 21), (10.2, 20), (9, 18), (0.1, 1)]:
+            self.assertEqual(tables._font_size_half_points(pt), expected, pt)
+        self.assertIsNone(tables._font_size_half_points(None))
+        for bad in (0, -1, float("nan"), float("inf"), True, "10"):
+            with self.subTest(bad), self.assertRaises(VerifyError) as ctx:
+                tables._font_size_half_points(bad)
+            self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    def test_font_size_pt_writes_sz_on_every_run_in_schema_order(self):
+        tables.execute_insert_table(
+            str(self.target),
+            [[{"markdown": "**Head**", "bold": True, "color": "FF0000"}, "plain"]],
+            "TableNormal",
+            font_size_pt=10.5,
+        )
+        runs = [r for r in self._tbl(2).iter() if projection._ln(r) == "r"]
+        self.assertTrue(runs)
+        for run in runs:
+            rpr = next(c for c in run if projection._ln(c) == "rPr")
+            tags = [projection._ln(c) for c in rpr]
+            self.assertIn("sz", tags)
+            self.assertIn("szCs", tags)
+            self.assertEqual([projection._attr(c, "val") for c in rpr if projection._ln(c) in ("sz", "szCs")], ["21", "21"])
+            # CT_RPr order: b, bCs ... color ... sz, szCs
+            self.assertLess(tags.index("sz"), tags.index("szCs"))
+            if "color" in tags:
+                self.assertLess(tags.index("color"), tags.index("sz"))
+            if "b" in tags:
+                self.assertLess(tags.index("b"), tags.index("bCs"))
+                self.assertLess(tags.index("bCs"), tags.index("sz"))
+
+    def test_no_font_size_leaves_runs_alone(self):
+        tables.execute_insert_table(str(self.target), [["a"]], "TableNormal")
+        for el in self._tbl(2).iter():
+            self.assertNotIn(projection._ln(el), ("sz", "szCs"))
+
+    def test_invalid_font_size_is_refused_before_writing(self):
+        before = self.target.read_bytes()
+        self._refused(ErrorCode.INVALID_INPUT, [["x"]], "TableNormal", font_size_pt=-3)
+        self.assertEqual(self.target.read_bytes(), before)
+
+
 # ---------------------------------------------------------------------------
 # issue #100: insert_table structured cell objects (gridSpan/vMerge/shading/
 # header rows/placement anchor). Group numbers below match the issue's

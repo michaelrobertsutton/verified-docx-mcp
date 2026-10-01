@@ -2276,9 +2276,23 @@ def list_tables(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any
 
 
 @mcp.tool()
-def get_table(path: str, table_id: int, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+def get_table(
+    path: str, table_id: int, part: str = projection.DEFAULT_PART, source: str = "auto"
+) -> dict[str, Any]:
     """Full row/cell detail for one table, addressed by the table_id
     list_tables reports.
+
+    `source` (issue #34, "auto" | "file" | "live", default "auto"): "auto"
+    reads the open document through the Live pane when one is connected for
+    this document, else the file. A live read is the only way to see a table
+    a co-author just added (the saved file lags). LIVE READS DIFFER: the main
+    document body only (a non-default `part` is INVALID_INPUT with
+    source="live", and "auto" falls back to the file); `text` is Word's plain
+    text, not markdown; per-cell grid_span/v_merge are not available (every
+    cell reports grid_span 1 / v_merge "none"), so use the table-level
+    has_merged_cells flag; a document containing a nested table is refused;
+    the pane must report "table_edit" (LIVE_CAPABILITY_MISSING otherwise).
+    The result adds source ("live"), style and header_row_count.
 
     Returns path, part, table_id, row_count, col_count, has_merged_cells,
     has_nested_table, rows (list of list of {row_index, cell_index,
@@ -2297,9 +2311,10 @@ def get_table(path: str, table_id: int, part: str = projection.DEFAULT_PART) -> 
       PART_NOT_FOUND  - part names a package part absent from this .docx
       TABLE_NOT_FOUND - table_id does not match any table (call list_tables)
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
+      LIVE_UNAVAILABLE / LIVE_CAPABILITY_MISSING / LIVE_DISCONNECTED / LIVE_OP_FAILED - source="live"
     """
     try:
-        return tables.execute_get_table(path, table_id, part)
+        return tables.execute_get_table(path, table_id, part, source=source)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -2314,10 +2329,27 @@ def replace_table_row(
     force: bool = False,
     track_changes: bool = False,
     allow_concurrent_editor: bool = False,
+    write_mode: str = "auto",
 ) -> dict[str, Any]:
     """Replace one table row's cell content wholesale, one markdown string
     per cell (cells must have exactly as many entries as the row has
     cells).
+
+    `write_mode` (issue #34, "auto" | "file" | "live", default "auto"):
+    "auto" routes through the Live pane when one is connected, else writes
+    the file -- the supported way to edit a table in a document a co-author
+    has open. LIVE MODE IS A SUBSET: cells are paragraphs with bold/italic/
+    links only; a table with a merged cell is refused
+    (MERGED_OR_NESTED_TABLE, as in file mode); `force` does not apply;
+    before/after are plain text, not markdown; revision_before/
+    revision_after are "live:sha256:<hex>" body hashes; the pane must report
+    "table_edit". The row is written as ONE Word batch, guarded by a
+    body-hash check and a re-read of every cell just before the write, then
+    verified by re-reading the table -- but Word batches are not
+    transactions, so under heavy co-authoring a cell edited in the last
+    instant can still be overwritten. A write that lands and then fails its
+    read-back is recorded in the audit log before VERIFICATION_FAILED is
+    raised.
 
     Refuses -- for the WHOLE table, not just this row -- the moment
     table_id names a table containing a merged cell (w:gridSpan != 1 or a
@@ -2349,7 +2381,12 @@ def replace_table_row(
       MERGED_OR_NESTED_TABLE  - this table has a merged/nested-table cell; use replace_cell_markdown
       COMMENT_ANCHORS_IN_RANGE / TRACKED_CHANGES_PRESENT - a hazard in the row; force=True to proceed
       OPC_INVALID             - the rendered .docx failed OPC validation
-      VERIFICATION_FAILED     - post-write verification failed; rolled back
+      VERIFICATION_FAILED     - post-write verification failed; rolled back (file mode), or the
+                                pane's read-back did not confirm the edit (live mode; audit-logged)
+      LIVE_UNAVAILABLE / LIVE_SESSION_ACTIVE / LIVE_SESSION_MISMATCH / LIVE_DISCONNECTED /
+      LIVE_STALE / LIVE_CAPABILITY_MISSING / LIVE_OP_FAILED - as replace_text (issue #154);
+                                LIVE_OP_FAILED here also covers a cell edited between the read and
+                                the write, and a document with nested tables
     """
     try:
         return tables.execute_replace_table_row(
@@ -2361,6 +2398,7 @@ def replace_table_row(
             force=force,
             track_changes=track_changes,
             allow_concurrent_editor=allow_concurrent_editor,
+            write_mode=write_mode,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -2449,7 +2487,7 @@ def replace_cell_markdown(
 def insert_table(
     path: str,
     rows: list[list[str | dict[str, Any]]],
-    style_id: str,
+    style_id: str | None = None,
     header_rows: int = 0,
     grid_dxa: list[int] | None = None,
     cant_split: bool = False,
@@ -2458,9 +2496,53 @@ def insert_table(
     force: bool = False,
     track_changes: bool = False,
     allow_concurrent_editor: bool = False,
+    write_mode: str = "auto",
+    style_from_table_id: int | None = None,
+    style_builtin: str | None = None,
+    font_size_pt: float | None = None,
 ) -> dict[str, Any]:
     """Insert a new table, one markdown string OR cell-spec object per
     cell (issue #100: https://github.com/michaelrobertsutton/JennyStack/issues/100).
+
+    `write_mode` (issue #34, "auto" | "file" | "live", default "auto"):
+    "auto" routes through the Live pane when one is connected for this
+    document, else writes the file. This is the supported way to add a table
+    to a document a co-author has open: a file write races that editor's
+    autosave. LIVE MODE IS A SUBSET:
+      - cells are paragraphs with bold/italic/links only (lists, headings,
+        nested tables -> INVALID_INPUT, nothing sent); the cell-spec keys
+        fill/color/bold/align/valign work, but span and v_merge (merged cells)
+        and cant_split are INVALID_INPUT;
+      - the anchor is {"paragraph_text": <exact text of one top-level
+        paragraph>, "position": "after"|"before" (default "after")} or
+        {"after_table_id": <int>}, or omitted to append at the end of the
+        body. section_key / after_paragraph_text anchors are file-mode only
+        (they come from the saved file, which lags a co-authored document).
+        0 matching paragraphs -> ZERO_MATCH, more than 1 ->
+        MATCH_COUNT_MISMATCH;
+      - the style is chosen BEFORE anything is inserted (STYLE_NOT_FOUND
+        leaves the document untouched): style_id is treated as a Word table
+        style NAME (e.g. "Grid Table 4 - Accent 1"; it must already be used
+        by a table in the document, or named in Word's style list on WordApi
+        1.5+), style_from_table_id copies an existing table's style, and
+        style_builtin takes a Word built-in style name (e.g.
+        "GridTable4_Accent1"; live only). All three are optional in live
+        mode; omit them for Word's default table look;
+      - the new table's table_id is read back from Word (list_tables numbers
+        the saved file, which lags);
+      - grid_dxa becomes column widths in points; font_size_pt sets the table
+        font size;
+      - `force` does not apply; revision_before/revision_after are
+        "live:sha256:<hex>" body hashes; before is "", after is the table's
+        plain text; the pane must report "table_edit"
+        (LIVE_CAPABILITY_MISSING otherwise -- reload the pane);
+      - the pane refuses (LIVE_STALE) if the document changed since the
+        body hash was read, BEFORE inserting anything.
+    Every requested property (text, fill, color, bold, alignment, widths,
+    font size, header rows, style) is re-read from Word and compared; a table
+    that lands but fails that check is recorded in the audit log and raised as
+    VERIFICATION_FAILED (there is nothing to roll back in live mode -- the
+    table stays in the document for you to fix or delete).
 
     rows is a list of rows, each a list of cells. A plain string cell
     means {"markdown": that string} -- today's exact behavior: short rows
@@ -2487,11 +2569,17 @@ def insert_table(
     cell -- put content emphasis in the markdown itself (**bold**) and
     reserve bold/color/align for header/title rows you will not re-edit.
 
-    style_id is REQUIRED and must name an existing w:type="table" style in
-    this document's styles.xml (list_styles reports style type) -- unlike
+    File mode: style_id (or style_from_table_id, which copies another
+    table's w:tblStyle -- STYLE_NOT_FOUND if that table has none) is
+    REQUIRED, and must name an existing w:type="table" style in this
+    document's styles.xml (list_styles reports style type) -- unlike
     GoogleDocs-MCP's insert_table, which relies on the Docs API's own
     default table style, raw OOXML has no sensible default to fall back
-    to.
+    to. style_builtin is live only (INVALID_INPUT in file mode).
+    font_size_pt (either mode) sets every run's size: w:sz/w:szCs in
+    half-points, the point size doubled and rounded half up; like
+    bold/color/align it lives on the runs and is replaced by the next
+    replace_cell_markdown on that cell.
 
     header_rows (default 0) sets w:tblHeader (repeating header row(s)) on
     the first N rows; must be < len(rows). grid_dxa (default None) gives
@@ -2555,7 +2643,11 @@ def insert_table(
       ZERO_MATCH / MATCH_COUNT_MISMATCH - anchor.after_paragraph_text matched
                              0 or >1 top-level paragraphs in the section
       OPC_INVALID         - the rendered .docx failed OPC validation
-      VERIFICATION_FAILED - post-write verification failed; rolled back
+      VERIFICATION_FAILED - post-write verification failed; rolled back (file mode), or the
+                             pane's read-back did not confirm the table (live mode; audit-logged)
+      LIVE_UNAVAILABLE / LIVE_SESSION_ACTIVE / LIVE_SESSION_MISMATCH / LIVE_DISCONNECTED /
+      LIVE_STALE / LIVE_CAPABILITY_MISSING / LIVE_OP_FAILED - as replace_text (issue #154);
+                             LIVE_OP_FAILED here also covers a document with nested tables
     """
     try:
         return tables.execute_insert_table(
@@ -2570,6 +2662,10 @@ def insert_table(
             force=force,
             track_changes=track_changes,
             allow_concurrent_editor=allow_concurrent_editor,
+            write_mode=write_mode,
+            style_from_table_id=style_from_table_id,
+            style_builtin=style_builtin,
+            font_size_pt=font_size_pt,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
