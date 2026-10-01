@@ -46,6 +46,15 @@ class OpCommentsListTests(unittest.TestCase):
         self.assertEqual(self.out["filteredIds"], ["c7", "c9"])
         self.assertEqual(self.out["filteredGetRange"], 2)
 
+    def test_counts_reflect_whole_collection_even_when_ids_filter_applies(self):
+        # makeDoc resolves every even-indexed comment: 150 total, 75 open.
+        self.assertEqual(self.out["bigCounts"], {"total": 150, "open": 75})
+        self.assertEqual(self.out["filteredCounts"], {"total": 150, "open": 75})
+
+    def test_scope_and_observed_at_reported(self):
+        self.assertEqual(self.out["scope"], "body")
+        self.assertTrue(self.out["hasObservedAt"])
+
     def test_include_anchor_false_skips_get_range(self):
         self.assertEqual(self.out["noAnchorGetRange"], 0)
         self.assertFalse(self.out["noAnchorHasAnchorText"])

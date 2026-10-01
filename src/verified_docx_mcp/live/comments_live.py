@@ -245,6 +245,13 @@ STALE_PANE_NOTE = (
 )
 
 
+STALE_PANE_NOTE_COUNTS = (
+    "the connected pane did not report the 'comment_counts' capability, so counts were computed from the "
+    "comments it returned and cannot show a gap. It is running an older taskpane.js: close and reopen the "
+    "Live pane in Word."
+)
+
+
 def _comments_for_handle(session: LiveSession, live_handle: str, *, include_anchor: bool) -> tuple[list[dict[str, Any]], bool]:
     """(comments, targeted). Ask the pane for just *live_handle* when it
     reports ``comments_by_id``; an older pane gets the full list (and
@@ -489,12 +496,84 @@ def _live_state(path: str, session: LiveSession) -> tuple[list[dict[str, Any]], 
     than raising here; a caller can still address any comment by its
     ``live:<id>`` handle directly (from this same call's own
     ``raw_comments``), which needs no file-side correlation at all."""
+    raw_comments, correlation, _result, _file_result = _live_state_full(path, session)
+    return raw_comments, correlation
+
+
+def _validated_pane_comments(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """The pane's ``comments`` list, refusing a malformed reply (issue #39):
+    a missing/non-list ``comments`` used to become ``[]``, which a caller
+    reads as "the document has no comments". A ``counts.open`` that disagrees
+    with the comments the pane returned is refused for the same reason."""
+    from ..errors import ErrorCode
+
+    comments = result.get("comments")
+    if not isinstance(comments, list):
+        raise _make_error(
+            ErrorCode.LIVE_OP_FAILED,
+            "the pane's comments_list reply had no 'comments' list; refusing to report an empty result",
+            {"reply_keys": sorted(result)},
+        )
+    counts = result.get("counts")
+    if isinstance(counts, dict):
+        open_returned = sum(1 for c in comments if not c.get("resolved", False))
+        if counts.get("total") != len(comments) or counts.get("open") != open_returned:
+            raise _make_error(
+                ErrorCode.LIVE_OP_FAILED,
+                f"the pane's comments_list counts {counts!r} disagree with the {len(comments)} comment(s) "
+                f"it returned ({open_returned} open)",
+                {"counts": counts, "returned_total": len(comments), "returned_open": open_returned},
+            )
+    return comments
+
+
+def _live_state_full(path: str, session: LiveSession):
+    """(raw_comments, correlation, pane_result, file_result): ``_live_state``
+    plus the pane's whole reply (counts/scope/observed_at) and the ONE read
+    of the local file this call makes (issue #39: it used to be read twice,
+    so the correlation and ``pending_suggestions`` could come from different
+    snapshots)."""
     result = _request(session, "comments_list")
-    raw_comments = result.get("comments") or []
+    raw_comments = _validated_pane_comments(result)
     file_result = _file_comments_and_suggestions(path)
     file_comments = file_result[0] if file_result is not None else []
     correlation = correlate_comments(raw_comments, file_comments)
-    return raw_comments, correlation
+    return raw_comments, correlation, result, file_result
+
+
+def _file_only_open_comments(
+    raw_comments: list[dict[str, Any]],
+    file_comments: list[dict[str, Any]],
+    correlation: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Open comments in the saved file that no live comment correlates with
+    -- ADVISORY only (issue #39). The file may be older than the live
+    document, ``correlate_comments`` accepts content-only matches, and file
+    mode lists a reply as its own comment, so a live reply's content is
+    treated as accounted for too. A hit means "the saved file has an open
+    comment the pane did not report", not "the pane is wrong"."""
+    matched = {e["comment_id"] for e in correlation if e["comment_id"]}
+    reply_contents = {
+        _normalize_content(r.get("content")) for c in raw_comments for r in (c.get("replies") or [])
+    }
+    out = []
+    for f in file_comments:
+        if f.get("resolved"):
+            continue
+        if f.get("comment_id") in matched:
+            continue
+        if _normalize_content(f.get("content")) in reply_contents:
+            continue
+        out.append(
+            {
+                "comment_id": f.get("comment_id"),
+                "content": f.get("content", ""),
+                "quoted_text": f.get("quoted_text", ""),
+                "author": f.get("author"),
+                "created_time": f.get("created_time"),
+            }
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -505,8 +584,7 @@ def _live_state(path: str, session: LiveSession) -> tuple[list[dict[str, Any]], 
 def execute_list_open_items_live(path: str) -> dict[str, Any]:
     resolved, _name = _document_name_and_path(path)
     session = _session_for(path)
-    raw_comments, correlation = _live_state(path, session)
-    file_result = _file_comments_and_suggestions(path)
+    raw_comments, correlation, pane_result, file_result = _live_state_full(path, session)
     # Issue #22 B3: pending_suggestions is None (never []) when there is
     # no local file to read w:ins/w:del from -- e.g. a SharePoint/
     # OneDrive document with no local sync. [] would silently claim
@@ -522,14 +600,78 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
     open_raw = [c for c in raw_comments if not c.get("resolved", False)]
     open_ids = {f"{_LIVE_HANDLE_PREFIX}{c.get('id')}" for c in open_raw}
 
-    return {
+    # Issue #39: the new fields come FIRST so a client that clips the tail of
+    # a long response still shows them. `counts` is the pane's own count of
+    # its whole collection; a pane that predates `comment_counts` reports
+    # none, so they are computed here from what it returned.
+    pane_counts = pane_result.get("counts")
+    older_pane = not isinstance(pane_counts, dict)
+    live_total = len(raw_comments) if older_pane else pane_counts["total"]
+    live_open = len(open_raw) if older_pane else pane_counts["open"]
+    warnings: list[dict[str, Any]] = []
+
+    scope = pane_result.get("scope") or "body"
+    if scope == "body":
+        warnings.append(
+            {
+                "code": "scope_body_only",
+                "message": "only comments in the main document body are visible to the pane; comments "
+                "anchored in headers, footers or text boxes are not listed",
+            }
+        )
+
+    # A second pane on this same document displaced another (or this one
+    # displaced it): the two can disagree about the document.
+    registry = _registry()
+    for collision in getattr(registry, "collisions", lambda: [])():
+        if (
+            collision.get("kind") == "same_document_duplicate"
+            and collision.get("document_name") == session.document_name
+            and collision.get("new_instance_id") == session.hello.instance_id
+        ):
+            warnings.append(
+                {
+                    "code": "same_document_duplicate",
+                    "message": "another pane for this document was connected when this pane connected "
+                    f"({collision.get('displaced_platform')}); the two can report different comments",
+                    "displaced_instance_id": collision.get("displaced_instance_id"),
+                }
+            )
+            break
+
+    file_only: list[dict[str, Any]] | None = None
+    if file_result is not None:
+        file_only = _file_only_open_comments(raw_comments, file_result[0], correlation)
+        if file_only:
+            warnings.append(
+                {
+                    "code": "file_has_unlisted_comments",
+                    "message": f"{len(file_only)} open comment(s) in the saved file were not matched to a live "
+                    "comment (advisory: the file may be older than the live document)",
+                }
+            )
+
+    result: dict[str, Any] = {
+        "counts": {"live_total": live_total, "live_open": live_open, "returned": len(open_raw)},
+        "scope": scope,
+        "pane": {
+            "instance_id": session.hello.instance_id,
+            "platform": session.hello.platform,
+            "host": session.hello.host,
+            "observed_at": pane_result.get("observed_at"),
+        },
+        "warnings": warnings,
         "path": str(resolved),
         "source": "live",
         "comments": [_live_comment_record(c) for c in open_raw],
         "pending_suggestions": suggestions,
         "file_side_available": file_result is not None,
+        "file_only_open_comments": file_only,
         "correlation": [entry for entry in correlation if entry["live_comment_id"] in open_ids],
     }
+    if older_pane:
+        result["pane_note"] = STALE_PANE_NOTE_COUNTS
+    return result
 
 
 def execute_list_open_items(path: str, source: str = "auto") -> dict[str, Any]:

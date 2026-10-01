@@ -256,6 +256,72 @@ class ListOpenItemsLiveCorrelationTests(LiveCommentsTestCase):
         for entry in result["correlation"]:
             self.assertIs(entry["w_id_stable"], False)
 
+    # -- issue #39: counts / scope / pane identity / warnings ---------------
+
+    async def test_counts_scope_and_pane_identity_come_first(self):
+        doc = self._fixture_comments()
+        doc.comments[1].resolved = True
+        await self.connect_pane(document=doc, instance_id="pane-A", platform="Mac")
+
+        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        self.assertEqual(list(result)[:4], ["counts", "scope", "pane", "warnings"])
+        self.assertEqual(result["counts"], {"live_total": 2, "live_open": 1, "returned": 1})
+        self.assertEqual(result["scope"], "body")
+        self.assertEqual(result["pane"]["instance_id"], "pane-A")
+        self.assertEqual(result["pane"]["platform"], "Mac")
+        self.assertEqual(result["pane"]["observed_at"], "2026-10-01T12:00:00.000Z")
+        self.assertIn("scope_body_only", [w["code"] for w in result["warnings"]])
+        self.assertNotIn("pane_note", result)
+
+    async def test_older_pane_without_counts_gets_computed_counts_and_note(self):
+        doc = self._fixture_comments()
+        pane = await self.connect_pane(document=doc, capabilities=[])
+        pane.comments_list_transform = lambda r: {"comments": r["comments"]}
+
+        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        self.assertEqual(result["counts"], {"live_total": 2, "live_open": 2, "returned": 2})
+        self.assertEqual(result["pane_note"], comments_live.STALE_PANE_NOTE_COUNTS)
+
+    async def test_missing_comments_list_is_refused_not_reported_empty(self):
+        pane = await self.connect_pane(document=self._fixture_comments())
+        pane.comments_list_transform = lambda r: {"counts": r["counts"]}
+
+        with self.assertRaises(VerifyError) as cm:
+            await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.LIVE_OP_FAILED)
+
+    async def test_counts_that_disagree_with_returned_comments_are_refused(self):
+        pane = await self.connect_pane(document=self._fixture_comments())
+        pane.comments_list_transform = lambda r: {**r, "counts": {"total": 7, "open": 7}}
+
+        with self.assertRaises(VerifyError) as cm:
+            await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.LIVE_OP_FAILED)
+
+    async def test_file_open_comment_missing_from_pane_is_advisory_warning(self):
+        # The pane reports only the single-paragraph comment; the saved
+        # file's multi-paragraph root comment has no live counterpart.
+        doc = self._fixture_comments()
+        doc.comments = [doc.comments[1]]
+        await self.connect_pane(document=doc)
+
+        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        self.assertIn("file_has_unlisted_comments", [w["code"] for w in result["warnings"]])
+        self.assertEqual(
+            [c["comment_id"] for c in result["file_only_open_comments"]], [ROOT_DURABLE_ID]
+        )
+
+    async def test_second_pane_on_same_document_warns(self):
+        doc = self._fixture_comments()
+        await self.connect_pane(document=doc, instance_id="pane-old", platform="Mac")
+        await self.connect_pane(document=doc, instance_id="pane-new", platform="OfficeOnline")
+
+        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        self.assertEqual(result["pane"]["instance_id"], "pane-new")
+        dup = [w for w in result["warnings"] if w["code"] == "same_document_duplicate"]
+        self.assertEqual(len(dup), 1)
+        self.assertEqual(dup[0]["displaced_instance_id"], "pane-old")
+
 
 # ---------------------------------------------------------------------------
 # add_anchored_comment(write_mode="live")

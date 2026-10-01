@@ -377,17 +377,26 @@ class SessionRegistry:
     def register(self, session: LiveSession) -> None:
         with self._lock:
             existing = self._sessions.get(session.document_name)
-            if existing is not None and existing.document_url != session.document_url:
+            if existing is not None and existing is not session:
+                same_document = existing.document_url == session.document_url
                 # A DIFFERENT document under the same basename -- see this
-                # class's own docstring. Recorded, not refused: the new
-                # session still takes over routing for this name (the
+                # class's own docstring -- or (issue #39) a second pane on
+                # the SAME document while the first is still registered
+                # (Word Online + desktop, two windows, a reloaded pane whose
+                # old socket has not closed yet). Recorded, not refused: the
+                # new session still takes over routing for this name (the
                 # existing behavior a caller may already depend on), but
                 # now there is somewhere to see it happened.
                 self._collisions.append(
                     {
+                        "kind": "same_document_duplicate" if same_document else "basename_collision",
                         "document_name": session.document_name,
                         "displaced_document_url": existing.document_url,
                         "new_document_url": session.document_url,
+                        "displaced_instance_id": existing.hello.instance_id,
+                        "new_instance_id": session.hello.instance_id,
+                        "displaced_platform": existing.hello.platform,
+                        "new_platform": session.hello.platform,
                         "at": time.time(),
                     }
                 )
@@ -402,9 +411,13 @@ class SessionRegistry:
         with self._lock:
             return list(self._collisions)
 
-    def unregister(self, document_name: str) -> None:
+    def unregister(self, session: LiveSession) -> None:
+        """Remove *session* only if it is still the registered one for its
+        name (issue #39): a closing OLD pane must not unregister a newer
+        pane that took over the same name."""
         with self._lock:
-            self._sessions.pop(document_name, None)
+            if self._sessions.get(session.document_name) is session:
+                del self._sessions[session.document_name]
 
     def get(self, document_name: str) -> LiveSession | None:
         with self._lock:
@@ -416,11 +429,11 @@ class SessionRegistry:
             self._evict_stale_locked()
             return list(self._sessions.values())
 
-    def touch_heartbeat(self, document_name: str, body_sha256: str | None = None) -> None:
+    def touch_heartbeat(self, session: LiveSession, body_sha256: str | None = None) -> None:
+        """Refresh *session* only (issue #39): a displaced pane's heartbeat
+        must not keep the newer session registered under its name alive."""
         with self._lock:
-            session = self._sessions.get(document_name)
-            if session is not None:
-                session.touch_heartbeat(body_sha256)
+            session.touch_heartbeat(body_sha256)
 
     def _evict_stale_locked(self) -> None:
         """Drop sessions that missed ``missed_heartbeats`` heartbeats at

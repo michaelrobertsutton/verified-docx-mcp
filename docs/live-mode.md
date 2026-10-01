@@ -818,11 +818,63 @@ re-listed every comment to verify). What changed:
   without the capability gets the old full listing, and the evidence
   carries a `pane_note` saying to reopen the pane.
 - **No pane caching.** The bridge sends `Cache-Control: no-store` on every
-  response and `taskpane.html` loads `taskpane.js?v=31`, so closing and
+  response and `taskpane.html` loads `taskpane.js?v=39`, so closing and
   reopening the pane picks up an edited `addin/*.js`. If a pane still
   behaves like an old build, check `live_status` for `comments_by_id` in its
   capabilities; bump the `?v=` value in `taskpane.html` when you change
   `taskpane.js` and suspect a cached copy.
+
+### "The pane shows a comment the tool doesn't list" (issue #39)
+
+`list_open_items(source="live")` returned 22 open comments while the pane's
+"Open comments" counter said 27. The cause is **not established** (candidates
+below), so the tool now makes a gap visible instead of guessing:
+
+- **Fields.** The live response leads with `counts` (`live_total`,
+  `live_open`, `returned`), `scope`, `pane` (`instance_id`, `platform`,
+  `host`, `observed_at`) and `warnings`. `comments_list` reports `counts`,
+  `scope` and `observed_at` itself (capability `"comment_counts"`); `counts`
+  always describe the whole collection, even for an `ids`-filtered call.
+- **Advisory only.** A stale Office.js collection still reports matching
+  counts, so nothing here proves completeness. Agents must say a comment is
+  "not visible to the pane", never "does not exist".
+- **Warnings.** `scope_body_only` (the pane reads `body.getComments()`, so
+  comments anchored in headers, footers or text boxes, issue #35, are not
+  seen); `same_document_duplicate` (a second pane for this document was
+  connected when this one connected: Word Online + desktop, two windows, or a
+  reloaded pane whose old socket had not closed); `file_has_unlisted_comments`
+  (the saved file has open comments no live comment matched, listed in
+  `file_only_open_comments`; the file may simply be older than the live
+  document, and a file-mode reply counts as its own comment, so replies whose
+  text matches a live reply are skipped).
+- **Malformed replies refuse.** A pane reply with no `comments` list, or
+  `counts` that disagree with the comments returned, raises `LIVE_OP_FAILED`
+  instead of reporting an empty result.
+- **The pane counter** now refreshes on every full `comments_list` and shows
+  "(as of HH:MM:SS)"; before, it was set once at pane load and never again,
+  so it could not be compared with a later tool call.
+- **Registry fixes.** A heartbeat or socket close now affects only the pane
+  that sent it. Before, a displaced pane's heartbeats kept the newer session
+  registered and its close unregistered the newer one. A same-document
+  overlap is logged in `live_status`'s `session_collisions` as
+  `kind: "same_document_duplicate"` (a different document with the same
+  basename is `kind: "basename_collision"`); routing is unchanged (the most
+  recent `hello` wins). `live_status` sessions carry `instance_id` and
+  `platform`.
+
+**Triage when the user sees a comment the tool doesn't list:**
+1. Compare `pane.instance_id`/`platform`/`observed_at` with the pane the user
+   is looking at; check `warnings` and `live_status.session_collisions`.
+2. Check where the missing comments are anchored (body text, a table, a text
+   box, a header). Outside the body means `scope_body_only` explains it.
+3. Close and reopen the pane, then list again. If the count changes, the
+   earlier read was stale.
+4. Compare ids against Word's own list (AppleScript `Word comments of
+   document`) to separate staleness from scope from routing.
+
+Not done: reading comments document-wide. Word's document-level comment
+collection may need `WordApiDesktop 1.4`; that member and requirement set are
+unverified here, so `scope` stays `"body"` until they are checked.
 
 ## What could block this, and the fix
 
