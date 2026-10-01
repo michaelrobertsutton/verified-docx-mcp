@@ -50,7 +50,12 @@ Tools implemented so far:
   **`list_styles(path)`** — read a `.docx` part as markdown/text/runs,
   and enumerate its heading-delimited sections, page-layout sections, and
   styles. Never refuse on a locked file (a validated snapshot is read
-  instead).
+  instead). `read_document`, `find_sections`, `list_tables` and
+  `get_table` also take `source="auto"|"file"|"live"` (issue #33): they
+  read the body a connected Word pane holds, and every response says
+  which `source` it came from. A file read while a pane session exists
+  for that file name carries a `live_session_ignored` warning. See "Live
+  reads" under [Live mode](#live-mode).
 - **`replace_body_markdown(path, markdown, ...)`**,
   **`replace_range_markdown(path, section_key, markdown, ...)`**,
   **`append_markdown(path, markdown, ...)`** — markdown -> OOXML writes,
@@ -385,8 +390,16 @@ same-named local stand-in file first. When there's genuinely no local
 file, `list_open_items(source="live")`'s `pending_suggestions` is `null`
 (never `[]`, which would look like "nothing pending") and it carries
 `file_side_available: false`; `live_save`'s `file_revision` is `null`.
-`read_document`/`list_parts`/`find_sections`/etc. remain file-only — this
-does not add a live read path for the structural read tools.
+Issue #33: `read_document`, `find_sections`, `list_tables` and `get_table`
+take `source="auto"|"file"|"live"` and can read the live body (body part
+only; `list_parts` and the other structural read tools stay file-only, and
+warn with `live_session_ignored` when a pane session exists). `auto`
+reads live when a pane that reports the `body_ooxml` capability is
+connected, and falls back to the file, with a warning saying why, when it
+can't be sure the pane holds this document. A live read never falls back
+to the file after it fails. In a live read `revision` is
+`live:sha256:<body hash>`; images are not included. Details:
+[docs/live-mode.md](docs/live-mode.md#live-reads-issue-33).
 
 Issue #27: `replace_cell_markdown` also takes `write_mode` — a live edit is
 compare-and-set against the cell's current text and read back

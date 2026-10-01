@@ -44,7 +44,17 @@ pane must honor.
                      result: ``DescribeResult`` (documentUrl, bodySha256,
                      changeTrackingMode, saved).
 
-  search          -- ``SearchPayload`` (find, matchCase, matchWholeWord).
+  body_ooxml      -- no payload (issue #33; capability ``body_ooxml``).
+                     Word calls: ``body.getOoxml()``, ``body.load("text")``.
+                     Reply result: ``{ooxml, bodySha256, documentUrl,
+                     strippedParts}`` -- ``ooxml`` is the Flat OPC
+                     ``pkg:package`` string with every ``pkg:binaryData``
+                     payload emptied (``strippedParts`` names them);
+                     ``bodySha256`` is computed exactly as ``describe``'s.
+                     Refuses with ``OP_ERROR_TOO_LARGE`` when the reply
+                     would exceed the pane's size limit.
+
+  search        -- ``SearchPayload`` (find, matchCase, matchWholeWord).
                      Word calls: ``body.search(find, {matchCase,
                      matchWholeWord})``, ``.load(["text"])`` on each
                      returned range, plus enough of the surrounding
@@ -196,6 +206,7 @@ VALID_OPS: frozenset[str] = frozenset(
     {
         "ping",
         "describe",
+        "body_ooxml",
         "search",
         "replace",
         "format",
@@ -220,6 +231,10 @@ VALID_OPS: frozenset[str] = frozenset(
 # WPs' branches so the two additions merge without conflict.
 OP_ERROR_ZERO_MATCH = "zero_match"
 OP_ERROR_MATCH_COUNT_MISMATCH = "match_count_mismatch"
+
+# `body_ooxml` refusal (issue #33): the document is too large to ship as one
+# websocket frame even with binaries stripped. Same lowercase convention.
+OP_ERROR_TOO_LARGE = "too_large"
 
 
 def _require(obj: dict[str, Any], key: str, expected_type: type | tuple[type, ...]) -> Any:

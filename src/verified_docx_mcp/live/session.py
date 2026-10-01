@@ -42,7 +42,7 @@ DEFAULT_REQUEST_TIMEOUT = 15.0
 
 # Read ops that walk every comment get more headroom than writes (issue #31:
 # ~100 comments on a co-authored SharePoint doc blew the 15 s default).
-OP_TIMEOUTS: dict[str, float] = {"comments_list": 60.0}
+OP_TIMEOUTS: dict[str, float] = {"comments_list": 60.0, "body_ooxml": 60.0}
 
 TIMEOUT_ENV = "VERIFIED_DOCX_LIVE_TIMEOUT_S"
 

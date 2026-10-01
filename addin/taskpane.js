@@ -223,7 +223,16 @@ const OP_LOG_LIMIT = 20;
 // edits). Reported only by builds that implement them, so a server never
 // sends cell_set to a pane that would answer "unknown op".
 // issue #31: "comments_by_id" = comments_list accepts `ids` / `include_anchor`.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id"];
+// issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
+// find_sections / list_tables / get_table).
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "body_ooxml"];
+
+// issue #33: the largest body_ooxml reply (UTF-8 bytes of its JSON) the pane
+// will send. Kept below the bridge's 64 MiB websocket max_size so an
+// oversized document gets an explicit `too_large` refusal instead of a frame
+// the bridge rejects by dropping the whole socket.
+const MAX_BODY_OOXML_BYTES = 48 * 1024 * 1024;
+const FLAT_OPC_NS = "http://schemas.microsoft.com/office/2006/xmlPackage";
 
 let opsSocket = null;
 let heartbeatTimer = null;
@@ -452,6 +461,8 @@ async function dispatchOp(op, payload) {
       return opPing();
     case "describe":
       return opDescribe();
+    case "body_ooxml":
+      return opBodyOoxml();
     case "search":
       return opSearch(payload);
     case "replace":
@@ -502,6 +513,55 @@ async function opDescribe() {
       changeTrackingMode: String(context.document.changeTrackingMode),
       saved: context.document.saved,
     };
+  });
+}
+
+// -- body_ooxml (issue #33) ---------------------------------------------
+
+// Empty every pkg:binaryData payload (images and other binary parts) and
+// return {ooxml, strippedParts}. The server's projection needs a part's
+// name and relationships, never its bytes. Namespace-aware (the Flat OPC
+// namespace, not a literal "pkg:" prefix), so an alternate serialization
+// cannot slip a payload past it. Throws if the XML does not parse, so a
+// malformed export is an error rather than an unstripped multi-MiB reply.
+function stripBinaryParts(ooxml) {
+  const doc = new DOMParser().parseFromString(ooxml, "application/xml");
+  if (doc.getElementsByTagName("parsererror").length > 0) {
+    throw refusalError("getOoxml returned XML that did not parse");
+  }
+  const strippedParts = [];
+  const nodes = doc.getElementsByTagNameNS(FLAT_OPC_NS, "binaryData");
+  for (let i = 0; i < nodes.length; i += 1) {
+    const node = nodes[i];
+    const part = node.parentNode;
+    strippedParts.push(part && part.getAttributeNS(FLAT_OPC_NS, "name"));
+    node.textContent = "";
+  }
+  return { ooxml: new XMLSerializer().serializeToString(doc), strippedParts };
+}
+
+async function opBodyOoxml() {
+  return Word.run(async (context) => {
+    const body = context.document.body;
+    const ooxmlResult = body.getOoxml();
+    body.load("text");
+    await context.sync();
+    const hash = await sha256Hex(body.text || "");
+    const { ooxml, strippedParts } = stripBinaryParts(ooxmlResult.value);
+    const result = {
+      ooxml,
+      bodySha256: hash,
+      documentUrl: Office.context.document.url,
+      strippedParts,
+    };
+    const bytes = new TextEncoder().encode(JSON.stringify(result)).length;
+    if (bytes > MAX_BODY_OOXML_BYTES) {
+      throw refusalError(
+        `body OOXML is ${bytes} bytes after stripping binaries, over the ${MAX_BODY_OOXML_BYTES}-byte limit`,
+        "too_large"
+      );
+    }
+    return result;
   });
 }
 

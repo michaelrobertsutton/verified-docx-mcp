@@ -58,6 +58,7 @@ from xml.etree import ElementTree as ET
 from . import audit, locate, markdown_to_ooxml, mutations, paths, projection, tracked_changes
 from .author import resolve_author_name
 from .errors import ErrorCode, _make_error
+from .live import reads_live
 from .live import write_mode as live_write_mode
 from .live.session import LiveDisconnected, LiveOpFailed, LiveStale
 from .projection import DEFAULT_PART, W_NS, TableBoundaryEvent
@@ -224,16 +225,11 @@ def list_tables_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dic
     return tables
 
 
-def execute_list_tables(path: str, part: str = DEFAULT_PART) -> dict[str, Any]:
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    from . import server as _server
-
-    local_path, is_temp = _server._read_local_copy(resolved)
-    try:
-        return {"path": str(resolved), "part": part, "tables": list_tables_impl(local_path, part)}
-    finally:
-        if is_temp:
-            local_path.unlink(missing_ok=True)
+def execute_list_tables(path: str, part: str = DEFAULT_PART, source: str = "auto") -> dict[str, Any]:
+    with reads_live.read_source(path, source, part) as rs:
+        return rs.annotate(
+            {"path": str(rs.resolved), "part": part, "tables": list_tables_impl(rs.local_path, part)}
+        )
 
 
 def get_table_impl(docx_path: Path, table_id: int, part_name: str = DEFAULT_PART) -> dict[str, Any]:
@@ -280,17 +276,12 @@ def get_table_impl(docx_path: Path, table_id: int, part_name: str = DEFAULT_PART
     }
 
 
-def execute_get_table(path: str, table_id: int, part: str = DEFAULT_PART) -> dict[str, Any]:
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    from . import server as _server
-
-    local_path, is_temp = _server._read_local_copy(resolved)
-    try:
-        result = get_table_impl(local_path, table_id, part)
-        return {"path": str(resolved), "part": part, **result}
-    finally:
-        if is_temp:
-            local_path.unlink(missing_ok=True)
+def execute_get_table(
+    path: str, table_id: int, part: str = DEFAULT_PART, source: str = "auto"
+) -> dict[str, Any]:
+    with reads_live.read_source(path, source, part) as rs:
+        result = get_table_impl(rs.local_path, table_id, part)
+        return rs.annotate({"path": str(rs.resolved), "part": part, **result})
 
 
 # ---------------------------------------------------------------------------
