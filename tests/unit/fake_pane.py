@@ -380,7 +380,16 @@ class FakeDocument:
             if not include_anchor:
                 d.pop("anchorText", None)
             out.append(d)
-        return {"comments": out}
+        # issue #39: counts describe the WHOLE collection, never the ids subset.
+        return {
+            "comments": out,
+            "counts": {
+                "total": len(self.comments),
+                "open": sum(1 for c in self.comments if not c.resolved),
+            },
+            "scope": "body",
+            "observed_at": "2026-10-01T12:00:00.000Z",
+        }
 
     def comment_add(self, find: str, expected_matches: int, text: str) -> dict[str, Any]:
         pre = self.sha256()
@@ -455,7 +464,13 @@ class FakePane:
         requirement_sets: dict[str, Any] | None = None,
         heartbeat_interval: float = 5.0,
         capabilities: list[str] | None = None,
+        instance_id: str = "pane-test",
     ) -> None:
+        self.instance_id = instance_id
+        # issue #39: tests set this to rewrite/strip fields of the next
+        # comments_list reply (a pane predating comment_counts, a malformed
+        # reply, a counts mismatch).
+        self.comments_list_transform = None
         self.document = document if document is not None else FakeDocument()
         self.document_url = document_url
         self.host = host
@@ -467,7 +482,9 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "comments_by_id"] if capabilities is None else list(capabilities)
+            ["row_scope", "cell_edit", "comments_by_id", "comment_counts"]
+            if capabilities is None
+            else list(capabilities)
         )
         # Every comments_list payload received, in order (issue #31 tests
         # assert reply/resolve send an ids-filtered one).
@@ -493,6 +510,7 @@ class FakePane:
                     "requirementSets": self.requirement_sets,
                     "bodySha256": self.document.sha256(),
                     "capabilities": self.capabilities,
+                    "instanceId": self.instance_id,
                 }
             )
         )
@@ -584,7 +602,10 @@ class FakePane:
             )
         if op == "comments_list":
             self.comments_list_payloads.append(dict(payload))
-            return doc.comments_list(payload.get("ids"), payload.get("include_anchor", True))
+            reply = doc.comments_list(payload.get("ids"), payload.get("include_anchor", True))
+            if self.comments_list_transform is not None:
+                reply = self.comments_list_transform(reply)
+            return reply
         if op == "comment_add":
             return doc.comment_add(payload["find"], int(payload["expected_matches"]), payload["text"])
         if op == "comment_reply":
