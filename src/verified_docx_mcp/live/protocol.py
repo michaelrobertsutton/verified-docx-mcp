@@ -276,6 +276,9 @@ VALID_OPS: frozenset[str] = frozenset(
         "table_get",
         "table_insert",
         "cells_set",
+        "revisions_list",
+        "revisions_accept",
+        "revisions_reject",
         "save",
     }
 )

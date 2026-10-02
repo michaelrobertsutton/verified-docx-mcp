@@ -220,6 +220,8 @@ def _raise_from_live_error(exc: BaseException) -> None:
         ) from exc
     if isinstance(exc, LiveOpFailed):
         code = exc.code
+        if code in ErrorCode.__members__:
+            raise _make_error(ErrorCode[code], exc.message, {"pane_error_code": code}) from exc
         if code == OP_ERROR_ZERO_MATCH:
             raise _make_error(ErrorCode.ZERO_MATCH, exc.message, {"pane_error_code": code}) from exc
         if code == OP_ERROR_MATCH_COUNT_MISMATCH:
@@ -513,7 +515,10 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
     # "nothing pending," which is not knowable without the file;
     # file_side_available names the reason explicitly rather than making
     # a caller guess from pending_suggestions being empty.
-    suggestions = file_result[1] if file_result is not None else None
+    from .revisions_live import list_revisions
+
+    revision_state = list_revisions(session)
+    suggestions = revision_state["revisions"]
 
     # list_open_items filters resolved the same way file mode does (an
     # "open item" is, by definition, not a resolved one) -- but the pane
@@ -527,6 +532,9 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
         "source": "live",
         "comments": [_live_comment_record(c) for c in open_raw],
         "pending_suggestions": suggestions,
+        "pending_suggestions_source": "live" if suggestions is not None else None,
+        "pending_suggestions_reason": revision_state.get("reason"),
+        "revision_coverage": revision_state["coverage"],
         "file_side_available": file_result is not None,
         "correlation": [entry for entry in correlation if entry["live_comment_id"] in open_ids],
     }
