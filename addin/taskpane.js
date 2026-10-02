@@ -230,7 +230,7 @@ const OP_LOG_LIMIT = 20;
 // issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
 // find_sections / list_tables).
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions"];
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard"];
 
 // issue #33: the largest body_ooxml reply (UTF-8 bytes of its JSON) the pane
 // will send. Kept below the bridge's 64 MiB websocket max_size so an
@@ -705,6 +705,7 @@ async function opReplace(payload) {
     }
 
     await guardRevisions(context, matchItems);
+    const commentsBefore = await guardComments(context, matchItems, payload.allow_comment_loss);
     let previousMode = null;
     if (payload.track_changes) {
       context.document.load("changeTrackingMode");
@@ -729,7 +730,10 @@ async function opReplace(payload) {
     await context.sync();
     const postHash = await sha256Hex(postBody.text || "");
 
-    return { applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
+    const remainingComments = await collectComments(context, {anchors: true, replies: true});
+    const remainingIds = new Set(remainingComments.map(c => c.id));
+    const commentsRemoved = commentsBefore.filter(c => !remainingIds.has(c.id));
+    return { comments_removed: commentsRemoved, applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
   });
 }
 
@@ -1474,4 +1478,26 @@ async function verifyCommentIdentity(context, comment, identity) {
   const norm = x => String(x || "").replace(/\s+/g, " ").trim();
   if (Object.keys(identity).some(k => norm(actual[k]) !== norm(identity[k])))
     throw refusalError("Comment identity changed; re-list before editing", "COMMENT_ID_STALE");
+}
+
+async function guardComments(context, ranges, allowLoss) {
+  const comments = context.document.body.getComments();
+  comments.load("items/id,items/content,items/authorName,items/resolved");
+  await context.sync();
+  const entries = comments.items.map(comment => {
+    const anchor = comment.getRange();
+    anchor.load("text");
+    comment.replies.load("items/id,items/content,items/authorName");
+    return {comment, anchor, relations: ranges.map(range => anchor.compareLocationWith(range))};
+  });
+  await context.sync();
+  const disjoint = new Set(["Before", "After", "AdjacentBefore", "AdjacentAfter"]);
+  const affected = entries.filter(e => e.relations.some(r => !disjoint.has(r.value))).map(e => ({
+    id: e.comment.id, content: e.comment.content, authorName: e.comment.authorName,
+    resolved: e.comment.resolved, anchorText: e.anchor.text,
+    replies: e.comment.replies.items.map(r => ({id: r.id, content: r.content, authorName: r.authorName}))
+  }));
+  if (affected.length && allowLoss !== true)
+    throw refusalError(`Replacement overlaps comments: ${JSON.stringify(affected)}`, "WOULD_DELETE_COMMENTS");
+  return affected;
 }

@@ -1421,6 +1421,7 @@ def replace_text(
     write_mode: str = "auto",
     within_row_containing: str | None = None,
     allow_concurrent_editor: bool = False,
+    allow_comment_loss: bool = False,
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
 
@@ -1574,6 +1575,7 @@ def replace_text(
             track_changes=track_changes,
             write_mode=write_mode,
             within_row_containing=within_row_containing,
+            allow_comment_loss=allow_comment_loss,
             allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
