@@ -5,10 +5,10 @@ import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
 export function fixture(path, initial='Heading. plain sentence', commented=true) {
   const state={text:initial, chars:Array.from(initial,(_,i)=>({bold:i<8,italic:false,
-    underline:'None',strikeThrough:false,color:'#000000',name:'Calibri',size:11})),comments:[],queue:[]};
+    underline:'None',strikeThrough:false,color:'#000000',name:'Calibri',size:11,doubleStrikeThrough:false,subscript:false,superscript:false})),comments:[],queue:[]};
   const ranges=(start,end)=>{
-    const font={load() {}};
-    for(const key of ['bold','italic','underline','strikeThrough','color','name','size'])
+    const font={load() {},reset() {state.queue.push(()=>state.chars.slice(start,end).forEach(c=>Object.assign(c,{bold:false,italic:false,underline:"None"})));}};
+    for(const key of ['bold','italic','underline','strikeThrough','color','name','size','doubleStrikeThrough','subscript','superscript'])
       Object.defineProperty(font,key,{get(){const vals=state.chars.slice(start,end).map(c=>c[key]);return vals.every(v=>v===vals[0])?vals[0]:null;},set(v){state.queue.push(()=>state.chars.slice(start,end).forEach(c=>c[key]=v));}});
     const range={load(){},font,get text(){return state.text.slice(start,end);},
       paragraphs:{items:[{text:state.text}],load(){}},getTrackedChanges:()=>({items:[],load(){}}),
