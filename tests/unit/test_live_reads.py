@@ -123,15 +123,11 @@ class LiveReadShapeTests(LiveReadsTestCase):
         self.assertEqual(result["source"], "live")
         self.assertEqual(result["sections"], projection.find_sections_impl(LIVE_BODY))
 
-    async def test_list_tables_and_get_table_over_live(self) -> None:
+    async def test_list_tables_over_live(self) -> None:
         await self.connect_live(LIVE_TABLES)
         listed = await self.call(tables.execute_list_tables, str(self.target))
         self.assertEqual(listed["source"], "live")
         self.assertEqual(listed["tables"], tables.list_tables_impl(LIVE_TABLES))
-        first = listed["tables"][0]["table_id"]
-        got = await self.call(tables.execute_get_table, str(self.target), first)
-        self.assertEqual(got["source"], "live")
-        self.assertEqual(got["rows"], tables.get_table_impl(LIVE_TABLES, first)["rows"])
 
     async def test_a_non_pkg_namespace_prefix_is_fine(self) -> None:
         await self.connect_live(body_ooxml=docx_to_flat_opc(LIVE_BODY, prefix="x1"))
@@ -148,6 +144,32 @@ class LiveReadShapeTests(LiveReadsTestCase):
         await self.connect_live(body_ooxml=big)
         result = await self.read()
         self.assertEqual(result["text"], self.live_text())
+
+
+class GetTableProvenanceTests(LiveReadsTestCase):
+    """get_table's live read is issue #34's table_get op (the numbering live
+    table edits use); only its FILE read carries issue #33's provenance."""
+
+    fixture_name = "tables.docx"
+
+    async def test_file_read_warns_when_a_session_exists(self) -> None:
+        await self.connect_live()
+        got = await self.call(tables.execute_get_table, str(self.target), 1, source="file")
+        self.assertEqual(got["source"], "file")
+        self.assertIn(reads_live.WARNING_LIVE_SESSION_IGNORED, got["warnings"])
+        self.assertEqual(got["live_session"]["reason"], reads_live.REASON_REQUESTED_FILE)
+
+    async def test_read_without_a_session_has_no_warning(self) -> None:
+        got = await self.call(tables.execute_get_table, str(self.target), 1)
+        self.assertEqual(got["source"], "file")
+        self.assertNotIn("warnings", got)
+
+    async def test_auto_with_a_session_reads_through_table_get(self) -> None:
+        pane = await self.connect_live()
+        with self.assertRaises(VerifyError):  # the fake document has no tables
+            await self.call(tables.execute_get_table, str(self.target), 1)
+        self.assertEqual(pane.table_get_payloads, [{"table_index": 1}])
+        self.assertEqual(pane.body_ooxml_requests, 0)
 
 
 class SourceSelectionTests(LiveReadsTestCase):

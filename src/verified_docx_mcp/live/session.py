@@ -42,7 +42,16 @@ DEFAULT_REQUEST_TIMEOUT = 15.0
 
 # Read ops that walk every comment get more headroom than writes (issue #31:
 # ~100 comments on a co-authored SharePoint doc blew the 15 s default).
-OP_TIMEOUTS: dict[str, float] = {"comments_list": 60.0, "body_ooxml": 60.0}
+# Issue #34: table ops make several syncs and touch every cell; a slow success
+# reported as LIVE_DISCONNECTED would be retried into a duplicate table.
+# Issue #33: body_ooxml serializes the whole body.
+OP_TIMEOUTS: dict[str, float] = {
+    "comments_list": 60.0,
+    "body_ooxml": 60.0,
+    "table_get": 60.0,
+    "table_insert": 90.0,
+    "cells_set": 60.0,
+}
 
 TIMEOUT_ENV = "VERIFIED_DOCX_LIVE_TIMEOUT_S"
 
