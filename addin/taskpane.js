@@ -75,6 +75,7 @@ async function collectComments(context, options) {
     if (wantAnchors) {
       range = comment.getRange();
       range.load("text");
+      range.paragraphs.load("items/text");
     }
     let replies = null;
     if (wantReplies) {
@@ -93,7 +94,10 @@ async function collectComments(context, options) {
       creationDate: comment.creationDate,
       resolved: comment.resolved,
     };
-    if (wantAnchors) out.anchorText = range.text;
+    if (wantAnchors) {
+      out.anchorText = range.text;
+      out.anchorParagraphText = range.paragraphs.items.map(p => p.text).join("\n");
+    }
     if (wantReplies) {
       out.replies = replies.items.map((r) => ({
         id: r.id,
@@ -526,6 +530,7 @@ async function opDescribe() {
     await context.sync();
     const hash = await sha256Hex(body.text || "");
     return {
+      session_epoch: paneEpoch,
       documentUrl: Office.context.document.url,
       bodySha256: hash,
       changeTrackingMode: String(context.document.changeTrackingMode),
@@ -1287,7 +1292,7 @@ async function opCommentsList(payload) {
       anchors: p.include_anchor !== false,
       replies: true,
     });
-    return { comments, timing_ms: { total: Date.now() - started } };
+    return { comments, session_epoch: paneEpoch, timing_ms: { total: Date.now() - started } };
   });
 }
 
@@ -1330,11 +1335,13 @@ async function opCommentAdd(payload) {
 
 async function opCommentReply(payload) {
   return Word.run(async (context) => {
+    checkCommentEpoch(payload);
     const comments = context.document.body.getComments();
     comments.load("items/id");
     await context.sync();
     const comment = comments.items.find((c) => c.id === payload.comment_id);
     if (!comment) throw refusalError(`no comment with id ${JSON.stringify(payload.comment_id)}`);
+    await verifyCommentIdentity(context, comment, payload.identity);
     const reply = comment.reply(payload.text);
     reply.load("id");
     await context.sync();
@@ -1344,11 +1351,13 @@ async function opCommentReply(payload) {
 
 async function opCommentResolve(payload) {
   return Word.run(async (context) => {
+    checkCommentEpoch(payload);
     const comments = context.document.body.getComments();
     comments.load("items/id");
     await context.sync();
     const comment = comments.items.find((c) => c.id === payload.comment_id);
     if (!comment) throw refusalError(`no comment with id ${JSON.stringify(payload.comment_id)}`);
+    await verifyCommentIdentity(context, comment, payload.identity);
     comment.resolved = !!payload.resolved;
     await context.sync();
     return { resolved: !!payload.resolved };
@@ -1447,4 +1456,22 @@ async function opRevisionsMutate(payload, action) {
     return result;
   };
   return retained.length ? Word.run(retained, execute) : Word.run(execute);
+}
+
+function checkCommentEpoch(payload) {
+  if (payload.session_epoch && payload.session_epoch !== paneEpoch)
+    throw refusalError("Comment handle is from another pane epoch", "COMMENT_ID_STALE");
+}
+async function verifyCommentIdentity(context, comment, identity) {
+  if (!identity) return;
+  comment.load("content,authorName");
+  const range = comment.getRange();
+  range.load("text");
+  range.paragraphs.load("items/text");
+  await context.sync();
+  const actual = {content: comment.content, authorName: comment.authorName,
+    anchorText: range.text, anchorParagraphText: range.paragraphs.items.map(p => p.text).join("\n")};
+  const norm = x => String(x || "").replace(/\s+/g, " ").trim();
+  if (Object.keys(identity).some(k => norm(actual[k]) !== norm(identity[k])))
+    throw refusalError("Comment identity changed; re-list before editing", "COMMENT_ID_STALE");
 }
