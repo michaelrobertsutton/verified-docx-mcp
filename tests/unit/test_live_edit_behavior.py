@@ -18,3 +18,7 @@ def test_comment_loss_guard():
 
 def test_replacement_and_format_readback():
     run_harness("formatting_harness.mjs")
+
+
+def test_delete_paragraph_guards_and_verification():
+    run_harness("paragraph_harness.mjs")

@@ -276,6 +276,7 @@ VALID_OPS: frozenset[str] = frozenset(
         "table_get",
         "table_insert",
         "cells_set",
+        "paragraph_delete",
         "textboxes_list",
         "textboxes_read",
         "scope_describe",
