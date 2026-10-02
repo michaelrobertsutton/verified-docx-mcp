@@ -536,6 +536,7 @@ class FakeDocument:
                     "after": find,
                     "colorAfter": f"#{color.lstrip('#')}" if color else color,
                     "strikeAfter": strike,
+                    "boldAfter": bold, "italicAfter": italic, "underlineAfter": underline,
                 }
                 for _ in positions
             ]
@@ -652,7 +653,7 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard"]
+            ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback"]
             if capabilities is None
             else list(capabilities)
         )
