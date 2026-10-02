@@ -37,14 +37,14 @@ class MakeErrorTests(unittest.TestCase):
         self.assertEqual(d["diagnostics"], {"detail": "stderr text"})
         self.assertFalse(d["retryable"])
 
-    def test_no_code_is_retryable_yet(self):
+    def test_only_shape_read_failure_is_retryable(self):
         # WP-02 has no revision-stamped write to race against — see
         # errors.py's _RETRYABLE_CODES comment. Every current member is
         # non-retryable.
         for code in ErrorCode:
             with self.subTest(code=code):
                 exc = _make_error(code, "x")
-                self.assertFalse(exc.envelope.retryable)
+                self.assertEqual(exc.envelope.retryable, code == ErrorCode.HOST_SHAPE_READ_FAILED)
 
     def test_render_path_codes_present(self):
         # These four map 1:1 onto render.py's RenderError.code values
