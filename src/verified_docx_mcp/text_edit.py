@@ -770,6 +770,7 @@ def execute_replace_text_live(
     revision_before: str | None = None,
     track_changes: bool = False,
     within_row_containing: str | None = None,
+    allow_comment_loss: bool = False,
 ) -> dict[str, Any]:
     """Live-mode ``replace_text`` (issue #106 WP-3): sends a ``replace``
     op over the pane's WSS ops channel instead of editing the .docx file.
@@ -811,6 +812,7 @@ def execute_replace_text_live(
 
     session = live_write_mode.live_session_for(path)
     document_name = session.document_name
+    live_write_mode.require_capability(session, "comment_loss_guard", feature_description="comment loss protection")
     if within_row_containing:
         live_write_mode.require_capability(
             session, _ROW_SCOPE_CAPABILITY, feature_description="within_row_containing"
@@ -826,6 +828,7 @@ def execute_replace_text_live(
         "expected_matches": expected_matches,
         "replace": replace,
         "track_changes": track_changes,
+        "allow_comment_loss": allow_comment_loss,
     }
     if within_row_containing:
         payload["rowAnchor"] = within_row_containing
@@ -868,7 +871,7 @@ def execute_replace_text_live(
     before_text = "\n".join(m.get("before", "") for m in matches)
     after_text = "\n".join(m.get("after", "") for m in matches)
 
-    return live_write_mode.live_evidence(
+    evidence = live_write_mode.live_evidence(
         applied=True,
         match_count=match_count,
         rung=2,
@@ -895,6 +898,9 @@ def execute_replace_text_live(
 # identical `find` text remain inseparable -- a named, documented
 # limitation (see server.py's docstrings), not solved here.
 # ---------------------------------------------------------------------------
+
+    evidence["comments_removed"] = result.get("comments_removed", [])
+    return evidence
 
 
 def _paragraph_by_ref(proj: projection.Projection) -> dict[str, projection.ParagraphMeta]:
@@ -983,6 +989,7 @@ def execute_replace_text(
     track_changes: bool = False,
     write_mode: str = "auto",
     within_row_containing: str | None = None,
+    allow_comment_loss: bool = False,
 ) -> dict[str, Any]:
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
@@ -994,6 +1001,7 @@ def execute_replace_text(
             revision_before=revision_before,
             track_changes=track_changes,
             within_row_containing=within_row_containing,
+            allow_comment_loss=allow_comment_loss,
         )
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
