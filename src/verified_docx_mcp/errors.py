@@ -118,6 +118,7 @@ class ErrorCode(Enum):
     # declared.
     LIVE_UNAVAILABLE = "LIVE_UNAVAILABLE"  # no connected pane session for the target document (live/session.py LiveUnavailable)
     LIVE_DISCONNECTED = "LIVE_DISCONNECTED"  # the pane's WebSocket closed mid-request, or a reply never arrived within the op timeout (live/session.py LiveDisconnected)
+    HOST_SHAPE_READ_FAILED = "HOST_SHAPE_READ_FAILED"
     MIXED_FORMATTING = "MIXED_FORMATTING"
     WOULD_DELETE_COMMENTS = "WOULD_DELETE_COMMENTS"
     COMMENT_ID_STALE = "COMMENT_ID_STALE"
@@ -150,7 +151,7 @@ class ErrorCode(Enum):
 # SYNC_IN_FLIGHT is deliberately NOT here: core/document-backend-protocol.md
 # §4 specifies exactly one wait (<=10s) performed by the tool itself before
 # raising, not a caller-side retry loop.
-_RETRYABLE_CODES: frozenset[ErrorCode] = frozenset()
+_RETRYABLE_CODES: frozenset[ErrorCode] = frozenset({ErrorCode.HOST_SHAPE_READ_FAILED})
 
 
 @dataclasses.dataclass(frozen=True)

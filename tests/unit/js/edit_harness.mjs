@@ -12,6 +12,7 @@ export function fixture(path, initial='Heading. plain sentence', commented=true)
       Object.defineProperty(font,key,{get(){const vals=state.chars.slice(start,end).map(c=>c[key]);return vals.every(v=>v===vals[0])?vals[0]:null;},set(v){state.queue.push(()=>state.chars.slice(start,end).forEach(c=>c[key]=v));}});
     const range={load(){},font,get text(){return state.text.slice(start,end);},
       paragraphs:{items:[{text:state.text}],load(){}},getTrackedChanges:()=>({items:[],load(){}}),
+      getComments:()=>({get items(){return state.comments;},load(){}}),
       compareLocationWith(other){return {value:end<=other.start?'Before':start>=other.end?'After':'Overlaps'};},
       start,end,
       insertText(text){const inherited={...state.chars[Math.max(0,start-1)]};
@@ -32,8 +33,8 @@ export function fixture(path, initial='Heading. plain sentence', commented=true)
     Office:{onReady(){},context:{requirements:{isSetSupported:()=>true}}},
     Word:{run:(objects,fn)=>(fn||objects)(context),InsertLocation:{replace:'Replace'},
       ChangeTrackingMode:{trackAll:'TrackAll'},UnderlineType:{single:'Single',none:'None'}}};
-  vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path,'utf8')+'\nglobalThis.api={opReplace,opFormat,guardComments};',sandbox);
-  return {state,context,sandbox,ranges};
+  vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path,'utf8')+'\nglobalThis.api={opReplace,opFormat,guardComments,opTextboxesList,opTextboxesRead,opScopeDescribe};',sandbox);
+  return {state,context,sandbox,ranges,body};
 }
 if(process.argv[1].endsWith('edit_harness.mjs')) {
   const f=fixture(process.argv[2]);
