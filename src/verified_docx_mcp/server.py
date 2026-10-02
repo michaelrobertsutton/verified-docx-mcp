@@ -3374,6 +3374,20 @@ def read_textbox(path: str, textbox_id: str) -> dict[str, Any]:
         _raise_tool_error(exc)
 
 
+@mcp.tool()
+def delete_paragraph(path: str, anchor_text: str, revision_before: str,
+                     track_changes: bool = False) -> dict[str, Any]:
+    """Delete exactly one whole live body paragraph; refuse anchors, comments,
+    revisions, table cells, section boundaries and the final paragraph.
+    """
+    from .live.paragraphs_live import delete_paragraph as execute
+
+    try:
+        return execute(path, anchor_text, revision_before, track_changes)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
 def main() -> None:
     """Entry point for the `verified-docx-mcp` command.
 
