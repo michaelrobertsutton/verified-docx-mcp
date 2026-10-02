@@ -357,6 +357,8 @@ def classify_op_failed(exc: LiveOpFailed) -> ErrorCode:
     ``replace``/``format``/``comment_add`` today, but not impossible from
     a future op) falls back to the generic ``LIVE_OP_FAILED``.
     """
+    if exc.code in ErrorCode.__members__ and exc.code != "LIVE_OP_FAILED":
+        return ErrorCode[exc.code]
     pane_code = (exc.code or "").strip().lower()
     if pane_code == "zero_match":
         return ErrorCode.ZERO_MATCH

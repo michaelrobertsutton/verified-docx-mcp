@@ -1,3 +1,4 @@
+import { webcrypto } from "node:crypto";
 // Loads addin/taskpane.js into a vm with stub Office/Word/DOM globals and a
 // fake Word context that counts sync() calls, then checks opCommentsList.
 // Prints one JSON line of results; exit code 1 on a thrown error.
@@ -46,7 +47,7 @@ const sandbox = {
   Promise,
   document: { getElementById: () => ({ addEventListener() {}, textContent: "", style: {} }) },
   window: {},
-  crypto: {},
+  crypto: webcrypto,
   TextEncoder,
   Office: { onReady() {}, HostType: { Word: "Word" }, context: {} },
   Word: { run: null },
