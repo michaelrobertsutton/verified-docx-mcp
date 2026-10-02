@@ -49,9 +49,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
+import zipfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree as ET
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -628,8 +632,16 @@ class FakePane:
         requirement_sets: dict[str, Any] | None = None,
         heartbeat_interval: float = 5.0,
         capabilities: list[str] | None = None,
+        body_ooxml: str | None = None,
+        body_ooxml_error: tuple[str, str] | None = None,
     ) -> None:
         self.document = document if document is not None else FakeDocument()
+        # issue #33: the Flat OPC string `body_ooxml` answers with (build one
+        # from a real .docx with `docx_to_flat_opc`), or a (code, message)
+        # refusal such as ("too_large", "...") to answer with instead.
+        self.body_ooxml = body_ooxml
+        self.body_ooxml_error = body_ooxml_error
+        self.body_ooxml_requests = 0
         self.document_url = document_url
         self.host = host
         self.platform = platform
@@ -640,7 +652,9 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "comments_by_id", "table_edit"] if capabilities is None else list(capabilities)
+            ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml"]
+            if capabilities is None
+            else list(capabilities)
         )
         # Every comments_list payload received, in order (issue #31 tests
         # assert reply/resolve send an ids-filtered one).
@@ -731,6 +745,16 @@ class FakePane:
             result = doc.describe()
             result["documentUrl"] = self.document_url
             return result
+        if op == "body_ooxml":
+            self.body_ooxml_requests += 1
+            if self.body_ooxml_error is not None:
+                raise OpRefused(*self.body_ooxml_error)
+            return {
+                "ooxml": self.body_ooxml or "",
+                "bodySha256": doc.sha256(),
+                "documentUrl": self.document_url,
+                "strippedParts": [],
+            }
         if op == "search":
             matches = doc.search(
                 payload["find"],
@@ -782,3 +806,41 @@ class FakePane:
         if op == "save":
             return doc.save()
         raise OpRefused("LIVE_OP_FAILED", f"fake pane does not implement op {op!r}")
+
+
+# ---------------------------------------------------------------------------
+# Flat OPC (issue #33): what Word's body.getOoxml() returns, built from a real
+# .docx so a live read can be compared with a file read of the same document.
+# ---------------------------------------------------------------------------
+
+_XML_DECL = re.compile(r"^\s*<\?xml[^>]*\?>\s*")
+_CT_NS = "{http://schemas.openxmlformats.org/package/2006/content-types}"
+
+
+def docx_to_flat_opc(docx_path: Path | str, *, prefix: str = "pkg") -> str:
+    """Flat OPC ``pkg:package`` for the .docx at *docx_path*: XML parts
+    embedded as ``pkg:xmlData``, every non-XML (binary) part emptied, exactly
+    as the pane's ``stripBinaryParts`` leaves it. *prefix* names the package
+    namespace prefix, so a test can prove nothing keys on the literal "pkg:"."""
+    ns = "http://schemas.microsoft.com/office/2006/xmlPackage"
+    with zipfile.ZipFile(docx_path) as zf:
+        content_types = ET.fromstring(zf.read("[Content_Types].xml"))
+        overrides = {o.get("PartName"): o.get("ContentType") for o in content_types.findall(f"{_CT_NS}Override")}
+        defaults = {d.get("Extension"): d.get("ContentType") for d in content_types.findall(f"{_CT_NS}Default")}
+        parts = []
+        for info in zf.infolist():
+            if info.is_dir() or info.filename == "[Content_Types].xml":
+                continue
+            name = "/" + info.filename
+            ext = info.filename.rsplit(".", 1)[-1]
+            content_type = overrides.get(name) or defaults.get(ext) or "application/octet-stream"
+            data = zf.read(info.filename)
+            if ext in ("xml", "rels"):
+                xml = _XML_DECL.sub("", data.decode("utf-8"))
+                body = f"<{prefix}:xmlData>{xml}</{prefix}:xmlData>"
+            else:
+                body = f"<{prefix}:binaryData></{prefix}:binaryData>"
+            parts.append(
+                f'<{prefix}:part {prefix}:name="{name}" {prefix}:contentType="{content_type}">{body}</{prefix}:part>'
+            )
+    return f'<{prefix}:package xmlns:{prefix}="{ns}">' + "".join(parts) + f"</{prefix}:package>"

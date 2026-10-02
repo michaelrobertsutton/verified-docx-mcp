@@ -148,9 +148,10 @@ connected pane, brings the bridge up.
   `list_open_items`'s own docstring): `write_mode.py`'s document-name
   resolution and every `comments_live.py` session lookup now tolerate a
   `path` that does not exist locally, using its basename to find a
-  connected session by name. `read_document`/`list_parts`/`find_sections`
-  and the other structural read tools remain file-only — this does not
-  add a live read path for them.
+  connected session by name. (Issue #33 later added a live read path for
+  `read_document`/`find_sections`/`list_tables`/`get_table` — see "Live
+  reads (issue #33)" below. `list_parts` and the other structural read
+  tools remain file-only.)
 
 **Why a document open in Word is now writable.** Before this WP, a desktop
 Word owner file on the target path only ever showed up as data
@@ -896,11 +897,82 @@ re-listed every comment to verify). What changed:
   without the capability gets the old full listing, and the evidence
   carries a `pane_note` saying to reopen the pane.
 - **No pane caching.** The bridge sends `Cache-Control: no-store` on every
-  response and `taskpane.html` loads `taskpane.js?v=31`, so closing and
+  response and `taskpane.html` loads `taskpane.js?v=33`, so closing and
   reopening the pane picks up an edited `addin/*.js`. If a pane still
   behaves like an old build, check `live_status` for `comments_by_id` in its
   capabilities; bump the `?v=` value in `taskpane.html` when you change
   `taskpane.js` and suspect a cached copy.
+
+### Live reads (issue #33)
+
+On a co-authored SharePoint document the live Word body is the source of
+truth, and the local `.docx` is only the same-named placeholder live writes
+need. `read_document`, `find_sections`, `list_tables` and `get_table` used to
+read that placeholder and return `warnings: []`, so a placeholder read could
+pass as the live body. Now each takes `source="auto"|"file"|"live"` and every
+response carries `source`. (`get_table`'s live read is issue #34's `table_get`
+op, which uses the same table numbering as live table edits; only its file
+read gets this section's `live_session_ignored` warning. The other three read
+the body through `body_ooxml`, described below. The two number tables the
+same way unless the document has a nested table, which `table_get` refuses.)
+
+- **`source="live"`** reads the body the connected pane holds. It needs a
+  session for the file name, the default part (`word/document.xml`: Word's
+  `getOoxml()` covers the body, not headers/footers/footnotes) and a pane
+  reporting the `body_ooxml` capability. Errors: `LIVE_UNAVAILABLE` (no
+  session), `INVALID_INPUT` (another part), `LIVE_CAPABILITY_MISSING` (old
+  pane — close and reopen the Live pane), `LIVE_SESSION_MISMATCH` (the
+  session's `document_url` is a different local file).
+- **`source="file"`** reads the local file, as before.
+- **`source="auto"`** (default) reads live when it safely can, otherwise the
+  file. It reads live only if a session exists for the file name, the part is
+  the body, the pane has `body_ooxml`, the `document_url` doesn't point at a
+  different local file, and no other document has ever connected under the
+  same file name (`SessionRegistry` keys on basename alone, and a SharePoint
+  URL can't be compared with a local path, so a collision means the pane may
+  hold a different document). Pass `source="live"` to read through a
+  collision on purpose.
+- **The warning.** A file read made while any session is registered for the
+  file name carries `"live_session_ignored"` in `warnings` plus
+  `live_session: {document_url, reason, action}`. `reason` is
+  `requested_file`, `part_not_in_live`, `pane_missing_capability`,
+  `basename_collision` or `session_mismatch`; `action` says what to do.
+  `list_parts` (file-only) carries the same warning. `find_sections`,
+  `list_tables` and `get_table` add a `warnings` key only when there is
+  something to say.
+- **No fallback after a live failure.** Once live is chosen, a pane timeout
+  (`LIVE_DISCONNECTED`), a `too_large` refusal (`LIVE_OP_FAILED`, message
+  points at `source="file"`) or an unreadable export (`LIVE_OP_FAILED`,
+  `diagnostics.stage == "flat_opc"`) is raised, never answered from the file.
+- **Revision.** A live `read_document` returns `revision:
+  "live:sha256:<hash>"` (the same token live writes accept as
+  `revision_before`; it hashes the body *text* only, not formatting,
+  comments or table structure) and `revision_detail: null`, plus
+  `live: {document_url, body_sha256, stripped_parts}`.
+- **Identifiers.** `para_ref` and `table_id` are positional and can change
+  between any two reads. Use them only with the `source` and `revision` they
+  were read at.
+- **One known difference from a file read.** Word's `getOoxml()` appends an
+  empty paragraph at the end of the body that a saved file doesn't have, so
+  a live `text` read ends with one extra newline and the last section's
+  `paragraph_count` is one higher. Markdown, tables and run text are
+  otherwise identical (checked on real Word against a Word-saved copy of
+  the same document: headings, bullets, numbered list, table, image).
+- **Warnings specific to live reads.** `live_styles_missing` /
+  `live_numbering_missing`: the body references styles or numbering but
+  Word's export omitted that part, so headings or lists may render wrongly.
+  The gap is never filled from the local file.
+
+How it works. The pane's `body_ooxml` op calls `body.getOoxml()` and returns
+the Flat OPC string with every `pkg:binaryData` payload emptied
+(namespace-aware, `strippedParts` names them), so images are not included.
+The server (`live/reads_live.py`) turns the Flat OPC into a temporary
+`.docx` and runs the existing projection code on it, then deletes it. That
+`.docx` is an adapter for projection only, not a valid export. The pane
+refuses with `too_large` above 48 MiB; the ops socket accepts messages up to
+64 MiB (`PANE_MAX_MESSAGE_BYTES`; the websockets default of 1 MiB would
+drop the pane's connection on a real proposal). `body_ooxml` waits 60 s;
+override with `VERIFIED_DOCX_LIVE_TIMEOUT_BODY_OOXML_S`.
 
 ## What could block this, and the fix
 

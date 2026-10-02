@@ -400,13 +400,16 @@ class GetTableLiveTests(_TableCase):
         await self.refused(ErrorCode.INVALID_INPUT, self.get, 1, "word/header1.xml", source="live")
         # ... while "auto" falls back to the file for it (which has no such part)
         await self.refused(ErrorCode.PART_NOT_FOUND, self.get, 1, "word/header1.xml")
-        # an explicit file read ignores the pane
+        # an explicit file read ignores the pane -- and says so (issue #33)
         file_result = await self.get(1, source="file")
-        self.assertNotIn("source", file_result)
+        self.assertEqual(file_result["source"], "file")
+        self.assertIn("live_session_ignored", file_result["warnings"])
+        self.assertEqual(file_result["live_session"]["reason"], "requested_file")
 
     async def test_auto_without_a_session_reads_the_file(self) -> None:
         result = await self.get(1)
-        self.assertNotIn("source", result)
+        self.assertEqual(result["source"], "file")
+        self.assertNotIn("warnings", result)  # no session, nothing to warn about
         self.assertEqual(result["table_id"], 1)
 
 

@@ -66,7 +66,7 @@ from . import (
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .live import bridge as live_bridge
-from .live import comments_live
+from .live import comments_live, reads_live
 from .middleware import EvidenceEnforcementMiddleware
 
 mcp = FastMCP(
@@ -772,7 +772,12 @@ def execute_list_parts(path: str) -> dict[str, Any]:
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     local_path, is_temp = _read_local_copy(resolved)
     try:
-        return {"path": str(resolved), "parts": projection.list_parts_impl(local_path)}
+        result: dict[str, Any] = {"path": str(resolved), "parts": projection.list_parts_impl(local_path)}
+        warnings, live_session = reads_live.file_read_warnings(path)
+        if warnings:
+            result["warnings"] = warnings
+            result["live_session"] = live_session
+        return result
     finally:
         if is_temp:
             local_path.unlink(missing_ok=True)
@@ -807,6 +812,7 @@ def execute_read_document(
     format: str = "markdown",
     part: str = projection.DEFAULT_PART,
     section_key: str | None = None,
+    source: str = "auto",
 ) -> dict[str, Any]:
     if format not in _VALID_READ_FORMATS:
         raise _make_error(
@@ -814,65 +820,66 @@ def execute_read_document(
             f"format must be one of {sorted(_VALID_READ_FORMATS)}, got {format!r}",
             {"format": format},
         )
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    local_path, is_temp = _read_local_copy(resolved)
-    try:
-        revision = projection.compute_revision(local_path)
-        result: dict[str, Any] = {
-            "path": str(resolved),
-            "part": part,
-            "format": format,
-            "section_key": section_key,
-            "revision": revision["token"],
-            "revision_detail": revision["detail"],
-        }
+    with reads_live.read_source(path, source, part) as rs:
+        return rs.annotate(_read_document_from(rs.local_path, rs.resolved, format, part, section_key))
 
-        if section_key is not None:
-            # Only a textbox-<n> sub-scope resolves here (WP-03 scope —
-            # a heading section_key, listed by find_sections alongside
-            # textbox ones, is not yet readable this way; that arrives
-            # with a later WP). None means section_key named no text box
-            # in this part — INVALID_INPUT with the keys that DO exist,
-            # never a silent empty read.
-            scoped = projection.project_textbox_scope(local_path, part, section_key)
-            if scoped is None:
-                available = [s["section_key"] for s in projection.iter_textbox_scopes(local_path, part)]
-                raise _make_error(
-                    ErrorCode.INVALID_INPUT,
-                    f"section_key {section_key!r} does not name a text box in part {part!r}.",
-                    {"section_key": section_key, "part": part, "available_textbox_keys": available},
-                )
-            if format == "text":
-                result["text"] = scoped.text
-            elif format == "runs":
-                result["runs"] = projection.runs_from_projection(scoped)
-            else:  # markdown
-                markdown, _, lossy_elements = projection.markdown_from_projection(local_path, scoped)
-                result["markdown"] = markdown
-                if lossy_elements:
-                    result["lossy_elements"] = lossy_elements
-            result["warnings"] = scoped.warnings
-            return result
 
+def _read_document_from(
+    local_path: Path, resolved: Path, format: str, part: str, section_key: str | None
+) -> dict[str, Any]:
+    revision = projection.compute_revision(local_path)
+    result: dict[str, Any] = {
+        "path": str(resolved),
+        "part": part,
+        "format": format,
+        "section_key": section_key,
+        "revision": revision["token"],
+        "revision_detail": revision["detail"],
+    }
+
+    if section_key is not None:
+        # Only a textbox-<n> sub-scope resolves here (WP-03 scope —
+        # a heading section_key, listed by find_sections alongside
+        # textbox ones, is not yet readable this way; that arrives
+        # with a later WP). None means section_key named no text box
+        # in this part — INVALID_INPUT with the keys that DO exist,
+        # never a silent empty read.
+        scoped = projection.project_textbox_scope(local_path, part, section_key)
+        if scoped is None:
+            available = [s["section_key"] for s in projection.iter_textbox_scopes(local_path, part)]
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"section_key {section_key!r} does not name a text box in part {part!r}.",
+                {"section_key": section_key, "part": part, "available_textbox_keys": available},
+            )
         if format == "text":
-            result["text"] = projection.read_document_text(local_path, part)
-            result["warnings"] = projection.project_part(local_path, part).warnings
+            result["text"] = scoped.text
         elif format == "runs":
-            result["runs"] = projection.read_document_runs(local_path, part)
-            result["warnings"] = projection.project_part(local_path, part).warnings
+            result["runs"] = projection.runs_from_projection(scoped)
         else:  # markdown
-            markdown, warnings, lossy_elements = projection.read_document_markdown(local_path, part)
+            markdown, _, lossy_elements = projection.markdown_from_projection(local_path, scoped)
             result["markdown"] = markdown
-            result["warnings"] = warnings
-            # Same response shape as GoogleDocs-MCP's read_document (issue
-            # #28 WP-03b-a): a lossy_elements key, present only when the
-            # rendering actually lost something (a merged/nested table).
             if lossy_elements:
                 result["lossy_elements"] = lossy_elements
+        result["warnings"] = scoped.warnings
         return result
-    finally:
-        if is_temp:
-            local_path.unlink(missing_ok=True)
+
+    if format == "text":
+        result["text"] = projection.read_document_text(local_path, part)
+        result["warnings"] = projection.project_part(local_path, part).warnings
+    elif format == "runs":
+        result["runs"] = projection.read_document_runs(local_path, part)
+        result["warnings"] = projection.project_part(local_path, part).warnings
+    else:  # markdown
+        markdown, warnings, lossy_elements = projection.read_document_markdown(local_path, part)
+        result["markdown"] = markdown
+        result["warnings"] = warnings
+        # Same response shape as GoogleDocs-MCP's read_document (issue
+        # #28 WP-03b-a): a lossy_elements key, present only when the
+        # rendering actually lost something (a merged/nested table).
+        if lossy_elements:
+            result["lossy_elements"] = lossy_elements
+    return result
 
 
 @mcp.tool()
@@ -881,9 +888,29 @@ def read_document(
     format: str = "markdown",
     part: str = projection.DEFAULT_PART,
     section_key: str | None = None,
+    source: str = "auto",
 ) -> dict[str, Any]:
     """Read a .docx part's content as markdown, flat text, or a run-level
     structural list.
+
+    source="auto"|"file"|"live" (issue #33) picks WHERE the content comes
+    from. "live" reads the body the connected Word pane currently holds
+    (body only: part must be the default word/document.xml, and the pane must
+    report the body_ooxml capability); "file" reads the local .docx; "auto"
+    (default) reads live when a pane session exists for this file name and
+    the read can be served live, otherwise the file. The response always
+    carries "source". A file read while a pane session exists for the name
+    also carries the "live_session_ignored" warning and a live_session
+    {document_url, reason, action} object, so a same-named placeholder file
+    can never pass as the live body. A live read never falls back to the
+    file: a pane failure is an error. In a live read revision is
+    "live:sha256:<body hash>" (the token live writes accept as
+    revision_before), revision_detail is None, and "live" carries
+    {document_url, body_sha256, stripped_parts}; images are not included.
+    A live read may also warn "live_styles_missing" or
+    "live_numbering_missing" when Word's export omitted a part the body
+    references. para_ref and table_id values are positional: use them only
+    with the same source and revision they were read at.
 
     part scopes the read to one package part — word/document.xml's body
     (the default) is a completely separate scope from a header, footer,
@@ -940,26 +967,35 @@ def read_document(
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
-        return execute_read_document(path, format, part, section_key)
+        return execute_read_document(path, format, part, section_key, source)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
-def execute_find_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    local_path, is_temp = _read_local_copy(resolved)
-    try:
-        return {"path": str(resolved), "part": part, "sections": projection.find_sections_impl(local_path, part)}
-    finally:
-        if is_temp:
-            local_path.unlink(missing_ok=True)
+def execute_find_sections(
+    path: str, part: str = projection.DEFAULT_PART, source: str = "auto"
+) -> dict[str, Any]:
+    with reads_live.read_source(path, source, part) as rs:
+        return rs.annotate(
+            {
+                "path": str(rs.resolved),
+                "part": part,
+                "sections": projection.find_sections_impl(rs.local_path, part),
+            }
+        )
 
 
 @mcp.tool()
-def find_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+def find_sections(
+    path: str, part: str = projection.DEFAULT_PART, source: str = "auto"
+) -> dict[str, Any]:
     """List heading-delimited section ranges AND text-box sub-scopes in a
     .docx part — this is the one call that discovers every section_key
     read_document(section_key=...) can then address.
+
+    source="auto"|"file"|"live" works as in read_document (issue #33): the
+    response carries "source", and a file read while a live pane session
+    exists for this file name carries the "live_session_ignored" warning.
 
     DISAMBIGUATION: this is about DOCUMENT SECTIONS (heading ranges, by
     style/outline level) — see list_page_sections for PAGE-LAYOUT sections
@@ -993,7 +1029,7 @@ def find_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, A
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
-        return execute_find_sections(path, part)
+        return execute_find_sections(path, part, source)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -2252,9 +2288,16 @@ def resolve_comment(
 
 
 @mcp.tool()
-def list_tables(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+def list_tables(
+    path: str, part: str = projection.DEFAULT_PART, source: str = "auto"
+) -> dict[str, Any]:
     """Enumerate every w:tbl in a .docx part, including tables nested
     inside a cell (each gets its own table_id, in document order).
+
+    source="auto"|"file"|"live" works as in read_document (issue #33): the
+    response carries "source", and a file read while a live pane session
+    exists for this file name carries the "live_session_ignored" warning.
+    table_id is positional; use it only with the same source and revision.
 
     Returns path, part, tables (list of {table_id, row_count, col_count,
     has_merged_cells, has_nested_table, nested_in_table_id}). table_id is
@@ -2270,7 +2313,7 @@ def list_tables(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
-        return tables.execute_list_tables(path, part)
+        return tables.execute_list_tables(path, part, source)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -2292,7 +2335,14 @@ def get_table(
     cell reports grid_span 1 / v_merge "none"), so use the table-level
     has_merged_cells flag; a document containing a nested table is refused;
     the pane must report "table_edit" (LIVE_CAPABILITY_MISSING otherwise).
-    The result adds source ("live"), style and header_row_count.
+    The result adds source ("live"), style and header_row_count. Every
+    response carries "source"; a file read while a live pane session exists
+    for this file name carries the "live_session_ignored" warning plus a
+    live_session object (issue #33), so a same-named placeholder file can
+    not pass as the live table. This live read goes through the pane's
+    table_get op (the same table numbering live table edits use), unlike
+    list_tables(source="live"), which reads the body OOXML: the two agree on
+    table_id when the document has no nested table.
 
     Returns path, part, table_id, row_count, col_count, has_merged_cells,
     has_nested_table, rows (list of list of {row_index, cell_index,
