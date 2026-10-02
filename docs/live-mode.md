@@ -870,6 +870,12 @@ response carries `source`.
 - **Identifiers.** `para_ref` and `table_id` are positional and can change
   between any two reads. Use them only with the `source` and `revision` they
   were read at.
+- **One known difference from a file read.** Word's `getOoxml()` appends an
+  empty paragraph at the end of the body that a saved file doesn't have, so
+  a live `text` read ends with one extra newline and the last section's
+  `paragraph_count` is one higher. Markdown, tables and run text are
+  otherwise identical (checked on real Word against a Word-saved copy of
+  the same document: headings, bullets, numbered list, table, image).
 - **Warnings specific to live reads.** `live_styles_missing` /
   `live_numbering_missing`: the body references styles or numbering but
   Word's export omitted that part, so headings or lists may render wrongly.
