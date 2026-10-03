@@ -51,6 +51,7 @@ before the guard" — the ordering below is the fix, not incidental):
 
 from __future__ import annotations
 
+import copy
 import difflib
 import os
 import re
@@ -66,7 +67,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from . import audit, markdown_to_ooxml, paths, projection, write_ledger
+from . import desktop_word, audit, markdown_to_ooxml, paths, projection, write_ledger
 from .errors import ErrorCode, _make_error
 from .live import write_mode as live_write_mode
 from .projection import DEFAULT_PART, R_NS, W_NS
@@ -786,6 +787,9 @@ def atomic_replace_docx_parts(
             staged_revision = projection.compute_revision(tmp_path)["token"]
 
             shutil.copyfile(original_path, jsbak_path)
+            # The host query takes real time, so it runs first: the fingerprint
+            # recheck must be the last thing before the package is replaced.
+            desktop_word.raise_if_open(original_path)
             _recheck_source(original_path, expected_source_fingerprint, stage="immediately before replacing")
             os.replace(str(tmp_path), str(original_path))
             replaced = True
@@ -813,13 +817,17 @@ def atomic_replace_docx_parts(
                         "jsbak_path": str(jsbak_path),
                     },
                 ) from exc
-            else:
-                jsbak_path.unlink(missing_ok=True)
-
             external_change_during_write = _installed_fingerprint(original_path) != staged_fingerprint
             if external_change_during_write:
-                ledger_reason = "the file changed after this write landed; ledger not updated"
+                raise _make_error(
+                    ErrorCode.VERIFICATION_FAILED,
+                    "Another writer changed the saved package before success could be confirmed; "
+                    "the original backup was retained and no rollback was attempted.",
+                    {"external_change_during_write": True, "rollback_skipped": True,
+                     "jsbak_path": str(jsbak_path)},
+                )
             else:
+                jsbak_path.unlink(missing_ok=True)
                 ledger_ok, ledger_reason = write_ledger.record_write(
                     original_path, staged_fingerprint, staged_revision
                 )
@@ -888,6 +896,7 @@ def _guard_before_write(
     # Never starts the bridge lazily; see raise_if_live_session_active's
     # own docstring.
     live_write_mode.raise_if_live_session_active(resolved)
+    desktop_word.raise_if_open(resolved)
 
     # Lazy import: server.py imports this module at load time to register
     # the tools below, so a module-level "from . import server" here would
@@ -1327,6 +1336,49 @@ def _evidence(
 # ---------------------------------------------------------------------------
 
 
+def _table_header_key(tbl: Any) -> str:
+    row = tbl.find(f"{{{W_NS}}}tr")
+    if row is None:
+        return ""
+    return " ".join("".join(t.text or "" for t in row.iter(f"{{{W_NS}}}t")).split())
+
+
+def _preserve_table_properties(old_elements: list[Any], new_elements: list[Any]) -> None:
+    """Carry each replaced top-level table's own properties onto its successor.
+
+    Tables are paired by first-row text first, so reordering, deleting or
+    inserting tables does not move one table's borders onto another. Whatever
+    is left pairs by order within the replaced range. Explicitly absent
+    borders are preserved too; unmatched new tables keep the renderer's
+    visible grid default.
+    """
+    old_tables = [el for el in old_elements if el.tag == f"{{{W_NS}}}tbl"]
+    new_tables = [el for el in new_elements if el.tag == f"{{{W_NS}}}tbl"]
+    pairs: dict[int, Any] = {}
+    free_old = list(range(len(old_tables)))
+    old_keys = [_table_header_key(t) for t in old_tables]
+    for ni, new in enumerate(new_tables):
+        key = _table_header_key(new)
+        if not key:
+            continue
+        for oi in free_old:
+            if old_keys[oi] == key:
+                pairs[ni] = old_tables[oi]
+                free_old.remove(oi)
+                break
+    for ni in range(len(new_tables)):
+        if ni not in pairs and free_old:
+            pairs[ni] = old_tables[free_old.pop(0)]
+    for ni, old in pairs.items():
+        new = new_tables[ni]
+        old_pr = old.find(f"{{{W_NS}}}tblPr")
+        new_pr = new.find(f"{{{W_NS}}}tblPr")
+        if new_pr is not None:
+            new.remove(new_pr)
+        if old_pr is not None:
+            new.insert(0, copy.deepcopy(old_pr))
+
+
 def execute_replace_body_markdown(
     path: str,
     markdown: str,
@@ -1362,6 +1414,7 @@ def execute_replace_body_markdown(
 
     ctx = markdown_to_ooxml.StyleContext.build(resolved)
     new_elements = markdown_to_ooxml.render_blocks(markdown, ctx)
+    _preserve_table_properties(target_elements, new_elements)
     # The verification target is what read_document_markdown would render
     # from THESE elements (run through the identical rendering rules
     # read_document_markdown itself uses; see projection.py's module
@@ -1524,6 +1577,7 @@ def execute_replace_range_markdown(
 
     ctx = markdown_to_ooxml.StyleContext.build(resolved)
     new_elements = markdown_to_ooxml.render_blocks(markdown, ctx)
+    _preserve_table_properties(target_elements, new_elements)
     # See replace_body_markdown's identical comment: verify against the
     # rendered PREVIEW of these elements, not the raw markdown text — and
     # (also as there) new_elements' own paragraphs only reference numIds
