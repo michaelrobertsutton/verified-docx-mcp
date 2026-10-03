@@ -32,3 +32,10 @@ def test_cloud_url_name_is_decoded(monkeypatch):
                             stderr=''))
     with pytest.raises(VerifyError):
         desktop_word.raise_if_open(Path('/tmp/My Document.docx'))
+
+
+def test_script_enumerates_documents_by_index():
+    # Word 16.113 rejects `repeat with d in documents` (-1708); the indexed
+    # form is the only one verified against desktop Word.
+    assert '    repeat with d in documents\n' not in desktop_word._SCRIPT
+    assert 'full name of document i' in desktop_word._SCRIPT

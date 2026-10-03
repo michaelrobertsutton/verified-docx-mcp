@@ -12,8 +12,10 @@ _SCRIPT = '''
 if application "Microsoft Word" is not running then return ""
 tell application "Microsoft Word"
     set paths to ""
-    repeat with d in documents
-        set documentPath to full name of d
+    -- Word 16.113 rejects `repeat with d in documents` (-1708, "every document
+    -- doesn't understand the count message"); index the documents instead.
+    repeat with i from 1 to (count of documents)
+        set documentPath to full name of document i
         try
             set documentPath to POSIX path of (documentPath as alias)
         end try

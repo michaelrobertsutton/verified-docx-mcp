@@ -787,8 +787,10 @@ def atomic_replace_docx_parts(
             staged_revision = projection.compute_revision(tmp_path)["token"]
 
             shutil.copyfile(original_path, jsbak_path)
-            _recheck_source(original_path, expected_source_fingerprint, stage="immediately before replacing")
+            # The host query takes real time, so it runs first: the fingerprint
+            # recheck must be the last thing before the package is replaced.
             desktop_word.raise_if_open(original_path)
+            _recheck_source(original_path, expected_source_fingerprint, stage="immediately before replacing")
             os.replace(str(tmp_path), str(original_path))
             replaced = True
             tmp_consumed = True
