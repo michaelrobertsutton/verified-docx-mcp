@@ -653,7 +653,7 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback"]
+            ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard"]
             if capabilities is None
             else list(capabilities)
         )

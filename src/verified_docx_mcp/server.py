@@ -3388,6 +3388,22 @@ def delete_paragraph(path: str, anchor_text: str, revision_before: str,
         _raise_tool_error(exc)
 
 
+@mcp.tool()
+def list_shapes(path: str) -> dict[str, Any]:
+    """List live body anchored shapes with paragraph anchors and OOXML geometry.
+
+    Includes table and textbox paragraphs. Excludes headers/footers and inline
+    pictures. DrawingML geometry uses EMUs; legacy VML retains its style units.
+    """
+    from .live import comments_live, write_mode
+    try:
+        session = write_mode.live_session_for(path)
+        write_mode.require_capability(session, "shape_guard", feature_description="shape inventory")
+        return comments_live._request(session, "shapes_list")
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
 def main() -> None:
     """Entry point for the `verified-docx-mcp` command.
 

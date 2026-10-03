@@ -888,6 +888,7 @@ def execute_replace_text_live(
     after_text = "\n".join(m.get("after", "") for m in matches)
 
     evidence = live_write_mode.live_evidence(
+        shape_result=result,
         applied=True,
         match_count=match_count,
         rung=2,
@@ -1249,6 +1250,7 @@ def execute_format_text_live(
     after_text = "\n".join(m.get("after", "") for m in matches)
 
     evidence = live_write_mode.live_evidence(
+        shape_result=result,
         applied=True,
         match_count=match_count,
         rung=1,
@@ -1862,6 +1864,7 @@ def execute_live_save(path: str) -> dict[str, Any]:
         "revision_after": f"live:sha256:{post_hash}",
         "file_revision": file_revision,
     }
+    evidence.update(live_write_mode.shape_counts(result))
     logged, _ = audit.append_audit(path=str(resolved), tool="live_save", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence

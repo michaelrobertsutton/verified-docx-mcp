@@ -278,6 +278,12 @@ class LiveSession:
         scheduled on ``self.loop`` -- see the block comment above
         ``request()``. Not called directly by anything outside this
         class."""
+        guarded = {"replace", "format", "cell_set", "cells_set", "table_insert",
+                   "paragraph_delete", "revisions_accept", "revisions_reject",
+                   "comment_add", "comment_reply", "comment_resolve", "save"}
+        if op in guarded and "shape_guard" not in self.hello.capabilities:
+            raise LiveOpFailed("LIVE_CAPABILITY_MISSING",
+                               "Reload the live pane: anchored-shape protection is required")
         if op not in VALID_OPS:
             raise ValueError(f"unknown op {op!r}; must be one of {sorted(VALID_OPS)}")
         if timeout is None:

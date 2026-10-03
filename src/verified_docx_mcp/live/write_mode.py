@@ -391,6 +391,7 @@ def live_evidence(
     document_name: str,
     tool: str,
     path: str,
+    shape_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build + audit-log the live-mode evidence envelope for one mutating
     live op, and return it.
@@ -440,6 +441,7 @@ def live_evidence(
         "track_changes_author": "word-signed-in-user",
         "orphaned_comment_ids": [],
     }
+    evidence.update(shape_counts(shape_result or {}))
     logged, _ = audit.append_audit(path=path, tool=tool, evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
@@ -475,3 +477,8 @@ def audit_live_failure(
         "detail": detail or {},
     }
     audit.append_audit(path=path, tool=f"{tool}:verification_failed", evidence=evidence)
+
+
+def shape_counts(result: dict[str, Any]) -> dict[str, Any]:
+    """Copy verified pane counts to public evidence and the audit entry."""
+    return {key: result[key] for key in ("shapes_before", "shapes_after") if key in result}
