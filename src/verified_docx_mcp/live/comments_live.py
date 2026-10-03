@@ -95,6 +95,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from . import bridge as live_bridge
+from . import write_mode
 from .protocol import OP_ERROR_MATCH_COUNT_MISMATCH, OP_ERROR_ZERO_MATCH
 from .session import (
     LiveDisconnected,
@@ -629,6 +630,7 @@ def execute_add_anchored_comment_live(
         "document_name": document_name,
         "author": "word-signed-in-user",
     }
+    evidence.update(write_mode.shape_counts(result))
     logged, _reason = audit.append_audit(path=str(resolved), tool="add_anchored_comment", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
@@ -670,7 +672,7 @@ def execute_reply_to_comment_live(path: str, comment_id: str, text: str, address
     parent_raw = next((c for c in raw_comments if c.get("id") == live_handle), None)
     parent_anchor = (parent_raw or {}).get("anchorText", "")
 
-    _request(session, "comment_reply", {"comment_id": live_handle, "text": text, **(address or {})})
+    result = _request(session, "comment_reply", {"comment_id": live_handle, "text": text, **(address or {})})
 
     # Verify by re-listing rather than trusting the op's own ok=true --
     # same discipline as file mode's own post-write re-read. Only the target
@@ -710,6 +712,7 @@ def execute_reply_to_comment_live(path: str, comment_id: str, text: str, address
     }
     if not (pre_targeted and post_targeted):
         evidence["pane_note"] = STALE_PANE_NOTE
+    evidence.update(write_mode.shape_counts(result))
     logged, _reason = audit.append_audit(path=str(resolved), tool="reply_to_comment", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
@@ -735,7 +738,7 @@ def execute_resolve_comment_live(path: str, comment_id: str, address: dict[str, 
         _raw_comments, correlation = _live_state(path, session)
         live_handle, resolved_via = _resolve_comment_handle(comment_id, correlation)
 
-    _request(session, "comment_resolve", {"comment_id": live_handle, "resolved": True, **(address or {})})
+    result = _request(session, "comment_resolve", {"comment_id": live_handle, "resolved": True, **(address or {})})
 
     # Independent post-op re-read -- the pane's own reply is not trusted
     # on its own, same discipline as file mode's own resolve_comment. Only
@@ -769,6 +772,7 @@ def execute_resolve_comment_live(path: str, comment_id: str, address: dict[str, 
     }
     if not post_targeted:
         evidence["pane_note"] = STALE_PANE_NOTE
+    evidence.update(write_mode.shape_counts(result))
     logged, _reason = audit.append_audit(path=str(resolved), tool="resolve_comment", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence

@@ -75,6 +75,7 @@ class ErrorCode(Enum):
     # Text location + targeted edits (locate.py, text_edit.py; WP-06)
     ZERO_MATCH = "ZERO_MATCH"  # `find` not located after the full normalization ladder; near-miss in diagnostics
     MATCH_COUNT_MISMATCH = "MATCH_COUNT_MISMATCH"  # match count != expected_matches (D4: expected_matches is required, no default)
+    ANCHORED_SHAPES = "ANCHORED_SHAPES"
     STRUCTURAL_BOUNDARY = "STRUCTURAL_BOUNDARY"  # a match crosses a w:p/w:tbl/w:tc boundary
 
     # Tracked changes (tracked_changes.py; WP-07)

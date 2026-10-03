@@ -12,7 +12,7 @@ const comment={id:'c',content:'question',authorName:'A',resolved:false,
 const context={document:{body:{load(){},get text(){return texts.join('\n');},paragraphs:collection},
   load(){},get changeTrackingMode(){return mode;},set changeTrackingMode(v){mode=v;}},sync:async()=>{}};
 class DOMParser {parseFromString(){const p={getElementsByTagNameNS:(ns,tag)=>(tag==='anchor'&&anchored)||(tag==='sectPr'&&section)?[{}]:[]};
-  return {getElementsByTagName:tag=>malformed?[{}]:[],getElementsByTagNameNS:(ns,tag)=>tag==='body'?[{getElementsByTagNameNS:()=>[p]}]:[]};}}
+  return {getElementsByTagName:tag=>malformed?[{}]:[],getElementsByTagNameNS:(ns,tag)=>tag==='body'?[{getElementsByTagNameNS:(ns,t)=>t==='p'?[p]:t==='anchor'&&anchored?[{}]:[]}]:[]};}}
 const sandbox={crypto:webcrypto,TextEncoder,console,DOMParser,document:{getElementById:()=>({addEventListener(){}})},
   Office:{onReady(){},context:{requirements:{isSetSupported:()=>true}}},Word:{run:fn=>fn(context),RangeLocation:{whole:'Whole'},ChangeTrackingMode:{trackAll:'TrackAll'}}};
 vm.createContext(sandbox);vm.runInContext(fs.readFileSync(process.argv[2],'utf8')+'\nglobalThis.op=opParagraphDelete;',sandbox);

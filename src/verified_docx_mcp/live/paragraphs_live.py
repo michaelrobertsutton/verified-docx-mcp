@@ -23,6 +23,7 @@ def delete_paragraph(path: str, anchor_text: str, revision_before: str,
                 "applied": None, "write_mode": "live", "error": exc.envelope.to_dict()})
         raise
     evidence = write_mode.live_evidence(
+        shape_result=result,
         applied=True, match_count=1, rung=1, before=anchor_text, after="",
         pre_body_sha256=pre, post_body_sha256=result["post"],
         document_name=session.document_name, tool="delete_paragraph", path=path)
