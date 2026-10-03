@@ -4,6 +4,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from .errors import ErrorCode, _make_error
 
@@ -36,7 +37,8 @@ def status(path: Path) -> dict:
         return {"supported": True, "checked": False, "open": None,
                 "detail": result.stderr.strip()}
     target = path.resolve()
-    candidates = result.stdout.splitlines()
+    candidates = [unquote(urlparse(p).path) if "://" in p else p
+                  for p in result.stdout.splitlines()]
     # If Word returns a cloud URL or an unresolved HFS path, a matching
     # basename is sufficient to refuse; it is never evidence of closure.
     opened = any(Path(p).resolve() == target or

@@ -22,3 +22,13 @@ def test_automation_failure_refuses(monkeypatch):
                         SimpleNamespace(returncode=1, stdout='', stderr='not authorized'))
     with pytest.raises(VerifyError):
         desktop_word.raise_if_open(Path('/tmp/example.docx'))
+
+
+def test_cloud_url_name_is_decoded(monkeypatch):
+    monkeypatch.setattr(desktop_word.sys, 'platform', 'darwin')
+    monkeypatch.setattr(desktop_word.subprocess, 'run', lambda *a, **k:
+                        SimpleNamespace(returncode=0,
+                            stdout='https://example.sharepoint.com/docs/My%20Document.docx?web=1',
+                            stderr=''))
+    with pytest.raises(VerifyError):
+        desktop_word.raise_if_open(Path('/tmp/My Document.docx'))
