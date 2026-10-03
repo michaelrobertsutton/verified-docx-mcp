@@ -51,6 +51,7 @@ before the guard" — the ordering below is the fix, not incidental):
 
 from __future__ import annotations
 
+import copy
 import difflib
 import os
 import re
@@ -1327,6 +1328,24 @@ def _evidence(
 # ---------------------------------------------------------------------------
 
 
+def _preserve_table_properties(old_elements: list[Any], new_elements: list[Any]) -> None:
+    """Match top-level tables by order within the replaced range.
+
+    Preserve each matched table's own properties, including explicit absent
+    borders, rather than borrowing formatting from unrelated sibling tables.
+    New unmatched tables keep the renderer's visible grid default.
+    """
+    old_tables = [el for el in old_elements if el.tag == f"{{{W_NS}}}tbl"]
+    new_tables = [el for el in new_elements if el.tag == f"{{{W_NS}}}tbl"]
+    for old, new in zip(old_tables, new_tables):
+        old_pr = old.find(f"{{{W_NS}}}tblPr")
+        new_pr = new.find(f"{{{W_NS}}}tblPr")
+        if new_pr is not None:
+            new.remove(new_pr)
+        if old_pr is not None:
+            new.insert(0, copy.deepcopy(old_pr))
+
+
 def execute_replace_body_markdown(
     path: str,
     markdown: str,
@@ -1362,6 +1381,7 @@ def execute_replace_body_markdown(
 
     ctx = markdown_to_ooxml.StyleContext.build(resolved)
     new_elements = markdown_to_ooxml.render_blocks(markdown, ctx)
+    _preserve_table_properties(target_elements, new_elements)
     # The verification target is what read_document_markdown would render
     # from THESE elements (run through the identical rendering rules
     # read_document_markdown itself uses; see projection.py's module
@@ -1524,6 +1544,7 @@ def execute_replace_range_markdown(
 
     ctx = markdown_to_ooxml.StyleContext.build(resolved)
     new_elements = markdown_to_ooxml.render_blocks(markdown, ctx)
+    _preserve_table_properties(target_elements, new_elements)
     # See replace_body_markdown's identical comment: verify against the
     # rendered PREVIEW of these elements, not the raw markdown text — and
     # (also as there) new_elements' own paragraphs only reference numIds
