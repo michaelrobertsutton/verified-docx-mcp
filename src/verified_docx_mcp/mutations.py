@@ -66,7 +66,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from . import audit, markdown_to_ooxml, paths, projection, write_ledger
+from . import desktop_word, audit, markdown_to_ooxml, paths, projection, write_ledger
 from .errors import ErrorCode, _make_error
 from .live import write_mode as live_write_mode
 from .projection import DEFAULT_PART, R_NS, W_NS
@@ -787,6 +787,7 @@ def atomic_replace_docx_parts(
 
             shutil.copyfile(original_path, jsbak_path)
             _recheck_source(original_path, expected_source_fingerprint, stage="immediately before replacing")
+            desktop_word.raise_if_open(original_path)
             os.replace(str(tmp_path), str(original_path))
             replaced = True
             tmp_consumed = True
@@ -813,13 +814,17 @@ def atomic_replace_docx_parts(
                         "jsbak_path": str(jsbak_path),
                     },
                 ) from exc
-            else:
-                jsbak_path.unlink(missing_ok=True)
-
             external_change_during_write = _installed_fingerprint(original_path) != staged_fingerprint
             if external_change_during_write:
-                ledger_reason = "the file changed after this write landed; ledger not updated"
+                raise _make_error(
+                    ErrorCode.VERIFICATION_FAILED,
+                    "Another writer changed the saved package before success could be confirmed; "
+                    "the original backup was retained and no rollback was attempted.",
+                    {"external_change_during_write": True, "rollback_skipped": True,
+                     "jsbak_path": str(jsbak_path)},
+                )
             else:
+                jsbak_path.unlink(missing_ok=True)
                 ledger_ok, ledger_reason = write_ledger.record_write(
                     original_path, staged_fingerprint, staged_revision
                 )
@@ -888,6 +893,7 @@ def _guard_before_write(
     # Never starts the bridge lazily; see raise_if_live_session_active's
     # own docstring.
     live_write_mode.raise_if_live_session_active(resolved)
+    desktop_word.raise_if_open(resolved)
 
     # Lazy import: server.py imports this module at load time to register
     # the tools below, so a module-level "from . import server" here would
