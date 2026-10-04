@@ -1046,6 +1046,28 @@ that folder at launch, so a copy made while Word is running will not
 appear until the next restart.
 
 
+### AppleScript revision enumeration can freeze Word (#59)
+
+On Word for Mac 16.113.3, enumerating revisions in a heavily redlined document
+has caused minutes of layout work on Word's main thread and blocked document
+AppleEvents. Do not use `revision type of every revision of active document`
+or `count of revisions of active document` as a test oracle or fallback on
+such documents. A timeout bounds the caller's wait; it does not cancel the
+work already running inside Word. Do not retry a timed-out enumeration.
+
+Use `live_status` and `list_open_items(source="live")` instead. Check revision
+coverage and the document body's OOXML markup count: Office.js can merge an
+adjacent insertion and deletion, so its count alone is not authoritative.
+Use live body OOXML for an independent check, never a same-named disk copy.
+Do not run a destructive accept/reject-all operation merely to obtain a count.
+
+For a responsiveness watchdog, use a document-level AppleEvent such as `count
+of documents`, with a short AppleScript timeout (for example five seconds) and
+an outer process timeout. An application-name probe may keep answering while
+document events are blocked. Stop on timeout and report the blocked host;
+avoid repeated probes and leave recovery decisions to the operator.
+
+
 ### Full revision visibility (#58)
 
 New panes return live body revision OOXML alongside Office.js metadata in the
