@@ -738,18 +738,39 @@ async function searchScoped(context, payload) {
   if (payload.scope && payload.scope !== "body") {
     if (payload.rowAnchor) throw refusalError("Row scope cannot be combined with text-box scopes", "INVALID_INPUT");
     const resolved = await resolveScopes(context, payload.scope, true);
-    const results = resolved.bodies.map(b => b.body.search(payload.find, {matchCase: true, matchWholeWord: false}));
-    results.forEach(r => r.load("text"));
-    resolved.bodies.forEach(b => b.body.load("text"));
-    await context.sync();
-    // Word for Mac 16.113 returns no search results inside shape text although the
-    // same body reads back correctly. Say so instead of reporting "found 0".
-    const blind = resolved.bodies.filter((b, i) => b.scope !== "body" && !results[i].items.length &&
-      String(b.body.text || "").includes(payload.find));
-    if (blind.length) throw refusalError(
-      `Word cannot search inside ${blind.map(b => b.shape.name).join(", ")}: the text is present but Range.search returns no matches in shape text on this host, so it cannot be addressed`,
-      "LIVE_CAPABILITY_MISSING");
-    return results.flatMap(r => r.items);
+    const merged = [];
+    for (const item of resolved.bodies) {
+      if (item.scope === "body") {
+        const found = item.body.search(payload.find, {matchCase: true, matchWholeWord: false});
+        found.load("text");
+        await context.sync();
+        merged.push(...found.items);
+        continue;
+      }
+      // Range.search inside shape text HANGS Word for Mac 16.113.3 when it has a hit (observed: the
+      // sync after search froze Word at 100% CPU; a no-match search returned normally), and other
+      // hosts return nothing. So shape text is never searched: only exact paragraph content is
+      // addressed, through paragraph Content ranges (no paragraph mark, no shape anchor).
+      item.body.load("text");
+      const paragraphs = item.body.paragraphs;
+      paragraphs.load("items/text");
+      await context.sync();
+      if (!payload.find || !String(item.body.text || "").includes(payload.find)) continue;
+      const exact = paragraphs.items.filter(p => p.text === payload.find);
+      // Every literal occurrence must be addressed: don't silently skip a
+      // substring in another paragraph when a whole paragraph also matches.
+      const occurrences = String(item.body.text || "").split(payload.find).length - 1;
+      if (!payload.find || exact.length !== occurrences) throw refusalError(
+        `Word cannot search inside ${item.shape.name}; this host supports only exact whole-paragraph shape edits`,
+        "LIVE_CAPABILITY_MISSING");
+      const ranges = exact.map(p => p.getRange("Content"));
+      ranges.forEach(r => r.load("text"));
+      await context.sync();
+      if (ranges.some(r => r.text !== payload.find)) throw refusalError(
+        "Shape paragraph content could not be addressed exactly", "LIVE_CAPABILITY_MISSING");
+      merged.push(...ranges);
+    }
+    return merged;
   }
   if (payload.rowAnchor === null || payload.rowAnchor === undefined) {
     const results = context.document.body.search(payload.find, { matchCase: true, matchWholeWord: false });
@@ -788,7 +809,8 @@ async function opReplace(payload) {
 
     await guardAnchoredParagraphs(context, matchItems);
     await guardRevisions(context, matchItems);
-    const commentsBefore = await guardComments(context, matchItems, payload.allow_comment_loss);
+    const shapeBodies = await scopeShapeBodies(context, payload.scope);
+    const commentsBefore = await guardComments(context, matchItems, payload.allow_comment_loss, shapeBodies);
     const policy = payload.inherit_format || "replaced";
     if (!["replaced", "previous", "none"].includes(policy)) throw refusalError("Invalid inherit_format", "INVALID_INPUT");
     if (policy === "none" && !Office.context.requirements.isSetSupported("WordApiDesktop", "1.3"))
@@ -841,6 +863,10 @@ async function opReplace(payload) {
     const remainingScope = await resolveScopes(context, payload.scope || "body", true);
     const remainingComments = [];
     for (const item of remainingScope.bodies) {
+      if (item.scope !== "body") {
+        remainingComments.push(...(await shapeCommentIds(context, item.body)).map(id => ({id})));
+        continue;
+      }
       const collection = item.body.getComments();
       collection.load("items/id");
       await context.sync();
@@ -869,6 +895,11 @@ async function opFormat(payload) {
       throw refusalError(
         `expected ${expectedMatches} match(es) for ${JSON.stringify(payload.find)}, found ${matchItems.length}`
       );
+    }
+
+    if (payload.scope && payload.scope !== "body") {
+      await guardRevisions(context, matchItems);
+      await guardComments(context, matchItems, false, await scopeShapeBodies(context, payload.scope));
     }
 
     let previousMode = null;
@@ -1678,7 +1709,37 @@ async function verifyCommentIdentity(context, comment, identity) {
     throw refusalError("Comment identity changed; re-list before editing", "COMMENT_ID_STALE");
 }
 
-async function guardComments(context, ranges, allowLoss) {
+// Word for Mac 16.113.3 throws GeneralException for every comment lookup on a range or body
+// inside shape text (range.getComments, parentBody.getComments), and Word does not keep
+// comments in text boxes at all (a comment anchor patched into a text box was gone from the
+// live OOXML after load). So for shape scopes the comment check reads the shape body's own
+// OOXML for comment marks instead, and fails closed when that cannot be read.
+async function shapeCommentIds(context, body) {
+  let xml;
+  try {
+    const ooxml = body.getOoxml();
+    await context.sync();
+    xml = String(ooxml.value || "");
+  } catch (error) {
+    throw refusalError("Cannot verify comments in shape text on this host (body OOXML unreadable)", "LIVE_CAPABILITY_MISSING");
+  }
+  return [...new Set([...xml.matchAll(/<w:comment(?:RangeStart|RangeEnd|Reference)\b[^>]*\bw:id="([^"]*)"/g)].map(m => m[1]))];
+}
+async function guardShapeComments(context, shapeBodies, allowLoss) {
+  const found = [];
+  for (const body of shapeBodies) found.push(...await shapeCommentIds(context, body));
+  if (found.length && allowLoss !== true)
+    throw refusalError(`Replacement overlaps comments in shape text: ${JSON.stringify(found)}`, "WOULD_DELETE_COMMENTS");
+  return found.map(id => ({id}));
+}
+// The text-box bodies a scoped op addresses (null for the main body).
+async function scopeShapeBodies(context, scope) {
+  if (!scope || scope === "body") return null;
+  return (await resolveScopes(context, scope, true)).bodies.filter(b => b.scope !== "body").map(b => b.body);
+}
+
+async function guardComments(context, ranges, allowLoss, shapeBodies) {
+  if (shapeBodies && shapeBodies.length) return guardShapeComments(context, shapeBodies, allowLoss);
   const affected = new Map();
   for (const range of ranges) {
     const comments = range.getComments();
