@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from verified_docx_mcp.live import comments_live, revisions_live
 
 
@@ -177,3 +179,60 @@ def test_date_instants_are_not_truncated_or_guessed():
     # A zone-less date only matches by exact string equality.
     assert not _handle_for("2026-10-04T14:55:00.000Z", _single_insert_xml("2026-10-04T14:55:00", None))
     assert _handle_for("2026-10-04T14:55:00", _single_insert_xml("2026-10-04T14:55:00", None))
+
+
+def _desktop_xml():
+    # Mirrors a real Word-authored document: adjacent pair, two identical insertions, a formatting change
+    # and an empty (structural) insertion mark that Word's Revision list does not enumerate.
+    return (f'<w:document xmlns:w="{W}" xmlns:u="{W16DU}"><w:body><w:p>'
+            '<w:ins w:id="0" w:author="B" w:date="2026-10-04T10:54:00Z" u:dateUtc="2026-10-04T14:54:00Z"><w:r><w:t>QRS</w:t></w:r></w:ins>'
+            '<w:del w:id="1" w:author="B" w:date="2026-10-04T10:54:00Z" u:dateUtc="2026-10-04T14:54:00Z"><w:r><w:delText>beta</w:delText></w:r></w:del>'
+            '<w:ins w:id="2" w:author="A" w:date="2026-10-04T10:54:00Z" u:dateUtc="2026-10-04T14:54:00Z"><w:r><w:t> dup</w:t></w:r></w:ins>'
+            '<w:ins w:id="3" w:author="A" w:date="2026-10-04T10:54:00Z" u:dateUtc="2026-10-04T14:54:00Z"><w:r><w:t> dup</w:t></w:r></w:ins>'
+            '<w:r><w:rPr><w:rPrChange w:id="4" w:author="A" w:date="2026-10-04T10:54:00Z"/></w:rPr><w:t>iota</w:t></w:r>'
+            '<w:ins w:id="5" w:author="A" w:date="2026-10-04T10:54:00Z" u:dateUtc="2026-10-04T14:54:00Z"/>'
+            '</w:p></w:body></w:document>')
+
+
+def _desktop_list(overrides=None):
+    d = "2026-10-04T10:54:00.000Z"  # Word.Revision.date is local time labelled Z, like w:date
+    rows = [("Insert", "B", "QRS"), ("Delete", "B", ""), ("Insert", "A", " dup"), ("Insert", "A", " dup\r\t\r\n"),
+            ("Property", "A", "iota")]
+    out = [{"revision_id": f"d{i}", "type": t, "author": a, "date": d, "text": x} for i, (t, a, x) in enumerate(rows)]
+    for i, change in (overrides or {}).items():
+        out[i].update(change)
+    return out
+
+
+def _list_with_desktop(desktop):
+    session = SimpleNamespace(hello=SimpleNamespace(capabilities={"live_revisions"}))
+    reply = {"revisions": [], "revision_ooxml": _desktop_xml(), "session_epoch": "e", "desktop_revisions": desktop}
+    with patch.object(comments_live, "_request", return_value=reply):
+        return revisions_live.list_revisions(session)["revisions"]
+
+
+def test_desktop_revisions_give_every_content_revision_a_handle_in_document_order():
+    items = _list_with_desktop(_desktop_list())
+    assert [i["markup_type"] for i in items] == ["ins", "del", "ins", "ins", "rPrChange", "ins"]
+    # incl. the deletion and the two identical insertions
+    assert [i["revision_id"] for i in items[:5]] == ["d0", "d1", "d2", "d3", "d4"]
+    assert all(i["actionable"] and i["source"] == "ooxml+officejs-desktop" for i in items[:5])
+    # the structural empty insertion mark is not in Word's list, so it stays read-only
+    assert not items[5]["actionable"] and items[5]["source"] == "ooxml"
+
+
+@pytest.mark.parametrize("patch_", [
+    {1: {"type": "Insert"}},                       # wrong type at a position
+    {0: {"author": "someone else"}},               # wrong author
+    {2: {"date": "2026-10-04T11:00:00.000Z"}},     # different instant
+    {0: {"text": "different"}},                    # insertion text differs
+    {4: {"revision_id": None}},                    # no handle
+])
+def test_desktop_mismatch_leaves_everything_read_only(patch_):
+    assert not any(i["actionable"] for i in _list_with_desktop(_desktop_list(patch_)))
+
+
+def test_desktop_count_mismatch_leaves_everything_read_only():
+    assert not any(i["actionable"] for i in _list_with_desktop(_desktop_list()[:-1]))
+    assert not any(i["actionable"] for i in _list_with_desktop([]))
+    assert not any(i["actionable"] for i in _list_with_desktop(None))

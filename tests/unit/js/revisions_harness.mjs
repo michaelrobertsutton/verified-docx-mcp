@@ -63,6 +63,27 @@ await assert.rejects(() => sandbox.api.guardRevisions(context,[guardRange('Insid
 await assert.rejects(() => sandbox.api.guardRevisions(context,[guardRange('OverlapsEnd')]), e => e.code === 'TRACKED_CHANGES_PRESENT');
 await sandbox.api.guardRevisions(context,[guardRange('AdjacentBefore')]);
 await sandbox.api.guardRevisions(context,[guardRange('After')]);
+// WordApiDesktop 1.4 Word.Revision objects list what the TrackedChange list omits (deletions) and are
+// individually accept()-able; a desktop Revision has no `text`, so it must never be asked to load it.
+items = []; hidden = 2;
+const accepted = [], loaded = [];
+const desktopRevisions = ['Delete', 'Insert'].map(type => ({type, author: 'A', date: 'd',
+  range: {text: type === 'Delete' ? '' : 'new', load() {}},
+  load(fields) {loaded.push(fields);}, track() {}, untrack() {}, reject() {},
+  accept() {hidden--; accepted.push(type);}}));
+body.getRange = () => ({revisions: {items: desktopRevisions, load() {}, track() {}, untrack() {}}});
+const withDesktop = await sandbox.api.opRevisionsList();
+assert.equal(withDesktop.desktop_revisions.length, 2);
+assert.equal(withDesktop.desktop_revisions.map(r => r.type).join(), 'Delete,Insert');
+const deletionId = withDesktop.desktop_revisions[0].revision_id;
+const onlyOne = await sandbox.api.opRevisionsMutate({revision_ids: [deletionId]}, 'accept');
+assert.equal(accepted.join(), 'Delete');assert.equal(onlyOne.ooxml_after, onlyOne.ooxml_before - 1);
+assert.equal(loaded.length > 0 && loaded.every(f => !f.includes('text')), true);
+await assert.rejects(() => sandbox.api.opRevisionsMutate({revision_ids: [deletionId]}, 'accept'), e => e.code === 'REVISION_ID_NOT_FOUND');
+// A host without the desktop collection (or one that throws) just omits the list: nothing else changes.
+body.getRange = () => {throw new Error('not supported');};
+assert.equal('desktop_revisions' in await sandbox.api.opRevisionsList(), false);
+delete body.getRange;
 sandbox.Office.context.requirements.isSetSupported = () => false;
 assert.equal((await sandbox.api.opRevisionsList()).revisions,null);
 console.log('revision behavior passed');
