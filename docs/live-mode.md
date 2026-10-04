@@ -1067,7 +1067,10 @@ If Word merges or omits revisions, the full markup list is visible but its
 entries cannot be accepted/rejected individually. Such calls refuse before
 mutation with `LIVE_CAPABILITY_MISSING`; use collection-level accept/reject-all
 instead. Duplicate metadata also remains read-only. Malformed OOXML reports
-partial coverage; older panes retain their API inventory and coverage warning.
+partial coverage; if the pane cannot read the body OOXML at all, it omits
+`revision_ooxml` and returns the Office.js inventory with
+`ooxml_revision_count: null` (unverified) instead of failing the operation
+(`live_status` and `list_open_items` depend on it); older panes retain their API inventory and coverage warning.
 Issue #58 remains open: safe individual addressing of omitted revisions still
 needs investigation on real Word builds. Do not treat complete visibility as
 complete individual editing support.
