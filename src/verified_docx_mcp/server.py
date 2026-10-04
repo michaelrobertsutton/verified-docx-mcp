@@ -654,6 +654,14 @@ def lock_status(path: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _revision_status(session: Any) -> dict[str, Any]:
+    from .live.revisions_live import list_revisions
+
+    state = list_revisions(session)
+    return {"revision_count": len(state["revisions"]) if state["revisions"] is not None else None,
+            "revision_coverage": state["coverage"], "revision_reason": state.get("reason")}
+
+
 def execute_live_status() -> dict[str, Any]:
     """Start the live bridge lazily (idempotent) and report its state.
 
@@ -687,6 +695,7 @@ def execute_live_status() -> dict[str, Any]:
                 "last_heartbeat_age_s": session.heartbeat_age(),
                 "body_sha256": session.last_body_sha256,
                 "requirement_sets": session.hello.requirement_sets,
+                **_revision_status(session),
             }
         )
 
@@ -1830,6 +1839,7 @@ def accept_tracked_changes(
     revision_ids: list[str] | None = None,
     revision_before: str | None = None,
     force: bool = False,
+    write_mode: str = "auto",
     allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Accept tracked changes (w:ins/w:del), atomically -- all of them, or
@@ -1866,6 +1876,10 @@ def accept_tracked_changes(
       VERIFICATION_FAILED               - post-write verification failed; rolled back
     """
     try:
+        from .live.revisions_live import mutate_revisions
+
+        if comments_live._resolve_write_mode(path, write_mode) == "live":
+            return mutate_revisions(path, "accept", revision_ids, revision_before)
         return tracked_changes.execute_accept_tracked_changes(
             path,
             revision_ids,
@@ -1883,6 +1897,7 @@ def reject_tracked_changes(
     revision_ids: list[str] | None = None,
     revision_before: str | None = None,
     force: bool = False,
+    write_mode: str = "auto",
     allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Reject tracked changes (w:ins/w:del), atomically -- all of them, or
@@ -1899,6 +1914,10 @@ def reject_tracked_changes(
     Errors: as accept_tracked_changes.
     """
     try:
+        from .live.revisions_live import mutate_revisions
+
+        if comments_live._resolve_write_mode(path, write_mode) == "live":
+            return mutate_revisions(path, "reject", revision_ids, revision_before)
         return tracked_changes.execute_reject_tracked_changes(
             path,
             revision_ids,

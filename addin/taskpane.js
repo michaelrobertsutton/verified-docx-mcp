@@ -226,7 +226,7 @@ const OP_LOG_LIMIT = 20;
 // issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
 // find_sections / list_tables).
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml"];
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions"];
 
 // issue #33: the largest body_ooxml reply (UTF-8 bytes of its JSON) the pane
 // will send. Kept below the bridge's 64 MiB websocket max_size so an
@@ -348,6 +348,8 @@ function connectOpsSocket() {
   socket.onopen = async () => {
     reconnectDelayMs = RECONNECT_MIN_MS;
     try {
+      paneEpoch = crypto.randomUUID();
+      revisionHandles.clear();
       const hash = await currentBodyHash();
       socket.send(
         JSON.stringify({
@@ -491,6 +493,12 @@ async function dispatchOp(op, payload) {
       return opTableInsert(payload);
     case "cells_set":
       return opCellsSet(payload);
+    case "revisions_list":
+      return opRevisionsList();
+    case "revisions_accept":
+      return opRevisionsMutate(payload, "accept");
+    case "revisions_reject":
+      return opRevisionsMutate(payload, "reject");
     case "save":
       return opSave();
     default:
@@ -691,6 +699,7 @@ async function opReplace(payload) {
       );
     }
 
+    await guardRevisions(context, matchItems);
     let previousMode = null;
     if (payload.track_changes) {
       context.document.load("changeTrackingMode");
@@ -1365,3 +1374,125 @@ Office.onReady((info) => {
   runAndRender();
   connectOpsSocket();
 });
+
+// #48: handles are pane-epoch identities, not invented Office.js revision ids.
+let paneEpoch = crypto.randomUUID();
+const revisionHandles = new Map();
+function revisionsSupported() {
+  return Office.context.requirements.isSetSupported("WordApi", "1.6");
+}
+async function revisionObjects(context, body) {
+  const changes = body.getTrackedChanges();
+  changes.load("items/author,items/date,items/text,items/type");
+  await context.sync();
+  return changes;
+}
+// Word for Mac's getTrackedChanges() can merge an adjacent insertion and
+// deletion into one item, so the API list undercounts. The document part's own
+// revision markup is the cross-check; null means "could not be read".
+const REVISION_MARKUP = /<w:(?:ins|del|moveFrom|moveTo|rPrChange|pPrChange|sectPrChange|tblPrChange|trPrChange|tcPrChange|tblGridChange|cellIns|cellDel|cellMerge|numberingChange)[\s/>]/g;
+async function bodyRevisionMarkupCount(context) {
+  try {
+    const ooxml = context.document.body.getOoxml();
+    await context.sync();
+    const xml = String(ooxml.value || "");
+    const start = xml.indexOf('pkg:name="/word/document.xml"');
+    let part = xml;
+    if (start >= 0) {
+      const end = xml.indexOf("</pkg:part>", start);
+      part = end >= 0 ? xml.slice(start, end) : xml.slice(start);
+    }
+    return (part.match(REVISION_MARKUP) || []).length;
+  } catch (error) {
+    return null;
+  }
+}
+async function opRevisionsList() {
+  if (!revisionsSupported()) return {revisions: null, coverage: "unavailable", reason: "WordApi 1.6 required"};
+  return Word.run(async context => {
+    const changes = await revisionObjects(context, context.document.body);
+    const entries = changes.items.map(change => {
+      const id = `revision:${paneEpoch}:${crypto.randomUUID()}`;
+      change.track();
+      changes.track();
+      const range = change.getRange();
+      range.paragraphs.load("items/text");
+      revisionHandles.set(id, {change, collection: changes, epoch: paneEpoch});
+      return {id, change, range};
+    });
+    await context.sync();
+    const markup = await bodyRevisionMarkupCount(context);
+    return {coverage: "body", session_epoch: paneEpoch, ooxml_revision_count: markup, revisions: entries.map(({id, change, range}) => ({
+      revision_id: id, type: change.type, author: change.author, date: change.date,
+      text: change.text, paragraph_context: range.paragraphs.items.map(p => p.text), scope: "body"
+    }))};
+  });
+}
+async function guardRevisions(context, ranges) {
+  if (!revisionsSupported()) throw refusalError("Cannot inspect revisions: WordApi 1.6 required", "LIVE_CAPABILITY_MISSING");
+  const refuse = () => refusalError("Accept or reject intersecting revisions before replacing text", "TRACKED_CHANGES_PRESENT");
+  const collections = ranges.map(r => r.getTrackedChanges());
+  collections.forEach(c => c.load("items"));
+  await context.sync();
+  if (collections.some(c => c.items.length)) throw refuse();
+  // Word for Mac's range.getTrackedChanges() only returns changes fully inside
+  // the range, so a match that sits inside (or straddles) a larger revision
+  // reports nothing. Compare against every revision in the match's paragraphs.
+  const scoped = ranges.filter(r => r.paragraphs && typeof r.compareLocationWith === "function");
+  const nearby = scoped.map(r => {
+    const first = r.paragraphs.getFirst(), last = r.paragraphs.getLast();
+    const changes = first.getRange("Start").expandTo(last.getRange("End")).getTrackedChanges();
+    changes.load("items");
+    return changes;
+  });
+  await context.sync();
+  const comparisons = [];
+  nearby.forEach((changes, i) => changes.items.forEach(change => comparisons.push(scoped[i].compareLocationWith(change.getRange()))));
+  await context.sync();
+  const apart = new Set(["Before", "After", "AdjacentBefore", "AdjacentAfter"]);
+  if (comparisons.some(c => !apart.has(c.value))) throw refuse();
+}
+async function opRevisionsMutate(payload, action) {
+  const retained = payload.revision_ids == null ? [] : payload.revision_ids.map(id => {
+    const entry = revisionHandles.get(id);
+    if (!entry || entry.epoch !== paneEpoch) throw refusalError("Stale revision handle; list revisions again", "REVISION_ID_NOT_FOUND");
+    return entry.change;
+  });
+  if (!revisionsSupported()) throw refusalError("WordApi 1.6 required", "LIVE_CAPABILITY_MISSING");
+  const execute = async context => {
+    await requireFreshBody(context, payload.expectedBodySha256);
+    const changes = await revisionObjects(context, context.document.body);
+    const before = changes.items.length;
+    const markupBefore = await bodyRevisionMarkupCount(context);
+    const all = payload.revision_ids == null;
+    const selected = all ? changes.items : payload.revision_ids.map(id => {
+      const entry = revisionHandles.get(id);
+      if (!entry || entry.epoch !== paneEpoch) throw refusalError("Stale revision handle; list revisions again", "REVISION_ID_NOT_FOUND");
+      return entry.change;
+    });
+    // Validate every retained object before queuing any mutation.
+    selected.forEach(c => c.load("author,date,text,type"));
+    await context.sync();
+    // One collection call covers items Word's list merged; per-item calls do not.
+    if (all && typeof changes[`${action}All`] === "function") changes[`${action}All`]();
+    else selected.forEach(c => c[action]());
+    await context.sync();
+    const remaining = await revisionObjects(context, context.document.body);
+    const markupAfter = await bodyRevisionMarkupCount(context);
+    context.document.body.load("text");
+    await context.sync();
+    const result = {applied: true, before_count: before, after_count: remaining.items.length,
+      changed_count: selected.length, ooxml_before: markupBefore, ooxml_after: markupAfter,
+      post: await sha256Hex(context.document.body.text || "")};
+    // The API list can undercount, so progress is judged on the markup itself.
+    const verified = all ? remaining.items.length === 0 && !markupAfter
+      : markupBefore != null && markupAfter != null ? markupAfter < markupBefore
+        : result.after_count === before - selected.length;
+    if (!verified) throw refusalError(JSON.stringify(result), "VERIFICATION_FAILED");
+    revisionHandles.forEach(e => {e.change.untrack(); e.collection.untrack();});
+    revisionHandles.clear();
+    await context.sync();
+    return result;
+  };
+  return retained.length ? Word.run(retained, execute) : Word.run(execute);
+}

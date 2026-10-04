@@ -51,6 +51,12 @@ OP_TIMEOUTS: dict[str, float] = {
     "table_get": 60.0,
     "table_insert": 90.0,
     "cells_set": 60.0,
+    # #48: revision ops walk every tracked change and serialize the body for the
+    # coverage cross-check; a timeout here would report a possibly-applied
+    # accept/reject as disconnected.
+    "revisions_list": 60.0,
+    "revisions_accept": 60.0,
+    "revisions_reject": 60.0,
 }
 
 TIMEOUT_ENV = "VERIFIED_DOCX_LIVE_TIMEOUT_S"
