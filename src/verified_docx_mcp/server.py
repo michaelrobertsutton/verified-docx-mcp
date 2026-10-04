@@ -1693,6 +1693,29 @@ def format_text(
 
 
 @mcp.tool()
+def live_open_pane(path: str, timeout_s: float = 60) -> dict[str, Any]:
+    """Make sure the Live pane is open and connected for this document (Word for Mac).
+
+    Opens the document in Word if it is not open, then opens the pane by driving
+    Word's UI (the ribbon's Live pane button, or the Add-ins popover), and returns
+    once the pane has actually connected. Returns immediately when it already is.
+    Use this instead of asking the user to click. Needs the calling app to have
+    macOS Accessibility permission. For documents you will keep working on, follow
+    up with `live_autoopen(path, enabled=true)` so Word opens the pane with the
+    document next time.
+
+    Returns `document_name`, `method` and `opened`. Errors: LIVE_UNAVAILABLE with a
+    message saying what to do by hand when the pane could not be opened.
+    """
+    from .live.open_pane_live import execute_open_pane
+
+    try:
+        return execute_open_pane(path, timeout_s)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
 def live_autoopen(path: str, enabled: bool | None = None) -> dict[str, Any]:
     """Read or set whether Word opens the Live pane automatically with this document.
 

@@ -1122,10 +1122,30 @@ What the tag is and is not:
 - After the manifest changes, fully quit and reopen Word and reinstall the
   manifest from `addin/` into the `wef` folder, then open the pane once more.
 
-Not covered: the first open of each document is still manual. After a Word
-restart the ribbon button moves to **Home > Add-ins > Developer Add-ins >
-verified-docx-mcp** (the popover is not exposed to accessibility scripting, so
-only a real mouse event works). `OnDocumentOpened` event-based activation would
+**The first open of a document: `live_open_pane` (Word for Mac).** Call
+`live_open_pane(path)` and it opens the document in Word if needed, opens the
+pane, and returns once the pane has actually connected (it never reports success
+on a guess). It first presses the ribbon's top-level **Live pane** button, which
+exists once the add-in has run in the current Word session; otherwise it opens
+the ribbon's **Add-ins** popover (**Home > Add-ins > Developer Add-ins >
+verified-docx-mcp**) with real mouse events, positioned from the Add-ins
+button's own on-screen position, because that popover is not exposed to
+accessibility scripting. It raises the target document's window first and
+refuses to continue on the wrong one. Needs the calling app to have macOS
+Accessibility permission (it asks for no other permission: calls into Finder or
+other apps would each raise their own macOS prompt). Verified on Word for Mac
+16.113.3 from a cold Word start (popover path, about 6 s), after reopening the
+document (ribbon-button path), with several documents open and a different one
+in front, and when the pane was already connected. For documents you keep
+working on, follow up with `live_autoopen(path, enabled=true)`.
+
+The same logic is available by hand: `osascript scripts/open_live_pane.applescript
+"<document name>"`. `scripts/make_shapes_fixture.applescript` builds the
+Word-authored shape fixture used by the text-box acceptance, with the
+Word-for-Mac addressing rules it needed written in its header.
+
+Not covered: Word for Windows and Word for the web (the tool refuses there
+with the manual instructions). `OnDocumentOpened` event-based activation would
 cover every document without tagging, but Microsoft documents it as unavailable
 on Office for Mac and it needs admin deployment. A shared-runtime startup
 behaviour (`Office.addin.setStartupBehavior`) is also document-scoped and was
