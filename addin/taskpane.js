@@ -230,7 +230,7 @@ const OP_LOG_LIMIT = 20;
 // issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
 // find_sections / list_tables).
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard"];
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback"];
 
 // issue #33: the largest body_ooxml reply (UTF-8 bytes of its JSON) the pane
 // will send. Kept below the bridge's 64 MiB websocket max_size so an
@@ -706,6 +706,16 @@ async function opReplace(payload) {
 
     await guardRevisions(context, matchItems);
     const commentsBefore = await guardComments(context, matchItems, payload.allow_comment_loss);
+    const policy = payload.inherit_format || "replaced";
+    if (!["replaced", "previous", "none"].includes(policy)) throw refusalError("Invalid inherit_format", "INVALID_INPUT");
+    if (policy === "none" && !Office.context.requirements.isSetSupported("WordApiDesktop", "1.3"))
+      throw refusalError("inherit_format=none requires WordApiDesktop 1.3", "LIVE_CAPABILITY_MISSING");
+    matchItems.forEach(r => r.font.load(FONT_FIELDS));
+    await context.sync();
+    const fonts = matchItems.map(r => fontSnapshot(r.font));
+    if (policy === "replaced" && fonts.some(f => Object.values(f).some(v => v === null || v === undefined || v === "")))
+      throw refusalError("Mixed formatting; choose previous or none explicitly", "MIXED_FORMATTING");
+    let inserted = [];
     let previousMode = null;
     if (payload.track_changes) {
       context.document.load("changeTrackingMode");
@@ -716,7 +726,12 @@ async function opReplace(payload) {
 
     const matches = matchItems.map((range) => ({ before: range.text, after: payload.replace }));
     try {
-      matchItems.forEach((range) => range.insertText(payload.replace, Word.InsertLocation.replace));
+      inserted = matchItems.map((range, i) => {
+        const target = range.insertText(payload.replace, Word.InsertLocation.replace);
+        if (payload.replace && policy === "replaced") FONT_FIELDS.forEach(k => {target.font[k] = fonts[i][k];});
+        if (payload.replace && policy === "none") target.font.reset();
+        return target;
+      });
       await context.sync();
     } finally {
       if (previousMode !== null) {
@@ -725,6 +740,16 @@ async function opReplace(payload) {
       }
     }
 
+    inserted.forEach(r => {r.load("text"); if (payload.replace) r.font.load(FONT_FIELDS);});
+    await context.sync();
+    inserted.forEach((r, i) => {
+      matches[i].after = r.text;
+      matches[i].fontBefore = fonts[i];
+      matches[i].fontAfter = payload.replace ? fontSnapshot(r.font) : null;
+      if (r.text !== payload.replace || (payload.replace && policy === "replaced" &&
+          FONT_FIELDS.some(k => matches[i].fontAfter[k] !== fonts[i][k])))
+        throw refusalError(`Replacement read-back failed: ${JSON.stringify(matches)}`, "VERIFICATION_FAILED");
+    });
     const postBody = context.document.body;
     postBody.load("text");
     await context.sync();
@@ -796,9 +821,15 @@ async function opFormat(payload) {
     // rather than echoing the request back -- lets the server detect a
     // write that didn't actually take (a protected range, a stale
     // object reference) instead of trusting an unconfirmed "applied".
-    matchItems.forEach((range) => range.font.load(["color", "strikeThrough"]));
+    matchItems.forEach(range => range.load("text"));
+    matchItems.forEach((range) => range.font.load(["bold", "italic", "underline", "color", "strikeThrough"]));
     await context.sync();
     matchItems.forEach((range, i) => {
+      matches[i].after = range.text;
+      matches[i].boldAfter = range.font.bold;
+      matches[i].italicAfter = range.font.italic;
+      matches[i].underlineAfter = range.font.underline === Word.UnderlineType.none ? false :
+        range.font.underline === Word.UnderlineType.single ? true : null;
       matches[i].colorAfter = range.font.color;
       matches[i].strikeAfter = range.font.strikeThrough;
     });
@@ -1548,4 +1579,10 @@ async function guardComments(context, ranges, allowLoss) {
   if (affected.length && allowLoss !== true)
     throw refusalError(`Replacement overlaps comments: ${JSON.stringify(affected)}`, "WOULD_DELETE_COMMENTS");
   return affected;
+}
+
+const FONT_FIELDS = ["bold", "italic", "underline", "strikeThrough", "color", "name", "size",
+  "doubleStrikeThrough", "subscript", "superscript"];
+function fontSnapshot(font) {
+  return Object.fromEntries(FONT_FIELDS.map(k => [k, font[k]]));
 }

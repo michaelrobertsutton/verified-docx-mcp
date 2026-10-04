@@ -14,3 +14,7 @@ def run_harness(name):
 
 def test_comment_loss_guard():
     run_harness("edit_harness.mjs")
+
+
+def test_replacement_and_format_readback():
+    run_harness("formatting_harness.mjs")

@@ -771,6 +771,7 @@ def execute_replace_text_live(
     track_changes: bool = False,
     within_row_containing: str | None = None,
     allow_comment_loss: bool = False,
+    inherit_format: str = "replaced",
 ) -> dict[str, Any]:
     """Live-mode ``replace_text`` (issue #106 WP-3): sends a ``replace``
     op over the pane's WSS ops channel instead of editing the .docx file.
@@ -807,11 +808,14 @@ def execute_replace_text_live(
     since Word, not this server, owns the file; the diagnostics say so
     explicitly).
     """
+    if inherit_format not in ("replaced", "previous", "none"):
+        raise _make_error(ErrorCode.INVALID_INPUT, "Invalid inherit_format")
     if not find:
         raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty")
 
     session = live_write_mode.live_session_for(path)
     document_name = session.document_name
+    live_write_mode.require_capability(session, "replacement_formatting", feature_description="replacement formatting")
     live_write_mode.require_capability(session, "comment_loss_guard", feature_description="comment loss protection")
     if within_row_containing:
         live_write_mode.require_capability(
@@ -829,6 +833,7 @@ def execute_replace_text_live(
         "replace": replace,
         "track_changes": track_changes,
         "allow_comment_loss": allow_comment_loss,
+        "inherit_format": inherit_format,
     }
     if within_row_containing:
         payload["rowAnchor"] = within_row_containing
@@ -899,6 +904,7 @@ def execute_replace_text_live(
 # limitation (see server.py's docstrings), not solved here.
 # ---------------------------------------------------------------------------
 
+    evidence["matches"] = matches
     evidence["comments_removed"] = result.get("comments_removed", [])
     return evidence
 
@@ -990,6 +996,7 @@ def execute_replace_text(
     write_mode: str = "auto",
     within_row_containing: str | None = None,
     allow_comment_loss: bool = False,
+    inherit_format: str = "replaced",
 ) -> dict[str, Any]:
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
@@ -1002,6 +1009,7 @@ def execute_replace_text(
             track_changes=track_changes,
             within_row_containing=within_row_containing,
             allow_comment_loss=allow_comment_loss,
+            inherit_format=inherit_format,
         )
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
@@ -1113,6 +1121,7 @@ def execute_format_text_live(
 
     session = live_write_mode.live_session_for(path)
     document_name = session.document_name
+    live_write_mode.require_capability(session, "format_readback", feature_description="all-property formatting readback")
     if within_row_containing:
         live_write_mode.require_capability(
             session, _ROW_SCOPE_CAPABILITY, feature_description="within_row_containing"
@@ -1169,6 +1178,10 @@ def execute_format_text_live(
                 "roll back in live mode -- Word, not this server, owns the document.",
                 {"matches": matches},
             )
+        for key in ("bold", "italic", "underline"):
+            if key in style and m.get(f"{key}After") is not style[key]:
+                raise _make_error(ErrorCode.VERIFICATION_FAILED,
+                                  f"Live {key} read-back differs from request", {"matches": matches})
         requested_color = style.get("color")
         if requested_color is not None:
             # Word's own Office.js font.color GETTER returns a "#"-prefixed
