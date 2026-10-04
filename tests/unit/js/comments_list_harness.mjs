@@ -20,7 +20,7 @@ function makeDoc(n) {
       load() {},
       getRange() {
         state.getRange += 1;
-        return { text: c._anchor, load() {} };
+        return { text: c._anchor, load() {}, paragraphs: {items: [{text: `paragraph ${i}`}], load() {}} };
       },
       replies: {
         items: [{ id: `r${i}`, content: `reply ${i}`, authorName: "B", creationDate: "d" }],
@@ -53,7 +53,7 @@ const sandbox = {
   Word: { run: null },
 };
 vm.createContext(sandbox);
-vm.runInContext(src + "\n;globalThis.__opCommentsList = opCommentsList;", sandbox);
+vm.runInContext(src + "\n;globalThis.__opCommentsList = opCommentsList; globalThis.__checkEpoch = checkCommentEpoch;", sandbox);
 
 async function run(n, payload) {
   const { state, context } = makeDoc(n);
@@ -78,3 +78,5 @@ const noAnchor = await run(150, { ids: ["c7"], include_anchor: false });
 out.noAnchorGetRange = noAnchor.getRange;
 out.noAnchorHasAnchorText = "anchorText" in noAnchor.result.comments[0];
 console.log(JSON.stringify(out));
+
+try { sandbox.__checkEpoch({session_epoch: "stale"}); throw new Error("stale epoch accepted"); } catch (e) { if (e.code !== "COMMENT_ID_STALE") throw e; }

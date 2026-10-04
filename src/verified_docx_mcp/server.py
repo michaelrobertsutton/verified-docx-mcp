@@ -2055,7 +2055,9 @@ def add_anchored_comment(
 
 
 @mcp.tool()
-def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
+def get_comment_thread(path: str, comment_id: str | None = None,
+                       source: str = "auto", session_epoch: str | None = None,
+                       match_spec: dict[str, str] | None = None) -> dict[str, Any]:
     """Read a comment and its direct replies, by durableId (from
     add_anchored_comment's own evidence, or word/commentsIds.xml's
     w16cid:durableId directly) -- or, as a fallback, a raw
@@ -2090,6 +2092,10 @@ def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
+        if comments_live._resolve_source(path, source) == "live":
+            return comments_live.execute_get_comment_thread_live(path, comment_id, match_spec, session_epoch)
+        if comment_id is None or match_spec is not None or session_epoch is not None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "File comment reads require comment_id only")
         return comments.execute_get_comment_thread(path, comment_id)
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -2098,10 +2104,12 @@ def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
 @mcp.tool()
 def reply_to_comment(
     path: str,
-    comment_id: str,
-    text: str,
+    comment_id: str | None = None,
+    text: str = "",
     write_mode: str = "auto",
     allow_concurrent_editor: bool = False,
+    session_epoch: str | None = None,
+    match_spec: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Reply to an existing comment (durableId), atomically -- issue #28
     WP-09.
@@ -2186,7 +2194,10 @@ def reply_to_comment(
     try:
         mode = comments_live._resolve_write_mode(path, write_mode)
         if mode == "live":
-            return comments_live.execute_reply_to_comment_live(path, comment_id, text)
+            handle, address = comments_live.address_comment(path, comment_id, match_spec, session_epoch)
+            return comments_live.execute_reply_to_comment_live(path, handle, text, address)
+        if comment_id is None or match_spec is not None or session_epoch is not None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "File comment writes require comment_id only")
         return comments.execute_reply_to_comment(
             path, comment_id, text, allow_concurrent_editor=allow_concurrent_editor
         )
@@ -2197,9 +2208,11 @@ def reply_to_comment(
 @mcp.tool()
 def resolve_comment(
     path: str,
-    comment_id: str,
+    comment_id: str | None = None,
     write_mode: str = "auto",
     allow_concurrent_editor: bool = False,
+    session_epoch: str | None = None,
+    match_spec: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Resolve a comment thread (durableId), atomically -- issue #28
     WP-09. Sets w15:done="1" on the comment's own commentsExtended.xml
@@ -2294,7 +2307,10 @@ def resolve_comment(
     try:
         mode = comments_live._resolve_write_mode(path, write_mode)
         if mode == "live":
-            return comments_live.execute_resolve_comment_live(path, comment_id)
+            handle, address = comments_live.address_comment(path, comment_id, match_spec, session_epoch)
+            return comments_live.execute_resolve_comment_live(path, handle, address)
+        if comment_id is None or match_spec is not None or session_epoch is not None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "File comment writes require comment_id only")
         return comments.execute_resolve_comment(
             path, comment_id, allow_concurrent_editor=allow_concurrent_editor
         )

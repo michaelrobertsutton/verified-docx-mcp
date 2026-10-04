@@ -118,6 +118,7 @@ class ErrorCode(Enum):
     # declared.
     LIVE_UNAVAILABLE = "LIVE_UNAVAILABLE"  # no connected pane session for the target document (live/session.py LiveUnavailable)
     LIVE_DISCONNECTED = "LIVE_DISCONNECTED"  # the pane's WebSocket closed mid-request, or a reply never arrived within the op timeout (live/session.py LiveDisconnected)
+    COMMENT_ID_STALE = "COMMENT_ID_STALE"
     LIVE_STALE = "LIVE_STALE"  # the pane's body hash before the op (result["pre"]) did not match a caller-supplied expected_body_sha256 (live/session.py LiveStale)
     LIVE_OP_FAILED = "LIVE_OP_FAILED"  # the pane replied ok=false (e.g. an expected_matches count mismatch it refused to act on) (live/session.py LiveOpFailed)
 

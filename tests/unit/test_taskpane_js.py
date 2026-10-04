@@ -37,7 +37,7 @@ class OpCommentsListTests(unittest.TestCase):
         self.assertEqual(self.out["bigCount"], 150)
         self.assertEqual(
             self.out["firstKeys"],
-            ["id", "content", "authorName", "creationDate", "resolved", "anchorText", "replies"],
+            ["id", "content", "authorName", "creationDate", "resolved", "anchorText", "anchorParagraphText", "replies"],
         )
         self.assertEqual(self.out["firstReplyCount"], 1)
         self.assertTrue(self.out["hasTiming"])
