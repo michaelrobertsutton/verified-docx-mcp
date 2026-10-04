@@ -1700,9 +1700,20 @@ function inspectDeleteParagraph(xml) {
   const bodies = [...doc.getElementsByTagNameNS(w,'body')];
   if (bodies.length !== 1) throw refusalError('Incomplete paragraph body inspection', 'STRUCTURAL_BOUNDARY');
   const paragraphs = [...bodies[0].getElementsByTagNameNS(w,'p')];
-  if (paragraphs.length !== 1) throw refusalError('Incomplete paragraph inspection', 'STRUCTURAL_BOUNDARY');
-  const p = paragraphs[0];
   const wp = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing';
+  // A text box's own paragraphs are nested in the target's OOXML, so report an
+  // anchored shape as that before the paragraph count can mislabel it.
+  if (bodies[0].getElementsByTagNameNS(wp,'anchor').length || bodies[0].getElementsByTagNameNS('urn:schemas-microsoft-com:vml','shape').length)
+    throw refusalError('Paragraph anchors a shape; re-anchoring is not supported', 'STRUCTURAL_BOUNDARY');
+  // Word's getOoxml appends one empty paragraph after the range (issue #33's
+  // trailing empty paragraph); anything else extra means the inspection saw
+  // more than the target paragraph.
+  const emptyTrailer = q => !(q.textContent || '').trim() && !q.getElementsByTagNameNS(wp,'anchor').length &&
+    !q.getElementsByTagNameNS(w,'drawing').length && !q.getElementsByTagNameNS(w,'pict').length &&
+    !q.getElementsByTagNameNS(w,'sectPr').length;
+  if (paragraphs.length < 1 || paragraphs.length > 2 || (paragraphs.length === 2 && !emptyTrailer(paragraphs[1])))
+    throw refusalError('Incomplete paragraph inspection', 'STRUCTURAL_BOUNDARY');
+  const p = paragraphs[0];
   if (p.getElementsByTagNameNS(wp,'anchor').length || p.getElementsByTagNameNS('urn:schemas-microsoft-com:vml','shape').length)
     throw refusalError('Paragraph anchors a shape; re-anchoring is not supported', 'STRUCTURAL_BOUNDARY');
   if (p.getElementsByTagNameNS(w,'sectPr').length)
