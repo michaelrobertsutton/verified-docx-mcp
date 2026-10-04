@@ -17,3 +17,15 @@ duplicate text. Put a revision-free same-named placeholder on disk.
 5. Confirm file-mode accept/reject on a closed disposable file still works.
 
 No current Word session may be touched to run these checks during implementation.
+
+
+## Safe revision oracle (#59)
+
+Do not enumerate or count Word revisions through AppleScript on large redlined
+documents. Use live body OOXML and compare its revision markup with the live
+list's coverage; Office.js alone can undercount adjacent insertions/deletions.
+The same-named disk placeholder is not an oracle. Record the live markup count,
+listed count and coverage. For host responsiveness, use a bounded document-level
+AppleEvent (`count of documents`), not the application name. A timeout does not
+cancel Word's in-flight layout work: stop probing and report it. See the
+AppleScript freeze guidance in `docs/live-mode.md`.

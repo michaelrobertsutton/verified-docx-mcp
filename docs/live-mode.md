@@ -1044,3 +1044,56 @@ not appear on the Home tab.
 subfolder, not renamed), then fully quit and reopen Word — it only reads
 that folder at launch, so a copy made while Word is running will not
 appear until the next restart.
+
+
+### AppleScript revision enumeration can freeze Word (#59)
+
+On Word for Mac 16.113.3, enumerating revisions in a heavily redlined document
+has caused minutes of layout work on Word's main thread and blocked document
+AppleEvents. Do not use `revision type of every revision of active document`
+or `count of revisions of active document` as a test oracle or fallback on
+such documents. A timeout bounds the caller's wait; it does not cancel the
+work already running inside Word. Do not retry a timed-out enumeration.
+
+Use `live_status` and `list_open_items(source="live")` instead. Check revision
+coverage and the document body's OOXML markup count: Office.js can merge an
+adjacent insertion and deletion, so its count alone is not authoritative.
+Use live body OOXML for an independent check, never a same-named disk copy.
+Do not run a destructive accept/reject-all operation merely to obtain a count.
+
+For a responsiveness watchdog, use a document-level AppleEvent such as `count
+of documents`, with a short AppleScript timeout (for example five seconds) and
+an outer process timeout. An application-name probe may keep answering while
+document events are blocked. Stop on timeout and report the blocked host;
+avoid repeated probes and leave recovery decisions to the operator.
+
+
+### Full revision visibility (#58)
+
+New panes return live body revision OOXML alongside Office.js metadata in the
+same operation. Lists parse the document part by namespace, including deleted
+text, formatting, move and table revisions. Scope remains the document body;
+headers and footers are not included. `ooxml_id` is informational, never an
+Office.js handle. Each entry has `source`, `actionable`, and
+`actionability_reason`. Individual handles are attached only when both
+inventories have equal counts and type/author/date/text match uniquely in each.
+Office.js reports the text of a deletion as empty, so deletions are matched on
+type/author/date only and stay read-only if that is not unique.
+Dates are compared as exact UTC instants. Word writes `w:date` as local
+wall-clock time labelled `Z` (observed on Word for Mac 16.113.3), so the
+comparison prefers `w16du:dateUtc`, which is the true UTC instant, and reports
+it as `date_utc`. Without `dateUtc` a differing `w:date` stays read-only
+rather than guessing a timezone, and sub-second differences never match.
+
+If Word merges or omits revisions, the full markup list is visible but its
+entries cannot be accepted/rejected individually. Such calls refuse before
+mutation with `LIVE_CAPABILITY_MISSING`; use collection-level accept/reject-all
+instead. Duplicate metadata also remains read-only. Malformed OOXML reports
+partial coverage; if the pane cannot read the body OOXML at all, it omits
+`revision_ooxml` and returns the Office.js inventory with
+`ooxml_revision_count: null` and reports `coverage: partial`, since the list
+cannot be cross-checked, instead of failing the operation
+(`live_status` and `list_open_items` depend on it); older panes retain their API inventory and coverage warning.
+Issue #58 remains open: safe individual addressing of omitted revisions still
+needs investigation on real Word builds. Do not treat complete visibility as
+complete individual editing support.
