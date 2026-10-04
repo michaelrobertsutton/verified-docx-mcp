@@ -42,7 +42,22 @@ DEFAULT_REQUEST_TIMEOUT = 15.0
 
 # Read ops that walk every comment get more headroom than writes (issue #31:
 # ~100 comments on a co-authored SharePoint doc blew the 15 s default).
-OP_TIMEOUTS: dict[str, float] = {"comments_list": 60.0}
+# Issue #34: table ops make several syncs and touch every cell; a slow success
+# reported as LIVE_DISCONNECTED would be retried into a duplicate table.
+# Issue #33: body_ooxml serializes the whole body.
+OP_TIMEOUTS: dict[str, float] = {
+    "comments_list": 60.0,
+    "body_ooxml": 60.0,
+    "table_get": 60.0,
+    "table_insert": 90.0,
+    "cells_set": 60.0,
+    # #48: revision ops walk every tracked change and serialize the body for the
+    # coverage cross-check; a timeout here would report a possibly-applied
+    # accept/reject as disconnected.
+    "revisions_list": 60.0,
+    "revisions_accept": 60.0,
+    "revisions_reject": 60.0,
+}
 
 TIMEOUT_ENV = "VERIFIED_DOCX_LIVE_TIMEOUT_S"
 
@@ -269,6 +284,12 @@ class LiveSession:
         scheduled on ``self.loop`` -- see the block comment above
         ``request()``. Not called directly by anything outside this
         class."""
+        guarded = {"replace", "format", "cell_set", "cells_set", "table_insert",
+                   "paragraph_delete", "revisions_accept", "revisions_reject",
+                   "comment_add", "comment_reply", "comment_resolve", "save"}
+        if op in guarded and "shape_guard" not in self.hello.capabilities:
+            raise LiveOpFailed("LIVE_CAPABILITY_MISSING",
+                               "Reload the live pane: anchored-shape protection is required")
         if op not in VALID_OPS:
             raise ValueError(f"unknown op {op!r}; must be one of {sorted(VALID_OPS)}")
         if timeout is None:

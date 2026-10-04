@@ -44,7 +44,17 @@ pane must honor.
                      result: ``DescribeResult`` (documentUrl, bodySha256,
                      changeTrackingMode, saved).
 
-  search          -- ``SearchPayload`` (find, matchCase, matchWholeWord).
+  body_ooxml      -- no payload (issue #33; capability ``body_ooxml``).
+                     Word calls: ``body.getOoxml()``, ``body.load("text")``.
+                     Reply result: ``{ooxml, bodySha256, documentUrl,
+                     strippedParts}`` -- ``ooxml`` is the Flat OPC
+                     ``pkg:package`` string with every ``pkg:binaryData``
+                     payload emptied (``strippedParts`` names them);
+                     ``bodySha256`` is computed exactly as ``describe``'s.
+                     Refuses with ``OP_ERROR_TOO_LARGE`` when the reply
+                     would exceed the pane's size limit.
+
+  search        -- ``SearchPayload`` (find, matchCase, matchWholeWord).
                      Word calls: ``body.search(find, {matchCase,
                      matchWholeWord})``, ``.load(["text"])`` on each
                      returned range, plus enough of the surrounding
@@ -167,12 +177,67 @@ pane must honor.
                      ``body.text`` read before/after; ``pre``/``post`` are
                      the whole-body SHA-256 as for ``replace``.
 
+  table_get       -- ``TableGetPayload`` (table_index, 1-based, numbered like
+                     ``list_tables``' ``table_id``). Issue #34; REQUIRES the
+                     pane's ``"table_edit"`` capability. Word calls:
+                     ``body.tables`` (``nestingLevel``), the addressed
+                     ``Table`` (``style``, ``headerRowCount``,
+                     ``getRange().getOoxml()`` scanned for ``w:gridSpan`` /
+                     ``w:vMerge``), then per cell ``body.text``,
+                     ``shadingColor``, ``horizontalAlignment``,
+                     ``verticalAlignment``, ``columnWidth`` and
+                     ``body.font`` (bold/color/size). Alignments are
+                     reported in the SERVER's vocabulary (left/center/right/
+                     both, top/center/bottom), never Word's enum names.
+                     A document containing a NESTED table is refused.
+                     Reply result: ``{style, headerRowCount, merged,
+                     rows: [[{text, fill, align, valign, width, bold,
+                     color, size}]]}`` (fill/color are "#RRGGBB" or "";
+                     bold/size are null when mixed).
+
+  table_insert    -- ``TableInsertPayload`` (anchor, rows, style,
+                     style_builtin, style_from_table_index, header_rows,
+                     column_widths_pt, font_size_pt, track_changes,
+                     expectedBodySha256). Issue #34; REQUIRES ``"table_edit"``.
+                     The pane compares ``expectedBodySha256`` with its own
+                     body hash BEFORE any write and refuses with pane code
+                     ``stale`` on a mismatch (the session's post-hoc
+                     ``result.pre`` check cannot undo a write that already
+                     landed). The style is resolved and validated BEFORE
+                     the table is inserted (pane code ``style_not_found``),
+                     so there is never an insert-then-delete rollback. The
+                     anchor is a unique top-level paragraph (``paragraph_text``
+                     + ``position`` before/after; 0 matches ``zero_match``,
+                     >1 ``match_count_mismatch``), ``after_table_index``, or
+                     absent (append to the body end). Word calls:
+                     ``paragraph.insertTable`` / ``table.insertTable`` /
+                     ``body.insertTable`` (WordApi 1.3), ``table.style`` /
+                     ``styleBuiltIn`` / ``headerRowCount`` / ``font.size``,
+                     per cell ``TableCell.shadingColor`` / ``horizontalAlignment``
+                     / ``verticalAlignment`` / ``columnWidth`` plus the same
+                     run writes as ``cell_set``; the new table's own index
+                     is found by ``getRange().compareLocationWith`` (a
+                     ``ClientResult``: ``.value`` is read after sync). Reply
+                     result: ``{applied, table_index, pre, post}``.
+
+  cells_set       -- ``CellsSetPayload`` (cells, track_changes,
+                     expectedBodySha256). Issue #34; REQUIRES ``"table_edit"``.
+                     ``cells`` is a list of ``{table_index, row_index,
+                     cell_index, paragraphs, expected_before_text}``. The pane
+                     checks the body hash, reads every addressed cell, then
+                     READS THEM ALL AGAIN in the batch right before writing;
+                     any mismatch refuses with nothing written. The writes
+                     are one Word batch, which is NOT a transaction: this is
+                     best-effort under co-authoring. Reply result:
+                     ``{applied, before: [..], after: [..], pre, post}``.
+
   save            -- no payload. Word calls: ``context.document.save()``.
                      Reply result: ``{"saved": true}``.
 
 Staleness (``expected_body_sha256``)
 -------------------------------------
-``search``/``replace``/``format``/``comment_add``/``cell_set`` payloads
+``search``/``replace``/``format``/``comment_add``/``cell_set``/
+``table_insert``/``cells_set`` payloads
 carry an optional ``expected_body_sha256``. The pane does not act on it -- it is
 read by ``live/session.py``'s ``LiveSession.request`` after the reply
 comes back: if the caller supplied one and the reply's ``result["pre"]``
@@ -185,6 +250,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
+import re
 from typing import Any
 
 
@@ -196,6 +263,7 @@ VALID_OPS: frozenset[str] = frozenset(
     {
         "ping",
         "describe",
+        "body_ooxml",
         "search",
         "replace",
         "format",
@@ -205,6 +273,17 @@ VALID_OPS: frozenset[str] = frozenset(
         "comment_resolve",
         "cell_get",
         "cell_set",
+        "table_get",
+        "table_insert",
+        "cells_set",
+        "paragraph_delete",
+        "shapes_list",
+        "textboxes_list",
+        "textboxes_read",
+        "scope_describe",
+        "revisions_list",
+        "revisions_accept",
+        "revisions_reject",
         "save",
     }
 )
@@ -220,6 +299,15 @@ VALID_OPS: frozenset[str] = frozenset(
 # WPs' branches so the two additions merge without conflict.
 OP_ERROR_ZERO_MATCH = "zero_match"
 OP_ERROR_MATCH_COUNT_MISMATCH = "match_count_mismatch"
+# Issue #34: the pane refused BEFORE writing because its own body hash no
+# longer equals the caller's expectedBodySha256 (maps to LIVE_STALE), and a
+# table style that does not exist (maps to STYLE_NOT_FOUND).
+OP_ERROR_STALE = "stale"
+OP_ERROR_STYLE_NOT_FOUND = "style_not_found"
+
+# `body_ooxml` refusal (issue #33): the document is too large to ship as one
+# websocket frame even with binaries stripped. Same lowercase convention.
+OP_ERROR_TOO_LARGE = "too_large"
 
 
 def _require(obj: dict[str, Any], key: str, expected_type: type | tuple[type, ...]) -> Any:
@@ -769,6 +857,214 @@ class CellSetPayload:
             cell_index=_require_index(obj, "cell_index"),
             paragraphs=paragraphs,
             expected_before_text=_require(obj, "expected_before_text", str),
+            track_changes=_optional(obj, "track_changes", bool, default=False),
+            expected_body_sha256=_optional(obj, "expectedBodySha256", str, default=None),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Live tables (issue #34). Validation happens in __post_init__ so a payload
+# built by the server is checked BEFORE anything is sent, not only when a
+# pane parses it.
+# ---------------------------------------------------------------------------
+
+_HEX6_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+_ALIGNS = frozenset({"left", "center", "right", "both"})
+_VALIGNS = frozenset({"top", "center", "bottom"})
+_POSITIONS = frozenset({"before", "after"})
+_CELL_KEYS = frozenset({"paragraphs", "fill", "color", "bold", "align", "valign"})
+
+
+def _is_finite_positive(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def _validate_paragraphs(paragraphs: Any, where: str) -> None:
+    if not isinstance(paragraphs, list):
+        raise ProtocolError(f"{where}: 'paragraphs' must be a list")
+    for paragraph in paragraphs:
+        if not isinstance(paragraph, list) or not all(isinstance(run, dict) for run in paragraph):
+            raise ProtocolError(f"{where}: 'paragraphs' must be a list of lists of run objects")
+        for run in paragraph:
+            if not isinstance(run.get("text", ""), str):
+                raise ProtocolError(f"{where}: a run's 'text' must be a string")
+            for flag in ("bold", "italic", "hard_break"):
+                if run.get(flag) is not None and not isinstance(run[flag], bool):
+                    raise ProtocolError(f"{where}: a run's {flag!r} must be a bool")
+            if run.get("link") is not None and not isinstance(run["link"], str):
+                raise ProtocolError(f"{where}: a run's 'link' must be a string")
+
+
+@dataclasses.dataclass(frozen=True)
+class TableGetPayload:
+    table_index: int
+
+    def to_json(self) -> dict[str, Any]:
+        return {"table_index": self.table_index}
+
+    @classmethod
+    def from_json(cls, obj: dict[str, Any]) -> TableGetPayload:
+        return cls(table_index=_require_index(obj, "table_index"))
+
+
+@dataclasses.dataclass(frozen=True)
+class TableInsertPayload:
+    rows: list[list[dict[str, Any]]]
+    anchor: dict[str, Any] | None = None
+    style: str | None = None
+    style_builtin: str | None = None
+    style_from_table_index: int | None = None
+    header_rows: int = 0
+    column_widths_pt: list[float] | None = None
+    font_size_pt: float | None = None
+    track_changes: bool = False
+    expected_body_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.rows or any(not isinstance(r, list) or not r for r in self.rows):
+            raise ProtocolError("'rows' must be a non-empty list of non-empty cell lists")
+        width = len(self.rows[0])
+        for r, row in enumerate(self.rows):
+            if len(row) != width:
+                raise ProtocolError(f"'rows' must be rectangular: row {r} has {len(row)} cell(s), row 0 has {width}")
+            for c, cell in enumerate(row):
+                self._validate_cell(cell, f"rows[{r}][{c}]")
+        self._validate_anchor()
+        sources = [s for s in (self.style, self.style_builtin, self.style_from_table_index) if s is not None]
+        if len(sources) > 1:
+            raise ProtocolError("at most one of 'style', 'style_builtin', 'style_from_table_index'")
+        if self.style_from_table_index is not None and (
+            isinstance(self.style_from_table_index, bool)
+            or not isinstance(self.style_from_table_index, int)
+            or self.style_from_table_index < 1
+        ):
+            raise ProtocolError("'style_from_table_index' must be an int >= 1")
+        if (
+            isinstance(self.header_rows, bool)
+            or not isinstance(self.header_rows, int)
+            or not 0 <= self.header_rows < len(self.rows)
+        ):
+            raise ProtocolError(f"'header_rows' must be an int in [0, {len(self.rows) - 1}]")
+        if self.column_widths_pt is not None and (
+            len(self.column_widths_pt) != width or not all(_is_finite_positive(w) for w in self.column_widths_pt)
+        ):
+            raise ProtocolError(f"'column_widths_pt' must be {width} positive finite number(s)")
+        if self.font_size_pt is not None and not _is_finite_positive(self.font_size_pt):
+            raise ProtocolError("'font_size_pt' must be a positive finite number")
+
+    @staticmethod
+    def _validate_cell(cell: Any, where: str) -> None:
+        if not isinstance(cell, dict):
+            raise ProtocolError(f"{where} must be an object")
+        unknown = set(cell) - _CELL_KEYS
+        if unknown:
+            raise ProtocolError(f"{where} has unknown key(s) {sorted(unknown)}")
+        _validate_paragraphs(cell.get("paragraphs", []), where)
+        for key in ("fill", "color"):
+            value = cell.get(key)
+            if value is not None and not (isinstance(value, str) and _HEX6_RE.match(value)):
+                raise ProtocolError(f"{where}: {key!r} must be a 6-digit hex color")
+        if cell.get("bold") is not None and not isinstance(cell["bold"], bool):
+            raise ProtocolError(f"{where}: 'bold' must be a bool")
+        if cell.get("align") is not None and cell["align"] not in _ALIGNS:
+            raise ProtocolError(f"{where}: 'align' must be one of {sorted(_ALIGNS)}")
+        if cell.get("valign") is not None and cell["valign"] not in _VALIGNS:
+            raise ProtocolError(f"{where}: 'valign' must be one of {sorted(_VALIGNS)}")
+
+    def _validate_anchor(self) -> None:
+        anchor = self.anchor
+        if anchor is None:
+            return
+        if not isinstance(anchor, dict):
+            raise ProtocolError("'anchor' must be an object")
+        has_para = "paragraph_text" in anchor
+        has_table = "after_table_index" in anchor
+        if has_para == has_table:
+            raise ProtocolError("'anchor' needs exactly one of 'paragraph_text' or 'after_table_index'")
+        unknown = set(anchor) - {"paragraph_text", "position", "after_table_index"}
+        if unknown:
+            raise ProtocolError(f"'anchor' has unknown key(s) {sorted(unknown)}")
+        if has_para:
+            if not isinstance(anchor["paragraph_text"], str) or not anchor["paragraph_text"].strip():
+                raise ProtocolError("'anchor.paragraph_text' must be a non-empty string")
+            if anchor.get("position") not in _POSITIONS:
+                raise ProtocolError(f"'anchor.position' must be one of {sorted(_POSITIONS)}")
+        else:
+            _require_index(anchor, "after_table_index")
+            if "position" in anchor:
+                raise ProtocolError("'anchor.position' is only valid with 'paragraph_text'")
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "rows": self.rows,
+            "anchor": self.anchor,
+            "style": self.style,
+            "style_builtin": self.style_builtin,
+            "style_from_table_index": self.style_from_table_index,
+            "header_rows": self.header_rows,
+            "column_widths_pt": self.column_widths_pt,
+            "font_size_pt": self.font_size_pt,
+            "track_changes": self.track_changes,
+        }
+        if self.expected_body_sha256 is not None:
+            out["expectedBodySha256"] = self.expected_body_sha256
+        return out
+
+    @classmethod
+    def from_json(cls, obj: dict[str, Any]) -> TableInsertPayload:
+        return cls(
+            rows=_require(obj, "rows", list),
+            anchor=_optional(obj, "anchor", dict, default=None),
+            style=_optional(obj, "style", str, default=None),
+            style_builtin=_optional(obj, "style_builtin", str, default=None),
+            style_from_table_index=_optional(obj, "style_from_table_index", int, default=None),
+            header_rows=_optional(obj, "header_rows", int, default=0),
+            column_widths_pt=_optional(obj, "column_widths_pt", list, default=None),
+            font_size_pt=_optional(obj, "font_size_pt", (int, float), default=None),
+            track_changes=_optional(obj, "track_changes", bool, default=False),
+            expected_body_sha256=_optional(obj, "expectedBodySha256", str, default=None),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class CellsSetPayload:
+    cells: list[dict[str, Any]]
+    track_changes: bool = False
+    expected_body_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.cells:
+            raise ProtocolError("'cells' must not be empty")
+        seen: set[tuple[int, int, int]] = set()
+        for i, cell in enumerate(self.cells):
+            if not isinstance(cell, dict):
+                raise ProtocolError(f"cells[{i}] must be an object")
+            address = (
+                _require_index(cell, "table_index"),
+                _require_index(cell, "row_index"),
+                _require_index(cell, "cell_index"),
+            )
+            if address in seen:
+                raise ProtocolError(f"cells[{i}] repeats address {address}")
+            seen.add(address)
+            _require(cell, "expected_before_text", str)
+            _validate_paragraphs(_require(cell, "paragraphs", list), f"cells[{i}]")
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"cells": self.cells, "track_changes": self.track_changes}
+        if self.expected_body_sha256 is not None:
+            out["expectedBodySha256"] = self.expected_body_sha256
+        return out
+
+    @classmethod
+    def from_json(cls, obj: dict[str, Any]) -> CellsSetPayload:
+        return cls(
+            cells=_require(obj, "cells", list),
             track_changes=_optional(obj, "track_changes", bool, default=False),
             expected_body_sha256=_optional(obj, "expectedBodySha256", str, default=None),
         )

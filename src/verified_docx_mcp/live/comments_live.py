@@ -95,6 +95,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from . import bridge as live_bridge
+from . import write_mode
 from .protocol import OP_ERROR_MATCH_COUNT_MISMATCH, OP_ERROR_ZERO_MATCH
 from .session import (
     LiveDisconnected,
@@ -220,6 +221,8 @@ def _raise_from_live_error(exc: BaseException) -> None:
         ) from exc
     if isinstance(exc, LiveOpFailed):
         code = exc.code
+        if code in ErrorCode.__members__:
+            raise _make_error(ErrorCode[code], exc.message, {"pane_error_code": code}) from exc
         if code == OP_ERROR_ZERO_MATCH:
             raise _make_error(ErrorCode.ZERO_MATCH, exc.message, {"pane_error_code": code}) from exc
         if code == OP_ERROR_MATCH_COUNT_MISMATCH:
@@ -355,10 +358,16 @@ def correlate_comments(
                 author_ok = _authors_corroborate(live_author, f.get("author"))
                 if anchor_ok and author_ok:
                     best, best_confidence = f, "exact"
-                    break  # an exact match is the best this can do
+                    # Continue to detect duplicate equally corroborated file comments.
                 if best is None:
                     best, best_confidence = f, "content-only"
 
+        exact = [f for f in file_comments if live_content and
+                 _normalize_content(f.get("content")) == live_content and live_anchor and
+                 _normalize_anchor(f.get("quoted_text")) == live_anchor and
+                 _authors_corroborate(live_author, f.get("author"))]
+        if len(exact) > 1:
+            best, best_confidence = None, "none"
         out.append(
             {
                 "live_comment_id": f"{_LIVE_HANDLE_PREFIX}{live.get('id')}",
@@ -399,13 +408,15 @@ def _resolve_comment_handle(comment_id: str, correlation: list[dict[str, Any]]) 
     if comment_id.startswith(_LIVE_HANDLE_PREFIX):
         return comment_id[len(_LIVE_HANDLE_PREFIX) :], "live-handle"
 
-    for entry in correlation:
-        if entry["confidence"] not in ("exact", "content-only"):
-            continue
-        if entry["comment_id"] is not None and entry["comment_id"] == comment_id:
-            return entry["live_comment_id"][len(_LIVE_HANDLE_PREFIX) :], "durableId-correlation"
-        if entry["w_id"] is not None and entry["w_id"] == comment_id:
-            return entry["live_comment_id"][len(_LIVE_HANDLE_PREFIX) :], "w_id-correlation"
+    candidates = [entry for entry in correlation
+                  if entry["confidence"] == "exact" and
+                  comment_id in (entry["comment_id"], entry["w_id"])]
+    if len(candidates) == 1:
+        entry = candidates[0]
+        via = "durableId-correlation" if entry["comment_id"] == comment_id else "w_id-correlation"
+        return entry["live_comment_id"][len(_LIVE_HANDLE_PREFIX):], via
+    if len(candidates) > 1:
+        raise _make_error(ErrorCode.INVALID_INPUT, "Ambiguous comment correlation; use a live handle", {})
 
     available_durable = sorted({e["comment_id"] for e in correlation if e["comment_id"]})
     available_live = sorted(e["live_comment_id"] for e in correlation)
@@ -468,7 +479,10 @@ def _live_comment_record(raw: dict[str, Any]) -> dict[str, Any]:
         for r in (raw.get("replies") or [])
     ]
     return {
-        "comment_id": f"{_LIVE_HANDLE_PREFIX}{raw.get('id')}",
+        "comment_id": (f"live:{raw['session_epoch']}:{raw.get('id')}"
+                       if raw.get("session_epoch") else f"live:{raw.get('id')}"),
+        "session_epoch": raw.get("session_epoch"),
+        "anchor_paragraph_text": raw.get("anchorParagraphText"),
         "w_id": None,
         "content": raw.get("content", ""),
         "resolved": bool(raw.get("resolved", False)),
@@ -535,6 +549,8 @@ def _live_state_full(path: str, session: LiveSession):
     snapshots)."""
     result = _request(session, "comments_list")
     raw_comments = _validated_pane_comments(result)
+    for comment in raw_comments:
+        comment["session_epoch"] = result.get("session_epoch")
     file_result = _file_comments_and_suggestions(path)
     file_comments = file_result[0] if file_result is not None else []
     correlation = correlate_comments(raw_comments, file_comments)
@@ -591,7 +607,10 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
     # "nothing pending," which is not knowable without the file;
     # file_side_available names the reason explicitly rather than making
     # a caller guess from pending_suggestions being empty.
-    suggestions = file_result[1] if file_result is not None else None
+    from .revisions_live import list_revisions
+
+    revision_state = list_revisions(session)
+    suggestions = revision_state["revisions"]
 
     # list_open_items filters resolved the same way file mode does (an
     # "open item" is, by definition, not a resolved one) -- but the pane
@@ -663,8 +682,12 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
         "warnings": warnings,
         "path": str(resolved),
         "source": "live",
+        "session_epoch": raw_comments[0].get("session_epoch") if raw_comments else _request(session, "describe").get("session_epoch"),
         "comments": [_live_comment_record(c) for c in open_raw],
         "pending_suggestions": suggestions,
+        "pending_suggestions_source": "live" if suggestions is not None else None,
+        "pending_suggestions_reason": revision_state.get("reason"),
+        "revision_coverage": revision_state["coverage"],
         "file_side_available": file_result is not None,
         "file_only_open_comments": file_only,
         "correlation": [entry for entry in correlation if entry["live_comment_id"] in open_ids],
@@ -749,6 +772,7 @@ def execute_add_anchored_comment_live(
         "document_name": document_name,
         "author": "word-signed-in-user",
     }
+    evidence.update(write_mode.shape_counts(result))
     logged, _reason = audit.append_audit(path=str(resolved), tool="add_anchored_comment", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
@@ -759,7 +783,7 @@ def execute_add_anchored_comment_live(
 # ---------------------------------------------------------------------------
 
 
-def execute_reply_to_comment_live(path: str, comment_id: str, text: str) -> dict[str, Any]:
+def execute_reply_to_comment_live(path: str, comment_id: str, text: str, address: dict[str, Any] | None = None) -> dict[str, Any]:
     """``write_mode="live"`` path for ``reply_to_comment``.
 
     ``revision_before``/``revision_after`` are ``"live:sha256:<hex>"`` of
@@ -790,7 +814,7 @@ def execute_reply_to_comment_live(path: str, comment_id: str, text: str) -> dict
     parent_raw = next((c for c in raw_comments if c.get("id") == live_handle), None)
     parent_anchor = (parent_raw or {}).get("anchorText", "")
 
-    _request(session, "comment_reply", {"comment_id": live_handle, "text": text})
+    result = _request(session, "comment_reply", {"comment_id": live_handle, "text": text, **(address or {})})
 
     # Verify by re-listing rather than trusting the op's own ok=true --
     # same discipline as file mode's own post-write re-read. Only the target
@@ -830,12 +854,13 @@ def execute_reply_to_comment_live(path: str, comment_id: str, text: str) -> dict
     }
     if not (pre_targeted and post_targeted):
         evidence["pane_note"] = STALE_PANE_NOTE
+    evidence.update(write_mode.shape_counts(result))
     logged, _reason = audit.append_audit(path=str(resolved), tool="reply_to_comment", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
 
 
-def execute_resolve_comment_live(path: str, comment_id: str) -> dict[str, Any]:
+def execute_resolve_comment_live(path: str, comment_id: str, address: dict[str, Any] | None = None) -> dict[str, Any]:
     """``write_mode="live"`` path for ``resolve_comment``. See
     ``execute_reply_to_comment_live``'s own docstring for why
     ``revision_before``/``revision_after`` are ``describe``-sourced
@@ -855,7 +880,7 @@ def execute_resolve_comment_live(path: str, comment_id: str) -> dict[str, Any]:
         _raw_comments, correlation = _live_state(path, session)
         live_handle, resolved_via = _resolve_comment_handle(comment_id, correlation)
 
-    _request(session, "comment_resolve", {"comment_id": live_handle, "resolved": True})
+    result = _request(session, "comment_resolve", {"comment_id": live_handle, "resolved": True, **(address or {})})
 
     # Independent post-op re-read -- the pane's own reply is not trusted
     # on its own, same discipline as file mode's own resolve_comment. Only
@@ -889,6 +914,64 @@ def execute_resolve_comment_live(path: str, comment_id: str) -> dict[str, Any]:
     }
     if not post_targeted:
         evidence["pane_note"] = STALE_PANE_NOTE
+    evidence.update(write_mode.shape_counts(result))
     logged, _reason = audit.append_audit(path=str(resolved), tool="resolve_comment", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
+
+
+def address_comment(path: str, comment_id: str | None, match_spec: dict[str, str] | None,
+                    session_epoch: str | None) -> tuple[str, dict[str, Any]]:
+    """Resolve exactly one live comment and carry its identity into the pane write."""
+    from ..errors import ErrorCode
+
+    if (comment_id is None) == (match_spec is None):
+        raise _make_error(ErrorCode.INVALID_INPUT, "Supply exactly one of comment_id or match_spec", {})
+    session = _session_for(path)
+    result = _request(session, "comments_list")
+    epoch = result.get("session_epoch")
+    if comment_id and comment_id.startswith("live:"):
+        parts = comment_id.split(":", 2)
+        if len(parts) == 3:
+            if session_epoch and session_epoch != parts[1]:
+                raise _make_error(ErrorCode.COMMENT_ID_STALE, "Conflicting comment epochs", {})
+            session_epoch, raw_id = parts[1], parts[2]
+        else:
+            raw_id = parts[1]
+    elif comment_id:
+        _raw, correlation = _live_state(path, session)
+        raw_id, _via = _resolve_comment_handle(comment_id, correlation)
+    else:
+        raw_id = None
+    if session_epoch is not None and session_epoch != epoch:
+        raise _make_error(ErrorCode.COMMENT_ID_STALE, "Comment belongs to an earlier pane epoch", {})
+    fields = {"author": "authorName", "text": "content", "anchor_text": "anchorText",
+              "anchor_paragraph_contains": "anchorParagraphText"}
+    if match_spec is not None and (not match_spec or set(match_spec) - fields.keys() or
+                                  any(not isinstance(v, str) or not v.strip() for v in match_spec.values())):
+        raise _make_error(ErrorCode.INVALID_INPUT, "Invalid or empty comment match_spec", {})
+    candidates = []
+    for comment in result.get("comments", []):
+        if raw_id is not None and comment.get("id") != raw_id:
+            continue
+        if match_spec and any(_normalize_anchor(comment.get(fields[k])) != _normalize_anchor(v)
+                              for k, v in match_spec.items()):
+            continue
+        candidates.append(comment)
+    if len(candidates) != 1:
+        raise _make_error(ErrorCode.INVALID_INPUT, "Comment address must match exactly once",
+                          {"match_count": len(candidates)})
+    target = candidates[0]
+    identity = {key: target[key] for key in fields.values() if key in target}
+    return f"live:{target['id']}", {"session_epoch": epoch, "identity": identity}
+
+
+def execute_get_comment_thread_live(path: str, comment_id: str | None = None,
+                                    match_spec: dict[str, str] | None = None,
+                                    session_epoch: str | None = None) -> dict[str, Any]:
+    handle, address = address_comment(path, comment_id, match_spec, session_epoch)
+    session = _session_for(path)
+    raw, _targeted = _comments_for_handle(session, handle[5:], include_anchor=True)
+    target = next(c for c in raw if c["id"] == handle[5:])
+    target["session_epoch"] = address["session_epoch"]
+    return _live_comment_record(target)

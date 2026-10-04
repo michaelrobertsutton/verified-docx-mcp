@@ -50,6 +50,7 @@ assumption (see its own module docstring), so ``replace_table_row``'s and
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,8 @@ from xml.etree import ElementTree as ET
 from . import audit, locate, markdown_to_ooxml, mutations, paths, projection, tracked_changes
 from .author import resolve_author_name
 from .errors import ErrorCode, _make_error
+from .live import protocol as live_protocol
+from .live import reads_live
 from .live import write_mode as live_write_mode
 from .live.session import LiveDisconnected, LiveOpFailed, LiveStale
 from .projection import DEFAULT_PART, W_NS, TableBoundaryEvent
@@ -224,16 +227,11 @@ def list_tables_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dic
     return tables
 
 
-def execute_list_tables(path: str, part: str = DEFAULT_PART) -> dict[str, Any]:
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    from . import server as _server
-
-    local_path, is_temp = _server._read_local_copy(resolved)
-    try:
-        return {"path": str(resolved), "part": part, "tables": list_tables_impl(local_path, part)}
-    finally:
-        if is_temp:
-            local_path.unlink(missing_ok=True)
+def execute_list_tables(path: str, part: str = DEFAULT_PART, source: str = "auto") -> dict[str, Any]:
+    with reads_live.read_source(path, source, part) as rs:
+        return rs.annotate(
+            {"path": str(rs.resolved), "part": part, "tables": list_tables_impl(rs.local_path, part)}
+        )
 
 
 def get_table_impl(docx_path: Path, table_id: int, part_name: str = DEFAULT_PART) -> dict[str, Any]:
@@ -280,17 +278,33 @@ def get_table_impl(docx_path: Path, table_id: int, part_name: str = DEFAULT_PART
     }
 
 
-def execute_get_table(path: str, table_id: int, part: str = DEFAULT_PART) -> dict[str, Any]:
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    from . import server as _server
-
-    local_path, is_temp = _server._read_local_copy(resolved)
-    try:
-        result = get_table_impl(local_path, table_id, part)
-        return {"path": str(resolved), "part": part, **result}
-    finally:
-        if is_temp:
-            local_path.unlink(missing_ok=True)
+def execute_get_table(
+    path: str, table_id: int, part: str = DEFAULT_PART, *, source: str = "auto"
+) -> dict[str, Any]:
+    if source not in _LIVE_SOURCES:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"source must be one of {_LIVE_SOURCES}, got {source!r}",
+            {"source": source},
+        )
+    # The live pane only sees the main document body: "auto" falls back to the
+    # file for any other part, an explicit "live" refuses.
+    if source == "live" and part != DEFAULT_PART:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"source='live' reads only the main document body ({DEFAULT_PART}); got part {part!r}. "
+            "Use source='file' for other parts.",
+            {"part": part},
+        )
+    if not (source == "auto" and part != DEFAULT_PART) and (
+        live_write_mode.resolve_write_mode(path, source) == "live"
+    ):
+        return execute_get_table_live(path, table_id)
+    # File read (issue #33): reports source="file" and, when a pane session
+    # exists for this file name, the live_session_ignored warning.
+    with reads_live.read_source(path, "file", part) as rs:
+        result = get_table_impl(rs.local_path, table_id, part)
+        return rs.annotate({"path": str(rs.resolved), "part": part, **result})
 
 
 # ---------------------------------------------------------------------------
@@ -394,14 +408,20 @@ def execute_replace_table_row(
     force: bool = False,
     allow_concurrent_editor: bool = False,
     track_changes: bool = False,
+    write_mode: str = "auto",
 ) -> dict[str, Any]:
+    mode = live_write_mode.resolve_write_mode(path, write_mode)
+    if mode == "live":
+        return execute_replace_table_row_live(
+            path, table_id, row_index, cells, revision_before=revision_before, track_changes=track_changes
+        )
     own_author = resolve_author_name()
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(
         resolved,
         revision_before,
         allow_concurrent_editor=allow_concurrent_editor,
-        live_capable=False,
+        live_capable=True,
     )
 
     document_root, raw_xml = mutations._load_document(resolved)
@@ -739,6 +759,7 @@ def execute_replace_cell_markdown_live(
         )
 
     return live_write_mode.live_evidence(
+        shape_result=result,
         applied=True,
         match_count=1,
         rung=3,
@@ -750,6 +771,446 @@ def execute_replace_cell_markdown_live(
         tool="replace_cell_markdown",
         path=path,
     )
+
+
+# ---------------------------------------------------------------------------
+# Live tables (issue #34): get_table / replace_table_row / insert_table over
+# the WSS ops channel (table_get / cells_set / table_insert). Same shape as
+# the live cell edit above: validate everything BEFORE sending, capability
+# gate, describe + stale check, the op, an INDEPENDENT read-back, evidence.
+# A write that lands but fails its read-back is audit-logged before the
+# error is raised (live_write_mode.audit_live_failure).
+# ---------------------------------------------------------------------------
+
+_TABLE_EDIT_CAPABILITY = "table_edit"
+_LIVE_SOURCES = ("auto", "file", "live")
+
+
+def _live_pre_hash(session: Any) -> str:
+    try:
+        return session.request_threadsafe("describe")["bodySha256"]
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+
+
+def _live_table_get(session: Any, table_index: int) -> dict[str, Any]:
+    return _live_cell_request(session, "table_get", live_protocol.TableGetPayload(table_index).to_json())
+
+
+def _norm_live_hex(value: Any) -> str | None:
+    """Word reports "#RRGGBB", "" or an automatic/none marker; the tools take
+    bare hex. Compare on the bare, upper-cased form; None means 'no colour'."""
+    if value is None:
+        return None
+    text = str(value).strip().lstrip("#").upper()
+    if text in ("", "AUTOMATIC", "AUTO", "NONE", "TRANSPARENT"):
+        return None
+    return text
+
+
+def _protocol_invalid(exc: live_protocol.ProtocolError) -> Any:
+    return _make_error(ErrorCode.INVALID_INPUT, f"invalid live table request: {exc}", {"reason": str(exc)})
+
+
+def _fail_live_verification(
+    *,
+    tool: str,
+    path: str,
+    document_name: str,
+    pre_hash: str,
+    session: Any,
+    problems: list[str],
+    what: str,
+) -> Any:
+    """Audit the landed-but-unverified write, then build the error to raise."""
+    post_hash: str | None
+    try:
+        post_hash = session.request_threadsafe("describe")["bodySha256"]
+    except Exception:  # noqa: BLE001 - best effort; the failure itself is what matters
+        post_hash = None
+    live_write_mode.audit_live_failure(
+        tool=tool,
+        path=path,
+        document_name=document_name,
+        pre_body_sha256=pre_hash,
+        post_body_sha256=post_hash,
+        reason=what,
+        detail={"problems": problems[:20]},
+    )
+    return _make_error(
+        ErrorCode.VERIFICATION_FAILED,
+        f"{what}: {'; '.join(problems[:5])}. Nothing to roll back in live mode -- Word, not this "
+        "server, owns the document; inspect the table and fix or remove it by hand.",
+        {"problems": problems},
+    )
+
+
+def execute_get_table_live(path: str, table_id: int) -> dict[str, Any]:
+    session = live_write_mode.live_session_for(path)
+    live_write_mode.require_capability(session, _TABLE_EDIT_CAPABILITY, feature_description="live table reads")
+    table = _live_table_get(session, table_id)
+    rows = [
+        [
+            {"row_index": r, "cell_index": c, "grid_span": 1, "v_merge": "none", "text": cell["text"]}
+            for c, cell in enumerate(row, start=1)
+        ]
+        for r, row in enumerate(table["rows"], start=1)
+    ]
+    return {
+        "path": path,
+        "part": DEFAULT_PART,
+        "table_id": table_id,
+        "row_count": len(rows),
+        "col_count": max((len(r) for r in rows), default=0),
+        "has_merged_cells": bool(table["merged"]),
+        "has_nested_table": False,  # a document with a nested table is refused outright
+        "rows": rows,
+        "source": "live",
+        "style": table["style"],
+        "header_row_count": table["headerRowCount"],
+    }
+
+
+def execute_replace_table_row_live(
+    path: str,
+    table_id: int,
+    row_index: int,
+    cells: list[str],
+    *,
+    revision_before: str | None = None,
+    track_changes: bool = False,
+) -> dict[str, Any]:
+    """Live ``replace_table_row`` (issue #34). Refuses a merged table like file
+    mode does (the pane reports a table-level ``merged`` flag read from the
+    table's OOXML). The row's cells are written as ONE Word batch guarded by a
+    body-hash precondition and a re-read of every cell just before the write --
+    best-effort under co-authoring, not a transaction."""
+    paragraphs_per_cell = [markdown_to_ooxml.parse_paragraph_runs(md) for md in cells]
+    session = live_write_mode.live_session_for(path)
+    live_write_mode.require_capability(session, _TABLE_EDIT_CAPABILITY, feature_description="live table row edits")
+    document_name = session.document_name
+    pre_hash = _live_pre_hash(session)
+    live_write_mode.check_not_stale(revision_before, pre_hash)
+
+    table = _live_table_get(session, table_id)
+    if table["merged"]:
+        raise _make_error(
+            ErrorCode.MERGED_OR_NESTED_TABLE,
+            f"table_id {table_id} contains a merged cell (w:gridSpan or w:vMerge); replace_table_row "
+            "refuses the whole table. Use replace_cell_markdown instead -- it writes one cell at a time.",
+            {"table_id": table_id},
+        )
+    if not 1 <= row_index <= len(table["rows"]):
+        raise _make_error(
+            ErrorCode.TABLE_ROW_NOT_FOUND,
+            f"row_index {row_index} is out of range for table_id {table_id} ({len(table['rows'])} row(s)).",
+            {"table_id": table_id, "row_index": row_index},
+        )
+    existing = table["rows"][row_index - 1]
+    if len(cells) != len(existing):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"cells has {len(cells)} entries but table_id {table_id} row {row_index} has {len(existing)} cell(s).",
+            {"table_id": table_id, "row_index": row_index, "cells_given": len(cells), "cell_count": len(existing)},
+        )
+    before_text = "\t".join(cell["text"] for cell in existing)
+    intended = [_intended_cell_text(p) for p in paragraphs_per_cell]
+
+    try:
+        payload = live_protocol.CellsSetPayload(
+            cells=[
+                {
+                    "table_index": table_id,
+                    "row_index": row_index,
+                    "cell_index": c,
+                    "paragraphs": _runs_to_wire(paragraphs_per_cell[c - 1]),
+                    "expected_before_text": existing[c - 1]["text"],
+                }
+                for c in range(1, len(cells) + 1)
+            ],
+            track_changes=track_changes,
+            expected_body_sha256=pre_hash,
+        )
+    except live_protocol.ProtocolError as exc:
+        raise _protocol_invalid(exc) from exc
+    result = _live_cell_request(session, "cells_set", payload.to_json(), expected_body_sha256=pre_hash)
+    if not result.get("applied"):
+        raise _make_error(
+            ErrorCode.VERIFICATION_FAILED,
+            "live row edit did not verify: the pane did not report applied=true.",
+            {"applied": result.get("applied")},
+        )
+
+    after_row = _live_table_get(session, table_id)["rows"][row_index - 1]
+    problems = [
+        f"cell {c}: {diff}"
+        for c, (want, got) in enumerate(zip(intended, after_row), start=1)
+        if (diff := mutations._diff_modulo_whitespace(want, got["text"]))
+    ]
+    if len(after_row) != len(intended):
+        problems.append(f"re-read row has {len(after_row)} cell(s), expected {len(intended)}")
+    if problems:
+        raise _fail_live_verification(
+            tool="replace_table_row", path=path, document_name=document_name, pre_hash=pre_hash,
+            session=session, problems=problems, what="live row edit did not verify on re-read",
+        )
+
+    return live_write_mode.live_evidence(
+        shape_result=result,
+        applied=True,
+        match_count=1,
+        rung=3,
+        before=before_text,
+        after="\t".join(cell["text"] for cell in after_row),
+        pre_body_sha256=pre_hash,
+        post_body_sha256=result.get("post", pre_hash),
+        document_name=document_name,
+        tool="replace_table_row",
+        path=path,
+    )
+
+
+def _live_anchor(anchor: dict[str, Any] | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """(wire anchor, anchor_resolved evidence) for a live insert_table anchor."""
+    if anchor is None:
+        return None, None
+    if not isinstance(anchor, dict):
+        raise _make_error(ErrorCode.INVALID_INPUT, "anchor must be an object.", {"anchor": anchor})
+    if "section_key" in anchor or "after_paragraph_text" in anchor:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "section_key / after_paragraph_text anchors are file-mode only (they come from the saved file's "
+            "projection, which is stale while the document is being co-authored). In live mode use "
+            "{\"paragraph_text\": <exact text of one top-level paragraph>, \"position\": \"after\"|\"before\"} "
+            "or {\"after_table_id\": <int>}, or omit anchor to append at the end.",
+            {"anchor": anchor},
+        )
+    unknown = set(anchor) - {"paragraph_text", "position", "after_table_id"}
+    if unknown or ("paragraph_text" in anchor) == ("after_table_id" in anchor):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "a live anchor is exactly one of {\"paragraph_text\", \"position\"} or {\"after_table_id\"}"
+            + (f"; unknown key(s) {sorted(unknown)}" if unknown else "") + ".",
+            {"anchor": anchor},
+        )
+    if "paragraph_text" in anchor:
+        position = anchor.get("position", "after")
+        wire = {"paragraph_text": anchor["paragraph_text"], "position": position}
+        return wire, {"paragraph_text": anchor["paragraph_text"], "position": position}
+    wire = {"after_table_index": anchor["after_table_id"]}
+    return wire, {"after_table_id": anchor["after_table_id"]}
+
+
+def _verify_live_table(
+    table: dict[str, Any],
+    specs: list[list[dict[str, Any]]],
+    *,
+    header_rows: int,
+    style: str | None,
+    font_size_pt: float | None,
+    widths_pt: list[float] | None,
+) -> list[str]:
+    """Compare Word's read-back with every property the caller asked for.
+    Returns a list of human-readable mismatches (empty = verified)."""
+    problems: list[str] = []
+    rows = table["rows"]
+    if len(rows) != len(specs):
+        return [f"re-read table has {len(rows)} row(s), expected {len(specs)}"]
+    for r, (got_row, spec_row) in enumerate(zip(rows, specs), start=1):
+        if len(got_row) != len(spec_row):
+            problems.append(f"row {r} has {len(got_row)} cell(s), expected {len(spec_row)}")
+            continue
+        for c, (got, spec) in enumerate(zip(got_row, spec_row), start=1):
+            where = f"row {r} cell {c}"
+            diff = mutations._diff_modulo_whitespace(spec["intended_text"], got["text"])
+            if diff:
+                problems.append(f"{where} text: {diff}")
+            if spec["fill"] and _norm_live_hex(got.get("fill")) != spec["fill"].upper():
+                problems.append(f"{where} fill is {got.get('fill')!r}, expected {spec['fill']!r}")
+            if spec["color"] and _norm_live_hex(got.get("color")) != spec["color"].upper():
+                problems.append(f"{where} color is {got.get('color')!r}, expected {spec['color']!r}")
+            if spec["bold"] and got.get("bold") is not True:
+                problems.append(f"{where} is not bold (read back {got.get('bold')!r})")
+            if spec["align"] and got.get("align") != spec["align"]:
+                problems.append(f"{where} align is {got.get('align')!r}, expected {spec['align']!r}")
+            if spec["valign"] and got.get("valign") != spec["valign"]:
+                problems.append(f"{where} valign is {got.get('valign')!r}, expected {spec['valign']!r}")
+            if font_size_pt is not None and spec["intended_text"]:
+                size = got.get("size")
+                if size is None or abs(float(size) - font_size_pt) > 0.01:
+                    problems.append(f"{where} font size is {size!r}, expected {font_size_pt}")
+            if widths_pt is not None:
+                width = got.get("width")
+                if width is None or abs(float(width) - widths_pt[c - 1]) > 1.5:
+                    problems.append(f"{where} width is {width!r}pt, expected {widths_pt[c - 1]}pt")
+    if table.get("headerRowCount") != header_rows:
+        problems.append(f"headerRowCount is {table.get('headerRowCount')!r}, expected {header_rows}")
+    if style is not None and table.get("style") != style:
+        problems.append(f"table style is {table.get('style')!r}, expected {style!r}")
+    return problems
+
+
+def execute_insert_table_live(
+    path: str,
+    rows: list[list[Any]],
+    *,
+    style_id: str | None = None,
+    style_from_table_id: int | None = None,
+    style_builtin: str | None = None,
+    header_rows: int = 0,
+    grid_dxa: list[int] | None = None,
+    cant_split: bool = False,
+    anchor: dict[str, Any] | None = None,
+    revision_before: str | None = None,
+    track_changes: bool = False,
+    font_size_pt: float | None = None,
+) -> dict[str, Any]:
+    """Live ``insert_table`` (issue #34). A SUBSET of file mode: no merged
+    cells (span / v_merge), no cant_split, no section_key anchors; cell
+    markdown is paragraphs with bold/italic/links only. Everything is
+    validated before anything is sent."""
+    if not rows or any(len(r) == 0 for r in rows):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT, "rows must be a non-empty list of non-empty cell lists.", {"rows": rows}
+        )
+    if cant_split:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "cant_split is not available in live mode (Word's JavaScript API cannot set it).",
+            {},
+        )
+    if not isinstance(header_rows, int) or isinstance(header_rows, bool) or not 0 <= header_rows < len(rows):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"header_rows must be an integer in [0, {len(rows) - 1}], got {header_rows!r}.",
+            {"header_rows": header_rows, "row_count": len(rows)},
+        )
+    if grid_dxa and any(isinstance(w, bool) or not isinstance(w, int) or w <= 0 for w in grid_dxa):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "grid_dxa must be a list of positive integers (dxa units), one per grid column.",
+            {"grid_dxa": grid_dxa},
+        )
+    _font_size_half_points(font_size_pt)  # validates: positive, finite
+
+    norm_rows, col_count = _normalize_rows(rows, grid_dxa if grid_dxa else None)
+    for r, row in enumerate(norm_rows, start=1):
+        for c, cell in enumerate(row, start=1):
+            if cell["span"] != 1 or cell["v_merge"] is not None:
+                raise _make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"row {r} cell {c}: merged cells (span / v_merge) are not available in live mode "
+                    "(Word's JavaScript API cannot merge cells). Close the document and use write_mode='file'.",
+                    {"row_index": r, "cell_index": c},
+                )
+    if grid_dxa and len(grid_dxa) != col_count:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"grid_dxa has {len(grid_dxa)} column(s) but the table has {col_count}.",
+            {"grid_dxa": grid_dxa, "col_count": col_count},
+        )
+    widths_pt = [w / 20 for w in grid_dxa] if grid_dxa else None
+
+    specs: list[list[dict[str, Any]]] = []
+    wire_rows: list[list[dict[str, Any]]] = []
+    for row in norm_rows:
+        spec_row: list[dict[str, Any]] = []
+        wire_row: list[dict[str, Any]] = []
+        for cell in row:
+            paragraphs = markdown_to_ooxml.parse_paragraph_runs(cell["markdown"])
+            spec_row.append({**cell, "intended_text": _intended_cell_text(paragraphs)})
+            wire_row.append(
+                {
+                    "paragraphs": _runs_to_wire(paragraphs),
+                    "fill": cell["fill"],
+                    "color": cell["color"],
+                    "bold": cell["bold"],
+                    "align": cell["align"],
+                    "valign": cell["valign"],
+                }
+            )
+        specs.append(spec_row)
+        wire_rows.append(wire_row)
+
+    wire_anchor, anchor_resolved = _live_anchor(anchor)
+
+    session = live_write_mode.live_session_for(path)
+    live_write_mode.require_capability(session, _TABLE_EDIT_CAPABILITY, feature_description="live table inserts")
+    document_name = session.document_name
+    pre_hash = _live_pre_hash(session)
+    live_write_mode.check_not_stale(revision_before, pre_hash)
+
+    # style_from_table_id: read the source table's style NOW, so the insert
+    # carries a concrete name and the read-back can verify it (the source's own
+    # index may shift once the new table is in).
+    style_name = style_id
+    if style_from_table_id is not None:
+        style_name = _live_table_get(session, style_from_table_id)["style"]
+        if not style_name:
+            raise _make_error(
+                ErrorCode.STYLE_NOT_FOUND,
+                f"table_id {style_from_table_id} has no table style to copy.",
+                {"table_id": style_from_table_id},
+            )
+
+    try:
+        payload = live_protocol.TableInsertPayload(
+            rows=wire_rows,
+            anchor=wire_anchor,
+            style=style_name,
+            style_builtin=style_builtin,
+            header_rows=header_rows,
+            column_widths_pt=widths_pt,
+            font_size_pt=font_size_pt,
+            track_changes=track_changes,
+            expected_body_sha256=pre_hash,
+        )
+    except live_protocol.ProtocolError as exc:
+        raise _protocol_invalid(exc) from exc
+
+    result = _live_cell_request(session, "table_insert", payload.to_json(), expected_body_sha256=pre_hash)
+    if not result.get("applied") or not isinstance(result.get("table_index"), int):
+        raise _make_error(
+            ErrorCode.VERIFICATION_FAILED,
+            "live table insert did not verify: the pane did not report applied=true with a table_index.",
+            {"result": result},
+        )
+    new_table_id = result["table_index"]
+
+    table = _live_table_get(session, new_table_id)
+    problems = _verify_live_table(
+        table,
+        specs,
+        header_rows=header_rows,
+        style=style_name,
+        font_size_pt=font_size_pt,
+        widths_pt=widths_pt,
+    )
+    if style_builtin is not None and not table.get("style"):
+        problems.append("the built-in table style did not take (the table reports no style)")
+    if problems:
+        raise _fail_live_verification(
+            tool="insert_table", path=path, document_name=document_name, pre_hash=pre_hash,
+            session=session, problems=problems, what="live table insert did not verify on re-read",
+        )
+
+    evidence = live_write_mode.live_evidence(
+        shape_result=result,
+        applied=True,
+        match_count=1,
+        rung=4,
+        before="",
+        after="\n".join("\t".join(cell["text"] for cell in row) for row in table["rows"]),
+        pre_body_sha256=pre_hash,
+        post_body_sha256=result.get("post", pre_hash),
+        document_name=document_name,
+        tool="insert_table",
+        path=path,
+    )
+    evidence["table_id"] = new_table_id
+    evidence["merged_cells"] = 0
+    evidence["anchor_resolved"] = anchor_resolved
+    return evidence
 
 
 # ---------------------------------------------------------------------------
@@ -774,7 +1235,7 @@ _VMERGE_VALUES = frozenset({"restart", "continue"})
 # right slot regardless of call order.
 _TCPR_CHILD_ORDER = ["tcW", "gridSpan", "vMerge", "shd", "vAlign"]
 _PPR_CHILD_ORDER = ["pStyle", "numPr", "jc"]
-_RPR_CHILD_ORDER = ["rStyle", "b", "bCs", "i", "iCs", "color"]
+_RPR_CHILD_ORDER = ["rStyle", "b", "bCs", "i", "iCs", "color", "sz", "szCs"]
 
 
 def _insert_ordered(parent: Any, new_child: Any, order: list[str]) -> None:
@@ -973,16 +1434,18 @@ def _normalize_rows(rows: list[list[Any]], grid_dxa: list[int] | None) -> tuple[
     return norm_rows, col_count
 
 
-def _apply_cell_formatting(elements: list[Any], cell: dict[str, Any]) -> None:
-    """align/bold/color live on the rendered runs/paragraphs themselves
-    (w:pPr/w:jc, w:rPr/w:b+w:bCs+w:color) -- see the docstring caveat on
-    execute_insert_table: replace_cell_markdown replaces these elements
-    wholesale, so this formatting does NOT survive a later cell edit
+def _apply_cell_formatting(
+    elements: list[Any], cell: dict[str, Any], font_size_half_points: int | None = None
+) -> None:
+    """align/bold/color/size live on the rendered runs/paragraphs themselves
+    (w:pPr/w:jc, w:rPr/w:b+w:bCs+w:color+w:sz+w:szCs) -- see the docstring
+    caveat on execute_insert_table: replace_cell_markdown replaces these
+    elements wholesale, so this formatting does NOT survive a later cell edit
     (unlike span/v_merge/fill/valign, which live in w:tcPr and do)."""
     align = cell["align"]
     bold = cell["bold"]
     color = cell["color"]
-    if align is None and not bold and color is None:
+    if align is None and not bold and color is None and font_size_half_points is None:
         return
     for el in elements:
         if projection._ln(el) != "p":
@@ -997,7 +1460,7 @@ def _apply_cell_formatting(elements: list[Any], cell: dict[str, Any]) -> None:
                 jc = ET.Element(_w("jc"))
                 _insert_ordered(ppr, jc, _PPR_CHILD_ORDER)
             jc.set(_w("val"), align)
-        if bold or color:
+        if bold or color or font_size_half_points is not None:
             for r in el:
                 if projection._ln(r) != "r":
                     continue
@@ -1005,6 +1468,13 @@ def _apply_cell_formatting(elements: list[Any], cell: dict[str, Any]) -> None:
                 if rpr is None:
                     rpr = ET.Element(_w("rPr"))
                     r.insert(0, rpr)
+                if font_size_half_points is not None:
+                    for tag in ("sz", "szCs"):
+                        sz = _first_child(rpr, tag)
+                        if sz is None:
+                            sz = ET.Element(_w(tag))
+                            _insert_ordered(rpr, sz, _RPR_CHILD_ORDER)
+                        sz.set(_w("val"), str(font_size_half_points))
                 if bold:
                     if _first_child(rpr, "b") is None:
                         _insert_ordered(rpr, ET.Element(_w("b")), _RPR_CHILD_ORDER)
@@ -1147,6 +1617,7 @@ def _build_table_element(
     explicit_grid: bool,
     header_rows: int,
     cant_split: bool,
+    font_size_half_points: int | None = None,
 ) -> tuple[Any, list[list[list[Any]]]]:
     tbl = ET.Element(_w("tbl"))
     tblpr = ET.SubElement(tbl, _w("tblPr"))
@@ -1194,7 +1665,7 @@ def _build_table_element(
                 _insert_ordered(tcpr, ET.Element(_w("vAlign"), {_w("val"): cell["valign"]}), _TCPR_CHILD_ORDER)
 
             elements = _render_cell_markdown(cell["markdown"], ctx)
-            _apply_cell_formatting(elements, cell)
+            _apply_cell_formatting(elements, cell, font_size_half_points)
             for el in elements:
                 tc.append(el)
             row_elements.append(elements)
@@ -1203,10 +1674,56 @@ def _build_table_element(
     return tbl, per_row_new_elements
 
 
+def _check_style_sources(
+    style_id: str | None, style_from_table_id: int | None, style_builtin: str | None
+) -> None:
+    given = [n for n, v in (("style_id", style_id), ("style_from_table_id", style_from_table_id), ("style_builtin", style_builtin)) if v is not None]
+    if len(given) > 1:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"give at most one of style_id, style_from_table_id, style_builtin; got {given}.",
+            {"given": given},
+        )
+
+
+def _font_size_half_points(font_size_pt: Any) -> int | None:
+    """w:sz/w:szCs are in half-points: the point size doubled, rounded half up."""
+    if font_size_pt is None:
+        return None
+    if (
+        isinstance(font_size_pt, bool)
+        or not isinstance(font_size_pt, (int, float))
+        or not math.isfinite(font_size_pt)
+        or font_size_pt <= 0
+    ):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"font_size_pt must be a positive finite number, got {font_size_pt!r}.",
+            {"font_size_pt": font_size_pt},
+        )
+    return max(1, math.floor(font_size_pt * 2 + 0.5))
+
+
+def _style_id_of_table(resolved: Path, table_id: int) -> str:
+    """The w:tblStyle of table *table_id* (any table, nested included)."""
+    root, _ = mutations._load_document(resolved)
+    tbl = _find_table_element(root, table_id)
+    tblpr = _first_child(tbl, "tblPr")
+    tblstyle = _first_child(tblpr, "tblStyle") if tblpr is not None else None
+    style = projection._attr(tblstyle, "val") if tblstyle is not None else None
+    if not style:
+        raise _make_error(
+            ErrorCode.STYLE_NOT_FOUND,
+            f"table_id {table_id} has no w:tblStyle to copy; give style_id instead.",
+            {"table_id": table_id},
+        )
+    return style
+
+
 def execute_insert_table(
     path: str,
     rows: list[list[Any]],
-    style_id: str,
+    style_id: str | None = None,
     *,
     header_rows: int = 0,
     grid_dxa: list[int] | None = None,
@@ -1216,20 +1733,59 @@ def execute_insert_table(
     force: bool = False,
     allow_concurrent_editor: bool = False,
     track_changes: bool = False,
+    write_mode: str = "auto",
+    style_from_table_id: int | None = None,
+    style_builtin: str | None = None,
+    font_size_pt: float | None = None,
 ) -> dict[str, Any]:
+    _check_style_sources(style_id, style_from_table_id, style_builtin)
+    mode = live_write_mode.resolve_write_mode(path, write_mode)
+    if mode == "live":
+        return execute_insert_table_live(
+            path,
+            rows,
+            style_id=style_id,
+            style_from_table_id=style_from_table_id,
+            style_builtin=style_builtin,
+            header_rows=header_rows,
+            grid_dxa=grid_dxa,
+            cant_split=cant_split,
+            anchor=anchor,
+            revision_before=revision_before,
+            track_changes=track_changes,
+            font_size_pt=font_size_pt,
+        )
+    if style_builtin is not None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "style_builtin is only available with write_mode='live' (it maps to a Word built-in "
+            "table style); give style_id (an OOXML table style id) or style_from_table_id.",
+            {"style_builtin": style_builtin},
+        )
+    if style_id is None and style_from_table_id is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "give style_id (an existing table style id, see list_styles) or style_from_table_id.",
+            {},
+        )
+    font_size_half_points = _font_size_half_points(font_size_pt)
+
     own_author = resolve_author_name()
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(
         resolved,
         revision_before,
         allow_concurrent_editor=allow_concurrent_editor,
-        live_capable=False,
+        live_capable=True,
     )
 
     if not rows or any(len(r) == 0 for r in rows):
         raise _make_error(
             ErrorCode.INVALID_INPUT, "rows must be a non-empty list of non-empty cell lists.", {"rows": rows}
         )
+
+    if style_from_table_id is not None:
+        style_id = _style_id_of_table(resolved, style_from_table_id)
 
     styles = projection.list_styles_impl(resolved)
     table_style_ids = {s["style_id"] for s in styles if s.get("type") == "table" and s.get("style_id")}
@@ -1290,7 +1846,8 @@ def execute_insert_table(
 
     ctx = markdown_to_ooxml.StyleContext.build(resolved)
     tbl, per_row_new_elements = _build_table_element(
-        ctx, style_id, norm_rows, col_count, grid_cols_dxa, explicit_grid, header_rows, cant_split
+        ctx, style_id, norm_rows, col_count, grid_cols_dxa, explicit_grid, header_rows, cant_split,
+        font_size_half_points,
     )
 
     track = tracked_changes.TrackContext(document_root, author=own_author) if track_changes else None
@@ -1373,6 +1930,21 @@ def execute_insert_table(
                 diff = mutations._diff_modulo_whitespace(intended, actual)
                 if diff:
                     raise ValueError(f"re-read cell does not match the intended rendering modulo whitespace: {diff}")
+                if font_size_half_points is not None:
+                    for el in actual_children:
+                        if projection._ln(el) != "p":
+                            continue
+                        for run in el:
+                            if projection._ln(run) != "r":
+                                continue
+                            rpr = _first_child(run, "rPr")
+                            sz = _first_child(rpr, "sz") if rpr is not None else None
+                            actual_sz = projection._attr(sz, "val") if sz is not None else None
+                            if actual_sz != str(font_size_half_points):
+                                raise ValueError(
+                                    f"row {row_index} cell {cell_index}: re-read w:sz {actual_sz!r}, "
+                                    f"expected {str(font_size_half_points)!r}"
+                                )
 
         for row_index in range(header_rows):
             trpr = _first_child(new_trs[row_index], "trPr")

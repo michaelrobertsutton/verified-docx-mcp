@@ -747,19 +747,20 @@ class LiveSessionActiveMarkdownRungGuardTests(LiveWriteBridgeTestCase):
 
 
 class LiveSessionActiveTableRungGuardTests(LiveWriteBridgeTestCase):
-    """A table tool (also no write_mode parameter) refuses under a
-    connected pane -- a second representative site distinct from
-    text_edit.py/mutations.py's own module."""
+    """A table tool's explicit write_mode="file" refuses under a connected
+    pane -- a second representative site distinct from text_edit.py/
+    mutations.py's own module. (Issue #34: replace_table_row now has a live
+    route, so "auto" would go live; the file-mode refusal is what's pinned.)"""
 
     fixture_name = "tables.docx"
 
     async def test_replace_table_row_refuses_under_connected_pane(self) -> None:
-        doc = FakeDocument(text="unused -- replace_table_row never talks to the pane")
+        doc = FakeDocument(text="unused -- an explicit file-mode call never talks to the pane")
         await self.connect_pane(doc)
         before_bytes = self.target.read_bytes()
 
         with self.assertRaises(VerifyError) as ctx:
-            tables.execute_replace_table_row(str(self.target), 1, 1, ["New A", "New B"])
+            tables.execute_replace_table_row(str(self.target), 1, 1, ["New A", "New B"], write_mode="file")
         self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.LIVE_SESSION_ACTIVE)
         self.assertEqual(self.target.read_bytes(), before_bytes)
 

@@ -148,9 +148,10 @@ connected pane, brings the bridge up.
   `list_open_items`'s own docstring): `write_mode.py`'s document-name
   resolution and every `comments_live.py` session lookup now tolerate a
   `path` that does not exist locally, using its basename to find a
-  connected session by name. `read_document`/`list_parts`/`find_sections`
-  and the other structural read tools remain file-only — this does not
-  add a live read path for them.
+  connected session by name. (Issue #33 later added a live read path for
+  `read_document`/`find_sections`/`list_tables`/`get_table` — see "Live
+  reads (issue #33)" below. `list_parts` and the other structural read
+  tools remain file-only.)
 
 **Why a document open in Word is now writable.** Before this WP, a desktop
 Word owner file on the target path only ever showed up as data
@@ -438,9 +439,87 @@ channel:
 - The pane must report `"cell_edit"` (reload it after upgrading), else
   `LIVE_CAPABILITY_MISSING`.
 
-The other table tools (`replace_table_row`, `insert_table`) still have no
-live route; on them `EXTERNAL_EDITOR_ACTIVE` can only be waited out or
-overridden. Tracked in a follow-up issue.
+## Live tables (issue #34)
+
+`insert_table`, `replace_table_row` (`write_mode`) and `get_table`
+(`source`) now have a live route, so a table can be added to or edited in a
+document a co-author has open. All three need the pane to report
+`"table_edit"` (reload the pane after upgrading), else
+`LIVE_CAPABILITY_MISSING`. New ops: `table_get`, `table_insert`, `cells_set`
+(see `live/protocol.py`); table ops get a longer reply timeout than the 15 s
+default so a slow success is not reported as a disconnect and retried into a
+duplicate table.
+
+**`insert_table(write_mode="live")` is a subset of file mode.**
+
+- Cells are paragraphs with bold/italic/links. `fill`, `color`, `bold`,
+  `align`, `valign` work. Merged cells (`span`, `v_merge`) and `cant_split`
+  are refused with `INVALID_INPUT` (Word's JavaScript API cannot do them).
+- **Anchor**: `{"paragraph_text": ..., "position": "after"|"before"}` (a
+  unique top-level paragraph; 0 matches `ZERO_MATCH`, more than 1
+  `MATCH_COUNT_MISMATCH`; text is matched modulo whitespace, smart quotes and
+  soft hyphens), `{"after_table_id": n}`, or none to append at the end.
+  `section_key` anchors are file-mode only: they come from the saved file,
+  which lags a co-authored document.
+- **Style** is validated before anything is inserted, so there is no
+  insert-then-delete rollback. `style_id` is a Word table style *name* in live
+  mode; it must already be used by a table in the document, or (WordApi 1.5+)
+  be in the document's style list. `style_from_table_id` copies an existing
+  table's style. `style_builtin` takes a Word built-in style name
+  (`GridTable4_Accent1`). All three are optional in live mode.
+- `table_id` in the result is read back from Word, not counted.
+- `grid_dxa` becomes column widths in points; `font_size_pt` sets the table
+  font size.
+
+**Safety, and its limit.**
+
+- The pane compares the caller's body hash with its own *before* writing and
+  refuses with `LIVE_STALE` if the document moved. (The older ops only compare
+  after the write; see the note in `live/session.py`.)
+- After the write the server re-reads the table (`table_get`) and compares
+  every requested property: text, fill, color, bold, alignment, widths, font
+  size, header rows, style. A mismatch is `VERIFICATION_FAILED`, and because
+  the table has already landed, **a failure record is written to the audit
+  log first** (`tool: "insert_table:verification_failed"`). The table stays in
+  the document for you to fix or delete.
+- `replace_table_row` writes the whole row as **one Word batch** guarded by
+  the body hash and a re-read of every cell just before the write. Word
+  batches are not transactions, so a cell edited in the last instant can still
+  be overwritten. It refuses a table containing a merged cell
+  (`MERGED_OR_NESTED_TABLE`; the pane reads this from the table's OOXML).
+- `get_table(source="live")` reads the main body only (a non-default `part`
+  is `INVALID_INPUT`; `"auto"` falls back to the file for it), returns Word's
+  plain text rather than markdown, and cannot report per-cell
+  `grid_span`/`v_merge` (use the table-level `has_merged_cells`).
+- Nested-table documents are refused, as for live cell edits.
+
+### Live tables: UNVERIFIED in real Word
+
+The server side and the pane logic are tested (a fake pane; a Node harness
+over a mock Word object model that enforces load/sync ordering and
+`ClientResult` rules). The real Office.js behaviour is **not** verified. Run
+this once and record the result:
+
+1. Reload the pane (it must report `table_edit`), open a copy of a real
+   proposal section, call `live_status`.
+2. `insert_table(path, rows=[["**Metric**","**Value**"],["Uptime","99.9%"]],
+   style_from_table_id=1, header_rows=1, grid_dxa=[2400,6960], font_size_pt=10,
+   anchor={"paragraph_text": "<a unique paragraph>", "position": "after"},
+   write_mode="live")`. Confirm the table appears where expected, `table_id`
+   matches `get_table(source="live")`, the style, header shading, widths and
+   bold match, and `verified_via: "word-addin"` is in the evidence.
+3. Things most likely to differ from the mock: whether a style *name* from
+   `style_id` is accepted (try both a name already in use and one that is only
+   in the style list), whether `style_builtin` yields the expected look,
+   whether column widths survive Word's page-width clamping (the read-back
+   allows 1.5 pt), and `getOoxml()` merged-cell detection on a real merged
+   table.
+4. `replace_table_row(path, 1, 2, ["a", "b"], write_mode="live")` on the new
+   table, then edit a cell by hand and retry to see the compare-and-set
+   refusal.
+5. Wait 5+ minutes, reopen from SharePoint, confirm the table is still there.
+
+Result: _not yet run._
 
 ### Running the pane in Word for the web: UNVERIFIED
 
@@ -818,7 +897,7 @@ re-listed every comment to verify). What changed:
   without the capability gets the old full listing, and the evidence
   carries a `pane_note` saying to reopen the pane.
 - **No pane caching.** The bridge sends `Cache-Control: no-store` on every
-  response and `taskpane.html` loads `taskpane.js?v=39`, so closing and
+  response and `taskpane.html` loads `taskpane.js?v=40`, so closing and
   reopening the pane picks up an edited `addin/*.js`. If a pane still
   behaves like an old build, check `live_status` for `comments_by_id` in its
   capabilities; bump the `?v=` value in `taskpane.html` when you change
@@ -875,6 +954,77 @@ below), so the tool now makes a gap visible instead of guessing:
 Not done: reading comments document-wide. Word's document-level comment
 collection may need `WordApiDesktop 1.4`; that member and requirement set are
 unverified here, so `scope` stays `"body"` until they are checked.
+
+### Live reads (issue #33)
+
+On a co-authored SharePoint document the live Word body is the source of
+truth, and the local `.docx` is only the same-named placeholder live writes
+need. `read_document`, `find_sections`, `list_tables` and `get_table` used to
+read that placeholder and return `warnings: []`, so a placeholder read could
+pass as the live body. Now each takes `source="auto"|"file"|"live"` and every
+response carries `source`. (`get_table`'s live read is issue #34's `table_get`
+op, which uses the same table numbering as live table edits; only its file
+read gets this section's `live_session_ignored` warning. The other three read
+the body through `body_ooxml`, described below. The two number tables the
+same way unless the document has a nested table, which `table_get` refuses.)
+
+- **`source="live"`** reads the body the connected pane holds. It needs a
+  session for the file name, the default part (`word/document.xml`: Word's
+  `getOoxml()` covers the body, not headers/footers/footnotes) and a pane
+  reporting the `body_ooxml` capability. Errors: `LIVE_UNAVAILABLE` (no
+  session), `INVALID_INPUT` (another part), `LIVE_CAPABILITY_MISSING` (old
+  pane — close and reopen the Live pane), `LIVE_SESSION_MISMATCH` (the
+  session's `document_url` is a different local file).
+- **`source="file"`** reads the local file, as before.
+- **`source="auto"`** (default) reads live when it safely can, otherwise the
+  file. It reads live only if a session exists for the file name, the part is
+  the body, the pane has `body_ooxml`, the `document_url` doesn't point at a
+  different local file, and no other document has ever connected under the
+  same file name (`SessionRegistry` keys on basename alone, and a SharePoint
+  URL can't be compared with a local path, so a collision means the pane may
+  hold a different document). Pass `source="live"` to read through a
+  collision on purpose.
+- **The warning.** A file read made while any session is registered for the
+  file name carries `"live_session_ignored"` in `warnings` plus
+  `live_session: {document_url, reason, action}`. `reason` is
+  `requested_file`, `part_not_in_live`, `pane_missing_capability`,
+  `basename_collision` or `session_mismatch`; `action` says what to do.
+  `list_parts` (file-only) carries the same warning. `find_sections`,
+  `list_tables` and `get_table` add a `warnings` key only when there is
+  something to say.
+- **No fallback after a live failure.** Once live is chosen, a pane timeout
+  (`LIVE_DISCONNECTED`), a `too_large` refusal (`LIVE_OP_FAILED`, message
+  points at `source="file"`) or an unreadable export (`LIVE_OP_FAILED`,
+  `diagnostics.stage == "flat_opc"`) is raised, never answered from the file.
+- **Revision.** A live `read_document` returns `revision:
+  "live:sha256:<hash>"` (the same token live writes accept as
+  `revision_before`; it hashes the body *text* only, not formatting,
+  comments or table structure) and `revision_detail: null`, plus
+  `live: {document_url, body_sha256, stripped_parts}`.
+- **Identifiers.** `para_ref` and `table_id` are positional and can change
+  between any two reads. Use them only with the `source` and `revision` they
+  were read at.
+- **One known difference from a file read.** Word's `getOoxml()` appends an
+  empty paragraph at the end of the body that a saved file doesn't have, so
+  a live `text` read ends with one extra newline and the last section's
+  `paragraph_count` is one higher. Markdown, tables and run text are
+  otherwise identical (checked on real Word against a Word-saved copy of
+  the same document: headings, bullets, numbered list, table, image).
+- **Warnings specific to live reads.** `live_styles_missing` /
+  `live_numbering_missing`: the body references styles or numbering but
+  Word's export omitted that part, so headings or lists may render wrongly.
+  The gap is never filled from the local file.
+
+How it works. The pane's `body_ooxml` op calls `body.getOoxml()` and returns
+the Flat OPC string with every `pkg:binaryData` payload emptied
+(namespace-aware, `strippedParts` names them), so images are not included.
+The server (`live/reads_live.py`) turns the Flat OPC into a temporary
+`.docx` and runs the existing projection code on it, then deletes it. That
+`.docx` is an adapter for projection only, not a valid export. The pane
+refuses with `too_large` above 48 MiB; the ops socket accepts messages up to
+64 MiB (`PANE_MAX_MESSAGE_BYTES`; the websockets default of 1 MiB would
+drop the pane's connection on a real proposal). `body_ooxml` waits 60 s;
+override with `VERIFIED_DOCX_LIVE_TIMEOUT_BODY_OOXML_S`.
 
 ## What could block this, and the fix
 

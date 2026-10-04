@@ -47,6 +47,7 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         "append_markdown",
         # issue #28 WP-06:
         "replace_text",
+        "delete_paragraph",
         "format_text",
         # issue #28 WP-07 (list_open_items is read-only, not listed here):
         "accept_tracked_changes",

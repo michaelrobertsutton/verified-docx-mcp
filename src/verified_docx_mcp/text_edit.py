@@ -770,6 +770,9 @@ def execute_replace_text_live(
     revision_before: str | None = None,
     track_changes: bool = False,
     within_row_containing: str | None = None,
+    allow_comment_loss: bool = False,
+    inherit_format: str = "replaced",
+    scope: str = "body",
 ) -> dict[str, Any]:
     """Live-mode ``replace_text`` (issue #106 WP-3): sends a ``replace``
     op over the pane's WSS ops channel instead of editing the .docx file.
@@ -806,18 +809,28 @@ def execute_replace_text_live(
     since Word, not this server, owns the file; the diagnostics say so
     explicitly).
     """
+    if inherit_format not in ("replaced", "previous", "none"):
+        raise _make_error(ErrorCode.INVALID_INPUT, "Invalid inherit_format")
     if not find:
         raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty")
 
     session = live_write_mode.live_session_for(path)
     document_name = session.document_name
+    live_write_mode.require_capability(session, "replacement_formatting", feature_description="replacement formatting")
+    live_write_mode.require_capability(session, "comment_loss_guard", feature_description="comment loss protection")
     if within_row_containing:
         live_write_mode.require_capability(
             session, _ROW_SCOPE_CAPABILITY, feature_description="within_row_containing"
         )
 
     try:
-        pre_hash = _live_describe(session, path, revision_before)
+        if scope != "body":
+            from .live.scopes_live import scope_state
+            scope_info = scope_state(session, scope, revision_before)
+            pre_hash = scope_info["bodySha256"]
+        else:
+            scope_info = None
+            pre_hash = _live_describe(session, path, revision_before)
     except LiveDisconnected as exc:
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
 
@@ -826,7 +839,13 @@ def execute_replace_text_live(
         "expected_matches": expected_matches,
         "replace": replace,
         "track_changes": track_changes,
+        "allow_comment_loss": allow_comment_loss,
+        "inherit_format": inherit_format,
     }
+    payload["scope"] = scope
+    payload["expectedBodySha256"] = pre_hash
+    if scope_info:
+        payload["expectedScopeSha256"] = scope_info["scopeSha256"]
     if within_row_containing:
         payload["rowAnchor"] = within_row_containing
     try:
@@ -846,7 +865,7 @@ def execute_replace_text_live(
     match_count = result.get("match_count", len(matches))
     post_hash = result.get("post")
 
-    if not result.get("applied") or post_hash == pre_hash:
+    if not result.get("applied") or (result.get("scope_post") == scope_info["scopeSha256"] if scope_info else post_hash == pre_hash):
         raise _make_error(
             ErrorCode.VERIFICATION_FAILED,
             "live replace did not verify: the pane's post-op body hash did not change from its "
@@ -868,7 +887,8 @@ def execute_replace_text_live(
     before_text = "\n".join(m.get("before", "") for m in matches)
     after_text = "\n".join(m.get("after", "") for m in matches)
 
-    return live_write_mode.live_evidence(
+    evidence = live_write_mode.live_evidence(
+        shape_result=result,
         applied=True,
         match_count=match_count,
         rung=2,
@@ -895,6 +915,13 @@ def execute_replace_text_live(
 # identical `find` text remain inseparable -- a named, documented
 # limitation (see server.py's docstrings), not solved here.
 # ---------------------------------------------------------------------------
+
+    if scope_info:
+        evidence["revision_before"] = f"live:scope:{scope_info['scopeSha256']}"
+        evidence["revision_after"] = f"live:scope:{result['scope_post']}"
+    evidence["matches"] = matches
+    evidence["comments_removed"] = result.get("comments_removed", [])
+    return evidence
 
 
 def _paragraph_by_ref(proj: projection.Projection) -> dict[str, projection.ParagraphMeta]:
@@ -983,6 +1010,9 @@ def execute_replace_text(
     track_changes: bool = False,
     write_mode: str = "auto",
     within_row_containing: str | None = None,
+    allow_comment_loss: bool = False,
+    inherit_format: str = "replaced",
+    scope: str = "body",
 ) -> dict[str, Any]:
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
@@ -994,8 +1024,13 @@ def execute_replace_text(
             revision_before=revision_before,
             track_changes=track_changes,
             within_row_containing=within_row_containing,
+            scope=scope,
+            allow_comment_loss=allow_comment_loss,
+            inherit_format=inherit_format,
         )
 
+    if scope != "body":
+        raise _make_error(ErrorCode.INVALID_INPUT, "scope requires live mode")
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(
         resolved,
@@ -1068,6 +1103,7 @@ def execute_format_text_live(
     revision_before: str | None = None,
     track_changes: bool = False,
     within_row_containing: str | None = None,
+    scope: str = "body",
 ) -> dict[str, Any]:
     """Live-mode ``format_text`` (issue #106 WP-3): sends a ``format`` op
     over the pane's WSS ops channel instead of editing the .docx file.
@@ -1105,13 +1141,20 @@ def execute_format_text_live(
 
     session = live_write_mode.live_session_for(path)
     document_name = session.document_name
+    live_write_mode.require_capability(session, "format_readback", feature_description="all-property formatting readback")
     if within_row_containing:
         live_write_mode.require_capability(
             session, _ROW_SCOPE_CAPABILITY, feature_description="within_row_containing"
         )
 
     try:
-        pre_hash = _live_describe(session, path, revision_before)
+        if scope != "body":
+            from .live.scopes_live import scope_state
+            scope_info = scope_state(session, scope, revision_before)
+            pre_hash = scope_info["bodySha256"]
+        else:
+            scope_info = None
+            pre_hash = _live_describe(session, path, revision_before)
     except LiveDisconnected as exc:
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
 
@@ -1125,6 +1168,10 @@ def execute_format_text_live(
         "color": style.get("color"),
         "track_changes": track_changes,
     }
+    payload["scope"] = scope
+    payload["expectedBodySha256"] = pre_hash
+    if scope_info:
+        payload["expectedScopeSha256"] = scope_info["scopeSha256"]
     if within_row_containing:
         payload["rowAnchor"] = within_row_containing
     try:
@@ -1161,6 +1208,10 @@ def execute_format_text_live(
                 "roll back in live mode -- Word, not this server, owns the document.",
                 {"matches": matches},
             )
+        for key in ("bold", "italic", "underline"):
+            if key in style and m.get(f"{key}After") is not style[key]:
+                raise _make_error(ErrorCode.VERIFICATION_FAILED,
+                                  f"Live {key} read-back differs from request", {"matches": matches})
         requested_color = style.get("color")
         if requested_color is not None:
             # Word's own Office.js font.color GETTER returns a "#"-prefixed
@@ -1198,7 +1249,8 @@ def execute_format_text_live(
     before_text = "\n".join(m.get("before", "") for m in matches)
     after_text = "\n".join(m.get("after", "") for m in matches)
 
-    return live_write_mode.live_evidence(
+    evidence = live_write_mode.live_evidence(
+        shape_result=result,
         applied=True,
         match_count=match_count,
         rung=1,
@@ -1216,6 +1268,12 @@ def execute_format_text_live(
 # Tool 2: format_text
 # ---------------------------------------------------------------------------
 
+    if scope_info:
+        evidence["revision_before"] = f"live:scope:{scope_info['scopeSha256']}"
+        evidence["revision_after"] = f"live:scope:{result['scope_post']}"
+    evidence["matches"] = matches
+    return evidence
+
 
 def execute_format_text(
     path: str,
@@ -1229,6 +1287,7 @@ def execute_format_text(
     track_changes: bool = False,
     write_mode: str = "auto",
     within_row_containing: str | None = None,
+    scope: str = "body",
 ) -> dict[str, Any]:
     style = _validate_style(style)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
@@ -1241,8 +1300,11 @@ def execute_format_text(
             revision_before=revision_before,
             track_changes=track_changes,
             within_row_containing=within_row_containing,
+            scope=scope,
         )
 
+    if scope != "body":
+        raise _make_error(ErrorCode.INVALID_INPUT, "scope requires live mode")
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(
         resolved,
@@ -1802,6 +1864,7 @@ def execute_live_save(path: str) -> dict[str, Any]:
         "revision_after": f"live:sha256:{post_hash}",
         "file_revision": file_revision,
     }
+    evidence.update(live_write_mode.shape_counts(result))
     logged, _ = audit.append_audit(path=str(resolved), tool="live_save", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence

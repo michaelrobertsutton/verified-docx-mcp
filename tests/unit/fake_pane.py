@@ -49,9 +49,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
+import zipfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree as ET
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -174,6 +178,17 @@ class FakeDocument:
         # fake's analogue of a write Word dropped, for the server's
         # independent read-back to catch.
         self.dropped_cell_writes: set[tuple[int, int, int]] = set()
+        # Issue #34 (live tables). table_meta is parallel to `tables`; the
+        # other three are fake-only knobs.
+        self.table_meta: list[dict[str, Any]] = []
+        # Formatting keys table_insert accepts but silently does not apply
+        # (any of fill/color/bold/align/valign/width/size/header) -- for the
+        # server's independent read-back to catch.
+        self.dropped_table_formatting: set[str] = set()
+        # Table styles the document "has" besides those its tables use.
+        self.known_styles: set[str] = {"Table Grid", "Grid Table 4 - Accent 1"}
+        # 0-based indices of tables the fake reports as containing a merged cell.
+        self.merged_tables: set[int] = set()
 
     def sha256(self) -> str:
         payload = self.text
@@ -220,6 +235,168 @@ class FakeDocument:
             ]
             self.tables[t][r][c] = "\n".join(paragraphs)
         return {"applied": True, "before": before, "after": self.tables[t][r][c], "pre": pre, "post": self.sha256()}
+
+    # -- live tables (issue #34) --------------------------------------
+    #
+    # Per-table metadata lives in `table_meta`, parallel to `tables` (created
+    # lazily so a test that only fills `tables` keeps working). Alignments are
+    # stored in the SERVER's vocabulary, as the real pane reports them.
+
+    _DEFAULT_CELL_FORMAT = {
+        "fill": "", "align": "left", "valign": "top", "width": 72.0, "bold": False, "color": "", "size": 11.0,
+    }
+    _BUILTIN_STYLES = {"GridTable4_Accent1": "Grid Table 4 - Accent 1", "TableGrid": "Table Grid"}
+
+    def _ensure_meta(self) -> None:
+        while len(self.table_meta) < len(self.tables):
+            t = len(self.table_meta)
+            self.table_meta.append(
+                {
+                    "style": "Table Grid",
+                    "header": 0,
+                    "pos": 1e9 + t,  # tables a test filled by hand sit after every paragraph
+                    "cells": {},
+                }
+            )
+
+    def _cell_format(self, t: int, r: int, c: int) -> dict[str, Any]:
+        self._ensure_meta()
+        return {**self._DEFAULT_CELL_FORMAT, **self.table_meta[t]["cells"].get((r, c), {})}
+
+    def _check_fresh(self, payload: dict[str, Any]) -> str:
+        pre = self.sha256()
+        expected = payload.get("expectedBodySha256")
+        if expected and expected != pre:
+            raise OpRefused("stale", "the document changed since it was read; nothing was written.")
+        return pre
+
+    def table_get(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_meta()
+        if self.has_nested_table:
+            raise OpRefused("LIVE_OP_FAILED", "the document contains a nested table; live cell edits are refused")
+        t = int(payload["table_index"]) - 1
+        if not 0 <= t < len(self.tables):
+            raise OpRefused("table_not_found", f"no table {t + 1} (the document has {len(self.tables)})")
+        meta = self.table_meta[t]
+        return {
+            "style": meta["style"],
+            "headerRowCount": meta["header"],
+            "merged": t in self.merged_tables,
+            "rows": [
+                [{"text": text, **self._cell_format(t, r, c)} for c, text in enumerate(row)]
+                for r, row in enumerate(self.tables[t])
+            ],
+        }
+
+    def table_insert(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_meta()
+        pre = self._check_fresh(payload)
+        if self.has_nested_table:
+            raise OpRefused("LIVE_OP_FAILED", "the document contains a nested table; live cell edits are refused")
+
+        # Style first: nothing is inserted if it cannot be applied.
+        style = "Table Grid"
+        if payload.get("style_from_table_index"):
+            src = int(payload["style_from_table_index"]) - 1
+            if not 0 <= src < len(self.tables) or not self.table_meta[src]["style"]:
+                raise OpRefused("style_not_found", "no table style to copy")
+            style = self.table_meta[src]["style"]
+        elif payload.get("style_builtin"):
+            if payload["style_builtin"] not in self._BUILTIN_STYLES:
+                raise OpRefused("style_not_found", f"{payload['style_builtin']!r} is not a built-in style")
+            style = self._BUILTIN_STYLES[payload["style_builtin"]]
+        elif payload.get("style"):
+            used = {m["style"] for m in self.table_meta}
+            if payload["style"] not in self.known_styles and payload["style"] not in used:
+                raise OpRefused("style_not_found", f"table style {payload['style']!r} was not found")
+            style = payload["style"]
+
+        anchor = payload.get("anchor")
+        paragraphs = self.text.split("\n")
+        if anchor and "paragraph_text" in anchor:
+            wanted = " ".join(anchor["paragraph_text"].split())
+            hits = [i for i, p in enumerate(paragraphs) if " ".join(p.split()) == wanted]
+            if len(hits) != 1:
+                raise OpRefused(
+                    "zero_match" if not hits else "match_count_mismatch",
+                    f"expected 1 top-level paragraph matching {anchor['paragraph_text']!r}, found {len(hits)}",
+                )
+            pos = hits[0] + (0.5 if anchor.get("position") != "before" else -0.5)
+        elif anchor and "after_table_index" in anchor:
+            n = int(anchor["after_table_index"])
+            if not 1 <= n <= len(self.tables):
+                raise OpRefused("table_not_found", f"after_table_index {n} is out of range")
+            pos = self.table_meta[n - 1]["pos"] + 1e-6
+        else:
+            pos = 2e9  # append at the end
+        index = sum(1 for m in self.table_meta if m["pos"] < pos)
+
+        dropped = self.dropped_table_formatting
+        texts: list[list[str]] = []
+        cells: dict[tuple[int, int], dict[str, Any]] = {}
+        for r, row in enumerate(payload["rows"]):
+            text_row = []
+            for c, spec in enumerate(row):
+                text_row.append(
+                    "\n".join(
+                        "".join("\n" if run.get("hard_break") else run["text"] for run in runs)
+                        for runs in spec.get("paragraphs", [])
+                    )
+                )
+                fmt: dict[str, Any] = {}
+                if spec.get("fill") and "fill" not in dropped:
+                    fmt["fill"] = "#" + spec["fill"].upper()
+                if spec.get("color") and "color" not in dropped:
+                    fmt["color"] = "#" + spec["color"].upper()
+                if spec.get("bold") and "bold" not in dropped:
+                    fmt["bold"] = True
+                if spec.get("align") and "align" not in dropped:
+                    fmt["align"] = spec["align"]
+                if spec.get("valign") and "valign" not in dropped:
+                    fmt["valign"] = spec["valign"]
+                if payload.get("column_widths_pt") and "width" not in dropped:
+                    fmt["width"] = payload["column_widths_pt"][c]
+                if payload.get("font_size_pt") and "size" not in dropped:
+                    fmt["size"] = float(payload["font_size_pt"])
+                cells[(r, c)] = fmt
+            texts.append(text_row)
+        self.tables.insert(index, texts)
+        self.table_meta.insert(
+            index,
+            {
+                "style": style,
+                "header": 0 if "header" in dropped else int(payload.get("header_rows") or 0),
+                "pos": pos,
+                "cells": cells,
+            },
+        )
+        # Merged-table flags are by index: shift those at/after the insertion.
+        self.merged_tables = {m + 1 if m >= index else m for m in self.merged_tables}
+        return {"applied": True, "table_index": index + 1, "pre": pre, "post": self.sha256()}
+
+    def cells_set(self, payload: dict[str, Any]) -> dict[str, Any]:
+        pre = self._check_fresh(payload)
+        if self.before_cell_set is not None:
+            self.before_cell_set()
+        addresses = [self._cell(spec) for spec in payload["cells"]]
+        before = [self.tables[t][r][c] for t, r, c in addresses]
+        for spec, text in zip(payload["cells"], before):
+            if text != spec["expected_before_text"]:
+                raise OpRefused(
+                    "LIVE_OP_FAILED",
+                    "a cell's text changed since it was read (another editor may be working in it); "
+                    "nothing was written",
+                )
+        for spec, address in zip(payload["cells"], addresses):
+            if address in self.dropped_cell_writes:
+                continue
+            t, r, c = address
+            self.tables[t][r][c] = "\n".join(
+                "".join("\n" if run.get("hard_break") else run["text"] for run in runs)
+                for runs in spec["paragraphs"]
+            )
+        after = [self.tables[t][r][c] for t, r, c in addresses]
+        return {"applied": True, "before": before, "after": after, "pre": pre, "post": self.sha256()}
 
     def _row_bounds(self, row_anchor: str) -> tuple[int, int]:
         """(start, end) absolute offsets of the ROW_DELIMITER-bounded
@@ -359,6 +536,7 @@ class FakeDocument:
                     "after": find,
                     "colorAfter": f"#{color.lstrip('#')}" if color else color,
                     "strikeAfter": strike,
+                    "boldAfter": bold, "italicAfter": italic, "underlineAfter": underline,
                 }
                 for _ in positions
             ]
@@ -465,6 +643,8 @@ class FakePane:
         heartbeat_interval: float = 5.0,
         capabilities: list[str] | None = None,
         instance_id: str = "pane-test",
+        body_ooxml: str | None = None,
+        body_ooxml_error: tuple[str, str] | None = None,
     ) -> None:
         self.instance_id = instance_id
         # issue #39: tests set this to rewrite/strip fields of the next
@@ -472,6 +652,12 @@ class FakePane:
         # reply, a counts mismatch).
         self.comments_list_transform = None
         self.document = document if document is not None else FakeDocument()
+        # issue #33: the Flat OPC string `body_ooxml` answers with (build one
+        # from a real .docx with `docx_to_flat_opc`), or a (code, message)
+        # refusal such as ("too_large", "...") to answer with instead.
+        self.body_ooxml = body_ooxml
+        self.body_ooxml_error = body_ooxml_error
+        self.body_ooxml_requests = 0
         self.document_url = document_url
         self.host = host
         self.platform = platform
@@ -482,13 +668,16 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "comments_by_id", "comment_counts"]
+            ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts"]
             if capabilities is None
             else list(capabilities)
         )
         # Every comments_list payload received, in order (issue #31 tests
         # assert reply/resolve send an ids-filtered one).
         self.comments_list_payloads: list[dict[str, Any]] = []
+        # Issue #34: every table_get / table_insert payload received.
+        self.table_get_payloads: list[dict[str, Any]] = []
+        self.table_insert_payloads: list[dict[str, Any]] = []
         # Ops named here are received but never answered -- lets a test
         # simulate an unresponsive pane (for LIVE_DISCONNECTED-by-timeout)
         # without needing a full socket-level failure injection.
@@ -573,6 +762,16 @@ class FakePane:
             result = doc.describe()
             result["documentUrl"] = self.document_url
             return result
+        if op == "body_ooxml":
+            self.body_ooxml_requests += 1
+            if self.body_ooxml_error is not None:
+                raise OpRefused(*self.body_ooxml_error)
+            return {
+                "ooxml": self.body_ooxml or "",
+                "bodySha256": doc.sha256(),
+                "documentUrl": self.document_url,
+                "strippedParts": [],
+            }
         if op == "search":
             matches = doc.search(
                 payload["find"],
@@ -616,6 +815,52 @@ class FakePane:
             return doc.cell_get(payload)
         if op == "cell_set":
             return doc.cell_set(payload)
+        if op == "table_get":
+            self.table_get_payloads.append(dict(payload))
+            return doc.table_get(payload)
+        if op == "table_insert":
+            self.table_insert_payloads.append(dict(payload))
+            return doc.table_insert(payload)
+        if op == "cells_set":
+            return doc.cells_set(payload)
         if op == "save":
             return doc.save()
         raise OpRefused("LIVE_OP_FAILED", f"fake pane does not implement op {op!r}")
+
+
+# ---------------------------------------------------------------------------
+# Flat OPC (issue #33): what Word's body.getOoxml() returns, built from a real
+# .docx so a live read can be compared with a file read of the same document.
+# ---------------------------------------------------------------------------
+
+_XML_DECL = re.compile(r"^\s*<\?xml[^>]*\?>\s*")
+_CT_NS = "{http://schemas.openxmlformats.org/package/2006/content-types}"
+
+
+def docx_to_flat_opc(docx_path: Path | str, *, prefix: str = "pkg") -> str:
+    """Flat OPC ``pkg:package`` for the .docx at *docx_path*: XML parts
+    embedded as ``pkg:xmlData``, every non-XML (binary) part emptied, exactly
+    as the pane's ``stripBinaryParts`` leaves it. *prefix* names the package
+    namespace prefix, so a test can prove nothing keys on the literal "pkg:"."""
+    ns = "http://schemas.microsoft.com/office/2006/xmlPackage"
+    with zipfile.ZipFile(docx_path) as zf:
+        content_types = ET.fromstring(zf.read("[Content_Types].xml"))
+        overrides = {o.get("PartName"): o.get("ContentType") for o in content_types.findall(f"{_CT_NS}Override")}
+        defaults = {d.get("Extension"): d.get("ContentType") for d in content_types.findall(f"{_CT_NS}Default")}
+        parts = []
+        for info in zf.infolist():
+            if info.is_dir() or info.filename == "[Content_Types].xml":
+                continue
+            name = "/" + info.filename
+            ext = info.filename.rsplit(".", 1)[-1]
+            content_type = overrides.get(name) or defaults.get(ext) or "application/octet-stream"
+            data = zf.read(info.filename)
+            if ext in ("xml", "rels"):
+                xml = _XML_DECL.sub("", data.decode("utf-8"))
+                body = f"<{prefix}:xmlData>{xml}</{prefix}:xmlData>"
+            else:
+                body = f"<{prefix}:binaryData></{prefix}:binaryData>"
+            parts.append(
+                f'<{prefix}:part {prefix}:name="{name}" {prefix}:contentType="{content_type}">{body}</{prefix}:part>'
+            )
+    return f'<{prefix}:package xmlns:{prefix}="{ns}">' + "".join(parts) + f"</{prefix}:package>"

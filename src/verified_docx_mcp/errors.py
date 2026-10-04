@@ -75,6 +75,7 @@ class ErrorCode(Enum):
     # Text location + targeted edits (locate.py, text_edit.py; WP-06)
     ZERO_MATCH = "ZERO_MATCH"  # `find` not located after the full normalization ladder; near-miss in diagnostics
     MATCH_COUNT_MISMATCH = "MATCH_COUNT_MISMATCH"  # match count != expected_matches (D4: expected_matches is required, no default)
+    ANCHORED_SHAPES = "ANCHORED_SHAPES"
     STRUCTURAL_BOUNDARY = "STRUCTURAL_BOUNDARY"  # a match crosses a w:p/w:tbl/w:tc boundary
 
     # Tracked changes (tracked_changes.py; WP-07)
@@ -118,6 +119,10 @@ class ErrorCode(Enum):
     # declared.
     LIVE_UNAVAILABLE = "LIVE_UNAVAILABLE"  # no connected pane session for the target document (live/session.py LiveUnavailable)
     LIVE_DISCONNECTED = "LIVE_DISCONNECTED"  # the pane's WebSocket closed mid-request, or a reply never arrived within the op timeout (live/session.py LiveDisconnected)
+    HOST_SHAPE_READ_FAILED = "HOST_SHAPE_READ_FAILED"
+    MIXED_FORMATTING = "MIXED_FORMATTING"
+    WOULD_DELETE_COMMENTS = "WOULD_DELETE_COMMENTS"
+    COMMENT_ID_STALE = "COMMENT_ID_STALE"
     LIVE_STALE = "LIVE_STALE"  # the pane's body hash before the op (result["pre"]) did not match a caller-supplied expected_body_sha256 (live/session.py LiveStale)
     LIVE_OP_FAILED = "LIVE_OP_FAILED"  # the pane replied ok=false (e.g. an expected_matches count mismatch it refused to act on) (live/session.py LiveOpFailed)
 
@@ -147,7 +152,7 @@ class ErrorCode(Enum):
 # SYNC_IN_FLIGHT is deliberately NOT here: core/document-backend-protocol.md
 # §4 specifies exactly one wait (<=10s) performed by the tool itself before
 # raising, not a caller-side retry loop.
-_RETRYABLE_CODES: frozenset[ErrorCode] = frozenset()
+_RETRYABLE_CODES: frozenset[ErrorCode] = frozenset({ErrorCode.HOST_SHAPE_READ_FAILED})
 
 
 @dataclasses.dataclass(frozen=True)

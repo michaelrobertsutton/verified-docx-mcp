@@ -357,11 +357,21 @@ def classify_op_failed(exc: LiveOpFailed) -> ErrorCode:
     ``replace``/``format``/``comment_add`` today, but not impossible from
     a future op) falls back to the generic ``LIVE_OP_FAILED``.
     """
+    if exc.code in ErrorCode.__members__ and exc.code != "LIVE_OP_FAILED":
+        return ErrorCode[exc.code]
     pane_code = (exc.code or "").strip().lower()
     if pane_code == "zero_match":
         return ErrorCode.ZERO_MATCH
     if pane_code == "match_count_mismatch":
         return ErrorCode.MATCH_COUNT_MISMATCH
+    # Issue #34: the pane refused before writing (body hash moved / unknown
+    # table style).
+    if pane_code == "stale":
+        return ErrorCode.LIVE_STALE
+    if pane_code == "style_not_found":
+        return ErrorCode.STYLE_NOT_FOUND
+    if pane_code == "table_not_found":
+        return ErrorCode.TABLE_NOT_FOUND
 
     match = _FOUND_COUNT_RE.search(exc.message or "")
     if match:
@@ -381,6 +391,7 @@ def live_evidence(
     document_name: str,
     tool: str,
     path: str,
+    shape_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build + audit-log the live-mode evidence envelope for one mutating
     live op, and return it.
@@ -430,6 +441,44 @@ def live_evidence(
         "track_changes_author": "word-signed-in-user",
         "orphaned_comment_ids": [],
     }
+    evidence.update(shape_counts(shape_result or {}))
     logged, _ = audit.append_audit(path=path, tool=tool, evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
+
+
+def audit_live_failure(
+    *,
+    tool: str,
+    path: str,
+    document_name: str,
+    pre_body_sha256: str,
+    post_body_sha256: str | None,
+    reason: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Audit-log a live write that LANDED but then failed its independent
+    read-back (issue #34). ``live_evidence`` only runs on success, so
+    without this a mutation that reached a co-author's open document and
+    then raised ``VERIFICATION_FAILED`` would leave no audit trail at all.
+    Best-effort, like every audit write: never raises.
+    """
+    evidence: dict[str, Any] = {
+        "applied": True,
+        "verified": False,
+        "write_mode": "live",
+        "verified_via": "word-addin",
+        "document_name": document_name,
+        "revision_before": f"{_LIVE_REVISION_PREFIX}{pre_body_sha256}",
+        "revision_after": (
+            f"{_LIVE_REVISION_PREFIX}{post_body_sha256}" if post_body_sha256 is not None else None
+        ),
+        "verification_failure": reason,
+        "detail": detail or {},
+    }
+    audit.append_audit(path=path, tool=f"{tool}:verification_failed", evidence=evidence)
+
+
+def shape_counts(result: dict[str, Any]) -> dict[str, Any]:
+    """Copy verified pane counts to public evidence and the audit entry."""
+    return {key: result[key] for key in ("shapes_before", "shapes_after") if key in result}

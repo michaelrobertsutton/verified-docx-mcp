@@ -81,6 +81,7 @@ async function collectComments(context, options) {
     if (wantAnchors) {
       range = comment.getRange();
       range.load("text");
+      range.paragraphs.load("items/text");
     }
     let replies = null;
     if (wantReplies) {
@@ -99,7 +100,10 @@ async function collectComments(context, options) {
       creationDate: comment.creationDate,
       resolved: comment.resolved,
     };
-    if (wantAnchors) out.anchorText = range.text;
+    if (wantAnchors) {
+      out.anchorText = range.text;
+      out.anchorParagraphText = range.paragraphs.items.map(p => p.text).join("\n");
+    }
     if (wantReplies) {
       out.replies = replies.items.map((r) => ({
         id: r.id,
@@ -230,8 +234,11 @@ const OP_LOG_LIMIT = 20;
 // edits). Reported only by builds that implement them, so a server never
 // sends cell_set to a pane that would answer "unknown op".
 // issue #31: "comments_by_id" = comments_list accepts `ids` / `include_anchor`.
+// issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
+// find_sections / list_tables).
+// issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
 // issue #39: "comment_counts" = comments_list reports counts/scope/observed_at.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "comment_counts"];
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -243,6 +250,13 @@ const PANE_INSTANCE_ID = (() => {
   }
   return `pane-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 })();
+
+// issue #33: the largest body_ooxml reply (UTF-8 bytes of its JSON) the pane
+// will send. Kept below the bridge's 64 MiB websocket max_size so an
+// oversized document gets an explicit `too_large` refusal instead of a frame
+// the bridge rejects by dropping the whole socket.
+const MAX_BODY_OOXML_BYTES = 48 * 1024 * 1024;
+const FLAT_OPC_NS = "http://schemas.microsoft.com/office/2006/xmlPackage";
 
 let opsSocket = null;
 let heartbeatTimer = null;
@@ -367,6 +381,8 @@ function connectOpsSocket() {
   socket.onopen = async () => {
     reconnectDelayMs = RECONNECT_MIN_MS;
     try {
+      paneEpoch = crypto.randomUUID();
+      revisionHandles.clear();
       const hash = await currentBodyHash();
       socket.send(
         JSON.stringify({
@@ -473,15 +489,46 @@ function summarizeResult(op, result) {
   if (op === "comment_add") return `comment_id=${result.comment_id}`;
   if (op === "cell_get") return `${(result.text || "").length} char(s)`;
   if (op === "cell_set") return `applied=${result.applied}`;
+  if (op === "table_get") return `${(result.rows || []).length} row(s)`;
+  if (op === "table_insert") return `table_index=${result.table_index}`;
+  if (op === "cells_set") return `applied=${result.applied}`;
   return "";
 }
 
+const SHAPE_GUARDED_OPS = new Set(["replace", "format", "cell_set", "cells_set",
+  "table_insert", "paragraph_delete", "revisions_accept", "revisions_reject",
+  "comment_add", "comment_reply", "comment_resolve", "save"]);
+
 async function dispatchOp(op, payload) {
+  if (!SHAPE_GUARDED_OPS.has(op)) return dispatchOpUnchecked(op, payload);
+  const before = await opShapesList();
+  // Accepting/rejecting tracked deletions can remove whole anchor paragraphs.
+  if (op.startsWith("revisions_") && before.shapes.length)
+    throw refusalError("Revision changes with anchored shapes require manual review", "ANCHORED_SHAPES");
+  const result = await dispatchOpUnchecked(op, payload);
+  let after;
+  try { after = await opShapesList(); }
+  catch (err) {
+    throw refusalError(`Shape read-back failed after ${op}; the edit may have applied; ` +
+      `no rollback attempted; shapes_before=${before.shapes.length}; ${err.message || err}`, "VERIFICATION_FAILED");
+  }
+  const identity = shapes => shapes.map(({anchor_paragraph, ...shape}) => JSON.stringify(shape)).sort();
+  if (JSON.stringify(identity(before.shapes)) !== JSON.stringify(identity(after.shapes)))
+    throw refusalError(`Shape verification failed after ${op}; no rollback attempted; ` +
+      JSON.stringify({shapes_before:before.shapes.length, shapes_after:after.shapes.length}), "VERIFICATION_FAILED");
+  return {...result, shapes_before:before.shapes.length, shapes_after:after.shapes.length};
+}
+
+async function dispatchOpUnchecked(op, payload) {
   switch (op) {
+    case "shapes_list":
+      return opShapesList();
     case "ping":
       return opPing();
     case "describe":
       return opDescribe();
+    case "body_ooxml":
+      return opBodyOoxml();
     case "search":
       return opSearch(payload);
     case "replace":
@@ -500,6 +547,26 @@ async function dispatchOp(op, payload) {
       return opCellGet(payload);
     case "cell_set":
       return opCellSet(payload);
+    case "table_get":
+      return opTableGet(payload);
+    case "table_insert":
+      return opTableInsert(payload);
+    case "cells_set":
+      return opCellsSet(payload);
+    case "paragraph_delete":
+      return opParagraphDelete(payload);
+    case "textboxes_list":
+      return opTextboxesList();
+    case "textboxes_read":
+      return opTextboxesRead(payload);
+    case "scope_describe":
+      return opScopeDescribe(payload);
+    case "revisions_list":
+      return opRevisionsList();
+    case "revisions_accept":
+      return opRevisionsMutate(payload, "accept");
+    case "revisions_reject":
+      return opRevisionsMutate(payload, "reject");
     case "save":
       return opSave();
     default:
@@ -527,11 +594,61 @@ async function opDescribe() {
     await context.sync();
     const hash = await sha256Hex(body.text || "");
     return {
+      session_epoch: paneEpoch,
       documentUrl: Office.context.document.url,
       bodySha256: hash,
       changeTrackingMode: String(context.document.changeTrackingMode),
       saved: context.document.saved,
     };
+  });
+}
+
+// -- body_ooxml (issue #33) ---------------------------------------------
+
+// Empty every pkg:binaryData payload (images and other binary parts) and
+// return {ooxml, strippedParts}. The server's projection needs a part's
+// name and relationships, never its bytes. Namespace-aware (the Flat OPC
+// namespace, not a literal "pkg:" prefix), so an alternate serialization
+// cannot slip a payload past it. Throws if the XML does not parse, so a
+// malformed export is an error rather than an unstripped multi-MiB reply.
+function stripBinaryParts(ooxml) {
+  const doc = new DOMParser().parseFromString(ooxml, "application/xml");
+  if (doc.getElementsByTagName("parsererror").length > 0) {
+    throw refusalError("getOoxml returned XML that did not parse");
+  }
+  const strippedParts = [];
+  const nodes = doc.getElementsByTagNameNS(FLAT_OPC_NS, "binaryData");
+  for (let i = 0; i < nodes.length; i += 1) {
+    const node = nodes[i];
+    const part = node.parentNode;
+    strippedParts.push(part && part.getAttributeNS(FLAT_OPC_NS, "name"));
+    node.textContent = "";
+  }
+  return { ooxml: new XMLSerializer().serializeToString(doc), strippedParts };
+}
+
+async function opBodyOoxml() {
+  return Word.run(async (context) => {
+    const body = context.document.body;
+    const ooxmlResult = body.getOoxml();
+    body.load("text");
+    await context.sync();
+    const hash = await sha256Hex(body.text || "");
+    const { ooxml, strippedParts } = stripBinaryParts(ooxmlResult.value);
+    const result = {
+      ooxml,
+      bodySha256: hash,
+      documentUrl: Office.context.document.url,
+      strippedParts,
+    };
+    const bytes = new TextEncoder().encode(JSON.stringify(result)).length;
+    if (bytes > MAX_BODY_OOXML_BYTES) {
+      throw refusalError(
+        `body OOXML is ${bytes} bytes after stripping binaries, over the ${MAX_BODY_OOXML_BYTES}-byte limit`,
+        "too_large"
+      );
+    }
+    return result;
   });
 }
 
@@ -618,6 +735,22 @@ async function resolveRowCells(context, rowAnchorText) {
 }
 
 async function searchScoped(context, payload) {
+  if (payload.scope && payload.scope !== "body") {
+    if (payload.rowAnchor) throw refusalError("Row scope cannot be combined with text-box scopes", "INVALID_INPUT");
+    const resolved = await resolveScopes(context, payload.scope, true);
+    const results = resolved.bodies.map(b => b.body.search(payload.find, {matchCase: true, matchWholeWord: false}));
+    results.forEach(r => r.load("text"));
+    resolved.bodies.forEach(b => b.body.load("text"));
+    await context.sync();
+    // Word for Mac 16.113 returns no search results inside shape text although the
+    // same body reads back correctly. Say so instead of reporting "found 0".
+    const blind = resolved.bodies.filter((b, i) => b.scope !== "body" && !results[i].items.length &&
+      String(b.body.text || "").includes(payload.find));
+    if (blind.length) throw refusalError(
+      `Word cannot search inside ${blind.map(b => b.shape.name).join(", ")}: the text is present but Range.search returns no matches in shape text on this host, so it cannot be addressed`,
+      "LIVE_CAPABILITY_MISSING");
+    return results.flatMap(r => r.items);
+  }
   if (payload.rowAnchor === null || payload.rowAnchor === undefined) {
     const results = context.document.body.search(payload.find, { matchCase: true, matchWholeWord: false });
     results.load("text");
@@ -638,6 +771,8 @@ async function searchScoped(context, payload) {
 async function opReplace(payload) {
   const expectedMatches = payload.expected_matches;
   return Word.run(async (context) => {
+    await requireFreshBody(context, payload.expectedBodySha256);
+    await requireFreshScope(context, payload);
     const body = context.document.body;
     body.load("text");
     await context.sync();
@@ -651,6 +786,19 @@ async function opReplace(payload) {
       );
     }
 
+    await guardAnchoredParagraphs(context, matchItems);
+    await guardRevisions(context, matchItems);
+    const commentsBefore = await guardComments(context, matchItems, payload.allow_comment_loss);
+    const policy = payload.inherit_format || "replaced";
+    if (!["replaced", "previous", "none"].includes(policy)) throw refusalError("Invalid inherit_format", "INVALID_INPUT");
+    if (policy === "none" && !Office.context.requirements.isSetSupported("WordApiDesktop", "1.3"))
+      throw refusalError("inherit_format=none requires WordApiDesktop 1.3", "LIVE_CAPABILITY_MISSING");
+    matchItems.forEach(r => r.font.load(FONT_FIELDS));
+    await context.sync();
+    const fonts = matchItems.map(r => fontSnapshot(r.font));
+    if (policy === "replaced" && fonts.some(f => Object.values(f).some(v => v === null || v === undefined || v === "")))
+      throw refusalError("Mixed formatting; choose previous or none explicitly", "MIXED_FORMATTING");
+    let inserted = [];
     let previousMode = null;
     if (payload.track_changes) {
       context.document.load("changeTrackingMode");
@@ -661,7 +809,12 @@ async function opReplace(payload) {
 
     const matches = matchItems.map((range) => ({ before: range.text, after: payload.replace }));
     try {
-      matchItems.forEach((range) => range.insertText(payload.replace, Word.InsertLocation.replace));
+      inserted = matchItems.map((range, i) => {
+        const target = range.insertText(payload.replace, Word.InsertLocation.replace);
+        if (payload.replace && policy === "replaced") FONT_FIELDS.forEach(k => {target.font[k] = fonts[i][k];});
+        if (payload.replace && policy === "none") target.font.reset();
+        return target;
+      });
       await context.sync();
     } finally {
       if (previousMode !== null) {
@@ -670,18 +823,41 @@ async function opReplace(payload) {
       }
     }
 
+    inserted.forEach(r => {r.load("text"); if (payload.replace) r.font.load(FONT_FIELDS);});
+    await context.sync();
+    inserted.forEach((r, i) => {
+      matches[i].after = r.text;
+      matches[i].fontBefore = fonts[i];
+      matches[i].fontAfter = payload.replace ? fontSnapshot(r.font) : null;
+      if (r.text !== payload.replace || (payload.replace && policy === "replaced" &&
+          FONT_FIELDS.some(k => matches[i].fontAfter[k] !== fonts[i][k])))
+        throw refusalError(`Replacement read-back failed: ${JSON.stringify(matches)}`, "VERIFICATION_FAILED");
+    });
     const postBody = context.document.body;
     postBody.load("text");
     await context.sync();
     const postHash = await sha256Hex(postBody.text || "");
 
-    return { applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
+    const remainingScope = await resolveScopes(context, payload.scope || "body", true);
+    const remainingComments = [];
+    for (const item of remainingScope.bodies) {
+      const collection = item.body.getComments();
+      collection.load("items/id");
+      await context.sync();
+      remainingComments.push(...collection.items);
+    }
+    const remainingIds = new Set(remainingComments.map(c => c.id));
+    const commentsRemoved = commentsBefore.filter(c => !remainingIds.has(c.id));
+    const scopePost = await scopeHash(context, payload.scope || "body");
+    return { scope_post: scopePost, comments_removed: commentsRemoved, applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
   });
 }
 
 async function opFormat(payload) {
   const expectedMatches = payload.expected_matches;
   return Word.run(async (context) => {
+    await requireFreshBody(context, payload.expectedBodySha256);
+    await requireFreshScope(context, payload);
     const body = context.document.body;
     body.load("text");
     await context.sync();
@@ -738,9 +914,15 @@ async function opFormat(payload) {
     // rather than echoing the request back -- lets the server detect a
     // write that didn't actually take (a protected range, a stale
     // object reference) instead of trusting an unconfirmed "applied".
-    matchItems.forEach((range) => range.font.load(["color", "strikeThrough"]));
+    matchItems.forEach(range => range.load("text"));
+    matchItems.forEach((range) => range.font.load(["bold", "italic", "underline", "color", "strikeThrough"]));
     await context.sync();
     matchItems.forEach((range, i) => {
+      matches[i].after = range.text;
+      matches[i].boldAfter = range.font.bold;
+      matches[i].italicAfter = range.font.italic;
+      matches[i].underlineAfter = range.font.underline === Word.UnderlineType.none ? false :
+        range.font.underline === Word.UnderlineType.single ? true : null;
       matches[i].colorAfter = range.font.color;
       matches[i].strikeAfter = range.font.strikeThrough;
     });
@@ -750,7 +932,8 @@ async function opFormat(payload) {
     await context.sync();
     const postHash = await sha256Hex(postBody.text || "");
 
-    return { applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
+    const scopePost = await scopeHash(context, payload.scope || "body");
+    return { scope_post: scopePost, applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
   });
 }
 
@@ -773,7 +956,7 @@ async function opFormat(payload) {
 // continuation cell is still a cell of its row). Manual sideload
 // verification against a real table (docs/live-mode.md) is still needed --
 // fake_pane.py's table model cannot exercise this object graph.
-async function resolveTableCell(context, payload) {
+async function loadTopLevelTables(context) {
   const tables = context.document.body.tables;
   tables.load("items");
   await context.sync();
@@ -784,9 +967,14 @@ async function resolveTableCell(context, payload) {
       "the document contains a nested table; table numbering cannot be mapped reliably, so live cell edits are refused"
     );
   }
-  const table = tables.items[payload.table_index - 1];
+  return tables.items;
+}
+
+async function resolveTableCell(context, payload) {
+  const tableItems = await loadTopLevelTables(context);
+  const table = tableItems[payload.table_index - 1];
   if (!table) {
-    throw refusalError(`no table ${payload.table_index} (the document has ${tables.items.length})`);
+    throw refusalError(`no table ${payload.table_index} (the document has ${tableItems.length})`);
   }
   const rows = table.rows;
   rows.load("items");
@@ -806,6 +994,30 @@ async function resolveTableCell(context, payload) {
     );
   }
   return cell;
+}
+
+// Queues (does not sync) the clear + per-run writes for one cell. Shared by
+// cell_set, cells_set and table_insert so a cell is always written one way.
+function writeCellParagraphs(cell, paragraphs) {
+  cell.body.clear();
+  paragraphs.forEach((runs, i) => {
+    // After clear() the cell holds one empty paragraph: fill it first,
+    // append the rest.
+    const paragraph =
+      i === 0 ? cell.body.paragraphs.getFirst() : cell.body.insertParagraph("", Word.InsertLocation.end);
+    (runs || []).forEach((run) => {
+      if (run.hard_break) {
+        paragraph.insertBreak(Word.BreakType.line, Word.InsertLocation.end);
+        return;
+      }
+      const range = paragraph.insertText(run.text, Word.InsertLocation.end);
+      range.font.bold = !!run.bold;
+      range.font.italic = !!run.italic;
+      if (run.link) {
+        range.hyperlink = run.link;
+      }
+    });
+  });
 }
 
 async function opCellGet(payload) {
@@ -836,6 +1048,7 @@ async function opCellSet(payload) {
       );
     }
 
+    await guardAnchoredBodies(context, [cell.body]);
     let previousMode = null;
     if (payload.track_changes) {
       context.document.load("changeTrackingMode");
@@ -845,26 +1058,7 @@ async function opCellSet(payload) {
     }
 
     try {
-      cell.body.clear();
-      const paragraphs = payload.paragraphs || [];
-      paragraphs.forEach((runs, i) => {
-        // After clear() the cell holds one empty paragraph: fill it first,
-        // append the rest.
-        const paragraph =
-          i === 0 ? cell.body.paragraphs.getFirst() : cell.body.insertParagraph("", Word.InsertLocation.end);
-        (runs || []).forEach((run) => {
-          if (run.hard_break) {
-            paragraph.insertBreak(Word.BreakType.line, Word.InsertLocation.end);
-            return;
-          }
-          const range = paragraph.insertText(run.text, Word.InsertLocation.end);
-          range.font.bold = !!run.bold;
-          range.font.italic = !!run.italic;
-          if (run.link) {
-            range.hyperlink = run.link;
-          }
-        });
-      });
+      writeCellParagraphs(cell, payload.paragraphs || []);
       await context.sync();
     } finally {
       if (previousMode !== null) {
@@ -880,6 +1074,337 @@ async function opCellSet(payload) {
     const postHash = await sha256Hex(postBody.text || "");
 
     return { applied: true, before, after: cell.body.text || "", pre: preHash, post: postHash };
+  });
+}
+
+// -- live tables (issue #34) ------------------------------------------------
+
+// Server vocabulary <-> Word enum names. Word's TableCell.horizontalAlignment
+// takes "Centered"/"Justified", not the "center"/"both" the tool exposes.
+const H_ALIGN_TO_WORD = { left: "Left", center: "Centered", right: "Right", both: "Justified" };
+const H_ALIGN_FROM_WORD = { Left: "left", Centered: "center", Right: "right", Justified: "both" };
+const V_ALIGN_TO_WORD = { top: "Top", center: "Center", bottom: "Bottom" };
+const V_ALIGN_FROM_WORD = { Top: "top", Center: "center", Bottom: "bottom" };
+
+function withHash(hex) {
+  return hex.startsWith("#") ? hex : `#${hex}`;
+}
+
+// Same normalization as the server's tables._texts_match_ladder: straight
+// quotes, no soft hyphens, collapsed whitespace, trimmed.
+// Built from code points (not literals) so no invisible character lives in the source.
+const charClass = (codes) => new RegExp(`[${codes.map((c) => String.fromCharCode(c)).join("")}]`, "g");
+const SMART_SINGLE_QUOTES = charClass([0x2018, 0x2019, 0x201a, 0x201b]);
+const SMART_DOUBLE_QUOTES = charClass([0x201c, 0x201d, 0x201e, 0x201f]);
+const SOFT_HYPHEN = charClass([0x00ad]);
+
+function normalizeAnchorText(text) {
+  return String(text || "")
+    .replace(SMART_SINGLE_QUOTES, "'")
+    .replace(SMART_DOUBLE_QUOTES, '"')
+    .replace(SOFT_HYPHEN, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Runs fn with change tracking forced to trackAll when `on`, and restores the
+// previous mode in a finally (a throwing sync must not leave the document
+// stuck on trackAll -- same rule as replace/format).
+async function withTracking(context, on, fn) {
+  let previousMode = null;
+  if (on) {
+    context.document.load("changeTrackingMode");
+    await context.sync();
+    previousMode = context.document.changeTrackingMode;
+    context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
+  }
+  try {
+    return await fn();
+  } finally {
+    if (previousMode !== null) {
+      context.document.changeTrackingMode = previousMode;
+      await context.sync();
+    }
+  }
+}
+
+// Reads the body hash and refuses (code "stale") BEFORE any write if the
+// caller's expectedBodySha256 no longer matches. The session's own check
+// compares result.pre only after the op has already run, which cannot undo a
+// write that landed.
+async function requireFreshBody(context, expectedHash) {
+  const body = context.document.body;
+  body.load("text");
+  await context.sync();
+  const preHash = await sha256Hex(body.text || "");
+  if (expectedHash && expectedHash !== preHash) {
+    throw refusalError(
+      "the document changed since it was read (body hash mismatch); nothing was written. Re-read and retry.",
+      "stale"
+    );
+  }
+  return preHash;
+}
+
+async function loadRowsAndCells(context, table) {
+  const rows = table.rows;
+  rows.load("items");
+  await context.sync();
+  rows.items.forEach((row) => row.cells.load("items"));
+  await context.sync();
+  return rows.items.map((row) => row.cells.items);
+}
+
+// The table's own part of its flat-OPC XML, so a style definition elsewhere in
+// the package cannot be mistaken for a merged cell.
+function documentPartXml(flatOpc) {
+  const start = flatOpc.indexOf('pkg:name="/word/document.xml"');
+  if (start < 0) return flatOpc;
+  const end = flatOpc.indexOf("</pkg:part>", start);
+  return end < 0 ? flatOpc.slice(start) : flatOpc.slice(start, end);
+}
+
+async function opTableGet(payload) {
+  return Word.run(async (context) => {
+    const tableItems = await loadTopLevelTables(context);
+    const table = tableItems[payload.table_index - 1];
+    if (!table) {
+      throw refusalError(
+        `no table ${payload.table_index} (the document has ${tableItems.length})`,
+        "table_not_found"
+      );
+    }
+    table.load(["style", "headerRowCount"]);
+    const ooxml = table.getRange().getOoxml();
+    await context.sync();
+    const grid = await loadRowsAndCells(context, table);
+    grid.forEach((cells) =>
+      cells.forEach((cell) => {
+        cell.load(["shadingColor", "horizontalAlignment", "verticalAlignment", "columnWidth"]);
+        cell.body.load("text");
+        cell.body.font.load(["bold", "color", "size"]);
+      })
+    );
+    await context.sync();
+    const part = documentPartXml(ooxml.value || "");
+    return {
+      style: table.style || "",
+      headerRowCount: table.headerRowCount,
+      merged: /<w:gridSpan[\s/>]/.test(part) || /<w:vMerge[\s/>]/.test(part),
+      rows: grid.map((cells) =>
+        cells.map((cell) => ({
+          text: cell.body.text || "",
+          fill: cell.shadingColor || "",
+          align: H_ALIGN_FROM_WORD[cell.horizontalAlignment] || String(cell.horizontalAlignment),
+          valign: V_ALIGN_FROM_WORD[cell.verticalAlignment] || String(cell.verticalAlignment),
+          width: cell.columnWidth,
+          bold: cell.body.font.bold,
+          color: cell.body.font.color || "",
+          size: cell.body.font.size,
+        }))
+      ),
+    };
+  });
+}
+
+// Resolves the style to apply BEFORE anything is inserted, so a bad style never
+// leaves a stray table behind (an insert-then-delete "rollback" is not one).
+// Returns {style} or {styleBuiltIn}.
+async function resolveInsertStyle(context, payload, tableItems) {
+  if (payload.style_from_table_index) {
+    const source = tableItems[payload.style_from_table_index - 1];
+    if (!source) {
+      throw refusalError(
+        `style_from_table_index ${payload.style_from_table_index} is out of range (the document has ${tableItems.length})`,
+        "style_not_found"
+      );
+    }
+    source.load("style");
+    await context.sync();
+    if (!source.style) {
+      throw refusalError(`table ${payload.style_from_table_index} has no table style to copy`, "style_not_found");
+    }
+    return { style: source.style };
+  }
+  if (payload.style_builtin) {
+    const enumValues = Word.BuiltInStyleName || {};
+    const value = enumValues[payload.style_builtin] || Object.values(enumValues).find((v) => v === payload.style_builtin);
+    if (!value) {
+      throw refusalError(`${JSON.stringify(payload.style_builtin)} is not a Word built-in style name`, "style_not_found");
+    }
+    return { styleBuiltIn: value };
+  }
+  if (payload.style) {
+    tableItems.forEach((t) => t.load("style"));
+    await context.sync();
+    if (tableItems.some((t) => t.style === payload.style)) return { style: payload.style };
+    if (Office.context.requirements.isSetSupported("WordApi", "1.5")) {
+      const found = context.document.getStyles().getByNameOrNullObject(payload.style);
+      found.load("isNullObject");
+      await context.sync();
+      if (!found.isNullObject) return { style: payload.style };
+    }
+    throw refusalError(
+      `table style ${JSON.stringify(payload.style)} was not found (it is not used by an existing table and the ` +
+        "document's style list does not name it); use style_from_table_id or a built-in style",
+      "style_not_found"
+    );
+  }
+  return {};
+}
+
+function findAnchorParagraph(paragraphItems, anchor) {
+  const wanted = normalizeAnchorText(anchor.paragraph_text);
+  const matches = paragraphItems.filter((p) => p.tableNestingLevel === 0 && normalizeAnchorText(p.text) === wanted);
+  if (matches.length !== 1) {
+    throw refusalError(
+      `expected 1 top-level paragraph matching ${JSON.stringify(anchor.paragraph_text)}, found ${matches.length}`,
+      matches.length === 0 ? "zero_match" : "match_count_mismatch"
+    );
+  }
+  return matches[0];
+}
+
+async function opTableInsert(payload) {
+  const rowCount = payload.rows.length;
+  const colCount = payload.rows[0].length;
+  return Word.run(async (context) => {
+    const preHash = await requireFreshBody(context, payload.expectedBodySha256);
+    const tableItems = await loadTopLevelTables(context);
+    const styleChoice = await resolveInsertStyle(context, payload, tableItems);
+
+    const anchor = payload.anchor || null;
+    let paragraphItems = null;
+    if (anchor && anchor.paragraph_text !== undefined) {
+      const paragraphs = context.document.body.paragraphs;
+      paragraphs.load("items/text,items/tableNestingLevel");
+      await context.sync();
+      paragraphItems = paragraphs.items;
+    }
+    let target = null;
+    if (anchor && anchor.paragraph_text !== undefined) {
+      target = findAnchorParagraph(paragraphItems, anchor);
+    } else if (anchor && anchor.after_table_index !== undefined) {
+      target = tableItems[anchor.after_table_index - 1];
+      if (!target) {
+        throw refusalError(
+          `after_table_index ${anchor.after_table_index} is out of range (the document has ${tableItems.length})`,
+          "table_not_found"
+        );
+      }
+    }
+
+    const emptyValues = payload.rows.map((row) => row.map(() => ""));
+    let newTable = null;
+    await withTracking(context, payload.track_changes, async () => {
+      if (target && anchor.paragraph_text !== undefined) {
+        newTable = target.insertTable(rowCount, colCount, anchor.position === "before" ? "Before" : "After", emptyValues);
+      } else if (target) {
+        newTable = target.insertTable(rowCount, colCount, "After", emptyValues);
+      } else {
+        newTable = context.document.body.insertTable(rowCount, colCount, "End", emptyValues);
+      }
+      if (styleChoice.style) newTable.style = styleChoice.style;
+      if (styleChoice.styleBuiltIn) newTable.styleBuiltIn = styleChoice.styleBuiltIn;
+      newTable.headerRowCount = payload.header_rows || 0;
+      const grid = await loadRowsAndCells(context, newTable);
+      payload.rows.forEach((row, r) =>
+        row.forEach((spec, c) => {
+          const cell = grid[r][c];
+          writeCellParagraphs(cell, spec.paragraphs || []);
+          if (spec.bold) cell.body.font.bold = true;
+          if (spec.color) cell.body.font.color = withHash(spec.color);
+          if (spec.fill) cell.shadingColor = withHash(spec.fill);
+          if (spec.align) cell.horizontalAlignment = H_ALIGN_TO_WORD[spec.align];
+          if (spec.valign) cell.verticalAlignment = V_ALIGN_TO_WORD[spec.valign];
+          if (payload.column_widths_pt) cell.columnWidth = payload.column_widths_pt[c];
+        })
+      );
+      if (payload.font_size_pt) newTable.font.size = payload.font_size_pt;
+      await context.sync();
+    });
+
+    // The new table's own 1-based index (list_tables numbering): compare each
+    // top-level table's range with the new one. compareLocationWith returns a
+    // ClientResult, so .value is only readable after the sync.
+    const allTables = context.document.body.tables;
+    allTables.load("items");
+    await context.sync();
+    const relations = allTables.items.map((t) => t.getRange().compareLocationWith(newTable.getRange()));
+    await context.sync();
+    const position = relations.findIndex((rel) => rel.value === "Equal");
+    if (position < 0) {
+      throw refusalError(
+        "the table was inserted but its position could not be determined; call list_tables to find it. Nothing was rolled back."
+      );
+    }
+
+    const postBody = context.document.body;
+    postBody.load("text");
+    await context.sync();
+    const postHash = await sha256Hex(postBody.text || "");
+    return { applied: true, table_index: position + 1, pre: preHash, post: postHash };
+  });
+}
+
+async function opCellsSet(payload) {
+  return Word.run(async (context) => {
+    const preHash = await requireFreshBody(context, payload.expectedBodySha256);
+    const tableItems = await loadTopLevelTables(context);
+
+    const gridByTable = new Map();
+    for (const spec of payload.cells) {
+      const table = tableItems[spec.table_index - 1];
+      if (!table) {
+        throw refusalError(
+          `no table ${spec.table_index} (the document has ${tableItems.length})`,
+          "table_not_found"
+        );
+      }
+      if (!gridByTable.has(spec.table_index)) {
+        // eslint-disable-next-line no-await-in-loop -- one table at a time keeps the batch small
+        gridByTable.set(spec.table_index, await loadRowsAndCells(context, table));
+      }
+    }
+    const cells = payload.cells.map((spec) => {
+      const grid = gridByTable.get(spec.table_index);
+      const row = grid[spec.row_index - 1];
+      if (!row) throw refusalError(`row_index ${spec.row_index} is out of range for table ${spec.table_index}`);
+      const cell = row[spec.cell_index - 1];
+      if (!cell) throw refusalError(`cell_index ${spec.cell_index} is out of range for row ${spec.row_index}`);
+      return cell;
+    });
+
+    // Word batches are not transactions. Narrow the window as far as the API
+    // allows: compare every cell, then read them ALL again immediately before
+    // queuing the writes, and refuse (writing nothing) on any difference.
+    const readAll = async () => {
+      cells.forEach((cell) => cell.body.load("text"));
+      await context.sync();
+      return cells.map((cell) => cell.body.text || "");
+    };
+    const mismatch = (texts) => payload.cells.findIndex((spec, i) => texts[i] !== spec.expected_before_text);
+    const before = await readAll();
+    let bad = mismatch(before);
+    if (bad < 0) bad = mismatch(await readAll());
+    if (bad >= 0) {
+      throw refusalError(
+        `cell ${bad + 1} of ${payload.cells.length} changed since it was read (another editor may be working in it); nothing was written`
+      );
+    }
+
+    await guardAnchoredBodies(context, cells.map(c => c.body));
+    await withTracking(context, payload.track_changes, async () => {
+      payload.cells.forEach((spec, i) => writeCellParagraphs(cells[i], spec.paragraphs || []));
+      await context.sync();
+    });
+
+    const after = await readAll();
+    const postBody = context.document.body;
+    postBody.load("text");
+    await context.sync();
+    const postHash = await sha256Hex(postBody.text || "");
+    return { applied: true, before, after, pre: preHash, post: postHash };
   });
 }
 
@@ -908,6 +1433,7 @@ async function opCommentsList(payload) {
       counts,
       scope: "body",
       observed_at: observedAt,
+      session_epoch: paneEpoch,
       timing_ms: { total: Date.now() - started },
     };
   });
@@ -952,11 +1478,13 @@ async function opCommentAdd(payload) {
 
 async function opCommentReply(payload) {
   return Word.run(async (context) => {
+    checkCommentEpoch(payload);
     const comments = context.document.body.getComments();
     comments.load("items/id");
     await context.sync();
     const comment = comments.items.find((c) => c.id === payload.comment_id);
     if (!comment) throw refusalError(`no comment with id ${JSON.stringify(payload.comment_id)}`);
+    await verifyCommentIdentity(context, comment, payload.identity);
     const reply = comment.reply(payload.text);
     reply.load("id");
     await context.sync();
@@ -966,11 +1494,13 @@ async function opCommentReply(payload) {
 
 async function opCommentResolve(payload) {
   return Word.run(async (context) => {
+    checkCommentEpoch(payload);
     const comments = context.document.body.getComments();
     comments.load("items/id");
     await context.sync();
     const comment = comments.items.find((c) => c.id === payload.comment_id);
     if (!comment) throw refusalError(`no comment with id ${JSON.stringify(payload.comment_id)}`);
+    await verifyCommentIdentity(context, comment, payload.identity);
     comment.resolved = !!payload.resolved;
     await context.sync();
     return { resolved: !!payload.resolved };
@@ -996,3 +1526,376 @@ Office.onReady((info) => {
   runAndRender();
   connectOpsSocket();
 });
+
+// #48: handles are pane-epoch identities, not invented Office.js revision ids.
+let paneEpoch = crypto.randomUUID();
+const revisionHandles = new Map();
+function revisionsSupported() {
+  return Office.context.requirements.isSetSupported("WordApi", "1.6");
+}
+async function revisionObjects(context, body) {
+  const changes = body.getTrackedChanges();
+  changes.load("items/author,items/date,items/text,items/type");
+  await context.sync();
+  return changes;
+}
+// Word for Mac's getTrackedChanges() can merge an adjacent insertion and
+// deletion into one item, so the API list undercounts. The document part's own
+// revision markup is the cross-check; null means "could not be read".
+const REVISION_MARKUP = /<w:(?:ins|del|moveFrom|moveTo|rPrChange|pPrChange|sectPrChange|tblPrChange|trPrChange|tcPrChange|tblGridChange|cellIns|cellDel|cellMerge|numberingChange)[\s/>]/g;
+async function bodyRevisionMarkupCount(context) {
+  try {
+    const ooxml = context.document.body.getOoxml();
+    await context.sync();
+    const xml = String(ooxml.value || "");
+    const start = xml.indexOf('pkg:name="/word/document.xml"');
+    let part = xml;
+    if (start >= 0) {
+      const end = xml.indexOf("</pkg:part>", start);
+      part = end >= 0 ? xml.slice(start, end) : xml.slice(start);
+    }
+    return (part.match(REVISION_MARKUP) || []).length;
+  } catch (error) {
+    return null;
+  }
+}
+async function opRevisionsList() {
+  if (!revisionsSupported()) return {revisions: null, coverage: "unavailable", reason: "WordApi 1.6 required"};
+  return Word.run(async context => {
+    const changes = await revisionObjects(context, context.document.body);
+    const entries = changes.items.map(change => {
+      const id = `revision:${paneEpoch}:${crypto.randomUUID()}`;
+      change.track();
+      changes.track();
+      const range = change.getRange();
+      range.paragraphs.load("items/text");
+      revisionHandles.set(id, {change, collection: changes, epoch: paneEpoch});
+      return {id, change, range};
+    });
+    await context.sync();
+    const markup = await bodyRevisionMarkupCount(context);
+    return {coverage: "body", session_epoch: paneEpoch, ooxml_revision_count: markup, revisions: entries.map(({id, change, range}) => ({
+      revision_id: id, type: change.type, author: change.author, date: change.date,
+      text: change.text, paragraph_context: range.paragraphs.items.map(p => p.text), scope: "body"
+    }))};
+  });
+}
+async function guardRevisions(context, ranges) {
+  if (!revisionsSupported()) throw refusalError("Cannot inspect revisions: WordApi 1.6 required", "LIVE_CAPABILITY_MISSING");
+  const refuse = () => refusalError("Accept or reject intersecting revisions before replacing text", "TRACKED_CHANGES_PRESENT");
+  const collections = ranges.map(r => r.getTrackedChanges());
+  collections.forEach(c => c.load("items"));
+  await context.sync();
+  if (collections.some(c => c.items.length)) throw refuse();
+  // Word for Mac's range.getTrackedChanges() only returns changes fully inside
+  // the range, so a match that sits inside (or straddles) a larger revision
+  // reports nothing. Compare against every revision in the match's paragraphs.
+  const scoped = ranges.filter(r => r.paragraphs && typeof r.paragraphs.getFirst === "function" && typeof r.compareLocationWith === "function");
+  const nearby = scoped.map(r => {
+    const first = r.paragraphs.getFirst(), last = r.paragraphs.getLast();
+    const changes = first.getRange("Start").expandTo(last.getRange("End")).getTrackedChanges();
+    changes.load("items");
+    return changes;
+  });
+  await context.sync();
+  const comparisons = [];
+  nearby.forEach((changes, i) => changes.items.forEach(change => comparisons.push(scoped[i].compareLocationWith(change.getRange()))));
+  await context.sync();
+  const apart = new Set(["Before", "After", "AdjacentBefore", "AdjacentAfter"]);
+  if (comparisons.some(c => !apart.has(c.value))) throw refuse();
+}
+async function opRevisionsMutate(payload, action) {
+  const retained = payload.revision_ids == null ? [] : payload.revision_ids.map(id => {
+    const entry = revisionHandles.get(id);
+    if (!entry || entry.epoch !== paneEpoch) throw refusalError("Stale revision handle; list revisions again", "REVISION_ID_NOT_FOUND");
+    return entry.change;
+  });
+  if (!revisionsSupported()) throw refusalError("WordApi 1.6 required", "LIVE_CAPABILITY_MISSING");
+  const execute = async context => {
+    await requireFreshBody(context, payload.expectedBodySha256);
+    const changes = await revisionObjects(context, context.document.body);
+    const before = changes.items.length;
+    const markupBefore = await bodyRevisionMarkupCount(context);
+    const all = payload.revision_ids == null;
+    const selected = all ? changes.items : payload.revision_ids.map(id => {
+      const entry = revisionHandles.get(id);
+      if (!entry || entry.epoch !== paneEpoch) throw refusalError("Stale revision handle; list revisions again", "REVISION_ID_NOT_FOUND");
+      return entry.change;
+    });
+    // Validate every retained object before queuing any mutation.
+    selected.forEach(c => c.load("author,date,text,type"));
+    await context.sync();
+    // One collection call covers items Word's list merged; per-item calls do not.
+    if (all && typeof changes[`${action}All`] === "function") changes[`${action}All`]();
+    else selected.forEach(c => c[action]());
+    await context.sync();
+    const remaining = await revisionObjects(context, context.document.body);
+    const markupAfter = await bodyRevisionMarkupCount(context);
+    context.document.body.load("text");
+    await context.sync();
+    const result = {applied: true, before_count: before, after_count: remaining.items.length,
+      changed_count: selected.length, ooxml_before: markupBefore, ooxml_after: markupAfter,
+      post: await sha256Hex(context.document.body.text || "")};
+    // The API list can undercount, so progress is judged on the markup itself.
+    const verified = all ? remaining.items.length === 0 && !markupAfter
+      : markupBefore != null && markupAfter != null ? markupAfter < markupBefore
+        : result.after_count === before - selected.length;
+    if (!verified) throw refusalError(JSON.stringify(result), "VERIFICATION_FAILED");
+    revisionHandles.forEach(e => {e.change.untrack(); e.collection.untrack();});
+    revisionHandles.clear();
+    await context.sync();
+    return result;
+  };
+  return retained.length ? Word.run(retained, execute) : Word.run(execute);
+}
+
+function checkCommentEpoch(payload) {
+  if (payload.session_epoch && payload.session_epoch !== paneEpoch)
+    throw refusalError("Comment handle is from another pane epoch", "COMMENT_ID_STALE");
+}
+async function verifyCommentIdentity(context, comment, identity) {
+  if (!identity) return;
+  comment.load("content,authorName");
+  const range = comment.getRange();
+  range.load("text");
+  range.paragraphs.load("items/text");
+  await context.sync();
+  const actual = {content: comment.content, authorName: comment.authorName,
+    anchorText: range.text, anchorParagraphText: range.paragraphs.items.map(p => p.text).join("\n")};
+  const norm = x => String(x || "").replace(/\s+/g, " ").trim();
+  if (Object.keys(identity).some(k => norm(actual[k]) !== norm(identity[k])))
+    throw refusalError("Comment identity changed; re-list before editing", "COMMENT_ID_STALE");
+}
+
+async function guardComments(context, ranges, allowLoss) {
+  const affected = new Map();
+  for (const range of ranges) {
+    const comments = range.getComments();
+    comments.load("items/id,items/content,items/authorName,items/resolved");
+    await context.sync();
+    const entries = comments.items.map(comment => {
+      const anchor = comment.getRange();
+      anchor.load("text");
+      comment.replies.load("items/id,items/content,items/authorName");
+      return {comment, anchor, relation: anchor.compareLocationWith(range)};
+    });
+    await context.sync();
+    const disjoint = new Set(["Before", "After", "AdjacentBefore", "AdjacentAfter"]);
+    entries.filter(e => !disjoint.has(e.relation.value)).forEach(e => affected.set(e.comment.id, {
+      id: e.comment.id, content: e.comment.content, authorName: e.comment.authorName,
+      resolved: e.comment.resolved, anchorText: e.anchor.text,
+      replies: e.comment.replies.items.map(r => ({id: r.id, content: r.content, authorName: r.authorName}))
+    }));
+  }
+  const result = [...affected.values()];
+  if (result.length && allowLoss !== true)
+    throw refusalError(`Replacement overlaps comments: ${JSON.stringify(result)}`, "WOULD_DELETE_COMMENTS");
+  return result;
+}
+
+const FONT_FIELDS = ["bold", "italic", "underline", "strikeThrough", "color", "name", "size",
+  "doubleStrikeThrough", "subscript", "superscript"];
+function fontSnapshot(font) {
+  return Object.fromEntries(FONT_FIELDS.map(k => [k, font[k]]));
+}
+
+async function resolveScopes(context, scope, writing=false) {
+  if (scope === 'body') return {bodies: [{scope: 'body', body: context.document.body}], warnings: []};
+  if (!Office.context.requirements.isSetSupported('WordApiDesktop', '1.2'))
+    throw refusalError('Text boxes require WordApiDesktop 1.2', 'LIVE_CAPABILITY_MISSING');
+  if (scope !== 'all' && !scope.startsWith(`textbox:${paneEpoch}:`))
+    throw refusalError('Stale or invalid text-box handle; list again', 'LIVE_STALE');
+  try {
+    const shapes = context.document.body.shapes;
+    shapes.load('items/id,items/name,items/type');
+    await context.sync();
+    const warnings = shapes.items.filter(s => s.type === Word.ShapeType.group || s.type === Word.ShapeType.canvas)
+      .map(s => ({shape_id: s.id, reason: 'group/canvas text coverage unavailable'}));
+    if (scope === 'all' && writing && warnings.length)
+      throw refusalError('Cannot safely write all scopes with incomplete shape coverage', 'LIVE_CAPABILITY_MISSING');
+    const selected = shapes.items.filter(s => s.type === Word.ShapeType.textBox || s.type === Word.ShapeType.geometricShape)
+      .filter(s => scope === 'all' || `textbox:${paneEpoch}:${s.id}` === scope);
+    if (scope !== 'all' && selected.length !== 1) throw refusalError('Text box no longer exists', 'LIVE_STALE');
+    selected.forEach(s => s.body.load('text'));
+    await context.sync();
+    const bodies = selected.map(s => {
+      if (typeof s.body.text !== 'string') throw new Error('host returned missing text');
+      return {scope: `textbox:${paneEpoch}:${s.id}`, body: s.body, shape: {id:s.id,name:s.name,type:s.type}};
+    });
+    if (scope === 'all') bodies.unshift({scope:'body',body:context.document.body});
+    return {bodies,warnings};
+  } catch (err) {
+    if (err.code === 'LIVE_STALE' || err.code === 'LIVE_CAPABILITY_MISSING') throw err;
+    throw refusalError(`Shape read failed (retryable): ${err.message || err}`, 'HOST_SHAPE_READ_FAILED');
+  }
+}
+async function scopeHash(context, scope) {
+  const resolved = await resolveScopes(context, scope);
+  resolved.bodies.forEach(b => b.body.load('text'));
+  await context.sync();
+  return sha256Hex(JSON.stringify(resolved.bodies.map(b => [b.scope,b.body.text])));
+}
+async function requireFreshScope(context, payload) {
+  if (payload.expectedScopeSha256 && await scopeHash(context,payload.scope || 'body') !== payload.expectedScopeSha256)
+    throw refusalError('Scope changed since it was read; nothing written', 'LIVE_STALE');
+}
+async function opScopeDescribe(payload) {
+  return Word.run(async context => ({scopeSha256:await scopeHash(context,payload.scope || 'body'),
+    bodySha256:await requireFreshBody(context),session_epoch:paneEpoch}));
+}
+async function opTextboxesList() {
+  return Word.run(async context => {
+    const resolved = await resolveScopes(context,'all');
+    const textboxes = [];
+    for (const item of resolved.bodies.filter(b => b.shape)) {
+      textboxes.push({textbox_id:item.scope,text:item.body.text,shape:item.shape,
+        revision:`live:scope:${await scopeHash(context,item.scope)}`});
+    }
+    return {textboxes,session_epoch:paneEpoch,coverage:resolved.warnings.length ? 'partial':'body_shapes',warnings:resolved.warnings};
+  });
+}
+async function opTextboxesRead(payload) {
+  return Word.run(async context => {
+    const resolved = await resolveScopes(context,payload.scope);
+    const item = resolved.bodies[0];
+    return {textbox_id:item.scope,text:item.body.text,shape:item.shape,session_epoch:paneEpoch,
+      revision:`live:scope:${await scopeHash(context,payload.scope)}`};
+  });
+}
+
+function inspectDeleteParagraph(xml) {
+  const doc = new DOMParser().parseFromString(xml,'application/xml');
+  const w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  if (doc.getElementsByTagName('parsererror').length)
+    throw refusalError('Paragraph OOXML inspection failed', 'STRUCTURAL_BOUNDARY');
+  const bodies = [...doc.getElementsByTagNameNS(w,'body')];
+  if (bodies.length !== 1) throw refusalError('Incomplete paragraph body inspection', 'STRUCTURAL_BOUNDARY');
+  if (shapeNodes(bodies[0]).length)
+    throw refusalError('Paragraph anchors a shape; re-anchoring is not supported', 'ANCHORED_SHAPES');
+  const paragraphs = [...bodies[0].getElementsByTagNameNS(w,'p')];
+  // Word's getOoxml appends one empty paragraph after the range (issue #33's
+  // trailing empty paragraph); anything else extra means the inspection saw
+  // more than the target paragraph.
+  const emptyTrailer = q => !(q.textContent || '').trim() && !shapeNodes(q).length &&
+    !q.getElementsByTagNameNS(w,'drawing').length && !q.getElementsByTagNameNS(w,'pict').length &&
+    !q.getElementsByTagNameNS(w,'sectPr').length;
+  if (paragraphs.length < 1 || paragraphs.length > 2 || (paragraphs.length === 2 && !emptyTrailer(paragraphs[1])))
+    throw refusalError('Incomplete paragraph inspection', 'STRUCTURAL_BOUNDARY');
+  const p = paragraphs[0];
+  if (p.getElementsByTagNameNS(w,'sectPr').length)
+    throw refusalError('Paragraph is a section boundary', 'STRUCTURAL_BOUNDARY');
+}
+async function opParagraphDelete(payload) {
+  return Word.run(async context => {
+    const pre = await requireFreshBody(context,payload.expectedBodySha256);
+    const paragraphs = context.document.body.paragraphs;
+    paragraphs.load('items/text,items/tableNestingLevel');
+    await context.sync();
+    const before = paragraphs.items.map(p => p.text);
+    const indexes = before.map((text,i) => text === payload.anchor_text ? i : -1).filter(i => i >= 0);
+    if (indexes.length !== 1) throw refusalError(`Expected unique whole paragraph, found ${indexes.length}`, 'MATCH_COUNT_MISMATCH');
+    const index = indexes[0];
+    const target = paragraphs.items[index];
+    if (index === before.length-1 || target.tableNestingLevel !== 0)
+      throw refusalError('Cannot delete final or table-cell paragraph', 'STRUCTURAL_BOUNDARY');
+    const xml = target.getOoxml();
+    await context.sync();
+    inspectDeleteParagraph(xml.value);
+    const range = target.getRange(Word.RangeLocation.whole);
+    await guardComments(context,[range],false);
+    await guardRevisions(context,[range]);
+    await withTracking(context,payload.track_changes,async () => {
+      target.delete();
+      await context.sync();
+    });
+    const remaining = context.document.body.paragraphs;
+    remaining.load('items/text');
+    context.document.body.load('text');
+    await context.sync();
+    const after = remaining.items.map(p => p.text);
+    const expected = before.filter((_,i) => i !== index);
+    const result = {applied:true,before_count:before.length,after_count:after.length,
+      before_paragraphs:before,after_paragraphs:after,pre,post:await sha256Hex(context.document.body.text || '')};
+    if (JSON.stringify(after) !== JSON.stringify(expected))
+      throw refusalError(`Paragraph deletion read-back failed; observed effects: ${JSON.stringify(result)}`, 'VERIFICATION_FAILED');
+    return result;
+  });
+}
+
+// Shape inventory reads OOXML, so it covers DrawingML and legacy VML without
+// requiring the newer desktop-only Shape API. Indices include table paragraphs.
+const SHAPE_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+const SHAPE_WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing';
+const SHAPE_V = 'urn:schemas-microsoft-com:vml';
+function shapeXml(xml) {
+  const doc = new DOMParser().parseFromString(xml, 'application/xml');
+  if (doc.getElementsByTagName('parsererror').length)
+    throw refusalError('Cannot inspect shape anchors', 'HOST_SHAPE_READ_FAILED');
+  const bodies = [...doc.getElementsByTagNameNS(SHAPE_W, 'body')];
+  if (bodies.length !== 1)
+    throw refusalError('Incomplete shape body inspection', 'HOST_SHAPE_READ_FAILED');
+  return bodies[0];
+}
+function shapeNodes(root) {
+  // Ignore the fallback representation of an AlternateContent choice.
+  const mc = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+  return [...root.getElementsByTagNameNS(SHAPE_WP, 'anchor'),
+    ...['shape','rect','roundrect','oval','line','polyline','arc','curve','image','group']
+      .flatMap(tag => [...root.getElementsByTagNameNS(SHAPE_V, tag)])].filter(node => {
+      for (let p = node.parentNode; p && p !== root; p = p.parentNode)
+        if (p.namespaceURI === mc && p.localName === 'Fallback' &&
+            p.parentNode.getElementsByTagNameNS(mc, 'Choice').length) return false;
+      return true;
+    });
+}
+function inventoryShapes(xml) {
+  const root = shapeXml(xml);
+  const paragraphs = [...root.getElementsByTagNameNS(SHAPE_W, 'p')];
+  return shapeNodes(root).map(node => {
+    let p = node.parentNode;
+    while (p && !(p.namespaceURI === SHAPE_W && p.localName === 'p')) p = p.parentNode;
+    const first = tag => node.getElementsByTagNameNS(SHAPE_WP, tag)[0];
+    const props = first('docPr');
+    const extent = first('extent');
+    const position = tag => {
+      const el = first(tag);
+      return el ? {relative_to:el.getAttribute('relativeFrom'), value:el.textContent} : null;
+    };
+    return {id: props ? props.getAttribute('id') : node.getAttribute('id'),
+      name: props ? props.getAttribute('name') : null,
+      kind:node.namespaceURI === SHAPE_V ? 'vml' : 'drawingml',
+      anchor_paragraph:{index:paragraphs.indexOf(p)+1,
+        text:p ? [...p.getElementsByTagNameNS(SHAPE_W,'t')].filter(t => {
+          let parent=t.parentNode;
+          while(parent && parent !== p) {
+            if(parent.namespaceURI === SHAPE_W && parent.localName === 'txbxContent') return false;
+            parent=parent.parentNode;
+          }
+          return true;
+        }).map(t => t.textContent).join('') : null},
+      size_emu:extent ? {width:extent.getAttribute('cx'),height:extent.getAttribute('cy')} : null,
+      horizontal_position:position('positionH'),vertical_position:position('positionV'),
+      legacy_style:node.namespaceURI === SHAPE_V ? node.getAttribute('style') : null};
+  });
+}
+async function opShapesList() {
+  return Word.run(async context => {
+    const xml = context.document.body.getOoxml();
+    await context.sync();
+    return {shapes:inventoryShapes(xml.value), coverage:'document_body',
+      paragraph_indexing:'all body paragraphs including tables and textboxes; 1-based'};
+  });
+}
+async function guardAnchoredBodies(context, bodies) {
+  const xml = bodies.map(body => body.getOoxml());
+  await context.sync();
+  if (xml.some(x => shapeNodes(shapeXml(x.value)).length))
+    throw refusalError('Edit touches a paragraph anchoring a shape; re-anchoring is unsupported', 'ANCHORED_SHAPES');
+}
+async function guardAnchoredParagraphs(context, ranges) {
+  const collections = ranges.map(r => r.paragraphs);
+  collections.forEach(p => p.load('items'));
+  await context.sync();
+  // Conservative: any text replacement in an anchored paragraph is refused.
+  await guardAnchoredBodies(context, collections.flatMap(p => p.items));
+}

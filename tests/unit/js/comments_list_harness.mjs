@@ -1,3 +1,4 @@
+import { webcrypto } from "node:crypto";
 // Loads addin/taskpane.js into a vm with stub Office/Word/DOM globals and a
 // fake Word context that counts sync() calls, then checks opCommentsList.
 // Prints one JSON line of results; exit code 1 on a thrown error.
@@ -19,7 +20,7 @@ function makeDoc(n) {
       load() {},
       getRange() {
         state.getRange += 1;
-        return { text: c._anchor, load() {} };
+        return { text: c._anchor, load() {}, paragraphs: {items: [{text: `paragraph ${i}`}], load() {}} };
       },
       replies: {
         items: [{ id: `r${i}`, content: `reply ${i}`, authorName: "B", creationDate: "d" }],
@@ -46,13 +47,13 @@ const sandbox = {
   Promise,
   document: { getElementById: () => ({ addEventListener() {}, textContent: "", style: {} }) },
   window: {},
-  crypto: {},
+  crypto: webcrypto,
   TextEncoder,
   Office: { onReady() {}, HostType: { Word: "Word" }, context: {} },
   Word: { run: null },
 };
 vm.createContext(sandbox);
-vm.runInContext(src + "\n;globalThis.__opCommentsList = opCommentsList;", sandbox);
+vm.runInContext(src + "\n;globalThis.__opCommentsList = opCommentsList; globalThis.__checkEpoch = checkCommentEpoch;", sandbox);
 
 async function run(n, payload) {
   const { state, context } = makeDoc(n);
@@ -82,3 +83,5 @@ out.filteredCounts = filtered.result.counts;
 out.scope = big.result.scope;
 out.hasObservedAt = typeof big.result.observed_at === "string" && big.result.observed_at.length > 0;
 console.log(JSON.stringify(out));
+
+try { sandbox.__checkEpoch({session_epoch: "stale"}); throw new Error("stale epoch accepted"); } catch (e) { if (e.code !== "COMMENT_ID_STALE") throw e; }

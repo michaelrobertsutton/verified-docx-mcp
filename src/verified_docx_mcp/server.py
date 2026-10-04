@@ -66,7 +66,7 @@ from . import (
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .live import bridge as live_bridge
-from .live import comments_live
+from .live import comments_live, reads_live
 from .middleware import EvidenceEnforcementMiddleware
 
 mcp = FastMCP(
@@ -577,6 +577,9 @@ def execute_lock_status(
     directory = resolved.parent
     target_name = resolved.name
 
+    from . import desktop_word
+
+    desktop_status = desktop_word.status(resolved)
     owner_file = _find_owner_file(directory, target_name)
 
     sample_1 = _stat_sample(resolved)
@@ -589,6 +592,7 @@ def execute_lock_status(
     result: dict[str, Any] = {
         "path": str(resolved),
         "owner_file": owner_file,
+        "desktop_word": desktop_status,
         "sync_quiesced": sync_quiesced,
         "sync_detail": {
             "sample_1": sample_1,
@@ -650,6 +654,14 @@ def lock_status(path: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _revision_status(session: Any) -> dict[str, Any]:
+    from .live.revisions_live import list_revisions
+
+    state = list_revisions(session)
+    return {"revision_count": len(state["revisions"]) if state["revisions"] is not None else None,
+            "revision_coverage": state["coverage"], "revision_reason": state.get("reason")}
+
+
 def execute_live_status() -> dict[str, Any]:
     """Start the live bridge lazily (idempotent) and report its state.
 
@@ -685,6 +697,7 @@ def execute_live_status() -> dict[str, Any]:
                 "requirement_sets": session.hello.requirement_sets,
                 "instance_id": session.hello.instance_id,
                 "platform": session.hello.platform,
+                **_revision_status(session),
             }
         )
 
@@ -774,7 +787,12 @@ def execute_list_parts(path: str) -> dict[str, Any]:
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     local_path, is_temp = _read_local_copy(resolved)
     try:
-        return {"path": str(resolved), "parts": projection.list_parts_impl(local_path)}
+        result: dict[str, Any] = {"path": str(resolved), "parts": projection.list_parts_impl(local_path)}
+        warnings, live_session = reads_live.file_read_warnings(path)
+        if warnings:
+            result["warnings"] = warnings
+            result["live_session"] = live_session
+        return result
     finally:
         if is_temp:
             local_path.unlink(missing_ok=True)
@@ -809,6 +827,7 @@ def execute_read_document(
     format: str = "markdown",
     part: str = projection.DEFAULT_PART,
     section_key: str | None = None,
+    source: str = "auto",
 ) -> dict[str, Any]:
     if format not in _VALID_READ_FORMATS:
         raise _make_error(
@@ -816,65 +835,66 @@ def execute_read_document(
             f"format must be one of {sorted(_VALID_READ_FORMATS)}, got {format!r}",
             {"format": format},
         )
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    local_path, is_temp = _read_local_copy(resolved)
-    try:
-        revision = projection.compute_revision(local_path)
-        result: dict[str, Any] = {
-            "path": str(resolved),
-            "part": part,
-            "format": format,
-            "section_key": section_key,
-            "revision": revision["token"],
-            "revision_detail": revision["detail"],
-        }
+    with reads_live.read_source(path, source, part) as rs:
+        return rs.annotate(_read_document_from(rs.local_path, rs.resolved, format, part, section_key))
 
-        if section_key is not None:
-            # Only a textbox-<n> sub-scope resolves here (WP-03 scope —
-            # a heading section_key, listed by find_sections alongside
-            # textbox ones, is not yet readable this way; that arrives
-            # with a later WP). None means section_key named no text box
-            # in this part — INVALID_INPUT with the keys that DO exist,
-            # never a silent empty read.
-            scoped = projection.project_textbox_scope(local_path, part, section_key)
-            if scoped is None:
-                available = [s["section_key"] for s in projection.iter_textbox_scopes(local_path, part)]
-                raise _make_error(
-                    ErrorCode.INVALID_INPUT,
-                    f"section_key {section_key!r} does not name a text box in part {part!r}.",
-                    {"section_key": section_key, "part": part, "available_textbox_keys": available},
-                )
-            if format == "text":
-                result["text"] = scoped.text
-            elif format == "runs":
-                result["runs"] = projection.runs_from_projection(scoped)
-            else:  # markdown
-                markdown, _, lossy_elements = projection.markdown_from_projection(local_path, scoped)
-                result["markdown"] = markdown
-                if lossy_elements:
-                    result["lossy_elements"] = lossy_elements
-            result["warnings"] = scoped.warnings
-            return result
 
+def _read_document_from(
+    local_path: Path, resolved: Path, format: str, part: str, section_key: str | None
+) -> dict[str, Any]:
+    revision = projection.compute_revision(local_path)
+    result: dict[str, Any] = {
+        "path": str(resolved),
+        "part": part,
+        "format": format,
+        "section_key": section_key,
+        "revision": revision["token"],
+        "revision_detail": revision["detail"],
+    }
+
+    if section_key is not None:
+        # Only a textbox-<n> sub-scope resolves here (WP-03 scope —
+        # a heading section_key, listed by find_sections alongside
+        # textbox ones, is not yet readable this way; that arrives
+        # with a later WP). None means section_key named no text box
+        # in this part — INVALID_INPUT with the keys that DO exist,
+        # never a silent empty read.
+        scoped = projection.project_textbox_scope(local_path, part, section_key)
+        if scoped is None:
+            available = [s["section_key"] for s in projection.iter_textbox_scopes(local_path, part)]
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"section_key {section_key!r} does not name a text box in part {part!r}.",
+                {"section_key": section_key, "part": part, "available_textbox_keys": available},
+            )
         if format == "text":
-            result["text"] = projection.read_document_text(local_path, part)
-            result["warnings"] = projection.project_part(local_path, part).warnings
+            result["text"] = scoped.text
         elif format == "runs":
-            result["runs"] = projection.read_document_runs(local_path, part)
-            result["warnings"] = projection.project_part(local_path, part).warnings
+            result["runs"] = projection.runs_from_projection(scoped)
         else:  # markdown
-            markdown, warnings, lossy_elements = projection.read_document_markdown(local_path, part)
+            markdown, _, lossy_elements = projection.markdown_from_projection(local_path, scoped)
             result["markdown"] = markdown
-            result["warnings"] = warnings
-            # Same response shape as GoogleDocs-MCP's read_document (issue
-            # #28 WP-03b-a): a lossy_elements key, present only when the
-            # rendering actually lost something (a merged/nested table).
             if lossy_elements:
                 result["lossy_elements"] = lossy_elements
+        result["warnings"] = scoped.warnings
         return result
-    finally:
-        if is_temp:
-            local_path.unlink(missing_ok=True)
+
+    if format == "text":
+        result["text"] = projection.read_document_text(local_path, part)
+        result["warnings"] = projection.project_part(local_path, part).warnings
+    elif format == "runs":
+        result["runs"] = projection.read_document_runs(local_path, part)
+        result["warnings"] = projection.project_part(local_path, part).warnings
+    else:  # markdown
+        markdown, warnings, lossy_elements = projection.read_document_markdown(local_path, part)
+        result["markdown"] = markdown
+        result["warnings"] = warnings
+        # Same response shape as GoogleDocs-MCP's read_document (issue
+        # #28 WP-03b-a): a lossy_elements key, present only when the
+        # rendering actually lost something (a merged/nested table).
+        if lossy_elements:
+            result["lossy_elements"] = lossy_elements
+    return result
 
 
 @mcp.tool()
@@ -883,9 +903,29 @@ def read_document(
     format: str = "markdown",
     part: str = projection.DEFAULT_PART,
     section_key: str | None = None,
+    source: str = "auto",
 ) -> dict[str, Any]:
     """Read a .docx part's content as markdown, flat text, or a run-level
     structural list.
+
+    source="auto"|"file"|"live" (issue #33) picks WHERE the content comes
+    from. "live" reads the body the connected Word pane currently holds
+    (body only: part must be the default word/document.xml, and the pane must
+    report the body_ooxml capability); "file" reads the local .docx; "auto"
+    (default) reads live when a pane session exists for this file name and
+    the read can be served live, otherwise the file. The response always
+    carries "source". A file read while a pane session exists for the name
+    also carries the "live_session_ignored" warning and a live_session
+    {document_url, reason, action} object, so a same-named placeholder file
+    can never pass as the live body. A live read never falls back to the
+    file: a pane failure is an error. In a live read revision is
+    "live:sha256:<body hash>" (the token live writes accept as
+    revision_before), revision_detail is None, and "live" carries
+    {document_url, body_sha256, stripped_parts}; images are not included.
+    A live read may also warn "live_styles_missing" or
+    "live_numbering_missing" when Word's export omitted a part the body
+    references. para_ref and table_id values are positional: use them only
+    with the same source and revision they were read at.
 
     part scopes the read to one package part — word/document.xml's body
     (the default) is a completely separate scope from a header, footer,
@@ -942,26 +982,35 @@ def read_document(
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
-        return execute_read_document(path, format, part, section_key)
+        return execute_read_document(path, format, part, section_key, source)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
-def execute_find_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
-    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
-    local_path, is_temp = _read_local_copy(resolved)
-    try:
-        return {"path": str(resolved), "part": part, "sections": projection.find_sections_impl(local_path, part)}
-    finally:
-        if is_temp:
-            local_path.unlink(missing_ok=True)
+def execute_find_sections(
+    path: str, part: str = projection.DEFAULT_PART, source: str = "auto"
+) -> dict[str, Any]:
+    with reads_live.read_source(path, source, part) as rs:
+        return rs.annotate(
+            {
+                "path": str(rs.resolved),
+                "part": part,
+                "sections": projection.find_sections_impl(rs.local_path, part),
+            }
+        )
 
 
 @mcp.tool()
-def find_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+def find_sections(
+    path: str, part: str = projection.DEFAULT_PART, source: str = "auto"
+) -> dict[str, Any]:
     """List heading-delimited section ranges AND text-box sub-scopes in a
     .docx part — this is the one call that discovers every section_key
     read_document(section_key=...) can then address.
+
+    source="auto"|"file"|"live" works as in read_document (issue #33): the
+    response carries "source", and a file read while a live pane session
+    exists for this file name carries the "live_session_ignored" warning.
 
     DISAMBIGUATION: this is about DOCUMENT SECTIONS (heading ranges, by
     style/outline level) — see list_page_sections for PAGE-LAYOUT sections
@@ -995,7 +1044,7 @@ def find_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, A
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
-        return execute_find_sections(path, part)
+        return execute_find_sections(path, part, source)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -1378,6 +1427,9 @@ def replace_text(
     write_mode: str = "auto",
     within_row_containing: str | None = None,
     allow_concurrent_editor: bool = False,
+    allow_comment_loss: bool = False,
+    inherit_format: str = "replaced",
+    scope: str = "body",
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
 
@@ -1531,6 +1583,9 @@ def replace_text(
             track_changes=track_changes,
             write_mode=write_mode,
             within_row_containing=within_row_containing,
+            scope=scope,
+            allow_comment_loss=allow_comment_loss,
+            inherit_format=inherit_format,
             allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
@@ -1549,6 +1604,7 @@ def format_text(
     write_mode: str = "auto",
     within_row_containing: str | None = None,
     allow_concurrent_editor: bool = False,
+    scope: str = "body",
 ) -> dict[str, Any]:
     """Apply character styling (bold/italic/underline/strike/color) to a
     matched text span, without touching its content.
@@ -1623,6 +1679,7 @@ def format_text(
             track_changes=track_changes,
             write_mode=write_mode,
             within_row_containing=within_row_containing,
+            scope=scope,
             allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
@@ -1813,6 +1870,7 @@ def accept_tracked_changes(
     revision_ids: list[str] | None = None,
     revision_before: str | None = None,
     force: bool = False,
+    write_mode: str = "auto",
     allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Accept tracked changes (w:ins/w:del), atomically -- all of them, or
@@ -1849,6 +1907,10 @@ def accept_tracked_changes(
       VERIFICATION_FAILED               - post-write verification failed; rolled back
     """
     try:
+        from .live.revisions_live import mutate_revisions
+
+        if comments_live._resolve_write_mode(path, write_mode) == "live":
+            return mutate_revisions(path, "accept", revision_ids, revision_before)
         return tracked_changes.execute_accept_tracked_changes(
             path,
             revision_ids,
@@ -1866,6 +1928,7 @@ def reject_tracked_changes(
     revision_ids: list[str] | None = None,
     revision_before: str | None = None,
     force: bool = False,
+    write_mode: str = "auto",
     allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Reject tracked changes (w:ins/w:del), atomically -- all of them, or
@@ -1882,6 +1945,10 @@ def reject_tracked_changes(
     Errors: as accept_tracked_changes.
     """
     try:
+        from .live.revisions_live import mutate_revisions
+
+        if comments_live._resolve_write_mode(path, write_mode) == "live":
+            return mutate_revisions(path, "reject", revision_ids, revision_before)
         return tracked_changes.execute_reject_tracked_changes(
             path,
             revision_ids,
@@ -2019,7 +2086,9 @@ def add_anchored_comment(
 
 
 @mcp.tool()
-def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
+def get_comment_thread(path: str, comment_id: str | None = None,
+                       source: str = "auto", session_epoch: str | None = None,
+                       match_spec: dict[str, str] | None = None) -> dict[str, Any]:
     """Read a comment and its direct replies, by durableId (from
     add_anchored_comment's own evidence, or word/commentsIds.xml's
     w16cid:durableId directly) -- or, as a fallback, a raw
@@ -2054,6 +2123,10 @@ def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
+        if comments_live._resolve_source(path, source) == "live":
+            return comments_live.execute_get_comment_thread_live(path, comment_id, match_spec, session_epoch)
+        if comment_id is None or match_spec is not None or session_epoch is not None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "File comment reads require comment_id only")
         return comments.execute_get_comment_thread(path, comment_id)
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -2062,10 +2135,12 @@ def get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
 @mcp.tool()
 def reply_to_comment(
     path: str,
-    comment_id: str,
-    text: str,
+    comment_id: str | None = None,
+    text: str = "",
     write_mode: str = "auto",
     allow_concurrent_editor: bool = False,
+    session_epoch: str | None = None,
+    match_spec: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Reply to an existing comment (durableId), atomically -- issue #28
     WP-09.
@@ -2150,7 +2225,10 @@ def reply_to_comment(
     try:
         mode = comments_live._resolve_write_mode(path, write_mode)
         if mode == "live":
-            return comments_live.execute_reply_to_comment_live(path, comment_id, text)
+            handle, address = comments_live.address_comment(path, comment_id, match_spec, session_epoch)
+            return comments_live.execute_reply_to_comment_live(path, handle, text, address)
+        if comment_id is None or match_spec is not None or session_epoch is not None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "File comment writes require comment_id only")
         return comments.execute_reply_to_comment(
             path, comment_id, text, allow_concurrent_editor=allow_concurrent_editor
         )
@@ -2161,9 +2239,11 @@ def reply_to_comment(
 @mcp.tool()
 def resolve_comment(
     path: str,
-    comment_id: str,
+    comment_id: str | None = None,
     write_mode: str = "auto",
     allow_concurrent_editor: bool = False,
+    session_epoch: str | None = None,
+    match_spec: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Resolve a comment thread (durableId), atomically -- issue #28
     WP-09. Sets w15:done="1" on the comment's own commentsExtended.xml
@@ -2258,7 +2338,10 @@ def resolve_comment(
     try:
         mode = comments_live._resolve_write_mode(path, write_mode)
         if mode == "live":
-            return comments_live.execute_resolve_comment_live(path, comment_id)
+            handle, address = comments_live.address_comment(path, comment_id, match_spec, session_epoch)
+            return comments_live.execute_resolve_comment_live(path, handle, address)
+        if comment_id is None or match_spec is not None or session_epoch is not None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "File comment writes require comment_id only")
         return comments.execute_resolve_comment(
             path, comment_id, allow_concurrent_editor=allow_concurrent_editor
         )
@@ -2275,9 +2358,16 @@ def resolve_comment(
 
 
 @mcp.tool()
-def list_tables(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+def list_tables(
+    path: str, part: str = projection.DEFAULT_PART, source: str = "auto"
+) -> dict[str, Any]:
     """Enumerate every w:tbl in a .docx part, including tables nested
     inside a cell (each gets its own table_id, in document order).
+
+    source="auto"|"file"|"live" works as in read_document (issue #33): the
+    response carries "source", and a file read while a live pane session
+    exists for this file name carries the "live_session_ignored" warning.
+    table_id is positional; use it only with the same source and revision.
 
     Returns path, part, tables (list of {table_id, row_count, col_count,
     has_merged_cells, has_nested_table, nested_in_table_id}). table_id is
@@ -2293,15 +2383,36 @@ def list_tables(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
-        return tables.execute_list_tables(path, part)
+        return tables.execute_list_tables(path, part, source)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
 @mcp.tool()
-def get_table(path: str, table_id: int, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
+def get_table(
+    path: str, table_id: int, part: str = projection.DEFAULT_PART, source: str = "auto"
+) -> dict[str, Any]:
     """Full row/cell detail for one table, addressed by the table_id
     list_tables reports.
+
+    `source` (issue #34, "auto" | "file" | "live", default "auto"): "auto"
+    reads the open document through the Live pane when one is connected for
+    this document, else the file. A live read is the only way to see a table
+    a co-author just added (the saved file lags). LIVE READS DIFFER: the main
+    document body only (a non-default `part` is INVALID_INPUT with
+    source="live", and "auto" falls back to the file); `text` is Word's plain
+    text, not markdown; per-cell grid_span/v_merge are not available (every
+    cell reports grid_span 1 / v_merge "none"), so use the table-level
+    has_merged_cells flag; a document containing a nested table is refused;
+    the pane must report "table_edit" (LIVE_CAPABILITY_MISSING otherwise).
+    The result adds source ("live"), style and header_row_count. Every
+    response carries "source"; a file read while a live pane session exists
+    for this file name carries the "live_session_ignored" warning plus a
+    live_session object (issue #33), so a same-named placeholder file can
+    not pass as the live table. This live read goes through the pane's
+    table_get op (the same table numbering live table edits use), unlike
+    list_tables(source="live"), which reads the body OOXML: the two agree on
+    table_id when the document has no nested table.
 
     Returns path, part, table_id, row_count, col_count, has_merged_cells,
     has_nested_table, rows (list of list of {row_index, cell_index,
@@ -2320,9 +2431,10 @@ def get_table(path: str, table_id: int, part: str = projection.DEFAULT_PART) -> 
       PART_NOT_FOUND  - part names a package part absent from this .docx
       TABLE_NOT_FOUND - table_id does not match any table (call list_tables)
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
+      LIVE_UNAVAILABLE / LIVE_CAPABILITY_MISSING / LIVE_DISCONNECTED / LIVE_OP_FAILED - source="live"
     """
     try:
-        return tables.execute_get_table(path, table_id, part)
+        return tables.execute_get_table(path, table_id, part, source=source)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -2337,10 +2449,27 @@ def replace_table_row(
     force: bool = False,
     track_changes: bool = False,
     allow_concurrent_editor: bool = False,
+    write_mode: str = "auto",
 ) -> dict[str, Any]:
     """Replace one table row's cell content wholesale, one markdown string
     per cell (cells must have exactly as many entries as the row has
     cells).
+
+    `write_mode` (issue #34, "auto" | "file" | "live", default "auto"):
+    "auto" routes through the Live pane when one is connected, else writes
+    the file -- the supported way to edit a table in a document a co-author
+    has open. LIVE MODE IS A SUBSET: cells are paragraphs with bold/italic/
+    links only; a table with a merged cell is refused
+    (MERGED_OR_NESTED_TABLE, as in file mode); `force` does not apply;
+    before/after are plain text, not markdown; revision_before/
+    revision_after are "live:sha256:<hex>" body hashes; the pane must report
+    "table_edit". The row is written as ONE Word batch, guarded by a
+    body-hash check and a re-read of every cell just before the write, then
+    verified by re-reading the table -- but Word batches are not
+    transactions, so under heavy co-authoring a cell edited in the last
+    instant can still be overwritten. A write that lands and then fails its
+    read-back is recorded in the audit log before VERIFICATION_FAILED is
+    raised.
 
     Refuses -- for the WHOLE table, not just this row -- the moment
     table_id names a table containing a merged cell (w:gridSpan != 1 or a
@@ -2372,7 +2501,12 @@ def replace_table_row(
       MERGED_OR_NESTED_TABLE  - this table has a merged/nested-table cell; use replace_cell_markdown
       COMMENT_ANCHORS_IN_RANGE / TRACKED_CHANGES_PRESENT - a hazard in the row; force=True to proceed
       OPC_INVALID             - the rendered .docx failed OPC validation
-      VERIFICATION_FAILED     - post-write verification failed; rolled back
+      VERIFICATION_FAILED     - post-write verification failed; rolled back (file mode), or the
+                                pane's read-back did not confirm the edit (live mode; audit-logged)
+      LIVE_UNAVAILABLE / LIVE_SESSION_ACTIVE / LIVE_SESSION_MISMATCH / LIVE_DISCONNECTED /
+      LIVE_STALE / LIVE_CAPABILITY_MISSING / LIVE_OP_FAILED - as replace_text (issue #154);
+                                LIVE_OP_FAILED here also covers a cell edited between the read and
+                                the write, and a document with nested tables
     """
     try:
         return tables.execute_replace_table_row(
@@ -2384,6 +2518,7 @@ def replace_table_row(
             force=force,
             track_changes=track_changes,
             allow_concurrent_editor=allow_concurrent_editor,
+            write_mode=write_mode,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -2472,7 +2607,7 @@ def replace_cell_markdown(
 def insert_table(
     path: str,
     rows: list[list[str | dict[str, Any]]],
-    style_id: str,
+    style_id: str | None = None,
     header_rows: int = 0,
     grid_dxa: list[int] | None = None,
     cant_split: bool = False,
@@ -2481,9 +2616,53 @@ def insert_table(
     force: bool = False,
     track_changes: bool = False,
     allow_concurrent_editor: bool = False,
+    write_mode: str = "auto",
+    style_from_table_id: int | None = None,
+    style_builtin: str | None = None,
+    font_size_pt: float | None = None,
 ) -> dict[str, Any]:
     """Insert a new table, one markdown string OR cell-spec object per
     cell (issue #100: https://github.com/michaelrobertsutton/JennyStack/issues/100).
+
+    `write_mode` (issue #34, "auto" | "file" | "live", default "auto"):
+    "auto" routes through the Live pane when one is connected for this
+    document, else writes the file. This is the supported way to add a table
+    to a document a co-author has open: a file write races that editor's
+    autosave. LIVE MODE IS A SUBSET:
+      - cells are paragraphs with bold/italic/links only (lists, headings,
+        nested tables -> INVALID_INPUT, nothing sent); the cell-spec keys
+        fill/color/bold/align/valign work, but span and v_merge (merged cells)
+        and cant_split are INVALID_INPUT;
+      - the anchor is {"paragraph_text": <exact text of one top-level
+        paragraph>, "position": "after"|"before" (default "after")} or
+        {"after_table_id": <int>}, or omitted to append at the end of the
+        body. section_key / after_paragraph_text anchors are file-mode only
+        (they come from the saved file, which lags a co-authored document).
+        0 matching paragraphs -> ZERO_MATCH, more than 1 ->
+        MATCH_COUNT_MISMATCH;
+      - the style is chosen BEFORE anything is inserted (STYLE_NOT_FOUND
+        leaves the document untouched): style_id is treated as a Word table
+        style NAME (e.g. "Grid Table 4 - Accent 1"; it must already be used
+        by a table in the document, or named in Word's style list on WordApi
+        1.5+), style_from_table_id copies an existing table's style, and
+        style_builtin takes a Word built-in style name (e.g.
+        "GridTable4_Accent1"; live only). All three are optional in live
+        mode; omit them for Word's default table look;
+      - the new table's table_id is read back from Word (list_tables numbers
+        the saved file, which lags);
+      - grid_dxa becomes column widths in points; font_size_pt sets the table
+        font size;
+      - `force` does not apply; revision_before/revision_after are
+        "live:sha256:<hex>" body hashes; before is "", after is the table's
+        plain text; the pane must report "table_edit"
+        (LIVE_CAPABILITY_MISSING otherwise -- reload the pane);
+      - the pane refuses (LIVE_STALE) if the document changed since the
+        body hash was read, BEFORE inserting anything.
+    Every requested property (text, fill, color, bold, alignment, widths,
+    font size, header rows, style) is re-read from Word and compared; a table
+    that lands but fails that check is recorded in the audit log and raised as
+    VERIFICATION_FAILED (there is nothing to roll back in live mode -- the
+    table stays in the document for you to fix or delete).
 
     rows is a list of rows, each a list of cells. A plain string cell
     means {"markdown": that string} -- today's exact behavior: short rows
@@ -2510,11 +2689,17 @@ def insert_table(
     cell -- put content emphasis in the markdown itself (**bold**) and
     reserve bold/color/align for header/title rows you will not re-edit.
 
-    style_id is REQUIRED and must name an existing w:type="table" style in
-    this document's styles.xml (list_styles reports style type) -- unlike
+    File mode: style_id (or style_from_table_id, which copies another
+    table's w:tblStyle -- STYLE_NOT_FOUND if that table has none) is
+    REQUIRED, and must name an existing w:type="table" style in this
+    document's styles.xml (list_styles reports style type) -- unlike
     GoogleDocs-MCP's insert_table, which relies on the Docs API's own
     default table style, raw OOXML has no sensible default to fall back
-    to.
+    to. style_builtin is live only (INVALID_INPUT in file mode).
+    font_size_pt (either mode) sets every run's size: w:sz/w:szCs in
+    half-points, the point size doubled and rounded half up; like
+    bold/color/align it lives on the runs and is replaced by the next
+    replace_cell_markdown on that cell.
 
     header_rows (default 0) sets w:tblHeader (repeating header row(s)) on
     the first N rows; must be < len(rows). grid_dxa (default None) gives
@@ -2578,7 +2763,11 @@ def insert_table(
       ZERO_MATCH / MATCH_COUNT_MISMATCH - anchor.after_paragraph_text matched
                              0 or >1 top-level paragraphs in the section
       OPC_INVALID         - the rendered .docx failed OPC validation
-      VERIFICATION_FAILED - post-write verification failed; rolled back
+      VERIFICATION_FAILED - post-write verification failed; rolled back (file mode), or the
+                             pane's read-back did not confirm the table (live mode; audit-logged)
+      LIVE_UNAVAILABLE / LIVE_SESSION_ACTIVE / LIVE_SESSION_MISMATCH / LIVE_DISCONNECTED /
+      LIVE_STALE / LIVE_CAPABILITY_MISSING / LIVE_OP_FAILED - as replace_text (issue #154);
+                             LIVE_OP_FAILED here also covers a document with nested tables
     """
     try:
         return tables.execute_insert_table(
@@ -2593,6 +2782,10 @@ def insert_table(
             force=force,
             track_changes=track_changes,
             allow_concurrent_editor=allow_concurrent_editor,
+            write_mode=write_mode,
+            style_from_table_id=style_from_table_id,
+            style_builtin=style_builtin,
+            font_size_pt=font_size_pt,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -3184,6 +3377,58 @@ def doctor() -> int:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_textboxes(path: str) -> dict[str, Any]:
+    """List live text-bearing shapes with epoch handles, coverage and revisions."""
+    from .live.scopes_live import read_scope
+
+    try:
+        return read_scope(path)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def read_textbox(path: str, textbox_id: str) -> dict[str, Any]:
+    """Read one live text box. Host failures are distinct from verified empty text."""
+    from .live.scopes_live import read_scope
+
+    try:
+        return read_scope(path, textbox_id)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def delete_paragraph(path: str, anchor_text: str, revision_before: str,
+                     track_changes: bool = False) -> dict[str, Any]:
+    """Delete exactly one whole live body paragraph; refuse anchors, comments,
+    revisions, table cells, section boundaries and the final paragraph.
+    """
+    from .live.paragraphs_live import delete_paragraph as execute
+
+    try:
+        return execute(path, anchor_text, revision_before, track_changes)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def list_shapes(path: str) -> dict[str, Any]:
+    """List live body anchored shapes with paragraph anchors and OOXML geometry.
+
+    Includes table and textbox paragraphs. Excludes headers/footers and inline
+    pictures. DrawingML geometry uses EMUs; legacy VML retains its style units.
+    """
+    from .live import comments_live, write_mode
+    try:
+        session = write_mode.live_session_for(path)
+        write_mode.require_capability(session, "shape_guard", feature_description="shape inventory")
+        return comments_live._request(session, "shapes_list")
+    except VerifyError as exc:
+        _raise_tool_error(exc)
 
 
 def main() -> None:

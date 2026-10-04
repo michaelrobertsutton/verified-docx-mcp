@@ -266,7 +266,7 @@ class ServeOnlyTests(unittest.TestCase):
             resp.read()
 
     def test_taskpane_js_served_with_version_query(self):
-        resp = self._get("/taskpane.js?v=39")
+        resp = self._get("/taskpane.js?v=40")
         self.assertEqual(resp.status, 200)
         self.assertIn(b"opCommentsList", resp.read())
 

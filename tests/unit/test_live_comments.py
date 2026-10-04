@@ -717,7 +717,7 @@ class TargetedVerifyTests(LiveCommentsTestCase):
         self.assertNotIn("pane_note", evidence)
 
     async def test_pane_without_capability_falls_back_and_flags_stale_pane(self):
-        doc, pane, live_id = await self._two_comments(capabilities=["row_scope"])
+        doc, pane, live_id = await self._two_comments(capabilities=["row_scope", "shape_guard"])
         reply = await self.call(comments_live.execute_reply_to_comment_live, str(self.target), live_id, "r")
         resolve = await self.call(comments_live.execute_resolve_comment_live, str(self.target), live_id)
         self.assertTrue(all("ids" not in p for p in pane.comments_list_payloads))

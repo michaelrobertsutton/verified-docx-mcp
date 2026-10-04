@@ -79,6 +79,10 @@ DEFAULT_PORT = 53135
 DEFAULT_OPS_PORT = DEFAULT_PORT + 1
 DEFAULT_HOST = "127.0.0.1"
 
+# Largest websocket message the ops socket accepts from a pane (issue #33:
+# a body_ooxml reply carries a whole document body).
+PANE_MAX_MESSAGE_BYTES = 64 * 2**20
+
 # bridge.py lives at src/verified_docx_mcp/live/bridge.py; the addin/
 # directory this WP-1 spike serves lives at the repo root, four levels
 # up. addin/ is deliberately NOT in pyproject.toml's sdist include list
@@ -379,6 +383,12 @@ def start_in_background(
                     host,
                     resolved_ops_port,
                     ssl=ctx,
+                    # issue #33: body_ooxml replies carry a whole document
+                    # body; the websockets default (1 MiB) would close the
+                    # socket on a real proposal. The pane refuses above 48 MiB
+                    # (MAX_BODY_OOXML_BYTES) so this ceiling is never the
+                    # first thing to fire.
+                    max_size=PANE_MAX_MESSAGE_BYTES,
                 )
                 state["server"] = server
                 state["ops_port"] = server.sockets[0].getsockname()[1]  # resolve an ephemeral (0) port
