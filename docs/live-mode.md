@@ -1055,7 +1055,11 @@ headers and footers are not included. `ooxml_id` is informational, never an
 Office.js handle. Each entry has `source`, `actionable`, and
 `actionability_reason`. Individual handles are attached only when both
 inventories have equal counts and type/author/date/text match uniquely in each.
-Date representations that differ conservatively remain read-only.
+Dates are compared as exact UTC instants. Word writes `w:date` as local
+wall-clock time labelled `Z` (observed on Word for Mac 16.113.3), so the
+comparison prefers `w16du:dateUtc`, which is the true UTC instant, and reports
+it as `date_utc`. Without `dateUtc` a differing `w:date` stays read-only
+rather than guessing a timezone, and sub-second differences never match.
 
 If Word merges or omits revisions, the full markup list is visible but its
 entries cannot be accepted/rejected individually. Such calls refuse before

@@ -98,3 +98,38 @@ def test_markup_package_and_bad_xml():
     session = SimpleNamespace(hello=SimpleNamespace(capabilities={"live_revisions"}))
     with patch.object(comments_live, "_request", return_value={"revisions": [], "revision_ooxml": '<broken'}):
         assert revisions_live.list_revisions(session)["coverage"] == "partial"
+
+
+W16DU = "http://schemas.microsoft.com/office/word/2023/wordml/word16du"
+
+
+def _single_insert_xml(date: str, date_utc: str | None) -> str:
+    extra = f' xmlns:u="{W16DU}" u:dateUtc="{date_utc}"' if date_utc else ""
+    return (f'<w:document xmlns:w="{W}"><w:body><w:p><w:ins w:id="0" w:author="A" w:date="{date}"{extra}>'
+            '<w:r><w:t>x</w:t></w:r></w:ins></w:p></w:body></w:document>')
+
+
+def _handle_for(api_date: str, xml: str) -> bool:
+    session = SimpleNamespace(hello=SimpleNamespace(capabilities={"live_revisions"}))
+    api = {"revision_id": "handle", "type": "Added", "author": "A", "date": api_date, "text": "x"}
+    with patch.object(comments_live, "_request", return_value={"revisions": [api], "revision_ooxml": xml}):
+        item = revisions_live.list_revisions(session)["revisions"][0]
+    return item["actionable"] and item["revision_id"] == "handle"
+
+
+def test_word_local_time_w_date_matches_via_date_utc():
+    # Captured from Word for Mac 16.113.3: w:date is LOCAL time labelled Z, dateUtc is the instant,
+    # Office.js reports the UTC instant with milliseconds.
+    xml = _single_insert_xml("2026-10-04T10:55:00Z", "2026-10-04T14:55:00Z")
+    assert _handle_for("2026-10-04T14:55:00.000Z", xml)
+    assert revisions_live._markup_revisions(xml, "e")[0]["date_utc"] == "2026-10-04T14:55:00Z"
+
+
+def test_date_instants_are_not_truncated_or_guessed():
+    # Sub-second difference is a different instant.
+    assert not _handle_for("2026-10-04T14:55:00.500Z", _single_insert_xml("d", "2026-10-04T14:55:00Z"))
+    # Without dateUtc the local-time w:date cannot be trusted as UTC: a different instant never matches.
+    assert not _handle_for("2026-10-04T14:55:00.000Z", _single_insert_xml("2026-10-04T10:55:00Z", None))
+    # A zone-less date only matches by exact string equality.
+    assert not _handle_for("2026-10-04T14:55:00.000Z", _single_insert_xml("2026-10-04T14:55:00", None))
+    assert _handle_for("2026-10-04T14:55:00", _single_insert_xml("2026-10-04T14:55:00", None))

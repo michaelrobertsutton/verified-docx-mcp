@@ -1,4 +1,5 @@
 """Live revision state never comes from an on-disk stand-in (#48)."""
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 from xml.etree import ElementTree as ET
@@ -47,8 +48,30 @@ _REVISION_TYPES = {
 }
 
 
+_W16DU_DATE_UTC = "{http://schemas.microsoft.com/office/word/2023/wordml/word16du}dateUtc"
+
+
+def _instant(value: Any) -> Any:
+    """A timezone-aware datetime for an ISO-8601 string with an explicit zone, else the raw value.
+
+    Never truncates: ``...00.000Z`` equals ``...00Z`` but ``...00.500Z`` does not. A string
+    without a zone is left as-is, so it can only match by exact string equality.
+    """
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(UTC)
+    return value
+
+
 def _identity(item: dict[str, Any]) -> tuple[Any, ...]:
-    return tuple(item.get(k) for k in ("type", "author", "date", "text"))
+    # Word writes w:date as LOCAL wall-clock time labelled "Z"; the true UTC instant is
+    # w16du:dateUtc. Office.js reports a real UTC instant, so prefer dateUtc when present.
+    when = item.get("date_utc") or item.get("date")
+    return (item.get("type"), item.get("author"), _instant(when), item.get("text"))
 
 
 def _markup_revisions(xml: str, epoch: str) -> list[dict[str, Any]]:
@@ -85,7 +108,7 @@ def _markup_revisions(xml: str, epoch: str) -> list[dict[str, Any]]:
             "revision_id": f"revision-ooxml:{epoch}:{uuid4()}",
             "ooxml_id": node.get(_W + "id"), "markup_type": kind,
             "type": _REVISION_TYPES[kind], "author": node.get(_W + "author"),
-            "date": node.get(_W + "date"), "text": text(node),
+            "date": node.get(_W + "date"), "date_utc": node.get(_W16DU_DATE_UTC), "text": text(node),
             "paragraph_context": [text(paragraph)] if paragraph.tag == _W + "p" else [],
             "scope": "body", "source": "ooxml", "actionable": False,
             "actionability_reason": "No unambiguous Office.js handle; use accept/reject-all",
