@@ -151,7 +151,10 @@ def document_name_from_url(document_url: str) -> str:
     all (defensive -- a real pane always reports a path-shaped URL).
     """
     parsed = urlparse(document_url)
-    path = unquote(parsed.path) if parsed.scheme else document_url
+    # Word reports a hosted file's name raw, so a "#" in it (``Plan #1.docx``) is part of the
+    # name, not a URL fragment: urlparse would cut the name there and the session could never
+    # be addressed by its real file name (#61 encoded-URL row).
+    path = unquote(parsed.path + (f"#{parsed.fragment}" if parsed.fragment else "")) if parsed.scheme else document_url
     name = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     return name or document_url
 
