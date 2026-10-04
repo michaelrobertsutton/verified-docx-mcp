@@ -1,6 +1,8 @@
 # Live stack acceptance handoff (#61)
 
-Status: **pending real Word execution**. This document records no new pass.
+Status: **partially executed on 2026-10-04** (Word for Mac 16.113.3, macOS 26.6.2;
+see "Execution results" at the end). Rows not listed as PASS are NOT RUN, BLOCKED or
+NOT SUPPORTED, not passed. #61 stays open.
 Run on disposable copies only. Keep #61 open until the matrix has evidence.
 The #58 visibility PR and #60 shape PR have separate commits: test each exact
 PR head before merge; record a combined integration commit if testing together.
@@ -97,3 +99,40 @@ Do not close #58 merely because full revision visibility passes: reliable
 individual accept/reject for omitted items remains unresolved. Keep #61 open
 until pending and blocked rows are resolved or explicitly dispositioned by the
 reviewer, including client limitations and behavioral decisions.
+
+## Execution results (2026-10-04, Word for Mac 16.113.3, macOS 26.6.2)
+
+Local documents are Word-authored (generated fixtures are labelled as such in the PR
+comments). Hosted rows used a personal OneDrive/SharePoint folder, opened from the
+synced copy; the pane reported the `https://…sharepoint.com/…` document URL.
+Evidence is in the acceptance comments on PR #62 (revisions), #64 (shapes), #68
+(document name) and #67 (opening the pane).
+
+| Scenario | Result | Evidence / note |
+| --- | --- | --- |
+| Existing gates 41, 42, 43, 44, 45, 48 | **PARTIAL** | #48 (live revisions) covered by the #62 run; shape guards (#44, #35-46) by the #64 run. Gates 41, 42, 43 and 45 were **NOT RUN**. |
+| Encoded cloud URL | **FAIL, fixed, PASS on the fix** | A hosted file `Accépt test 61 #1.docx` registered as `Accépt test 61 ` (the `#` was read as a URL fragment), so tools addressing the real name got `LIVE_UNAVAILABLE`. Fixed in PR #68; after the fix the session is `Accépt test 61 #1.docx` and the live read succeeds. |
+| Online pane (Word for the web) | **NOT RUN** | Sideloading into Word Online was not attempted. |
+| Duplicate panes | **NOT RUN** | A second window/pane for one document was not opened. |
+| Full restart | **PASS (shape handles)** | After Word was force-quit and relaunched several times, a text-box handle from the earlier session was refused (`LIVE_STALE`) with no mutation op sent and the document unchanged. Revision handles after a pane reconnect also refuse (#62). Comment handles were **NOT RUN**. |
+| Revision clients | **PASS on Mac; Windows and WordApi 1.4/1.5 BLOCKED** | Mac: merged insert/delete visible, full metadata, accept/reject-all, individual actionability (see #62). No Windows or older client was available. |
+| Old pane guards (no `comment_loss_guard` / `shape_guard`) | **NOT RUN** | |
+| Shape read failure (transient, persistent) | **NOT RUN on a real host** | Covered only by the JS harness, which is not a real-Word pass. |
+| Shape read-back failure | **NOT RUN on a real host** | Covered only by the JS harness. |
+| Protected formatting | **BLOCKED** | No way found to protect a shape paragraph on Word for Mac. |
+| Malformed paragraph OOXML | **NOT RUN** | |
+| Legacy inventory (genuine VML-only / AlternateContent) | **BLOCKED** | No genuine legacy fixture. Word-authored DrawingML with VML fallback exists but is not a substitute. |
+| Shape-local guards | **PARTIAL** | A tracked insertion inside a text box refuses replace and format (`TRACKED_CHANGES_PRESENT`) on Mac, local and hosted. A comment inside a text box is **NOT SUPPORTED** on Word for Mac: it cannot be created and a comment anchor patched into the file is dropped on load. |
+| #60 paragraph fallback | **PASS on Mac (local + hosted); Windows BLOCKED** | See #64. |
+
+### Host findings from this run (each fixed on its PR)
+- `Range.search` on shape text **freezes Word for Mac** (100% CPU, no AppleEvent answered) when it has a hit. Shape text is no longer searched (#64).
+- Every comment lookup inside shape text throws `GeneralException`. The shape comment guard reads the shape body's OOXML and fails closed (#64).
+- Word writes `w:date` as local time labelled `Z`; the true UTC instant is `w16du:dateUtc`. Office.js reports deletion text as empty and omits merged deletions (#62).
+- A hosted file name containing `#` was truncated by the document-name parser (#68).
+- After a Word restart the add-in button moves under **Home > Add-ins > Developer Add-ins** and is not exposed to accessibility scripting (see #66; `live_autoopen` in #67 removes the need to open the pane by hand for tagged documents).
+
+### Behavior decisions (observed, not changed)
+- **Revision handles after an individual accept/reject:** observed. A second id from the same listing is refused with `REVISION_ID_NOT_FOUND`; re-list before another individual edit (#62).
+- **Tracked-delete `delete_paragraph` reporting `VERIFICATION_FAILED` while tracking is on:** NOT RUN.
+- **Closing a newer pane does not re-register a displaced older pane:** NOT RUN (needs the duplicate-pane row).
