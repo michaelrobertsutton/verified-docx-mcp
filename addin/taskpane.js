@@ -1451,7 +1451,7 @@ async function guardRevisions(context, ranges) {
   // Word for Mac's range.getTrackedChanges() only returns changes fully inside
   // the range, so a match that sits inside (or straddles) a larger revision
   // reports nothing. Compare against every revision in the match's paragraphs.
-  const scoped = ranges.filter(r => r.paragraphs && typeof r.compareLocationWith === "function");
+  const scoped = ranges.filter(r => r.paragraphs && typeof r.paragraphs.getFirst === "function" && typeof r.compareLocationWith === "function");
   const nearby = scoped.map(r => {
     const first = r.paragraphs.getFirst(), last = r.paragraphs.getLast();
     const changes = first.getRange("Start").expandTo(last.getRange("End")).getTrackedChanges();
