@@ -1,8 +1,9 @@
 # Live stack acceptance handoff (#61)
 
-Status: **partially executed on 2026-10-04** (Word for Mac 16.113.3, macOS 26.6.2;
-see "Execution results" at the end). Rows not listed as PASS are NOT RUN, BLOCKED or
-NOT SUPPORTED, not passed. #61 stays open.
+Status: **executed on 2026-10-04 on Word for Mac 16.113.3 / macOS 26.6.2** (see "Execution results"
+at the end). Rows not listed as PASS are BLOCKED, NOT SUPPORTED or OUT OF SCOPE with the
+reason stated, not passed. Reviewer scope decision: Mac only (Windows and Word for the web
+are out of scope).
 Run on disposable copies only. Keep #61 open until the matrix has evidence.
 The #58 visibility PR and #60 shape PR have separate commits: test each exact
 PR head before merge; record a combined integration commit if testing together.
@@ -110,17 +111,17 @@ Evidence is in the acceptance comments on PR #62 (revisions), #64 (shapes), #68
 
 | Scenario | Result | Evidence / note |
 | --- | --- | --- |
-| Existing gates 41, 42, 43, 44, 45, 48 | **PARTIAL** | #48 (live revisions) covered by the #62 run; shape guards (#44, #35-46) by the #64 run. Gates 41, 42, 43 and 45 were **NOT RUN**. |
+| Existing gates 41, 42, 43, 44, 45, 48 | **PASS on Mac, local + hosted** (see notes) | Run on a Word-authored fixture (`scripts/make_gates_fixture.applescript`) with one script per gate. **#43** 11/11 (unique delete, mark gone, neighbours unchanged; duplicate, final, table-cell, stale revision, pending revision and comment-bearing paragraphs refuse without mutation; tracking restored). **#42** 8/8 (partial and full range comments with replies; default refuses before any match changes; `allow_comment_loss` reports exactly the threads Word lost; outside comments survive). **#41** 14/14 (identical author/text/anchor comments, epoch-qualified handles, reply/resolve hit only the addressed comment, text-only duplicate match refuses, old-epoch handles refuse after a reconnect, fresh handles work, file-mode read and reply on the closed copy). **#45** 8 of 9 plus one expectation corrected: replaced preserves plain, `none` clears direct formatting, mixed refuses, multiple matches and empty replacement apply, every `format_text` property applies to a table-cell substring (independent read-back); `previous` gave the new text the formatting of the text it replaced (plain), not the preceding bold, i.e. Word's own inheritance, which is what the policy documents. #44 and #48: see the #64 and #62 runs. **Not run within these gates:** a paragraph anchoring a floating shape (#43), content-only/ambiguous *file* correlations (#41), a protected range (#45). Note: a file-mode write on a copy Word has since saved is refused (`EXTERNAL_EDITOR_ACTIVE`) until `allow_concurrent_editor=true`, by design. |
 | Encoded cloud URL | **FAIL, fixed, PASS on the fix** | A hosted file `Accépt test 61 #1.docx` registered as `Accépt test 61 ` (the `#` was read as a URL fragment), so tools addressing the real name got `LIVE_UNAVAILABLE`. Fixed in PR #68; after the fix the session is `Accépt test 61 #1.docx` and the live read succeeds. |
-| Online pane (Word for the web) | **NOT RUN** | Sideloading into Word Online was not attempted. |
-| Duplicate panes | **NOT RUN** | A second window/pane for one document was not opened. |
+| Online pane (Word for the web) | **OUT OF SCOPE (reviewer: Mac only)** | Not attempted. |
+| Duplicate panes | **PASS (observed)** | Two real windows of one document (Window > New Window), each with a pane. The second pane displaced the first: one session registered, a `same_document_duplicate` collision recorded with both instance ids, and live calls were answered only by the newer pane (no routing through the displaced one). Closing the newer window left the session registered and answering (the pane runtime is not torn down per window), so no stale routing and no re-registration question arose in this setup. |
 | Full restart | **PASS (shape handles)** | After Word was force-quit and relaunched several times, a text-box handle from the earlier session was refused (`LIVE_STALE`) with no mutation op sent and the document unchanged. Revision handles after a pane reconnect also refuse (#62). Comment handles were **NOT RUN**. |
 | Revision clients | **PASS on Mac; Windows and WordApi 1.4/1.5 BLOCKED** | Mac: merged insert/delete visible, full metadata, accept/reject-all, individual actionability (see #62). No Windows or older client was available. |
-| Old pane guards (no `comment_loss_guard` / `shape_guard`) | **NOT RUN** | |
-| Shape read failure (transient, persistent) | **NOT RUN on a real host** | Covered only by the JS harness, which is not a real-Word pass. |
-| Shape read-back failure | **NOT RUN on a real host** | Covered only by the JS harness. |
+| Old pane guards (no `comment_loss_guard` / `shape_guard`) | **PASS** | Disposable pane copies (scratch only) that do not advertise the capability. Without `comment_loss_guard` a body `replace_text` is refused (`LIVE_CAPABILITY_MISSING`, no pane op sent, body unchanged). Without `shape_guard` guarded writes and `list_shapes` are refused (`LIVE_CAPABILITY_MISSING`) before reaching the pane; document unchanged. |
+| Shape read failure (transient, persistent) | **PASS** | Disposable pane copy whose shape-scope read throws. Transient (first read only): one retry, then 7 text boxes with their real text. Persistent: `HOST_SHAPE_READ_FAILED`, `retryable: true`, exactly two attempts, never an empty string. |
+| Shape read-back failure | **PASS** | Disposable pane copy whose shape `insertText` does nothing: `VERIFICATION_FAILED` with accurate before/after evidence and no claimed rollback; the shape text is unchanged. |
 | Protected formatting | **BLOCKED** | No way found to protect a shape paragraph on Word for Mac. |
-| Malformed paragraph OOXML | **NOT RUN** | |
+| Malformed paragraph OOXML | **PASS** | Disposable pane copy that corrupts the paragraph OOXML before inspection: `delete_paragraph` refuses (`STRUCTURAL_BOUNDARY`) before any deletion; text, other paragraphs and shapes preserved. |
 | Legacy inventory (genuine VML-only / AlternateContent) | **BLOCKED** | No genuine legacy fixture. Word-authored DrawingML with VML fallback exists but is not a substitute. |
 | Shape-local guards | **PARTIAL** | A tracked insertion inside a text box refuses replace and format (`TRACKED_CHANGES_PRESENT`) on Mac, local and hosted. A comment inside a text box is **NOT SUPPORTED** on Word for Mac: it cannot be created and a comment anchor patched into the file is dropped on load. |
 | #60 paragraph fallback | **PASS on Mac (local + hosted); Windows BLOCKED** | See #64. |
@@ -134,5 +135,15 @@ Evidence is in the acceptance comments on PR #62 (revisions), #64 (shapes), #68
 
 ### Behavior decisions (observed, not changed)
 - **Revision handles after an individual accept/reject:** observed. A second id from the same listing is refused with `REVISION_ID_NOT_FOUND`; re-list before another individual edit (#62).
-- **Tracked-delete `delete_paragraph` reporting `VERIFICATION_FAILED` while tracking is on:** NOT RUN.
-- **Closing a newer pane does not re-register a displaced older pane:** NOT RUN (needs the duplicate-pane row).
+- **Tracked-delete `delete_paragraph` reporting `VERIFICATION_FAILED` while tracking is on:** observed on Word for Mac, local and hosted. The paragraph collection keeps the deleted paragraph (count 15 before and after) while the live markup shows the `w:del`, so the strict count check reports `VERIFICATION_FAILED` with the observed effects instead of claiming success, and the tracking mode is restored. Policy unchanged; a decision is needed only if this should become a success with a different check.
+- **Closing a newer pane does not re-register a displaced older pane:** not reproducible on Word for Mac: after the newer window closed, the newer pane's session stayed registered and kept answering. Policy unchanged.
+
+### Dispositions of the rows that are not a plain PASS
+- **Windows, older WordApi 1.4/1.5 clients, Word Online:** out of scope per the reviewer (Mac only). They stay unverified, not passed.
+- **Protected formatting:** BLOCKED by the host: no way was found to make a shape paragraph write-protected on Word for Mac, so a refused-write path cannot be provoked. The verified-write contract is covered by the read-back failure row above.
+- **Genuine legacy VML-only / AlternateContent inventory:** BLOCKED: no genuine legacy fixture is available; Word-authored DrawingML with VML fallback is not a substitute.
+- **Comment inside a text box:** NOT SUPPORTED on Word for Mac (Word does not keep one).
+- **Not run within the existing gates:** floating-shape-anchored paragraph delete (#43) and content-only/ambiguous file correlations (#41), listed in the gates row.
+
+### How the injected-failure rows were run
+Each used a disposable copy of the pane (`taskpane.js`) in a scratch directory served by a separate bridge, never a branch: one fixed patch per variant (capability not advertised; shape read throws first time / always; shape `insertText` made a no-op; paragraph OOXML replaced by `<broken`). The real Word session then ran the real tool calls against it.
