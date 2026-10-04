@@ -285,6 +285,9 @@ VALID_OPS: frozenset[str] = frozenset(
         "revisions_accept",
         "revisions_reject",
         "save",
+        # issue #66: tag a document so Word opens the Live pane with it
+        "autoopen_get",
+        "autoopen_set",
     }
 )
 

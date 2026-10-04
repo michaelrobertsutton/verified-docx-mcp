@@ -1693,6 +1693,38 @@ def format_text(
 
 
 @mcp.tool()
+def live_autoopen(path: str, enabled: bool | None = None) -> dict[str, Any]:
+    """Read or set whether Word opens the Live pane automatically with this document.
+
+    The pane has to be opened by hand once per document (Home > Add-ins >
+    Developer Add-ins > verified-docx-mcp). Calling this with `enabled=true`
+    from that pane writes the Office document setting
+    `Office.AutoShowTaskpaneWithDocument` into the .docx, so every later open
+    of that document (local or SharePoint/OneDrive, Word for Mac 15.34+ /
+    Windows / web) shows the pane and connects it without a click. Omit
+    `enabled` to only read the current state.
+
+    The setting is stored inside the document and travels with it. It is
+    harmless for people without the add-in (Office ignores it), but it does
+    mark the document as modified, so ask before tagging a document that is
+    not disposable. The pane only auto-opens if the add-in is sideloaded or
+    centrally deployed; the manifest must use the
+    `Office.AutoShowTaskpaneWithDocument` TaskpaneId (it does).
+
+    Returns `enabled`, `supported`, `was_enabled` (when set) and `applied`.
+    Errors: LIVE_UNAVAILABLE (no pane connected for this document),
+    LIVE_CAPABILITY_MISSING (an older pane build, or a host without
+    AddinCommands 1.1), VERIFICATION_FAILED (the setting did not read back).
+    """
+    from .live.autoopen_live import execute_autoopen
+
+    try:
+        return execute_autoopen(path, enabled)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
 def live_save(path: str) -> dict[str, Any]:
     """Ask the connected Word task pane to save the live document.
 

@@ -1097,3 +1097,36 @@ cannot be cross-checked, instead of failing the operation
 Issue #58 remains open: safe individual addressing of omitted revisions still
 needs investigation on real Word builds. Do not treat complete visibility as
 complete individual editing support.
+
+
+### Opening the pane automatically (#66)
+
+The pane has to be opened by hand **once per document**. Then call
+`live_autoopen(path, enabled=true)` from that pane: it writes the Office
+document setting `Office.AutoShowTaskpaneWithDocument` into the document (the
+manifest's `TaskpaneId` is the same name, which is what makes Word honour it),
+reads it back, and `live_save` persists it. From then on, opening that document
+shows the pane and connects it with no click. Without `enabled` the tool only
+reads the current state. Verified on Word for Mac 16.113.3: tag, save, close,
+reopen, and the session connected unattended.
+
+What the tag is and is not:
+- It is stored inside the .docx (`word/webextensions/`, `store="developer"`,
+  `storeType="Registry"`), so it travels with the file, including to
+  SharePoint/OneDrive. It marks the document as modified. Ask before tagging a
+  document that is not disposable. People without the add-in are unaffected.
+- It only works where the add-in is sideloaded or centrally deployed, not for a
+  Marketplace install, and needs AddinCommands 1.1 (Word for Mac 15.34+,
+  Windows 1705+, web). The tool refuses with `LIVE_CAPABILITY_MISSING` on an
+  older pane build or host.
+- After the manifest changes, fully quit and reopen Word and reinstall the
+  manifest from `addin/` into the `wef` folder, then open the pane once more.
+
+Not covered: the first open of each document is still manual. After a Word
+restart the ribbon button moves to **Home > Add-ins > Developer Add-ins >
+verified-docx-mcp** (the popover is not exposed to accessibility scripting, so
+only a real mouse event works). `OnDocumentOpened` event-based activation would
+cover every document without tagging, but Microsoft documents it as unavailable
+on Office for Mac and it needs admin deployment. A shared-runtime startup
+behaviour (`Office.addin.setStartupBehavior`) is also document-scoped and was
+not tried.
