@@ -1427,6 +1427,7 @@ def replace_text(
     allow_concurrent_editor: bool = False,
     allow_comment_loss: bool = False,
     inherit_format: str = "replaced",
+    scope: str = "body",
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
 
@@ -1580,6 +1581,7 @@ def replace_text(
             track_changes=track_changes,
             write_mode=write_mode,
             within_row_containing=within_row_containing,
+            scope=scope,
             allow_comment_loss=allow_comment_loss,
             inherit_format=inherit_format,
             allow_concurrent_editor=allow_concurrent_editor,
@@ -1600,6 +1602,7 @@ def format_text(
     write_mode: str = "auto",
     within_row_containing: str | None = None,
     allow_concurrent_editor: bool = False,
+    scope: str = "body",
 ) -> dict[str, Any]:
     """Apply character styling (bold/italic/underline/strike/color) to a
     matched text span, without touching its content.
@@ -1674,6 +1677,7 @@ def format_text(
             track_changes=track_changes,
             write_mode=write_mode,
             within_row_containing=within_row_containing,
+            scope=scope,
             allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
@@ -3350,6 +3354,28 @@ def doctor() -> int:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_textboxes(path: str) -> dict[str, Any]:
+    """List live text-bearing shapes with epoch handles, coverage and revisions."""
+    from .live.scopes_live import read_scope
+
+    try:
+        return read_scope(path)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def read_textbox(path: str, textbox_id: str) -> dict[str, Any]:
+    """Read one live text box. Host failures are distinct from verified empty text."""
+    from .live.scopes_live import read_scope
+
+    try:
+        return read_scope(path, textbox_id)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
 
 
 def main() -> None:

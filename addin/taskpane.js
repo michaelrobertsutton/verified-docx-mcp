@@ -230,7 +230,7 @@ const OP_LOG_LIMIT = 20;
 // issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
 // find_sections / list_tables).
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback"];
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes"];
 
 // issue #33: the largest body_ooxml reply (UTF-8 bytes of its JSON) the pane
 // will send. Kept below the bridge's 64 MiB websocket max_size so an
@@ -497,6 +497,12 @@ async function dispatchOp(op, payload) {
       return opTableInsert(payload);
     case "cells_set":
       return opCellsSet(payload);
+    case "textboxes_list":
+      return opTextboxesList();
+    case "textboxes_read":
+      return opTextboxesRead(payload);
+    case "scope_describe":
+      return opScopeDescribe(payload);
     case "revisions_list":
       return opRevisionsList();
     case "revisions_accept":
@@ -671,6 +677,22 @@ async function resolveRowCells(context, rowAnchorText) {
 }
 
 async function searchScoped(context, payload) {
+  if (payload.scope && payload.scope !== "body") {
+    if (payload.rowAnchor) throw refusalError("Row scope cannot be combined with text-box scopes", "INVALID_INPUT");
+    const resolved = await resolveScopes(context, payload.scope, true);
+    const results = resolved.bodies.map(b => b.body.search(payload.find, {matchCase: true, matchWholeWord: false}));
+    results.forEach(r => r.load("text"));
+    resolved.bodies.forEach(b => b.body.load("text"));
+    await context.sync();
+    // Word for Mac 16.113 returns no search results inside shape text although the
+    // same body reads back correctly. Say so instead of reporting "found 0".
+    const blind = resolved.bodies.filter((b, i) => b.scope !== "body" && !results[i].items.length &&
+      String(b.body.text || "").includes(payload.find));
+    if (blind.length) throw refusalError(
+      `Word cannot search inside ${blind.map(b => b.shape.name).join(", ")}: the text is present but Range.search returns no matches in shape text on this host, so it cannot be addressed`,
+      "LIVE_CAPABILITY_MISSING");
+    return results.flatMap(r => r.items);
+  }
   if (payload.rowAnchor === null || payload.rowAnchor === undefined) {
     const results = context.document.body.search(payload.find, { matchCase: true, matchWholeWord: false });
     results.load("text");
@@ -691,6 +713,8 @@ async function searchScoped(context, payload) {
 async function opReplace(payload) {
   const expectedMatches = payload.expected_matches;
   return Word.run(async (context) => {
+    await requireFreshBody(context, payload.expectedBodySha256);
+    await requireFreshScope(context, payload);
     const body = context.document.body;
     body.load("text");
     await context.sync();
@@ -755,16 +779,26 @@ async function opReplace(payload) {
     await context.sync();
     const postHash = await sha256Hex(postBody.text || "");
 
-    const remainingComments = await collectComments(context, {anchors: true, replies: true});
+    const remainingScope = await resolveScopes(context, payload.scope || "body", true);
+    const remainingComments = [];
+    for (const item of remainingScope.bodies) {
+      const collection = item.body.getComments();
+      collection.load("items/id");
+      await context.sync();
+      remainingComments.push(...collection.items);
+    }
     const remainingIds = new Set(remainingComments.map(c => c.id));
     const commentsRemoved = commentsBefore.filter(c => !remainingIds.has(c.id));
-    return { comments_removed: commentsRemoved, applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
+    const scopePost = await scopeHash(context, payload.scope || "body");
+    return { scope_post: scopePost, comments_removed: commentsRemoved, applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
   });
 }
 
 async function opFormat(payload) {
   const expectedMatches = payload.expected_matches;
   return Word.run(async (context) => {
+    await requireFreshBody(context, payload.expectedBodySha256);
+    await requireFreshScope(context, payload);
     const body = context.document.body;
     body.load("text");
     await context.sync();
@@ -839,7 +873,8 @@ async function opFormat(payload) {
     await context.sync();
     const postHash = await sha256Hex(postBody.text || "");
 
-    return { applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
+    const scopePost = await scopeHash(context, payload.scope || "body");
+    return { scope_post: scopePost, applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
   });
 }
 
@@ -1560,29 +1595,97 @@ async function verifyCommentIdentity(context, comment, identity) {
 }
 
 async function guardComments(context, ranges, allowLoss) {
-  const comments = context.document.body.getComments();
-  comments.load("items/id,items/content,items/authorName,items/resolved");
-  await context.sync();
-  const entries = comments.items.map(comment => {
-    const anchor = comment.getRange();
-    anchor.load("text");
-    comment.replies.load("items/id,items/content,items/authorName");
-    return {comment, anchor, relations: ranges.map(range => anchor.compareLocationWith(range))};
-  });
-  await context.sync();
-  const disjoint = new Set(["Before", "After", "AdjacentBefore", "AdjacentAfter"]);
-  const affected = entries.filter(e => e.relations.some(r => !disjoint.has(r.value))).map(e => ({
-    id: e.comment.id, content: e.comment.content, authorName: e.comment.authorName,
-    resolved: e.comment.resolved, anchorText: e.anchor.text,
-    replies: e.comment.replies.items.map(r => ({id: r.id, content: r.content, authorName: r.authorName}))
-  }));
-  if (affected.length && allowLoss !== true)
-    throw refusalError(`Replacement overlaps comments: ${JSON.stringify(affected)}`, "WOULD_DELETE_COMMENTS");
-  return affected;
+  const affected = new Map();
+  for (const range of ranges) {
+    const comments = range.getComments();
+    comments.load("items/id,items/content,items/authorName,items/resolved");
+    await context.sync();
+    const entries = comments.items.map(comment => {
+      const anchor = comment.getRange();
+      anchor.load("text");
+      comment.replies.load("items/id,items/content,items/authorName");
+      return {comment, anchor, relation: anchor.compareLocationWith(range)};
+    });
+    await context.sync();
+    const disjoint = new Set(["Before", "After", "AdjacentBefore", "AdjacentAfter"]);
+    entries.filter(e => !disjoint.has(e.relation.value)).forEach(e => affected.set(e.comment.id, {
+      id: e.comment.id, content: e.comment.content, authorName: e.comment.authorName,
+      resolved: e.comment.resolved, anchorText: e.anchor.text,
+      replies: e.comment.replies.items.map(r => ({id: r.id, content: r.content, authorName: r.authorName}))
+    }));
+  }
+  const result = [...affected.values()];
+  if (result.length && allowLoss !== true)
+    throw refusalError(`Replacement overlaps comments: ${JSON.stringify(result)}`, "WOULD_DELETE_COMMENTS");
+  return result;
 }
 
 const FONT_FIELDS = ["bold", "italic", "underline", "strikeThrough", "color", "name", "size",
   "doubleStrikeThrough", "subscript", "superscript"];
 function fontSnapshot(font) {
   return Object.fromEntries(FONT_FIELDS.map(k => [k, font[k]]));
+}
+
+async function resolveScopes(context, scope, writing=false) {
+  if (scope === 'body') return {bodies: [{scope: 'body', body: context.document.body}], warnings: []};
+  if (!Office.context.requirements.isSetSupported('WordApiDesktop', '1.2'))
+    throw refusalError('Text boxes require WordApiDesktop 1.2', 'LIVE_CAPABILITY_MISSING');
+  if (scope !== 'all' && !scope.startsWith(`textbox:${paneEpoch}:`))
+    throw refusalError('Stale or invalid text-box handle; list again', 'LIVE_STALE');
+  try {
+    const shapes = context.document.body.shapes;
+    shapes.load('items/id,items/name,items/type');
+    await context.sync();
+    const warnings = shapes.items.filter(s => s.type === Word.ShapeType.group || s.type === Word.ShapeType.canvas)
+      .map(s => ({shape_id: s.id, reason: 'group/canvas text coverage unavailable'}));
+    if (scope === 'all' && writing && warnings.length)
+      throw refusalError('Cannot safely write all scopes with incomplete shape coverage', 'LIVE_CAPABILITY_MISSING');
+    const selected = shapes.items.filter(s => s.type === Word.ShapeType.textBox || s.type === Word.ShapeType.geometricShape)
+      .filter(s => scope === 'all' || `textbox:${paneEpoch}:${s.id}` === scope);
+    if (scope !== 'all' && selected.length !== 1) throw refusalError('Text box no longer exists', 'LIVE_STALE');
+    selected.forEach(s => s.body.load('text'));
+    await context.sync();
+    const bodies = selected.map(s => {
+      if (typeof s.body.text !== 'string') throw new Error('host returned missing text');
+      return {scope: `textbox:${paneEpoch}:${s.id}`, body: s.body, shape: {id:s.id,name:s.name,type:s.type}};
+    });
+    if (scope === 'all') bodies.unshift({scope:'body',body:context.document.body});
+    return {bodies,warnings};
+  } catch (err) {
+    if (err.code === 'LIVE_STALE' || err.code === 'LIVE_CAPABILITY_MISSING') throw err;
+    throw refusalError(`Shape read failed (retryable): ${err.message || err}`, 'HOST_SHAPE_READ_FAILED');
+  }
+}
+async function scopeHash(context, scope) {
+  const resolved = await resolveScopes(context, scope);
+  resolved.bodies.forEach(b => b.body.load('text'));
+  await context.sync();
+  return sha256Hex(JSON.stringify(resolved.bodies.map(b => [b.scope,b.body.text])));
+}
+async function requireFreshScope(context, payload) {
+  if (payload.expectedScopeSha256 && await scopeHash(context,payload.scope || 'body') !== payload.expectedScopeSha256)
+    throw refusalError('Scope changed since it was read; nothing written', 'LIVE_STALE');
+}
+async function opScopeDescribe(payload) {
+  return Word.run(async context => ({scopeSha256:await scopeHash(context,payload.scope || 'body'),
+    bodySha256:await requireFreshBody(context),session_epoch:paneEpoch}));
+}
+async function opTextboxesList() {
+  return Word.run(async context => {
+    const resolved = await resolveScopes(context,'all');
+    const textboxes = [];
+    for (const item of resolved.bodies.filter(b => b.shape)) {
+      textboxes.push({textbox_id:item.scope,text:item.body.text,shape:item.shape,
+        revision:`live:scope:${await scopeHash(context,item.scope)}`});
+    }
+    return {textboxes,session_epoch:paneEpoch,coverage:resolved.warnings.length ? 'partial':'body_shapes',warnings:resolved.warnings};
+  });
+}
+async function opTextboxesRead(payload) {
+  return Word.run(async context => {
+    const resolved = await resolveScopes(context,payload.scope);
+    const item = resolved.bodies[0];
+    return {textbox_id:item.scope,text:item.body.text,shape:item.shape,session_epoch:paneEpoch,
+      revision:`live:scope:${await scopeHash(context,payload.scope)}`};
+  });
 }

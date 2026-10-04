@@ -772,6 +772,7 @@ def execute_replace_text_live(
     within_row_containing: str | None = None,
     allow_comment_loss: bool = False,
     inherit_format: str = "replaced",
+    scope: str = "body",
 ) -> dict[str, Any]:
     """Live-mode ``replace_text`` (issue #106 WP-3): sends a ``replace``
     op over the pane's WSS ops channel instead of editing the .docx file.
@@ -823,7 +824,13 @@ def execute_replace_text_live(
         )
 
     try:
-        pre_hash = _live_describe(session, path, revision_before)
+        if scope != "body":
+            from .live.scopes_live import scope_state
+            scope_info = scope_state(session, scope, revision_before)
+            pre_hash = scope_info["bodySha256"]
+        else:
+            scope_info = None
+            pre_hash = _live_describe(session, path, revision_before)
     except LiveDisconnected as exc:
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
 
@@ -835,6 +842,10 @@ def execute_replace_text_live(
         "allow_comment_loss": allow_comment_loss,
         "inherit_format": inherit_format,
     }
+    payload["scope"] = scope
+    payload["expectedBodySha256"] = pre_hash
+    if scope_info:
+        payload["expectedScopeSha256"] = scope_info["scopeSha256"]
     if within_row_containing:
         payload["rowAnchor"] = within_row_containing
     try:
@@ -854,7 +865,7 @@ def execute_replace_text_live(
     match_count = result.get("match_count", len(matches))
     post_hash = result.get("post")
 
-    if not result.get("applied") or post_hash == pre_hash:
+    if not result.get("applied") or (result.get("scope_post") == scope_info["scopeSha256"] if scope_info else post_hash == pre_hash):
         raise _make_error(
             ErrorCode.VERIFICATION_FAILED,
             "live replace did not verify: the pane's post-op body hash did not change from its "
@@ -904,6 +915,9 @@ def execute_replace_text_live(
 # limitation (see server.py's docstrings), not solved here.
 # ---------------------------------------------------------------------------
 
+    if scope_info:
+        evidence["revision_before"] = f"live:scope:{scope_info['scopeSha256']}"
+        evidence["revision_after"] = f"live:scope:{result['scope_post']}"
     evidence["matches"] = matches
     evidence["comments_removed"] = result.get("comments_removed", [])
     return evidence
@@ -997,6 +1011,7 @@ def execute_replace_text(
     within_row_containing: str | None = None,
     allow_comment_loss: bool = False,
     inherit_format: str = "replaced",
+    scope: str = "body",
 ) -> dict[str, Any]:
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
@@ -1008,10 +1023,13 @@ def execute_replace_text(
             revision_before=revision_before,
             track_changes=track_changes,
             within_row_containing=within_row_containing,
+            scope=scope,
             allow_comment_loss=allow_comment_loss,
             inherit_format=inherit_format,
         )
 
+    if scope != "body":
+        raise _make_error(ErrorCode.INVALID_INPUT, "scope requires live mode")
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(
         resolved,
@@ -1084,6 +1102,7 @@ def execute_format_text_live(
     revision_before: str | None = None,
     track_changes: bool = False,
     within_row_containing: str | None = None,
+    scope: str = "body",
 ) -> dict[str, Any]:
     """Live-mode ``format_text`` (issue #106 WP-3): sends a ``format`` op
     over the pane's WSS ops channel instead of editing the .docx file.
@@ -1128,7 +1147,13 @@ def execute_format_text_live(
         )
 
     try:
-        pre_hash = _live_describe(session, path, revision_before)
+        if scope != "body":
+            from .live.scopes_live import scope_state
+            scope_info = scope_state(session, scope, revision_before)
+            pre_hash = scope_info["bodySha256"]
+        else:
+            scope_info = None
+            pre_hash = _live_describe(session, path, revision_before)
     except LiveDisconnected as exc:
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
 
@@ -1142,6 +1167,10 @@ def execute_format_text_live(
         "color": style.get("color"),
         "track_changes": track_changes,
     }
+    payload["scope"] = scope
+    payload["expectedBodySha256"] = pre_hash
+    if scope_info:
+        payload["expectedScopeSha256"] = scope_info["scopeSha256"]
     if within_row_containing:
         payload["rowAnchor"] = within_row_containing
     try:
@@ -1219,7 +1248,7 @@ def execute_format_text_live(
     before_text = "\n".join(m.get("before", "") for m in matches)
     after_text = "\n".join(m.get("after", "") for m in matches)
 
-    return live_write_mode.live_evidence(
+    evidence = live_write_mode.live_evidence(
         applied=True,
         match_count=match_count,
         rung=1,
@@ -1237,6 +1266,12 @@ def execute_format_text_live(
 # Tool 2: format_text
 # ---------------------------------------------------------------------------
 
+    if scope_info:
+        evidence["revision_before"] = f"live:scope:{scope_info['scopeSha256']}"
+        evidence["revision_after"] = f"live:scope:{result['scope_post']}"
+    evidence["matches"] = matches
+    return evidence
+
 
 def execute_format_text(
     path: str,
@@ -1250,6 +1285,7 @@ def execute_format_text(
     track_changes: bool = False,
     write_mode: str = "auto",
     within_row_containing: str | None = None,
+    scope: str = "body",
 ) -> dict[str, Any]:
     style = _validate_style(style)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
@@ -1262,8 +1298,11 @@ def execute_format_text(
             revision_before=revision_before,
             track_changes=track_changes,
             within_row_containing=within_row_containing,
+            scope=scope,
         )
 
+    if scope != "body":
+        raise _make_error(ErrorCode.INVALID_INPUT, "scope requires live mode")
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(
         resolved,
