@@ -10,7 +10,8 @@ from verified_docx_mcp.live import comments_live, revisions_live
 
 def test_old_pane_never_reports_placeholder_revisions():
     session = SimpleNamespace(hello=SimpleNamespace(capabilities=set()))
-    with patch.object(comments_live, "_session_for", return_value=session), \
+    with patch.object(comments_live, "_request", return_value={}), \
+         patch.object(comments_live, "_session_for", return_value=session), \
          patch.object(comments_live, "_document_name_and_path", return_value=(Path("/tmp/doc.docx"), "doc")), \
          patch.object(comments_live, "_live_state", return_value=([], [])), \
          patch.object(comments_live, "_request", return_value={"session_epoch": "epoch"}), \
