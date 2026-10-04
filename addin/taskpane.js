@@ -682,7 +682,15 @@ async function searchScoped(context, payload) {
     const resolved = await resolveScopes(context, payload.scope, true);
     const results = resolved.bodies.map(b => b.body.search(payload.find, {matchCase: true, matchWholeWord: false}));
     results.forEach(r => r.load("text"));
+    resolved.bodies.forEach(b => b.body.load("text"));
     await context.sync();
+    // Word for Mac 16.113 returns no search results inside shape text although the
+    // same body reads back correctly. Say so instead of reporting "found 0".
+    const blind = resolved.bodies.filter((b, i) => b.scope !== "body" && !results[i].items.length &&
+      String(b.body.text || "").includes(payload.find));
+    if (blind.length) throw refusalError(
+      `Word cannot search inside ${blind.map(b => b.shape.name).join(", ")}: the text is present but Range.search returns no matches in shape text on this host, so it cannot be addressed`,
+      "LIVE_CAPABILITY_MISSING");
     return results.flatMap(r => r.items);
   }
   if (payload.rowAnchor === null || payload.rowAnchor === undefined) {
