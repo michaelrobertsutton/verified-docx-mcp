@@ -230,7 +230,7 @@ const OP_LOG_LIMIT = 20;
 // issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
 // find_sections / list_tables).
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes"];
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph"];
 
 // issue #33: the largest body_ooxml reply (UTF-8 bytes of its JSON) the pane
 // will send. Kept below the bridge's 64 MiB websocket max_size so an
@@ -497,6 +497,8 @@ async function dispatchOp(op, payload) {
       return opTableInsert(payload);
     case "cells_set":
       return opCellsSet(payload);
+    case "paragraph_delete":
+      return opParagraphDelete(payload);
     case "textboxes_list":
       return opTextboxesList();
     case "textboxes_read":
@@ -1687,5 +1689,69 @@ async function opTextboxesRead(payload) {
     const item = resolved.bodies[0];
     return {textbox_id:item.scope,text:item.body.text,shape:item.shape,session_epoch:paneEpoch,
       revision:`live:scope:${await scopeHash(context,payload.scope)}`};
+  });
+}
+
+function inspectDeleteParagraph(xml) {
+  const doc = new DOMParser().parseFromString(xml,'application/xml');
+  const w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  if (doc.getElementsByTagName('parsererror').length)
+    throw refusalError('Paragraph OOXML inspection failed', 'STRUCTURAL_BOUNDARY');
+  const bodies = [...doc.getElementsByTagNameNS(w,'body')];
+  if (bodies.length !== 1) throw refusalError('Incomplete paragraph body inspection', 'STRUCTURAL_BOUNDARY');
+  const paragraphs = [...bodies[0].getElementsByTagNameNS(w,'p')];
+  const wp = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing';
+  // A text box's own paragraphs are nested in the target's OOXML, so report an
+  // anchored shape as that before the paragraph count can mislabel it.
+  if (bodies[0].getElementsByTagNameNS(wp,'anchor').length || bodies[0].getElementsByTagNameNS('urn:schemas-microsoft-com:vml','shape').length)
+    throw refusalError('Paragraph anchors a shape; re-anchoring is not supported', 'STRUCTURAL_BOUNDARY');
+  // Word's getOoxml appends one empty paragraph after the range (issue #33's
+  // trailing empty paragraph); anything else extra means the inspection saw
+  // more than the target paragraph.
+  const emptyTrailer = q => !(q.textContent || '').trim() && !q.getElementsByTagNameNS(wp,'anchor').length &&
+    !q.getElementsByTagNameNS(w,'drawing').length && !q.getElementsByTagNameNS(w,'pict').length &&
+    !q.getElementsByTagNameNS(w,'sectPr').length;
+  if (paragraphs.length < 1 || paragraphs.length > 2 || (paragraphs.length === 2 && !emptyTrailer(paragraphs[1])))
+    throw refusalError('Incomplete paragraph inspection', 'STRUCTURAL_BOUNDARY');
+  const p = paragraphs[0];
+  if (p.getElementsByTagNameNS(wp,'anchor').length || p.getElementsByTagNameNS('urn:schemas-microsoft-com:vml','shape').length)
+    throw refusalError('Paragraph anchors a shape; re-anchoring is not supported', 'STRUCTURAL_BOUNDARY');
+  if (p.getElementsByTagNameNS(w,'sectPr').length)
+    throw refusalError('Paragraph is a section boundary', 'STRUCTURAL_BOUNDARY');
+}
+async function opParagraphDelete(payload) {
+  return Word.run(async context => {
+    const pre = await requireFreshBody(context,payload.expectedBodySha256);
+    const paragraphs = context.document.body.paragraphs;
+    paragraphs.load('items/text,items/tableNestingLevel');
+    await context.sync();
+    const before = paragraphs.items.map(p => p.text);
+    const indexes = before.map((text,i) => text === payload.anchor_text ? i : -1).filter(i => i >= 0);
+    if (indexes.length !== 1) throw refusalError(`Expected unique whole paragraph, found ${indexes.length}`, 'MATCH_COUNT_MISMATCH');
+    const index = indexes[0];
+    const target = paragraphs.items[index];
+    if (index === before.length-1 || target.tableNestingLevel !== 0)
+      throw refusalError('Cannot delete final or table-cell paragraph', 'STRUCTURAL_BOUNDARY');
+    const xml = target.getOoxml();
+    await context.sync();
+    inspectDeleteParagraph(xml.value);
+    const range = target.getRange(Word.RangeLocation.whole);
+    await guardComments(context,[range],false);
+    await guardRevisions(context,[range]);
+    await withTracking(context,payload.track_changes,async () => {
+      target.delete();
+      await context.sync();
+    });
+    const remaining = context.document.body.paragraphs;
+    remaining.load('items/text');
+    context.document.body.load('text');
+    await context.sync();
+    const after = remaining.items.map(p => p.text);
+    const expected = before.filter((_,i) => i !== index);
+    const result = {applied:true,before_count:before.length,after_count:after.length,
+      before_paragraphs:before,after_paragraphs:after,pre,post:await sha256Hex(context.document.body.text || '')};
+    if (JSON.stringify(after) !== JSON.stringify(expected))
+      throw refusalError(`Paragraph deletion read-back failed; observed effects: ${JSON.stringify(result)}`, 'VERIFICATION_FAILED');
+    return result;
   });
 }
