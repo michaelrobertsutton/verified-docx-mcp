@@ -238,7 +238,7 @@ const OP_LOG_LIMIT = 20;
 // find_sections / list_tables).
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
 // issue #39: "comment_counts" = comments_list reports counts/scope/observed_at.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts"];
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -527,6 +527,10 @@ async function dispatchOpUnchecked(op, payload) {
       return opPing();
     case "describe":
       return opDescribe();
+    case "autoopen_get":
+      return opAutoopenGet();
+    case "autoopen_set":
+      return opAutoopenSet(payload);
     case "body_ooxml":
       return opBodyOoxml();
     case "search":
@@ -584,6 +588,37 @@ async function opPing() {
     await context.sync();
     return {};
   });
+}
+
+// issue #66: Office opens the add-in's task pane with a document that carries this
+// document setting (manifest TaskpaneId Office.AutoShowTaskpaneWithDocument). The
+// setting travels in the .docx; the pane must already be open once to write it.
+const AUTOOPEN_SETTING = "Office.AutoShowTaskpaneWithDocument";
+function autoopenSupported() {
+  try {
+    return Office.context.requirements.isSetSupported("AddinCommands", "1.1");
+  } catch (error) {
+    return false;
+  }
+}
+function opAutoopenGet() {
+  return {
+    enabled: Office.context.document.settings.get(AUTOOPEN_SETTING) === true,
+    supported: autoopenSupported(),
+    session_epoch: paneEpoch,
+  };
+}
+async function opAutoopenSet(payload) {
+  if (typeof payload.enabled !== "boolean") throw refusalError("enabled must be true or false", "INVALID_INPUT");
+  if (!autoopenSupported()) throw refusalError("This Office host does not support auto-opening a task pane (AddinCommands 1.1)", "LIVE_CAPABILITY_MISSING");
+  const settings = Office.context.document.settings;
+  const before = settings.get(AUTOOPEN_SETTING) === true;
+  settings.set(AUTOOPEN_SETTING, payload.enabled);
+  await new Promise((resolve, reject) => settings.saveAsync(result =>
+    result.status === Office.AsyncResultStatus.Succeeded ? resolve() : reject(new Error(`settings.saveAsync failed: ${result.error && result.error.message}`))));
+  const after = settings.get(AUTOOPEN_SETTING) === true;
+  if (after !== payload.enabled) throw refusalError(`autoopen setting did not take (wanted ${payload.enabled}, read back ${after})`, "VERIFICATION_FAILED");
+  return {enabled: after, was_enabled: before, supported: true, session_epoch: paneEpoch};
 }
 
 async function opDescribe() {
