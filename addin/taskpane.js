@@ -1568,21 +1568,29 @@ async function revisionObjects(context, body) {
 // deletion into one item, so the API list undercounts. The document part's own
 // revision markup is the cross-check; null means "could not be read".
 const REVISION_MARKUP = /<w:(?:ins|del|moveFrom|moveTo|rPrChange|pPrChange|sectPrChange|tblPrChange|trPrChange|tcPrChange|tblGridChange|cellIns|cellDel|cellMerge|numberingChange)[\s/>]/g;
-async function bodyRevisionMarkupCount(context) {
+// One guarded read of the body OOXML: null means it could not be read. Shared by the
+// markup count and the revision listing so a failed read never fails the whole op.
+async function bodyOoxmlOrNull(context) {
   try {
     const ooxml = context.document.body.getOoxml();
     await context.sync();
-    const xml = String(ooxml.value || "");
-    const start = xml.indexOf('pkg:name="/word/document.xml"');
-    let part = xml;
-    if (start >= 0) {
-      const end = xml.indexOf("</pkg:part>", start);
-      part = end >= 0 ? xml.slice(start, end) : xml.slice(start);
-    }
-    return (part.match(REVISION_MARKUP) || []).length;
+    return String(ooxml.value || "");
   } catch (error) {
     return null;
   }
+}
+function revisionMarkupCount(xml) {
+  const start = xml.indexOf('pkg:name="/word/document.xml"');
+  let part = xml;
+  if (start >= 0) {
+    const end = xml.indexOf("</pkg:part>", start);
+    part = end >= 0 ? xml.slice(start, end) : xml.slice(start);
+  }
+  return (part.match(REVISION_MARKUP) || []).length;
+}
+async function bodyRevisionMarkupCount(context) {
+  const xml = await bodyOoxmlOrNull(context);
+  return xml === null ? null : revisionMarkupCount(xml);
 }
 async function opRevisionsList() {
   if (!revisionsSupported()) return {revisions: null, coverage: "unavailable", reason: "WordApi 1.6 required"};
@@ -1598,8 +1606,11 @@ async function opRevisionsList() {
       return {id, change, range};
     });
     await context.sync();
-    const markup = await bodyRevisionMarkupCount(context);
-    return {coverage: "body", session_epoch: paneEpoch, ooxml_revision_count: markup, revisions: entries.map(({id, change, range}) => ({
+    const xml = await bodyOoxmlOrNull(context);
+    const markup = xml === null ? null : revisionMarkupCount(xml);
+    // An unreadable body OOXML must not fail the listing: omit revision_ooxml and the
+    // server keeps the Office.js inventory (ooxml_revision_count null = unverified).
+    return {...(xml === null ? {} : {revision_ooxml: xml}), coverage: "body", session_epoch: paneEpoch, ooxml_revision_count: markup, revisions: entries.map(({id, change, range}) => ({
       revision_id: id, type: change.type, author: change.author, date: change.date,
       text: change.text, paragraph_context: range.paragraphs.items.map(p => p.text), scope: "body"
     }))};
