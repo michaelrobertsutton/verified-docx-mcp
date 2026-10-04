@@ -35,6 +35,21 @@ assert.equal(partial.revisions.length, 1);assert.equal(partial.ooxml_revision_co
 // Accept-all goes through the collection so merged revisions are covered too.
 const everything = await sandbox.api.opRevisionsMutate({},'accept');
 assert.equal(everything.ooxml_after, 0);assert.equal(items.length, 0);
+// An unreadable body OOXML must not fail the listing (it once aborted live_status too):
+// the Office.js inventory is kept, revision_ooxml is omitted, the markup count is unknown.
+items = [revision('a')]; hidden = 0;
+const realOoxml = body.getOoxml;
+body.getOoxml = () => {throw new Error('getOoxml failed');};
+const unreadable = await sandbox.api.opRevisionsList();
+assert.equal(unreadable.revisions.length, 1);assert.equal(unreadable.ooxml_revision_count, null);
+assert.equal('revision_ooxml' in unreadable, false);
+body.getOoxml = realOoxml;
+// A readable body ships its OOXML, read once, alongside the inventory.
+let reads = 0;
+body.getOoxml = () => {reads++; return realOoxml();};
+const readable = await sandbox.api.opRevisionsList();
+assert.match(readable.revision_ooxml, /<w:ins /);assert.equal(readable.ooxml_revision_count, 1);assert.equal(reads, 1);
+body.getOoxml = realOoxml; items = [];
 // An accept that leaves markup behind must not claim success.
 items = [revision('a')]; hidden = 1;
 collection.acceptAll = () => {};
