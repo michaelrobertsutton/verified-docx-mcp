@@ -71,7 +71,11 @@ def _identity(item: dict[str, Any]) -> tuple[Any, ...]:
     # Word writes w:date as LOCAL wall-clock time labelled "Z"; the true UTC instant is
     # w16du:dateUtc. Office.js reports a real UTC instant, so prefer dateUtc when present.
     when = item.get("date_utc") or item.get("date")
-    return (item.get("type"), item.get("author"), _instant(when), item.get("text"))
+    # Office.js reports the text of a Deleted revision as "" (observed on Word for Mac
+    # 16.113.3) while the markup carries it, so deletions are identified without text.
+    # Uniqueness on both sides is still required, so identical deletions stay read-only.
+    text = None if item.get("type") == "Deleted" else item.get("text")
+    return (item.get("type"), item.get("author"), _instant(when), text)
 
 
 def _markup_revisions(xml: str, epoch: str) -> list[dict[str, Any]]:

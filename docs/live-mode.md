@@ -1055,6 +1055,8 @@ headers and footers are not included. `ooxml_id` is informational, never an
 Office.js handle. Each entry has `source`, `actionable`, and
 `actionability_reason`. Individual handles are attached only when both
 inventories have equal counts and type/author/date/text match uniquely in each.
+Office.js reports the text of a deletion as empty, so deletions are matched on
+type/author/date only and stay read-only if that is not unique.
 Dates are compared as exact UTC instants. Word writes `w:date` as local
 wall-clock time labelled `Z` (observed on Word for Mac 16.113.3), so the
 comparison prefers `w16du:dateUtc`, which is the true UTC instant, and reports
