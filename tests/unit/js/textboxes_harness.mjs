@@ -28,8 +28,48 @@ await assert.rejects(()=>f.sandbox.api.opTextboxesList(),e=>e.code==='HOST_SHAPE
 // A host that cannot search shape text must say so, not report "found 0".
 const blind=fixture(path,'blind text',false);
 blind.body.search=()=>({items:[],load(){}});
+blind.body.paragraphs={get items(){return [{text:blind.state.text,getRange:()=>blind.ranges(0,blind.state.text.length)}];},load(){}};
+const blindSync=f.context.sync;
+f.context.sync=async()=>{await blindSync();await blind.context.sync();};
 items=[{id:9,name:'blind',type:'TextBox',body:blind.body}];
 const blindHandle=(await f.sandbox.api.opTextboxesList()).textboxes[0].textbox_id;
 await assert.rejects(()=>f.sandbox.api.opReplace({scope:blindHandle,find:'blind',replace:'x',expected_matches:1}),
   e=>e.code==='LIVE_CAPABILITY_MISSING'&&/cannot search inside blind/.test(e.message));
+// Whole-paragraph fallback uses the normal guards and read-back path.
+await assert.rejects(()=>f.sandbox.api.opReplace({scope:blindHandle,find:'blind text',replace:'x',expected_matches:2}),
+  e=>e.code==='LIVE_OP_FAILED'&&/expected 2/.test(e.message));
+assert.equal(blind.state.text,'blind text');
+const whole=await f.sandbox.api.opReplace({scope:blindHandle,find:'blind text',replace:'updated shape',expected_matches:1,inherit_format:'previous'});
+assert.equal(whole.match_count,1);assert.equal(blind.state.text,'updated shape');
+assert.equal(f.state.text,'body text');
+const formatted=await f.sandbox.api.opFormat({scope:blindHandle,find:'updated shape',expected_matches:1,bold:true});
+assert.equal(formatted.matches[0].boldAfter,true);
+blind.state.comments=[{id:'inside',start:0,end:13,load(){},getRange(){return blind.ranges(0,13);},replies:{items:[],load(){}}}];
+await assert.rejects(()=>f.sandbox.api.opReplace({scope:blindHandle,find:'updated shape',replace:'no',expected_matches:1,inherit_format:'previous'}),
+  e=>e.code==='WOULD_DELETE_COMMENTS');
+await assert.rejects(()=>f.sandbox.api.opFormat({scope:blindHandle,find:'updated shape',expected_matches:1,bold:false}),
+  e=>e.code==='WOULD_DELETE_COMMENTS');
+assert.equal(blind.state.text,'updated shape');
+blind.state.comments=[];
+const fresh=await f.sandbox.api.opScopeDescribe({scope:blindHandle});
+blind.state.text='changed shape';
+await assert.rejects(()=>f.sandbox.api.opReplace({scope:blindHandle,expectedScopeSha256:fresh.scopeSha256,
+  find:'changed shape',replace:'no',expected_matches:1}),e=>e.code==='LIVE_STALE');
+blind.state.text='updated shape';
+// Do not address only the whole-paragraph occurrence while omitting a substring.
+blind.state.text='updated\rupdated shape';
+blind.body.paragraphs={items:[{text:'updated',getRange:()=>blind.ranges(0,7)}],load(){}};
+await assert.rejects(()=>f.sandbox.api.opFormat({scope:blindHandle,find:'updated',expected_matches:1,bold:false}),
+  e=>e.code==='LIVE_CAPABILITY_MISSING');
+blind.state.text='updated shape';
+blind.body.paragraphs={get items(){return [{text:blind.state.text,getRange:()=>blind.ranges(0,blind.state.text.length)}];},load(){}};
+// A host that ignores a replacement must fail read-back verification.
+blind.body.paragraphs={items:[{text:'updated shape',getRange(){const range=blind.ranges(0,13);range.insertText=()=>blind.ranges(0,13);return range;}}],load(){}};
+await assert.rejects(()=>f.sandbox.api.opReplace({scope:blindHandle,find:'updated shape',replace:'ignored',expected_matches:1,inherit_format:'previous'}),
+  e=>e.code==='VERIFICATION_FAILED');
+blind.body.paragraphs={get items(){return [{text:blind.state.text,getRange:()=>blind.ranges(0,blind.state.text.length)}];},load(){}};
+const getRange=blind.body.paragraphs.items[0].getRange;
+blind.body.paragraphs={items:[{text:'updated shape',getRange(){const range=getRange();range.getTrackedChanges=()=>({items:[{}],load(){}});return range;}}],load(){}};
+await assert.rejects(()=>f.sandbox.api.opReplace({scope:blindHandle,find:'updated shape',replace:'no',expected_matches:1}),
+  e=>e.code==='TRACKED_CHANGES_PRESENT');
 console.log('text boxes passed');

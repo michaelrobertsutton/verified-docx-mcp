@@ -742,14 +742,34 @@ async function searchScoped(context, payload) {
     results.forEach(r => r.load("text"));
     resolved.bodies.forEach(b => b.body.load("text"));
     await context.sync();
-    // Word for Mac 16.113 returns no search results inside shape text although the
-    // same body reads back correctly. Say so instead of reporting "found 0".
-    const blind = resolved.bodies.filter((b, i) => b.scope !== "body" && !results[i].items.length &&
-      String(b.body.text || "").includes(payload.find));
-    if (blind.length) throw refusalError(
-      `Word cannot search inside ${blind.map(b => b.shape.name).join(", ")}: the text is present but Range.search returns no matches in shape text on this host, so it cannot be addressed`,
-      "LIVE_CAPABILITY_MISSING");
-    return results.flatMap(r => r.items);
+    // Some hosts read shape text but return no search results. Address only
+    // exact paragraph content, excluding its paragraph mark and shape anchor.
+    const merged = [];
+    for (let i = 0; i < resolved.bodies.length; i++) {
+      const item = resolved.bodies[i];
+      if (item.scope === "body" || results[i].items.length ||
+          !String(item.body.text || "").includes(payload.find)) {
+        merged.push(...results[i].items);
+        continue;
+      }
+      const paragraphs = item.body.paragraphs;
+      paragraphs.load("items/text");
+      await context.sync();
+      const exact = paragraphs.items.filter(p => p.text === payload.find);
+      // Every literal occurrence must be addressed: don't silently skip a
+      // substring in another paragraph when a whole paragraph also matches.
+      const occurrences = String(item.body.text || "").split(payload.find).length - 1;
+      if (!payload.find || exact.length !== occurrences) throw refusalError(
+        `Word cannot search inside ${item.shape.name}; this host supports only exact whole-paragraph shape edits`,
+        "LIVE_CAPABILITY_MISSING");
+      const ranges = exact.map(p => p.getRange("Content"));
+      ranges.forEach(r => r.load("text"));
+      await context.sync();
+      if (ranges.some(r => r.text !== payload.find)) throw refusalError(
+        "Shape paragraph content could not be addressed exactly", "LIVE_CAPABILITY_MISSING");
+      merged.push(...ranges);
+    }
+    return merged;
   }
   if (payload.rowAnchor === null || payload.rowAnchor === undefined) {
     const results = context.document.body.search(payload.find, { matchCase: true, matchWholeWord: false });
@@ -869,6 +889,11 @@ async function opFormat(payload) {
       throw refusalError(
         `expected ${expectedMatches} match(es) for ${JSON.stringify(payload.find)}, found ${matchItems.length}`
       );
+    }
+
+    if (payload.scope && payload.scope !== "body") {
+      await guardRevisions(context, matchItems);
+      await guardComments(context, matchItems, false);
     }
 
     let previousMode = null;
