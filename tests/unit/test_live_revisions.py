@@ -157,6 +157,18 @@ def test_deletion_matches_although_office_js_reports_empty_text():
     assert [i["actionable"] for i in ambiguous] == [False, True, False]
 
 
+def test_unreadable_markup_is_reported_partial_not_complete():
+    # The pane omitted revision_ooxml and the count (body OOXML unreadable): the API list cannot
+    # be cross-checked, so it must not be presented as complete body coverage.
+    session = SimpleNamespace(hello=SimpleNamespace(capabilities={"live_revisions"}))
+    reply = {"revisions": [{"revision_id": "h", "type": "Added", "author": "A", "date": "d", "text": "x"}],
+             "coverage": "body", "ooxml_revision_count": None}
+    with patch.object(comments_live, "_request", return_value=reply):
+        state = revisions_live.list_revisions(session)
+    assert state["coverage"] == "partial" and "could not be read" in state["reason"]
+    assert len(state["revisions"]) == 1
+
+
 def test_date_instants_are_not_truncated_or_guessed():
     # Sub-second difference is a different instant.
     assert not _handle_for("2026-10-04T14:55:00.500Z", _single_insert_xml("d", "2026-10-04T14:55:00Z"))

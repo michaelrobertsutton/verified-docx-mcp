@@ -30,7 +30,12 @@ def list_revisions(session: Any) -> dict[str, Any]:
                                 actionability_reason=None, source="ooxml+officejs")
         return {**state, "revisions": inventory, "ooxml_revision_count": len(inventory),
                 "coverage": "body", "reason": None}
-    if revisions is not None and isinstance(markup, int) and markup > len(revisions):
+    if revisions is not None and markup is None:
+        # The body markup could not be read, so the API list cannot be cross-checked.
+        state = {**state, "coverage": "partial", "reason": (
+            "Body revision markup could not be read, so this list may omit revisions "
+            "Word merged into neighbours (e.g. deletions)")}
+    elif revisions is not None and isinstance(markup, int) and markup > len(revisions):
         # Word's API merged or dropped items: never present this list as complete.
         state = {**state, "coverage": "partial", "reason": (
             f"Word's API returned {len(revisions)} revisions but the document body has {markup}; "

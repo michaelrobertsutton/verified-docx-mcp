@@ -1069,7 +1069,8 @@ mutation with `LIVE_CAPABILITY_MISSING`; use collection-level accept/reject-all
 instead. Duplicate metadata also remains read-only. Malformed OOXML reports
 partial coverage; if the pane cannot read the body OOXML at all, it omits
 `revision_ooxml` and returns the Office.js inventory with
-`ooxml_revision_count: null` (unverified) instead of failing the operation
+`ooxml_revision_count: null` and reports `coverage: partial`, since the list
+cannot be cross-checked, instead of failing the operation
 (`live_status` and `list_open_items` depend on it); older panes retain their API inventory and coverage warning.
 Issue #58 remains open: safe individual addressing of omitted revisions still
 needs investigation on real Word builds. Do not treat complete visibility as
