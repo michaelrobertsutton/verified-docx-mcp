@@ -577,6 +577,9 @@ def execute_lock_status(
     directory = resolved.parent
     target_name = resolved.name
 
+    from . import desktop_word
+
+    desktop_status = desktop_word.status(resolved)
     owner_file = _find_owner_file(directory, target_name)
 
     sample_1 = _stat_sample(resolved)
@@ -589,6 +592,7 @@ def execute_lock_status(
     result: dict[str, Any] = {
         "path": str(resolved),
         "owner_file": owner_file,
+        "desktop_word": desktop_status,
         "sync_quiesced": sync_quiesced,
         "sync_detail": {
             "sample_1": sample_1,

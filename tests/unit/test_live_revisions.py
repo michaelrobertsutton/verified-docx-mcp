@@ -25,6 +25,18 @@ def test_live_list_does_not_substitute_file_state():
         assert revisions_live.list_revisions(session)["revisions"][0]["text"] == "live"
 
 
+def test_partial_coverage_is_reported_when_markup_exceeds_api_list():
+    session = SimpleNamespace(hello=SimpleNamespace(capabilities={"live_revisions"}))
+    reply = {"revisions": [{"text": "a"}] * 2, "coverage": "body", "ooxml_revision_count": 5}
+    with patch.object(comments_live, "_request", return_value=reply):
+        state = revisions_live.list_revisions(session)
+    assert state["coverage"] == "partial"
+    assert "2 revisions" in state["reason"] and "has 5" in state["reason"]
+    full = {**reply, "ooxml_revision_count": 2}
+    with patch.object(comments_live, "_request", return_value=full):
+        assert revisions_live.list_revisions(session)["coverage"] == "body"
+
+
 def test_revision_js_behavior():
     node = shutil.which("node")
     assert node, "Node is required for new pane behavior tests"

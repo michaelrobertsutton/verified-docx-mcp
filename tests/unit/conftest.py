@@ -17,3 +17,13 @@ def _isolated_state_dir(tmp_path_factory, monkeypatch):
     ``os.environ["XDG_STATE_HOME"]``.
     """
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path_factory.mktemp("state")))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_desktop_word_query(monkeypatch, request):
+    """Unit writes must never query the developer's actual Word session."""
+    if request.node.module.__name__ == 'test_desktop_word':
+        return
+    from verified_docx_mcp import desktop_word
+    monkeypatch.setattr(desktop_word, 'status', lambda path:
+                        {'supported': True, 'checked': True, 'open': False})

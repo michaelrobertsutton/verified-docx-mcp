@@ -401,6 +401,12 @@ def _build_table(tokens: list[Any], open_idx: int, close_idx: int, ctx: StyleCon
         ET.SubElement(tblpr, _w("tblStyle"), {_wa("val"): ctx.table_style_id})
     ET.SubElement(tblpr, _w("tblW"), {_wa("w"): "0", _wa("type"): "auto"})
 
+    # Explicit borders render consistently even when TableNormal is selected.
+    borders = ET.SubElement(tblpr, _w("tblBorders"))
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        ET.SubElement(borders, _w(edge), {_wa("val"): "single", _wa("sz"): "4",
+                                        _wa("space"): "0", _wa("color"): "auto"})
+
     row_data: list[list[list[RunSpec]]] = []
     j = open_idx + 1
     while j < close_idx:
