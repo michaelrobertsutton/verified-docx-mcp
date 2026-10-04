@@ -391,20 +391,13 @@ class WriteWindowTests(_Base):
         def post_verify_with_external_write(path: Path):
             _external_overwrite(path, old="R1C1", new="EXTERNAL")
 
-        result = mutations.atomic_replace_docx_parts(
-            self.target, self._overrides(), post_verify=post_verify_with_external_write
+        envelope = self.assertRefused(
+            ErrorCode.VERIFICATION_FAILED, mutations.atomic_replace_docx_parts,
+            self.target, self._overrides(), post_verify=post_verify_with_external_write,
         )
-        self.assertTrue(result["external_change_during_write"])
-        self.assertFalse(result["ledger_logged"])
-        # revision_after is the token of the bytes we STAGED, not a re-read of
-        # what an external writer left behind (the bug that hid #27's step 4).
-        current = projection.compute_revision(self.target)["token"]
-        self.assertNotEqual(result["revision_after"], current)
-        # ...so the next call's revision_before, taken from it, conflicts.
-        self.assertRefused(
-            ErrorCode.REVISION_CONFLICT, self.write_cell, "next", revision_before=result["revision_after"]
-        )
-        # The ledger was NOT updated to claim bytes we did not produce.
+        self.assertTrue(envelope.diagnostics["external_change_during_write"])
+        self.assertTrue(envelope.diagnostics["rollback_skipped"])
+        self.assertTrue(Path(envelope.diagnostics["jsbak_path"]).exists())
         self.assertEqual(self.activity()["ledger"], "none")
 
     def test_verification_failure_after_external_change_does_not_roll_back(self):

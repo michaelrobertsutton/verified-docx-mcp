@@ -8,7 +8,14 @@ from . import comments_live, write_mode
 def list_revisions(session: Any) -> dict[str, Any]:
     if "live_revisions" not in session.hello.capabilities:
         return {"revisions": None, "coverage": "unavailable", "reason": "pane lacks live_revisions"}
-    return comments_live._request(session, "revisions_list")
+    state = comments_live._request(session, "revisions_list")
+    revisions, markup = state.get("revisions"), state.get("ooxml_revision_count")
+    if revisions is not None and isinstance(markup, int) and markup > len(revisions):
+        # Word's API merged or dropped items: never present this list as complete.
+        state = {**state, "coverage": "partial", "reason": (
+            f"Word's API returned {len(revisions)} revisions but the document body has {markup}; "
+            "adjacent tracked insertions and deletions can be merged into one item, so this list is incomplete.")}
+    return state
 
 
 def mutate_revisions(path: str, action: str, ids: list[str] | None,

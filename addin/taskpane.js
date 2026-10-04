@@ -710,7 +710,15 @@ async function searchScoped(context, payload) {
     const resolved = await resolveScopes(context, payload.scope, true);
     const results = resolved.bodies.map(b => b.body.search(payload.find, {matchCase: true, matchWholeWord: false}));
     results.forEach(r => r.load("text"));
+    resolved.bodies.forEach(b => b.body.load("text"));
     await context.sync();
+    // Word for Mac 16.113 returns no search results inside shape text although the
+    // same body reads back correctly. Say so instead of reporting "found 0".
+    const blind = resolved.bodies.filter((b, i) => b.scope !== "body" && !results[i].items.length &&
+      String(b.body.text || "").includes(payload.find));
+    if (blind.length) throw refusalError(
+      `Word cannot search inside ${blind.map(b => b.shape.name).join(", ")}: the text is present but Range.search returns no matches in shape text on this host, so it cannot be addressed`,
+      "LIVE_CAPABILITY_MISSING");
     return results.flatMap(r => r.items);
   }
   if (payload.rowAnchor === null || payload.rowAnchor === undefined) {
@@ -1489,6 +1497,26 @@ async function revisionObjects(context, body) {
   await context.sync();
   return changes;
 }
+// Word for Mac's getTrackedChanges() can merge an adjacent insertion and
+// deletion into one item, so the API list undercounts. The document part's own
+// revision markup is the cross-check; null means "could not be read".
+const REVISION_MARKUP = /<w:(?:ins|del|moveFrom|moveTo|rPrChange|pPrChange|sectPrChange|tblPrChange|trPrChange|tcPrChange|tblGridChange|cellIns|cellDel|cellMerge|numberingChange)[\s/>]/g;
+async function bodyRevisionMarkupCount(context) {
+  try {
+    const ooxml = context.document.body.getOoxml();
+    await context.sync();
+    const xml = String(ooxml.value || "");
+    const start = xml.indexOf('pkg:name="/word/document.xml"');
+    let part = xml;
+    if (start >= 0) {
+      const end = xml.indexOf("</pkg:part>", start);
+      part = end >= 0 ? xml.slice(start, end) : xml.slice(start);
+    }
+    return (part.match(REVISION_MARKUP) || []).length;
+  } catch (error) {
+    return null;
+  }
+}
 async function opRevisionsList() {
   if (!revisionsSupported()) return {revisions: null, coverage: "unavailable", reason: "WordApi 1.6 required"};
   return Word.run(async context => {
@@ -1503,7 +1531,8 @@ async function opRevisionsList() {
       return {id, change, range};
     });
     await context.sync();
-    return {coverage: "body", session_epoch: paneEpoch, revisions: entries.map(({id, change, range}) => ({
+    const markup = await bodyRevisionMarkupCount(context);
+    return {coverage: "body", session_epoch: paneEpoch, ooxml_revision_count: markup, revisions: entries.map(({id, change, range}) => ({
       revision_id: id, type: change.type, author: change.author, date: change.date,
       text: change.text, paragraph_context: range.paragraphs.items.map(p => p.text), scope: "body"
     }))};
@@ -1511,10 +1540,27 @@ async function opRevisionsList() {
 }
 async function guardRevisions(context, ranges) {
   if (!revisionsSupported()) throw refusalError("Cannot inspect revisions: WordApi 1.6 required", "LIVE_CAPABILITY_MISSING");
+  const refuse = () => refusalError("Accept or reject intersecting revisions before replacing text", "TRACKED_CHANGES_PRESENT");
   const collections = ranges.map(r => r.getTrackedChanges());
   collections.forEach(c => c.load("items"));
   await context.sync();
-  if (collections.some(c => c.items.length)) throw refusalError("Accept or reject intersecting revisions before replacing text", "TRACKED_CHANGES_PRESENT");
+  if (collections.some(c => c.items.length)) throw refuse();
+  // Word for Mac's range.getTrackedChanges() only returns changes fully inside
+  // the range, so a match that sits inside (or straddles) a larger revision
+  // reports nothing. Compare against every revision in the match's paragraphs.
+  const scoped = ranges.filter(r => r.paragraphs && typeof r.paragraphs.getFirst === "function" && typeof r.compareLocationWith === "function");
+  const nearby = scoped.map(r => {
+    const first = r.paragraphs.getFirst(), last = r.paragraphs.getLast();
+    const changes = first.getRange("Start").expandTo(last.getRange("End")).getTrackedChanges();
+    changes.load("items");
+    return changes;
+  });
+  await context.sync();
+  const comparisons = [];
+  nearby.forEach((changes, i) => changes.items.forEach(change => comparisons.push(scoped[i].compareLocationWith(change.getRange()))));
+  await context.sync();
+  const apart = new Set(["Before", "After", "AdjacentBefore", "AdjacentAfter"]);
+  if (comparisons.some(c => !apart.has(c.value))) throw refuse();
 }
 async function opRevisionsMutate(payload, action) {
   const retained = payload.revision_ids == null ? [] : payload.revision_ids.map(id => {
@@ -1527,7 +1573,9 @@ async function opRevisionsMutate(payload, action) {
     await requireFreshBody(context, payload.expectedBodySha256);
     const changes = await revisionObjects(context, context.document.body);
     const before = changes.items.length;
-    const selected = payload.revision_ids == null ? changes.items : payload.revision_ids.map(id => {
+    const markupBefore = await bodyRevisionMarkupCount(context);
+    const all = payload.revision_ids == null;
+    const selected = all ? changes.items : payload.revision_ids.map(id => {
       const entry = revisionHandles.get(id);
       if (!entry || entry.epoch !== paneEpoch) throw refusalError("Stale revision handle; list revisions again", "REVISION_ID_NOT_FOUND");
       return entry.change;
@@ -1535,14 +1583,22 @@ async function opRevisionsMutate(payload, action) {
     // Validate every retained object before queuing any mutation.
     selected.forEach(c => c.load("author,date,text,type"));
     await context.sync();
-    selected.forEach(c => c[action]());
+    // One collection call covers items Word's list merged; per-item calls do not.
+    if (all && typeof changes[`${action}All`] === "function") changes[`${action}All`]();
+    else selected.forEach(c => c[action]());
     await context.sync();
     const remaining = await revisionObjects(context, context.document.body);
+    const markupAfter = await bodyRevisionMarkupCount(context);
     context.document.body.load("text");
     await context.sync();
     const result = {applied: true, before_count: before, after_count: remaining.items.length,
-      changed_count: selected.length, post: await sha256Hex(context.document.body.text || "")};
-    if (result.after_count !== before - selected.length) throw refusalError(JSON.stringify(result), "VERIFICATION_FAILED");
+      changed_count: selected.length, ooxml_before: markupBefore, ooxml_after: markupAfter,
+      post: await sha256Hex(context.document.body.text || "")};
+    // The API list can undercount, so progress is judged on the markup itself.
+    const verified = all ? remaining.items.length === 0 && !markupAfter
+      : markupBefore != null && markupAfter != null ? markupAfter < markupBefore
+        : result.after_count === before - selected.length;
+    if (!verified) throw refusalError(JSON.stringify(result), "VERIFICATION_FAILED");
     revisionHandles.forEach(e => {e.change.untrack(); e.collection.untrack();});
     revisionHandles.clear();
     await context.sync();
@@ -1675,7 +1731,14 @@ function inspectDeleteParagraph(xml) {
   if (shapeNodes(bodies[0]).length)
     throw refusalError('Paragraph anchors a shape; re-anchoring is not supported', 'ANCHORED_SHAPES');
   const paragraphs = [...bodies[0].getElementsByTagNameNS(w,'p')];
-  if (paragraphs.length !== 1) throw refusalError('Incomplete paragraph inspection', 'STRUCTURAL_BOUNDARY');
+  // Word's getOoxml appends one empty paragraph after the range (issue #33's
+  // trailing empty paragraph); anything else extra means the inspection saw
+  // more than the target paragraph.
+  const emptyTrailer = q => !(q.textContent || '').trim() && !shapeNodes(q).length &&
+    !q.getElementsByTagNameNS(w,'drawing').length && !q.getElementsByTagNameNS(w,'pict').length &&
+    !q.getElementsByTagNameNS(w,'sectPr').length;
+  if (paragraphs.length < 1 || paragraphs.length > 2 || (paragraphs.length === 2 && !emptyTrailer(paragraphs[1])))
+    throw refusalError('Incomplete paragraph inspection', 'STRUCTURAL_BOUNDARY');
   const p = paragraphs[0];
   if (p.getElementsByTagNameNS(w,'sectPr').length)
     throw refusalError('Paragraph is a section boundary', 'STRUCTURAL_BOUNDARY');
