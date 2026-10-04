@@ -33,3 +33,20 @@ shape, unsupported substrings, and replacement/format read-back failures.
 Record Word version, requirement sets, pane epoch, exact commit and write
 evidence. Actual host support remains pending; fix failures or request changes
 before merging. No whole-shape OOXML replacement is performed.
+
+### Word for Mac 16.113.3 findings (real-host acceptance)
+
+- **`Range.search` on shape text freezes Word** (100% CPU on the main thread, no
+  AppleEvent answered until the process is killed) when the text has a hit; a
+  search with no hit returns normally. Shape text is therefore never searched:
+  only exact paragraph content is addressed, through paragraph `Content` ranges.
+  Substrings and finds spanning paragraphs refuse with `LIVE_CAPABILITY_MISSING`.
+- **Comment lookups inside shape text throw `GeneralException`**
+  (`range.getComments`, `parentBody.getComments`), and Word does not keep a
+  comment anchored in a text box (one patched into the file was gone from the
+  live OOXML after load). The comment guard for shapes reads the shape body's
+  OOXML for comment marks instead, and fails closed (`LIVE_CAPABILITY_MISSING`)
+  if that cannot be read. "Comment inside a text box" cannot be produced by Word
+  for Mac, so that row is NOT SUPPORTED, not passed.
+- The revision guard works in shapes: a tracked insertion inside a text box
+  refuses replace and format with `TRACKED_CHANGES_PRESENT`.
