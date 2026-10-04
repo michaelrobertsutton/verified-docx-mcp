@@ -379,6 +379,9 @@ class HelloMessage:
     requirement_sets: dict[str, Any]
     body_sha256: str
     capabilities: frozenset[str] = frozenset()
+    # issue #39: per-load pane id (optional; an older pane sends none), so a
+    # response / live_status can say WHICH pane instance answered.
+    instance_id: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -389,6 +392,7 @@ class HelloMessage:
             "requirementSets": self.requirement_sets,
             "bodySha256": self.body_sha256,
             "capabilities": sorted(self.capabilities),
+            "instanceId": self.instance_id,
         }
 
     @classmethod
@@ -405,6 +409,7 @@ class HelloMessage:
             requirement_sets=_require(obj, "requirementSets", dict),
             body_sha256=_require(obj, "bodySha256", str),
             capabilities=frozenset(capabilities_raw),
+            instance_id=_optional(obj, "instanceId", str, default=""),
         )
 
 

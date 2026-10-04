@@ -69,6 +69,12 @@ async function collectComments(context, options) {
   comments.load("items/id,items/content,items/authorName,items/creationDate,items/resolved");
   await context.sync();
 
+  // issue #39: counts describe the WHOLE collection, never the ids-filtered
+  // subset, so a caller can compare them with what it received.
+  const counts = {
+    total: comments.items.length,
+    open: comments.items.filter((c) => !c.resolved).length,
+  };
   const picked = idFilter ? comments.items.filter((c) => idFilter.has(c.id)) : comments.items;
   const extras = picked.map((comment) => {
     let range = null;
@@ -86,7 +92,7 @@ async function collectComments(context, options) {
   });
   if (wantAnchors || wantReplies) await context.sync();
 
-  return extras.map(({ comment, range, replies }) => {
+  const items = extras.map(({ comment, range, replies }) => {
     const out = {
       id: comment.id,
       content: comment.content,
@@ -108,6 +114,7 @@ async function collectComments(context, options) {
     }
     return out;
   });
+  return { items, counts, observedAt: new Date().toISOString() };
 }
 
 async function buildReport() {
@@ -118,7 +125,7 @@ async function buildReport() {
 
     const bodyText = body.text || "";
     const bodyHash = await sha256Hex(bodyText);
-    const comments = await collectComments(context);
+    const { items: comments } = await collectComments(context);
 
     return {
       wp: "issue-106-wp1",
@@ -230,7 +237,19 @@ const OP_LOG_LIMIT = 20;
 // issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
 // find_sections / list_tables).
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard"];
+// issue #39: "comment_counts" = comments_list reports counts/scope/observed_at.
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts"];
+
+// issue #39: per-load id, sent in `hello`, so the server can say which pane
+// instance answered. Falls back when crypto.randomUUID is unavailable.
+const PANE_INSTANCE_ID = (() => {
+  try {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  } catch (err) {
+    // fall through to the non-crypto id below
+  }
+  return `pane-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+})();
 
 // issue #33: the largest body_ooxml reply (UTF-8 bytes of its JSON) the pane
 // will send. Kept below the bridge's 64 MiB websocket max_size so an
@@ -268,7 +287,17 @@ function renderSummary(report) {
   capEl.textContent = ok14 ? "supported" : "NOT supported";
   capEl.className = "v " + (ok14 ? "ok" : "bad");
   const open = (report.comments || []).filter((c) => !c.resolved).length;
-  commentsEl.textContent = String(open);
+  updateCommentsCounter(open, report.generated_at);
+}
+
+// issue #39: the counter used to be set once at pane load and never again, so
+// it could disagree with a later list_open_items with no way to tell why. It
+// now refreshes on every full comments_list and shows when it was read.
+function updateCommentsCounter(open, observedAt) {
+  const el = document.getElementById("comments-line");
+  if (!el) return;
+  const at = observedAt ? ` (as of ${String(observedAt).slice(11, 19)})` : "";
+  el.textContent = `${open}${at}`;
 }
 
 function renderActivity() {
@@ -374,6 +403,7 @@ function connectOpsSocket() {
           // than risk this pane silently ignoring an unknown payload key
           // and running an unscoped op instead.
           capabilities: PANE_CAPABILITIES,
+          instanceId: PANE_INSTANCE_ID,
         })
       );
       setWsStatus("connected");
@@ -1388,12 +1418,24 @@ async function opCommentsList(payload) {
   const p = payload || {};
   const started = Date.now();
   return Word.run(async (context) => {
-    const comments = await collectComments(context, {
+    const { items, counts, observedAt } = await collectComments(context, {
       ids: p.ids,
       anchors: p.include_anchor !== false,
       replies: true,
     });
-    return { comments, session_epoch: paneEpoch, timing_ms: { total: Date.now() - started } };
+    // issue #39: only the body collection is read (body.getComments()), so
+    // comments anchored outside the main body (headers, footers, text boxes;
+    // issue #35) are not covered. `scope` says so instead of implying more.
+    // `counts`/`observed_at` describe the whole collection at read time.
+    if (p.ids === undefined || p.ids === null) updateCommentsCounter(counts.open, observedAt);
+    return {
+      comments: items,
+      counts,
+      scope: "body",
+      observed_at: observedAt,
+      session_epoch: paneEpoch,
+      timing_ms: { total: Date.now() - started },
+    };
   });
 }
 

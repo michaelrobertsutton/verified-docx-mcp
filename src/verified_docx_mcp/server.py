@@ -695,6 +695,8 @@ def execute_live_status() -> dict[str, Any]:
                 "last_heartbeat_age_s": session.heartbeat_age(),
                 "body_sha256": session.last_body_sha256,
                 "requirement_sets": session.hello.requirement_sets,
+                "instance_id": session.hello.instance_id,
+                "platform": session.hello.platform,
                 **_revision_status(session),
             }
         )
@@ -1788,7 +1790,28 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     straight from the pane (including real reply threading, since the
     pane sees it and file mode's own reply_count=0/replies=[] limit above
     does not apply here). Resolved comments are filtered out the same way
-    file mode does, even though the pane reports them too. The response
+    file mode does, even though the pane reports them too.
+
+    Issue #39 -- READ THESE BEFORE TELLING A USER A COMMENT DOES NOT EXIST.
+    The live response leads with `counts` (`live_total`/`live_open`: the
+    pane's own count of the whole collection it read; `returned`: how many
+    open comments are in `comments`), `scope` ("body": only the main
+    document body is read, so comments anchored in headers, footers or text
+    boxes are NOT visible), `pane` (`instance_id`/`platform`/`host`/
+    `observed_at`: WHICH pane answered and when it read), and `warnings`
+    (`scope_body_only`, `same_document_duplicate` when a second pane for
+    this document was connected, `file_has_unlisted_comments` when the saved
+    file has open comments the pane did not report). `file_only_open_comments`
+    lists those. All of it is advisory: a pane that returns a stale
+    collection still reports matching counts, so the tool cannot certify
+    completeness. When a user can see a comment this does not list, say it
+    is "not visible to the pane" and quote `counts`/`scope`/`observed_at`;
+    never say it does not exist. A pane that predates `comment_counts`
+    gets computed counts plus a `pane_note`. A malformed pane reply (no
+    `comments` list, or `counts` that disagree with the comments returned)
+    raises LIVE_OP_FAILED rather than reporting an empty result.
+
+    The response
     also carries a top-level `correlation` list: for each listed live
     comment, the best-matching file-mode comment_id (durableId, or a raw
     w:id fallback) from this same document's on-disk snapshot, matched by

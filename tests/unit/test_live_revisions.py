@@ -9,12 +9,12 @@ from verified_docx_mcp.live import comments_live, revisions_live
 
 
 def test_old_pane_never_reports_placeholder_revisions():
-    session = SimpleNamespace(hello=SimpleNamespace(capabilities=set()))
+    session = SimpleNamespace(hello=SimpleNamespace(capabilities=set(), instance_id=None, platform=None, host=None))
     with patch.object(comments_live, "_request", return_value={}), \
          patch.object(comments_live, "_session_for", return_value=session), \
          patch.object(comments_live, "_document_name_and_path", return_value=(Path("/tmp/doc.docx"), "doc")), \
          patch.object(comments_live, "_live_state", return_value=([], [])), \
-         patch.object(comments_live, "_request", return_value={"session_epoch": "epoch"}), \
+         patch.object(comments_live, "_request", return_value={"comments": [], "counts": {"total": 0, "open": 0}, "session_epoch": "epoch"}), \
          patch.object(comments_live, "_file_comments_and_suggestions", return_value=([], [{"id": "fake"}])):
         result = comments_live.execute_list_open_items_live("/tmp/doc.docx")
     assert result["pending_suggestions"] is None

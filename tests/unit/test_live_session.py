@@ -104,10 +104,36 @@ class SessionCollisionTests(LiveBridgeTestCase):
     name alone. Never refused (the common case -- the SAME document
     reconnecting -- must not be flagged), but recorded so it is visible."""
 
-    async def test_same_url_reconnect_is_not_a_collision(self):
-        await self.connect_pane(document_url="/tmp/Shared/Proposal.docx")
+    async def test_same_url_reconnect_after_close_is_not_a_collision(self):
+        first = await self.connect_pane(document_url="/tmp/Shared/Proposal.docx")
+        await first.close()
+        await asyncio.sleep(0.1)  # bridge processes the close and unregisters
         await self.connect_pane(document_url="/tmp/Shared/Proposal.docx")  # reconnect, same doc
         self.assertEqual(self.registry.collisions(), [])
+
+    async def test_overlapping_same_url_pane_is_recorded_as_duplicate(self):
+        """Issue #39: a second pane on the SAME document while the first is
+        still connected (Word Online + desktop, two windows) used to be
+        invisible; it is recorded now, still not refused."""
+        await self.connect_pane(document_url="/tmp/Shared/Proposal.docx", instance_id="old", platform="Mac")
+        await self.connect_pane(
+            document_url="/tmp/Shared/Proposal.docx", instance_id="new", platform="OfficeOnline"
+        )
+        collisions = self.registry.collisions()
+        self.assertEqual(len(collisions), 1)
+        self.assertEqual(collisions[0]["kind"], "same_document_duplicate")
+        self.assertEqual(collisions[0]["displaced_instance_id"], "old")
+        self.assertEqual(collisions[0]["new_instance_id"], "new")
+        self.assertEqual(self.registry.get("Proposal.docx").hello.instance_id, "new")
+
+    async def test_closing_displaced_pane_does_not_unregister_newer_one(self):
+        old = await self.connect_pane(document_url="/tmp/Shared/Two.docx", instance_id="old")
+        await self.connect_pane(document_url="/tmp/Shared/Two.docx", instance_id="new")
+        await old.close()
+        await asyncio.sleep(0.1)
+        current = self.registry.get("Two.docx")
+        self.assertIsNotNone(current)
+        self.assertEqual(current.hello.instance_id, "new")
 
     async def test_different_url_same_basename_is_recorded_not_refused(self):
         await self.connect_pane(document_url="https://contoso.sharepoint.com/sites/A/Proposal.docx")
@@ -296,6 +322,14 @@ class HeartbeatEvictionTests(LiveBridgeTestCase):
         with self.assertRaises(live_session.LiveUnavailable):
             await self.registry.request("Hb.docx", "ping", {}, timeout=1)
 
+    async def test_displaced_panes_heartbeats_do_not_keep_newer_session_alive(self):
+        """Issue #39: heartbeats used to refresh whichever session held the
+        name, so a displaced pane kept a silent newer one registered."""
+        await self.connect_pane(document_url="/tmp/Hb3.docx", instance_id="old", heartbeat_interval=0.05)
+        await self.connect_pane(document_url="/tmp/Hb3.docx", instance_id="new", heartbeat_interval=1000)
+        await asyncio.sleep(0.5)  # old keeps heartbeating; new is silent past stale_after
+        self.assertIsNone(self.registry.get("Hb3.docx"))
+
     async def test_regular_heartbeats_keep_session_alive(self):
         await self.connect_pane(document_url="/tmp/Hb2.docx", heartbeat_interval=0.05)
         await asyncio.sleep(0.4)  # several heartbeats land within this window
@@ -343,6 +377,15 @@ class LiveStatusShapeTests(LiveBridgeTestCase):
         status = server_module.execute_live_status()
         self.assertEqual(len(status["session_collisions"]), 1)
         self.assertEqual(status["session_collisions"][0]["document_name"], "Dup.docx")
+        self.assertEqual(status["session_collisions"][0]["kind"], "basename_collision")
+
+    async def test_live_status_reports_instance_id_and_platform(self):
+        from verified_docx_mcp import server as server_module
+
+        await self.connect_pane(document_url="/tmp/Id.docx", instance_id="pane-xyz", platform="Mac")
+        session = server_module.execute_live_status()["sessions"][0]
+        self.assertEqual(session["instance_id"], "pane-xyz")
+        self.assertEqual(session["platform"], "Mac")
 
 
 if __name__ == "__main__":

@@ -288,7 +288,7 @@ async def _handle_pane_connection(connection: ServerConnection, *, registry: Ses
                     hb = HeartbeatMessage.from_json(raw_msg)
                 except ProtocolError:
                     continue
-                registry.touch_heartbeat(document_name, hb.body_sha256)
+                registry.touch_heartbeat(session, hb.body_sha256)
             elif msg_type == "reply":
                 try:
                     reply = OpReply.from_json(raw_msg)
@@ -297,7 +297,7 @@ async def _handle_pane_connection(connection: ServerConnection, *, registry: Ses
                 session.resolve_reply(reply)
             # any other message type: ignored, not fatal (forward compat)
     finally:
-        registry.unregister(document_name)
+        registry.unregister(session)
         session.fail_pending(LiveDisconnected(f"pane for {document_name!r} disconnected"))
 
 

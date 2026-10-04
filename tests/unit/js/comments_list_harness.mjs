@@ -77,6 +77,11 @@ out.filteredGetRange = filtered.getRange;
 const noAnchor = await run(150, { ids: ["c7"], include_anchor: false });
 out.noAnchorGetRange = noAnchor.getRange;
 out.noAnchorHasAnchorText = "anchorText" in noAnchor.result.comments[0];
+// issue #39: counts describe the whole collection, even under an ids filter.
+out.bigCounts = big.result.counts;
+out.filteredCounts = filtered.result.counts;
+out.scope = big.result.scope;
+out.hasObservedAt = typeof big.result.observed_at === "string" && big.result.observed_at.length > 0;
 console.log(JSON.stringify(out));
 
 try { sandbox.__checkEpoch({session_epoch: "stale"}); throw new Error("stale epoch accepted"); } catch (e) { if (e.code !== "COMMENT_ID_STALE") throw e; }
