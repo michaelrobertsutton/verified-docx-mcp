@@ -238,7 +238,7 @@ const OP_LOG_LIMIT = 20;
 // find_sections / list_tables).
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
 // issue #39: "comment_counts" = comments_list reports counts/scope/observed_at.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen"];
+const PANE_CAPABILITIES = ["shared_queue", "row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -413,7 +413,7 @@ function connectOpsSocket() {
     }
   };
 
-  socket.onmessage = async (event) => {
+  socket.onmessage = (event) => {
     let message;
     try {
       message = JSON.parse(event.data);
@@ -424,18 +424,21 @@ function connectOpsSocket() {
     const requestId = message.request_id;
     const op = message.op;
     const payload = message.payload || {};
-    try {
-      const result = await dispatchOp(op, payload);
-      logOp(op, true, summarizeResult(op, result));
-      socket.send(JSON.stringify({ type: "reply", request_id: requestId, ok: true, result }));
-    } catch (err) {
-      const code = err && err.code ? err.code : "LIVE_OP_FAILED";
-      const msg = err && err.message ? err.message : String(err);
-      logOp(op, false, msg);
-      socket.send(
-        JSON.stringify({ type: "reply", request_id: requestId, ok: false, error: { code, message: msg } })
-      );
-    }
+    enqueuePaneOperation(async () => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      try {
+        const result = await dispatchOp(op, payload);
+        logOp(payload.clientId ? `${op} [${payload.clientId.slice(0, 8)}]` : op, true, summarizeResult(op, result));
+        socket.send(JSON.stringify({ type: "reply", request_id: requestId, ok: true, result }));
+      } catch (err) {
+        const code = err && err.code ? err.code : "LIVE_OP_FAILED";
+        const msg = err && err.message ? err.message : String(err);
+        logOp(payload.clientId ? `${op} [${payload.clientId.slice(0, 8)}]` : op, false, msg);
+        socket.send(
+          JSON.stringify({ type: "reply", request_id: requestId, ok: false, error: { code, message: msg } })
+        );
+      }
+    }).catch(() => {}); // closed socket: result is unknown; never replay
   };
 
   socket.onclose = () => {
@@ -499,7 +502,24 @@ const SHAPE_GUARDED_OPS = new Set(["replace", "format", "cell_set", "cells_set",
   "table_insert", "paragraph_delete", "revisions_accept", "revisions_reject",
   "comment_add", "comment_reply", "comment_resolve", "save"]);
 
+// One queue across reconnects. A timed-out write can still be running in Word;
+// later commands must not overlap it, including commands on a new socket.
+let paneOperationQueue = Promise.resolve();
+function enqueuePaneOperation(operation) {
+  const result = paneOperationQueue.then(operation);
+  paneOperationQueue = result.catch(() => {});
+  return result;
+}
+const READ_ONLY_OPS = new Set(["ping", "describe", "body_ooxml", "search", "comments_list",
+  "cell_get", "table_get", "shapes_list", "textboxes_list", "textboxes_read", "scope_describe",
+  "revisions_list", "autoopen_get"]);
+
 async function dispatchOp(op, payload) {
+  if (!READ_ONLY_OPS.has(op) && payload.clientId) {
+    if (!payload.expectedBodySha256)
+      throw refusalError("Shared write requires a body baseline", "LIVE_STALE");
+    await Word.run(async context => requireFreshBody(context, payload.expectedBodySha256));
+  }
   if (!SHAPE_GUARDED_OPS.has(op)) return dispatchOpUnchecked(op, payload);
   const before = await opShapesList();
   // Accepting/rejecting tracked deletions can remove whole anchor paragraphs.

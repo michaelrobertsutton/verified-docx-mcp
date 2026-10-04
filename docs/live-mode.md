@@ -1171,3 +1171,25 @@ cover every document without tagging, but Microsoft documents it as unavailable
 on Office for Mac and it needs admin deployment. A shared-runtime startup
 behaviour (`Office.addin.setStartupBehavior`) is also document-scoped and was
 not tried.
+
+## Experimental shared bridge (#47 draft)
+
+Set `VERIFIED_DOCX_SHARED_BRIDGE=1` in **each** MCP server's environment and
+restart the servers. Call `live_status` in each process before using live tools.
+The first process owns the normal HTTPS/WSS ports; the others use a private
+same-user Unix socket. Reopen the pane to load `shared_queue`. Windows shared
+transport is unsupported; the normal non-shared bridge remains unchanged.
+
+`live_status.shared` reports your `client_id`, attached clients, and active
+leases. The pane activity log includes the originating client ID. Read the live
+body before writing. After `LIVE_STALE`, re-read and reconsider the edit.
+`live_document_lock(path, lease_s=60)` acquires or renews a **whole-document**
+lease; `live_document_lock(path, release=true)` releases it. Reads remain
+available to other clients. Leases expire after 1-300 seconds. Hold a lease
+across a multi-call edit/verification workflow to exclude other agent writers.
+There are no independent section locks in this draft.
+
+If the owner exits, writes are not retried. Call `live_status` to reattach/elect
+an owner, wait for the pane, and re-read before deciding whether a previous
+operation needs repeating. A timeout can mean an edit applied but its reply
+was lost. See the [research, limitations and Claude acceptance checklist](acceptance/47-shared-bridge-handoff.md).
