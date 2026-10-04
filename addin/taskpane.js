@@ -1633,6 +1633,37 @@ async function bodyRevisionMarkupCount(context) {
   const xml = await bodyOoxmlOrNull(context);
   return xml === null ? null : revisionMarkupCount(xml);
 }
+// WordApiDesktop 1.4 Word.Revision: Word for Mac's TrackedChange list omits deletions and merges
+// neighbours, but this collection lists every content revision (deletions too) in document order, each
+// with its own accept()/reject(). Handles are registered like the TrackedChange ones; `desktop` marks
+// them so the mutation path loads the right fields. null = not available or unreadable (the server then
+// keeps the old behaviour).
+function desktopRevisionsSupported() {
+  try {
+    return Office.context.requirements.isSetSupported("WordApiDesktop", "1.4");
+  } catch (error) {
+    return false;
+  }
+}
+async function desktopRevisionList(context) {
+  if (!desktopRevisionsSupported()) return null;
+  try {
+    const collection = context.document.body.getRange("Whole").revisions;
+    collection.load("items/type,items/author,items/date");
+    await context.sync();
+    const ranges = collection.items.map(r => {const g = r.range; g.load("text"); return g;});
+    await context.sync();
+    collection.track();
+    return collection.items.map((revision, i) => {
+      const id = `revision:${paneEpoch}:${crypto.randomUUID()}`;
+      revision.track();
+      revisionHandles.set(id, {change: revision, collection, epoch: paneEpoch, desktop: true});
+      return {revision_id: id, type: revision.type, author: revision.author, date: revision.date, text: ranges[i].text};
+    });
+  } catch (error) {
+    return null;
+  }
+}
 async function opRevisionsList() {
   if (!revisionsSupported()) return {revisions: null, coverage: "unavailable", reason: "WordApi 1.6 required"};
   return Word.run(async context => {
@@ -1647,11 +1678,12 @@ async function opRevisionsList() {
       return {id, change, range};
     });
     await context.sync();
+    const desktop = await desktopRevisionList(context);
     const xml = await bodyOoxmlOrNull(context);
     const markup = xml === null ? null : revisionMarkupCount(xml);
     // An unreadable body OOXML must not fail the listing: omit revision_ooxml and the
     // server keeps the Office.js inventory (ooxml_revision_count null = unverified).
-    return {...(xml === null ? {} : {revision_ooxml: xml}), coverage: "body", session_epoch: paneEpoch, ooxml_revision_count: markup, revisions: entries.map(({id, change, range}) => ({
+    return {...(desktop ? {desktop_revisions: desktop} : {}), ...(xml === null ? {} : {revision_ooxml: xml}), coverage: "body", session_epoch: paneEpoch, ooxml_revision_count: markup, revisions: entries.map(({id, change, range}) => ({
       revision_id: id, type: change.type, author: change.author, date: change.date,
       text: change.text, paragraph_context: range.paragraphs.items.map(p => p.text), scope: "body"
     }))};
@@ -1699,8 +1731,10 @@ async function opRevisionsMutate(payload, action) {
       if (!entry || entry.epoch !== paneEpoch) throw refusalError("Stale revision handle; list revisions again", "REVISION_ID_NOT_FOUND");
       return entry.change;
     });
-    // Validate every retained object before queuing any mutation.
-    selected.forEach(c => c.load("author,date,text,type"));
+    // Validate every retained object before queuing any mutation (a desktop Revision has no `text`).
+    const desktopHandles = new Set((payload.revision_ids || []).filter(id => (revisionHandles.get(id) || {}).desktop)
+      .map(id => revisionHandles.get(id).change));
+    selected.forEach(c => c.load(desktopHandles.has(c) ? "author,date,type" : "author,date,text,type"));
     await context.sync();
     // One collection call covers items Word's list merged; per-item calls do not.
     if (all && typeof changes[`${action}All`] === "function") changes[`${action}All`]();

@@ -19,9 +19,14 @@ def list_revisions(session: Any) -> dict[str, Any]:
             inventory = _markup_revisions(xml, state.get("session_epoch", "unknown"))
         except (ET.ParseError, ValueError):
             return {**state, "coverage": "partial", "reason": "Live revision OOXML could not be parsed"}
-        # Metadata is not a safe handle correlation when the API merges revisions.
+        # WordApiDesktop 1.4 lists every content revision, deletions included, in document order, each as
+        # its own accept()/reject()-able object: align by order, verified pairwise (#58).
+        desktop = state.pop("desktop_revisions", None)
+        # Otherwise metadata is not a safe handle correlation when the API merges revisions.
         api = revisions or []
-        if len(api) == len(inventory):
+        if _align_desktop(inventory, desktop):
+            pass
+        elif len(api) == len(inventory):
             for item in inventory:
                 matches = [r for r in api if _identity(r) == _identity(item)]
                 peers = [r for r in inventory if _identity(r) == _identity(item)]
@@ -53,7 +58,43 @@ _REVISION_TYPES = {
 }
 
 
-_W16DU_DATE_UTC = "{http://schemas.microsoft.com/office/word/2023/wordml/word16du}dateUtc"
+_DESKTOP_KIND = {"Insert": "ins", "Delete": "del", "Property": "rPrChange", "ParagraphProperty": "pPrChange",
+                 "TableProperty": "tblPrChange", "SectionProperty": "sectPrChange",
+                 "MovedFrom": "moveFrom", "MovedTo": "moveTo"}
+
+
+def _is_structural(item: dict[str, Any]) -> bool:
+    """An empty insertion/deletion mark (paragraph mark, table row/cell): in the markup, not in Word's lists."""
+    return item["markup_type"] in ("ins", "del") and not item["text"]
+
+
+def _align_desktop(inventory: list[dict[str, Any]], desktop: Any) -> bool:
+    """Give each content revision the handle of its WordApiDesktop ``Revision`` by document order.
+
+    Only when the two sequences agree pairwise (type, author, instant, and text for insertions);
+    any disagreement leaves every entry read-only. Word's ``Revision.date`` is local time labelled
+    ``Z`` like ``w:date``, so it is compared against both ``w:date`` and ``w16du:dateUtc``.
+    """
+    if not isinstance(desktop, list) or not desktop:
+        return False
+    candidates = [i for i in inventory if not _is_structural(i)]
+    if len(candidates) != len(desktop):
+        return False
+    for item, rev in zip(candidates, desktop, strict=True):
+        when = _instant(rev.get("date"))
+        if (not rev.get("revision_id") or _DESKTOP_KIND.get(rev.get("type")) != item["markup_type"]
+                or rev.get("author") != item["author"] or not isinstance(when, datetime)
+                or when not in (_instant(item.get("date")), _instant(item.get("date_utc")))):
+            return False
+        if item["markup_type"] == "ins" and str(rev.get("text", "")).rstrip() != item["text"].rstrip():
+            return False
+    for item, rev in zip(candidates, desktop, strict=True):
+        item.update(revision_id=rev["revision_id"], actionable=True, actionability_reason=None,
+                    source="ooxml+officejs-desktop")
+    return True
+
+
+_W16DU_DATE_UTC ="{http://schemas.microsoft.com/office/word/2023/wordml/word16du}dateUtc"
 
 
 def _instant(value: Any) -> Any:

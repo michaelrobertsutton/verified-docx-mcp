@@ -1085,18 +1085,39 @@ comparison prefers `w16du:dateUtc`, which is the true UTC instant, and reports
 it as `date_utc`. Without `dateUtc` a differing `w:date` stays read-only
 rather than guessing a timezone, and sub-second differences never match.
 
-If Word merges or omits revisions, the full markup list is visible but its
-entries cannot be accepted/rejected individually. Such calls refuse before
-mutation with `LIVE_CAPABILITY_MISSING`; use collection-level accept/reject-all
-instead. Duplicate metadata also remains read-only. Malformed OOXML reports
+Entries without a handle cannot be accepted/rejected individually: such calls
+refuse before mutation with `LIVE_CAPABILITY_MISSING`; use collection-level
+accept/reject-all instead. See "Individual accept/reject of every content
+revision" below for which entries get handles. Malformed OOXML reports
 partial coverage; if the pane cannot read the body OOXML at all, it omits
 `revision_ooxml` and returns the Office.js inventory with
 `ooxml_revision_count: null` and reports `coverage: partial`, since the list
 cannot be cross-checked, instead of failing the operation
 (`live_status` and `list_open_items` depend on it); older panes retain their API inventory and coverage warning.
-Issue #58 remains open: safe individual addressing of omitted revisions still
-needs investigation on real Word builds. Do not treat complete visibility as
-complete individual editing support.
+
+#### Individual accept/reject of every content revision (#58)
+
+Word for Mac's `getTrackedChanges()` omits deletions and merges neighbours at
+every scope (body or paragraph), so it cannot address them. WordApiDesktop 1.4
+adds `Range.revisions`: `Word.Revision` objects, one per content revision,
+deletions included, in document order, each with its own `accept()` / `reject()`
+(verified on Word for Mac 16.113.3: it lists 9 of the 16 markup elements of a
+document where `getTrackedChanges()` lists 6).
+
+The pane returns that list as `desktop_revisions`, with handles. The server
+gives each content revision (in the markup) the handle of the Revision at the
+same position, but only when the two sequences agree pairwise on type, author,
+instant (`Revision.date` is local time labelled `Z`, like `w:date`) and, for
+insertions, text; otherwise every entry stays read-only, as before. Order, not
+metadata, tells identical revisions apart, so duplicate insertions are
+actionable too. Entries so correlated report `source: "ooxml+officejs-desktop"`.
+Success is verified on the markup (it must shrink) and a reused handle is
+refused (`REVISION_ID_NOT_FOUND`) until the list is re-read.
+
+Still read-only: the structural empty insertion marks (paragraph marks and
+table row/cell marks) that Word's revision lists never enumerate. They are
+handled by accept/reject-all, which also covers them. Older panes and hosts
+without WordApiDesktop 1.4 keep the previous behaviour.
 
 
 ### Opening the pane automatically (#66)
