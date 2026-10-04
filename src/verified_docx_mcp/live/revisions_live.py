@@ -1,5 +1,7 @@
 """Live revision state never comes from an on-disk stand-in (#48)."""
 from typing import Any
+from uuid import uuid4
+from xml.etree import ElementTree as ET
 
 from ..errors import ErrorCode, _make_error
 from . import comments_live, write_mode
@@ -10,6 +12,23 @@ def list_revisions(session: Any) -> dict[str, Any]:
         return {"revisions": None, "coverage": "unavailable", "reason": "pane lacks live_revisions"}
     state = comments_live._request(session, "revisions_list")
     revisions, markup = state.get("revisions"), state.get("ooxml_revision_count")
+    xml = state.pop("revision_ooxml", None)
+    if xml is not None:
+        try:
+            inventory = _markup_revisions(xml, state.get("session_epoch", "unknown"))
+        except (ET.ParseError, ValueError):
+            return {**state, "coverage": "partial", "reason": "Live revision OOXML could not be parsed"}
+        # Metadata is not a safe handle correlation when the API merges revisions.
+        api = revisions or []
+        if len(api) == len(inventory):
+            for item in inventory:
+                matches = [r for r in api if _identity(r) == _identity(item)]
+                peers = [r for r in inventory if _identity(r) == _identity(item)]
+                if len(matches) == len(peers) == 1 and matches[0].get("revision_id"):
+                    item.update(revision_id=matches[0]["revision_id"], actionable=True,
+                                actionability_reason=None, source="ooxml+officejs")
+        return {**state, "revisions": inventory, "ooxml_revision_count": len(inventory),
+                "coverage": "body", "reason": None}
     if revisions is not None and isinstance(markup, int) and markup > len(revisions):
         # Word's API merged or dropped items: never present this list as complete.
         state = {**state, "coverage": "partial", "reason": (
@@ -18,8 +37,67 @@ def list_revisions(session: Any) -> dict[str, Any]:
     return state
 
 
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_PKG = "{http://schemas.microsoft.com/office/2006/xmlPackage}"
+_REVISION_TYPES = {
+    "ins": "Added", "del": "Deleted", "moveFrom": "MoveFrom", "moveTo": "MoveTo",
+    **{name: "Formatted" for name in ("rPrChange", "pPrChange", "sectPrChange",
+        "tblPrChange", "trPrChange", "tcPrChange", "tblGridChange", "numberingChange")},
+    "cellIns": "CellInserted", "cellDel": "CellDeleted", "cellMerge": "CellMerged",
+}
+
+
+def _identity(item: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(item.get(k) for k in ("type", "author", "date", "text"))
+
+
+def _markup_revisions(xml: str, epoch: str) -> list[dict[str, Any]]:
+    if "<!DOCTYPE" in xml or "<!ENTITY" in xml:
+        raise ValueError("DTD/entity declarations are not allowed")
+    root = ET.fromstring(xml)
+    if root.tag == _PKG + "package":
+        parts = [p for p in root.findall(_PKG + "part")
+                 if p.get(_PKG + "name") == "/word/document.xml"]
+        if len(parts) != 1:
+            raise ValueError("Missing or duplicate document part")
+        document = parts[0].find(_PKG + "xmlData/" + _W + "document")
+    else:
+        document = root if root.tag == _W + "document" else None
+    if document is None or document.find(_W + "body") is None:
+        raise ValueError("Missing document body")
+    body = document.find(_W + "body")
+    assert body is not None
+    parents = {child: parent for parent in body.iter() for child in parent}
+
+    def text(node: ET.Element) -> str:
+        return "".join(n.text or "" for n in node.iter()
+                       if n.tag in (_W + "t", _W + "delText"))
+
+    result = []
+    for node in body.iter():
+        kind = node.tag.removeprefix(_W)
+        if node.tag != _W + kind or kind not in _REVISION_TYPES:
+            continue
+        paragraph = node
+        while paragraph.tag != _W + "p" and paragraph in parents:
+            paragraph = parents[paragraph]
+        result.append({
+            "revision_id": f"revision-ooxml:{epoch}:{uuid4()}",
+            "ooxml_id": node.get(_W + "id"), "markup_type": kind,
+            "type": _REVISION_TYPES[kind], "author": node.get(_W + "author"),
+            "date": node.get(_W + "date"), "text": text(node),
+            "paragraph_context": [text(paragraph)] if paragraph.tag == _W + "p" else [],
+            "scope": "body", "source": "ooxml", "actionable": False,
+            "actionability_reason": "No unambiguous Office.js handle; use accept/reject-all",
+        })
+    return result
+
+
 def mutate_revisions(path: str, action: str, ids: list[str] | None,
                      revision_before: str | None) -> dict[str, Any]:
+    if ids and any(i.startswith("revision-ooxml:") for i in ids):
+        raise _make_error(ErrorCode.LIVE_CAPABILITY_MISSING,
+                          "OOXML-only revisions cannot be edited individually; use accept/reject-all")
     session = write_mode.live_session_for(path)
     write_mode.require_capability(session, "live_revisions", feature_description="live revisions")
     if ids is not None and (not ids or len(ids) != len(set(ids))):

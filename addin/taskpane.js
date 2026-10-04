@@ -1574,7 +1574,9 @@ async function opRevisionsList() {
     });
     await context.sync();
     const markup = await bodyRevisionMarkupCount(context);
-    return {coverage: "body", session_epoch: paneEpoch, ooxml_revision_count: markup, revisions: entries.map(({id, change, range}) => ({
+    const xml = context.document.body.getOoxml();
+    await context.sync();
+    return {revision_ooxml: xml.value, coverage: "body", session_epoch: paneEpoch, ooxml_revision_count: markup, revisions: entries.map(({id, change, range}) => ({
       revision_id: id, type: change.type, author: change.author, date: change.date,
       text: change.text, paragraph_context: range.paragraphs.items.map(p => p.text), scope: "body"
     }))};

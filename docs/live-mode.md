@@ -1044,3 +1044,24 @@ not appear on the Home tab.
 subfolder, not renamed), then fully quit and reopen Word — it only reads
 that folder at launch, so a copy made while Word is running will not
 appear until the next restart.
+
+
+### Full revision visibility (#58)
+
+New panes return live body revision OOXML alongside Office.js metadata in the
+same operation. Lists parse the document part by namespace, including deleted
+text, formatting, move and table revisions. Scope remains the document body;
+headers and footers are not included. `ooxml_id` is informational, never an
+Office.js handle. Each entry has `source`, `actionable`, and
+`actionability_reason`. Individual handles are attached only when both
+inventories have equal counts and type/author/date/text match uniquely in each.
+Date representations that differ conservatively remain read-only.
+
+If Word merges or omits revisions, the full markup list is visible but its
+entries cannot be accepted/rejected individually. Such calls refuse before
+mutation with `LIVE_CAPABILITY_MISSING`; use collection-level accept/reject-all
+instead. Duplicate metadata also remains read-only. Malformed OOXML reports
+partial coverage; older panes retain their API inventory and coverage warning.
+Issue #58 remains open: safe individual addressing of omitted revisions still
+needs investigation on real Word builds. Do not treat complete visibility as
+complete individual editing support.

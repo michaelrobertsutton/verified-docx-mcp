@@ -45,3 +45,56 @@ def test_revision_js_behavior():
     root = Path(__file__).resolve().parents[2]
     subprocess.run([node, str(root / "tests/unit/js/revisions_harness.mjs"),
                     str(root / "addin/taskpane.js")], check=True, capture_output=True, text=True)
+
+
+W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def test_full_markup_inventory_and_safe_refusal():
+    import pytest
+
+    from verified_docx_mcp.errors import VerifyError
+    xml = f'''<x:document xmlns:x="{W}"><x:body><x:p>
+      <x:ins x:id="1" x:author="A" x:date="d"><x:r><x:t>new</x:t></x:r></x:ins>
+      <x:del x:id="2" x:author="B" x:date="e"><x:r><x:delText>old</x:delText></x:r></x:del>
+    </x:p></x:body></x:document>'''
+    session = SimpleNamespace(hello=SimpleNamespace(capabilities={"live_revisions"}))
+    reply = {"revisions": [{"type": "Added", "author": "A", "date": "d",
+             "text": "new", "revision_id": "api"}], "revision_ooxml": xml,
+             "session_epoch": "epoch"}
+    with patch.object(comments_live, "_request", return_value=reply):
+        state = revisions_live.list_revisions(session)
+    assert state["coverage"] == "body"
+    assert [r["text"] for r in state["revisions"]] == ["new", "old"]
+    assert state["revisions"][1]["author"] == "B"
+    assert all(not r["actionable"] for r in state["revisions"])
+    with patch.object(revisions_live.write_mode, "live_session_for") as connect:
+        with pytest.raises(VerifyError):
+            revisions_live.mutate_revisions("unused", "accept",
+                                           [state["revisions"][1]["revision_id"]], None)
+        connect.assert_not_called()
+
+
+def test_unique_metadata_maps_only_complete_api_inventory():
+    xml = f'<w:document xmlns:w="{W}"><w:body><w:p><w:ins w:id="7" w:author="A" w:date="d"><w:r><w:t>x</w:t></w:r></w:ins></w:p></w:body></w:document>'
+    session = SimpleNamespace(hello=SimpleNamespace(capabilities={"live_revisions"}))
+    api = {"revision_id": "handle", "type": "Added", "author": "A", "date": "d", "text": "x"}
+    with patch.object(comments_live, "_request", return_value={"revisions": [api], "revision_ooxml": xml}):
+        item = revisions_live.list_revisions(session)["revisions"][0]
+    assert item["actionable"] and item["revision_id"] == "handle"
+    duplicated = xml.replace('</w:p>', '<w:ins w:id="8" w:author="A" w:date="d"><w:r><w:t>x</w:t></w:r></w:ins></w:p>')
+    with patch.object(comments_live, "_request", return_value={"revisions": [api, api], "revision_ooxml": duplicated}):
+        assert all(not r["actionable"] for r in revisions_live.list_revisions(session)["revisions"])
+
+
+def test_markup_package_and_bad_xml():
+    import pytest
+    inner = f'<a:document xmlns:a="{W}"><a:body><a:p><a:rPrChange a:id="1"/></a:p></a:body></a:document>'
+    package = '<q:package xmlns:q="http://schemas.microsoft.com/office/2006/xmlPackage"><q:part q:name="/word/document.xml"><q:xmlData>' + inner + '</q:xmlData></q:part></q:package>'
+    assert revisions_live._markup_revisions(package, "e")[0]["type"] == "Formatted"
+    for xml in ('<broken', '<!DOCTYPE x><x/>', '<x/>'):
+        with pytest.raises((ValueError, revisions_live.ET.ParseError)):
+            revisions_live._markup_revisions(xml, "e")
+    session = SimpleNamespace(hello=SimpleNamespace(capabilities={"live_revisions"}))
+    with patch.object(comments_live, "_request", return_value={"revisions": [], "revision_ooxml": '<broken'}):
+        assert revisions_live.list_revisions(session)["coverage"] == "partial"
