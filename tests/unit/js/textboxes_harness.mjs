@@ -25,4 +25,11 @@ assert.equal((await f.sandbox.api.opTextboxesList()).coverage,'partial');
 await assert.rejects(()=>f.sandbox.api.opReplace({scope:'all',find:'text',replace:'x',expected_matches:2}),e=>e.code==='LIVE_CAPABILITY_MISSING');
 items=[{id:1,name:'broken',type:'TextBox',body:{load(){},text:undefined}}];
 await assert.rejects(()=>f.sandbox.api.opTextboxesList(),e=>e.code==='HOST_SHAPE_READ_FAILED');
+// A host that cannot search shape text must say so, not report "found 0".
+const blind=fixture(path,'blind text',false);
+blind.body.search=()=>({items:[],load(){}});
+items=[{id:9,name:'blind',type:'TextBox',body:blind.body}];
+const blindHandle=(await f.sandbox.api.opTextboxesList()).textboxes[0].textbox_id;
+await assert.rejects(()=>f.sandbox.api.opReplace({scope:blindHandle,find:'blind',replace:'x',expected_matches:1}),
+  e=>e.code==='LIVE_CAPABILITY_MISSING'&&/cannot search inside blind/.test(e.message));
 console.log('text boxes passed');
