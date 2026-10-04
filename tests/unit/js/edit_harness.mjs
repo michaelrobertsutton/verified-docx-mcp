@@ -1,17 +1,18 @@
 // Behavioral model of ranges, formatting and comments. Mutations queue until sync.
 import fs from 'node:fs';
+import {DOMParser,EMPTY} from './shape_dom.mjs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
 export function fixture(path, initial='Heading. plain sentence', commented=true) {
-  const state={text:initial, chars:Array.from(initial,(_,i)=>({bold:i<8,italic:false,
+  const state={paragraphXml:EMPTY,text:initial, chars:Array.from(initial,(_,i)=>({bold:i<8,italic:false,
     underline:'None',strikeThrough:false,color:'#000000',name:'Calibri',size:11,doubleStrikeThrough:false,subscript:false,superscript:false})),comments:[],queue:[]};
   const ranges=(start,end)=>{
     const font={load() {},reset() {state.queue.push(()=>state.chars.slice(start,end).forEach(c=>Object.assign(c,{bold:false,italic:false,underline:"None"})));}};
     for(const key of ['bold','italic','underline','strikeThrough','color','name','size','doubleStrikeThrough','subscript','superscript'])
       Object.defineProperty(font,key,{get(){const vals=state.chars.slice(start,end).map(c=>c[key]);return vals.every(v=>v===vals[0])?vals[0]:null;},set(v){state.queue.push(()=>state.chars.slice(start,end).forEach(c=>c[key]=v));}});
     const range={load(){},font,get text(){return state.text.slice(start,end);},
-      paragraphs:{items:[{text:state.text}],load(){}},getTrackedChanges:()=>({items:[],load(){}}),
+      paragraphs:{items:[{text:state.text,getOoxml:()=>({value:state.paragraphXml})}],load(){}},getTrackedChanges:()=>({items:[],load(){}}),
       getComments:()=>({get items(){return state.comments;},load(){}}),
       compareLocationWith(other){return {value:end<=other.start?'Before':start>=other.end?'After':'Overlaps'};},
       start,end,
@@ -28,7 +29,7 @@ export function fixture(path, initial='Heading. plain sentence', commented=true)
   const body={load(){},get text(){return state.text;},getComments:()=>({get items(){return state.comments;},load(){}}),
     search(find){let items=[];for(let i=state.text.indexOf(find);i>=0;i=state.text.indexOf(find,i+find.length))items.push(ranges(i,i+find.length));return {items,load(){}};}};
   const context={document:{body,changeTrackingMode:'Off',load(){}},sync:async()=>{const q=state.queue.splice(0);q.forEach(fn=>fn());}};
-  const sandbox={crypto:webcrypto,TextEncoder,console,DOMParser:globalThis.DOMParser,
+  const sandbox={crypto:webcrypto,TextEncoder,console,DOMParser,
     document:{getElementById:()=>({addEventListener(){}})},
     Office:{onReady(){},context:{requirements:{isSetSupported:()=>true}}},
     Word:{run:(objects,fn)=>(fn||objects)(context),InsertLocation:{replace:'Replace'},

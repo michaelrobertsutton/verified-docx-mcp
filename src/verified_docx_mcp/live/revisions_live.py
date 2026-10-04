@@ -29,6 +29,7 @@ def mutate_revisions(path: str, action: str, ids: list[str] | None,
     result = comments_live._request(session, f"revisions_{action}",
                                     {"revision_ids": ids, "expectedBodySha256": pre})
     evidence = write_mode.live_evidence(
+        shape_result=result,
         applied=True, match_count=result["changed_count"], rung=1,
         before=str(result["before_count"]), after=str(result["after_count"]),
         pre_body_sha256=pre, post_body_sha256=result["post"],

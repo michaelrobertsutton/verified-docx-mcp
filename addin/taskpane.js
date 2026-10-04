@@ -230,7 +230,7 @@ const OP_LOG_LIMIT = 20;
 // issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
 // find_sections / list_tables).
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
-const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph"];
+const PANE_CAPABILITIES = ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard"];
 
 // issue #33: the largest body_ooxml reply (UTF-8 bytes of its JSON) the pane
 // will send. Kept below the bridge's 64 MiB websocket max_size so an
@@ -465,8 +465,34 @@ function summarizeResult(op, result) {
   return "";
 }
 
+const SHAPE_GUARDED_OPS = new Set(["replace", "format", "cell_set", "cells_set",
+  "table_insert", "paragraph_delete", "revisions_accept", "revisions_reject",
+  "comment_add", "comment_reply", "comment_resolve", "save"]);
+
 async function dispatchOp(op, payload) {
+  if (!SHAPE_GUARDED_OPS.has(op)) return dispatchOpUnchecked(op, payload);
+  const before = await opShapesList();
+  // Accepting/rejecting tracked deletions can remove whole anchor paragraphs.
+  if (op.startsWith("revisions_") && before.shapes.length)
+    throw refusalError("Revision changes with anchored shapes require manual review", "ANCHORED_SHAPES");
+  const result = await dispatchOpUnchecked(op, payload);
+  let after;
+  try { after = await opShapesList(); }
+  catch (err) {
+    throw refusalError(`Shape read-back failed after ${op}; the edit may have applied; ` +
+      `no rollback attempted; shapes_before=${before.shapes.length}; ${err.message || err}`, "VERIFICATION_FAILED");
+  }
+  const identity = shapes => shapes.map(({anchor_paragraph, ...shape}) => JSON.stringify(shape)).sort();
+  if (JSON.stringify(identity(before.shapes)) !== JSON.stringify(identity(after.shapes)))
+    throw refusalError(`Shape verification failed after ${op}; no rollback attempted; ` +
+      JSON.stringify({shapes_before:before.shapes.length, shapes_after:after.shapes.length}), "VERIFICATION_FAILED");
+  return {...result, shapes_before:before.shapes.length, shapes_after:after.shapes.length};
+}
+
+async function dispatchOpUnchecked(op, payload) {
   switch (op) {
+    case "shapes_list":
+      return opShapesList();
     case "ping":
       return opPing();
     case "describe":
@@ -730,6 +756,7 @@ async function opReplace(payload) {
       );
     }
 
+    await guardAnchoredParagraphs(context, matchItems);
     await guardRevisions(context, matchItems);
     const commentsBefore = await guardComments(context, matchItems, payload.allow_comment_loss);
     const policy = payload.inherit_format || "replaced";
@@ -991,6 +1018,7 @@ async function opCellSet(payload) {
       );
     }
 
+    await guardAnchoredBodies(context, [cell.body]);
     let previousMode = null;
     if (payload.track_changes) {
       context.document.load("changeTrackingMode");
@@ -1335,6 +1363,7 @@ async function opCellsSet(payload) {
       );
     }
 
+    await guardAnchoredBodies(context, cells.map(c => c.body));
     await withTracking(context, payload.track_changes, async () => {
       payload.cells.forEach((spec, i) => writeCellParagraphs(cells[i], spec.paragraphs || []));
       await context.sync();
@@ -1699,23 +1728,18 @@ function inspectDeleteParagraph(xml) {
     throw refusalError('Paragraph OOXML inspection failed', 'STRUCTURAL_BOUNDARY');
   const bodies = [...doc.getElementsByTagNameNS(w,'body')];
   if (bodies.length !== 1) throw refusalError('Incomplete paragraph body inspection', 'STRUCTURAL_BOUNDARY');
+  if (shapeNodes(bodies[0]).length)
+    throw refusalError('Paragraph anchors a shape; re-anchoring is not supported', 'ANCHORED_SHAPES');
   const paragraphs = [...bodies[0].getElementsByTagNameNS(w,'p')];
-  const wp = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing';
-  // A text box's own paragraphs are nested in the target's OOXML, so report an
-  // anchored shape as that before the paragraph count can mislabel it.
-  if (bodies[0].getElementsByTagNameNS(wp,'anchor').length || bodies[0].getElementsByTagNameNS('urn:schemas-microsoft-com:vml','shape').length)
-    throw refusalError('Paragraph anchors a shape; re-anchoring is not supported', 'STRUCTURAL_BOUNDARY');
   // Word's getOoxml appends one empty paragraph after the range (issue #33's
   // trailing empty paragraph); anything else extra means the inspection saw
   // more than the target paragraph.
-  const emptyTrailer = q => !(q.textContent || '').trim() && !q.getElementsByTagNameNS(wp,'anchor').length &&
+  const emptyTrailer = q => !(q.textContent || '').trim() && !shapeNodes(q).length &&
     !q.getElementsByTagNameNS(w,'drawing').length && !q.getElementsByTagNameNS(w,'pict').length &&
     !q.getElementsByTagNameNS(w,'sectPr').length;
   if (paragraphs.length < 1 || paragraphs.length > 2 || (paragraphs.length === 2 && !emptyTrailer(paragraphs[1])))
     throw refusalError('Incomplete paragraph inspection', 'STRUCTURAL_BOUNDARY');
   const p = paragraphs[0];
-  if (p.getElementsByTagNameNS(wp,'anchor').length || p.getElementsByTagNameNS('urn:schemas-microsoft-com:vml','shape').length)
-    throw refusalError('Paragraph anchors a shape; re-anchoring is not supported', 'STRUCTURAL_BOUNDARY');
   if (p.getElementsByTagNameNS(w,'sectPr').length)
     throw refusalError('Paragraph is a section boundary', 'STRUCTURAL_BOUNDARY');
 }
@@ -1754,4 +1778,82 @@ async function opParagraphDelete(payload) {
       throw refusalError(`Paragraph deletion read-back failed; observed effects: ${JSON.stringify(result)}`, 'VERIFICATION_FAILED');
     return result;
   });
+}
+
+// Shape inventory reads OOXML, so it covers DrawingML and legacy VML without
+// requiring the newer desktop-only Shape API. Indices include table paragraphs.
+const SHAPE_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+const SHAPE_WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing';
+const SHAPE_V = 'urn:schemas-microsoft-com:vml';
+function shapeXml(xml) {
+  const doc = new DOMParser().parseFromString(xml, 'application/xml');
+  if (doc.getElementsByTagName('parsererror').length)
+    throw refusalError('Cannot inspect shape anchors', 'HOST_SHAPE_READ_FAILED');
+  const bodies = [...doc.getElementsByTagNameNS(SHAPE_W, 'body')];
+  if (bodies.length !== 1)
+    throw refusalError('Incomplete shape body inspection', 'HOST_SHAPE_READ_FAILED');
+  return bodies[0];
+}
+function shapeNodes(root) {
+  // Ignore the fallback representation of an AlternateContent choice.
+  const mc = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+  return [...root.getElementsByTagNameNS(SHAPE_WP, 'anchor'),
+    ...['shape','rect','roundrect','oval','line','polyline','arc','curve','image','group']
+      .flatMap(tag => [...root.getElementsByTagNameNS(SHAPE_V, tag)])].filter(node => {
+      for (let p = node.parentNode; p && p !== root; p = p.parentNode)
+        if (p.namespaceURI === mc && p.localName === 'Fallback' &&
+            p.parentNode.getElementsByTagNameNS(mc, 'Choice').length) return false;
+      return true;
+    });
+}
+function inventoryShapes(xml) {
+  const root = shapeXml(xml);
+  const paragraphs = [...root.getElementsByTagNameNS(SHAPE_W, 'p')];
+  return shapeNodes(root).map(node => {
+    let p = node.parentNode;
+    while (p && !(p.namespaceURI === SHAPE_W && p.localName === 'p')) p = p.parentNode;
+    const first = tag => node.getElementsByTagNameNS(SHAPE_WP, tag)[0];
+    const props = first('docPr');
+    const extent = first('extent');
+    const position = tag => {
+      const el = first(tag);
+      return el ? {relative_to:el.getAttribute('relativeFrom'), value:el.textContent} : null;
+    };
+    return {id: props ? props.getAttribute('id') : node.getAttribute('id'),
+      name: props ? props.getAttribute('name') : null,
+      kind:node.namespaceURI === SHAPE_V ? 'vml' : 'drawingml',
+      anchor_paragraph:{index:paragraphs.indexOf(p)+1,
+        text:p ? [...p.getElementsByTagNameNS(SHAPE_W,'t')].filter(t => {
+          let parent=t.parentNode;
+          while(parent && parent !== p) {
+            if(parent.namespaceURI === SHAPE_W && parent.localName === 'txbxContent') return false;
+            parent=parent.parentNode;
+          }
+          return true;
+        }).map(t => t.textContent).join('') : null},
+      size_emu:extent ? {width:extent.getAttribute('cx'),height:extent.getAttribute('cy')} : null,
+      horizontal_position:position('positionH'),vertical_position:position('positionV'),
+      legacy_style:node.namespaceURI === SHAPE_V ? node.getAttribute('style') : null};
+  });
+}
+async function opShapesList() {
+  return Word.run(async context => {
+    const xml = context.document.body.getOoxml();
+    await context.sync();
+    return {shapes:inventoryShapes(xml.value), coverage:'document_body',
+      paragraph_indexing:'all body paragraphs including tables and textboxes; 1-based'};
+  });
+}
+async function guardAnchoredBodies(context, bodies) {
+  const xml = bodies.map(body => body.getOoxml());
+  await context.sync();
+  if (xml.some(x => shapeNodes(shapeXml(x.value)).length))
+    throw refusalError('Edit touches a paragraph anchoring a shape; re-anchoring is unsupported', 'ANCHORED_SHAPES');
+}
+async function guardAnchoredParagraphs(context, ranges) {
+  const collections = ranges.map(r => r.paragraphs);
+  collections.forEach(p => p.load('items'));
+  await context.sync();
+  // Conservative: any text replacement in an anchored paragraph is refused.
+  await guardAnchoredBodies(context, collections.flatMap(p => p.items));
 }

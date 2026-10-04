@@ -759,6 +759,7 @@ def execute_replace_cell_markdown_live(
         )
 
     return live_write_mode.live_evidence(
+        shape_result=result,
         applied=True,
         match_count=1,
         rung=3,
@@ -955,6 +956,7 @@ def execute_replace_table_row_live(
         )
 
     return live_write_mode.live_evidence(
+        shape_result=result,
         applied=True,
         match_count=1,
         rung=3,
@@ -1193,6 +1195,7 @@ def execute_insert_table_live(
         )
 
     evidence = live_write_mode.live_evidence(
+        shape_result=result,
         applied=True,
         match_count=1,
         rung=4,

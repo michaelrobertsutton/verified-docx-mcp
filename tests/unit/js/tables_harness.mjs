@@ -1,3 +1,4 @@
+import {DOMParser,EMPTY} from './shape_dom.mjs';
 // Loads addin/taskpane.js into a vm with a MOCK Word object model and drives the
 // issue #34 ops (table_get / table_insert / cells_set) plus the refactored
 // cell_set. Prints one JSON line: {results: [{name, pass, detail}]}.
@@ -198,6 +199,7 @@ function makeContext(model) {
         return makePara(ref);
       },
     };
+    impl.getOoxml = () => clientResult(() => EMPTY);
     return node("cell.body", ["text"], impl);
   }
 
@@ -269,6 +271,7 @@ function makeContext(model) {
     "body",
     ["text"],
     {
+      getOoxml: () => clientResult(() => EMPTY),
       get text() { return bodyText(model); },
       // Like Word, body.paragraphs includes the paragraphs INSIDE table cells
       // (tableNestingLevel 1), in document order.
@@ -314,6 +317,7 @@ function makeContext(model) {
 
 function loadPane(model) {
   const sandbox = {
+    DOMParser,
     console,
     Date,
     JSON,
