@@ -187,7 +187,11 @@ class Broker:
                         self.locks.pop(key, None)
                         return {"released": True}
                     duration = request.get("lease_s", 60)
-                    if not isinstance(duration, (int, float)) or not 1 <= duration <= 300:
+                    if (
+                        isinstance(duration, bool)
+                        or not isinstance(duration, (int, float))
+                        or not 1 <= duration <= 300
+                    ):
                         raise ValueError("lease_s must be between 1 and 300")
                     self.locks[key] = {
                         "client_id": client_id,

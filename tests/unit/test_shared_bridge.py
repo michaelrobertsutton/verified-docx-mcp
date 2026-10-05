@@ -290,3 +290,11 @@ def test_status_probe_does_not_acknowledge_another_write(setup_broker):
     call(b, observe=False)
     with pytest.raises(LiveOpFailed, match="LIVE_STALE"):
         call(b, "replace")
+
+
+def test_lease_rejects_bool_and_out_of_range(setup_broker):
+    _, _, a, _, call = setup_broker
+    for bad in (True, 0, 301, "60"):
+        with pytest.raises(ValueError, match="lease_s"):
+            call(a, action="lock", lease_s=bad)
+    assert call(a, action="lock", lease_s=5)["lease_s"] == 5
