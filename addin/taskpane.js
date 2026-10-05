@@ -238,7 +238,7 @@ const OP_LOG_LIMIT = 20;
 // find_sections / list_tables).
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
 // issue #39: "comment_counts" = comments_list reports counts/scope/observed_at.
-const PANE_CAPABILITIES = ["shared_queue", "row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen"];
+const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -512,10 +512,11 @@ function enqueuePaneOperation(operation) {
 }
 const READ_ONLY_OPS = new Set(["ping", "describe", "body_ooxml", "search", "comments_list",
   "cell_get", "table_get", "shapes_list", "textboxes_list", "textboxes_read", "scope_describe",
-  "revisions_list", "autoopen_get"]);
+  "revisions_list", "autoopen_get", "sections_list"]);
 
 async function dispatchOp(op, payload) {
-  if (!READ_ONLY_OPS.has(op) && payload.clientId) {
+  const sectionScoped = !!(payload.ownSections && payload.ownSections.length);
+  if (!READ_ONLY_OPS.has(op) && payload.clientId && !sectionScoped) {
     if (!payload.expectedBodySha256)
       throw refusalError("Shared write requires a body baseline", "LIVE_STALE");
     await Word.run(async context => requireFreshBody(context, payload.expectedBodySha256));
@@ -543,6 +544,8 @@ async function dispatchOpUnchecked(op, payload) {
   switch (op) {
     case "shapes_list":
       return opShapesList();
+    case "sections_list":
+      return opSectionsList();
     case "ping":
       return opPing();
     case "describe":
@@ -707,6 +710,122 @@ async function opBodyOoxml() {
   });
 }
 
+
+// -- section locks (#47) ------------------------------------------------
+// A section is what find_sections reports: a heading paragraph (outline level
+// 1-9, outside tables) up to the next heading at any level. The broker sends
+// `forbiddenSections` (slugs locked by OTHER clients) and `ownSections`
+// ({slug, expectedSha256} locked by this client) with every shared write; the
+// pane re-resolves them from the live headings and checks the real mutation
+// target before anything is written. A slug that is missing or ambiguous
+// fails closed.
+function sectionSlug(text) {
+  return (text || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "section";
+}
+async function loadSectionMap(context) {
+  // A separate collection from body.paragraphs: ops (paragraph_delete, table_insert)
+  // keep paragraph objects from their own load, and reloading that collection here
+  // would invalidate them.
+  const paragraphs = context.document.body.getRange("Whole").paragraphs;
+  paragraphs.load("items/text,items/outlineLevel,items/tableNestingLevel");
+  await context.sync();
+  const items = paragraphs.items;
+  const heads = [];
+  items.forEach((p, i) => {
+    const level = p.outlineLevel;
+    if (p.tableNestingLevel === 0 && Number.isInteger(level) && level >= 1 && level <= 9)
+      heads.push({ index: i, level, text: (p.text || "").trim() });
+  });
+  const seen = new Map();
+  const sections = heads.map((h, n) => {
+    const slug = sectionSlug(h.text);
+    const ordinal = (seen.get(slug) || 0) + 1;
+    seen.set(slug, ordinal);
+    const end = n + 1 < heads.length ? heads[n + 1].index : items.length;
+    return { slug, section_key: `${slug}-${ordinal}`, heading_text: h.text, level: h.level, start: h.index, end };
+  });
+  return { items, sections };
+}
+function sectionSha(items, section) {
+  return sha256Hex(items.slice(section.start, section.end).map(p => p.text || "").join("\n"));
+}
+async function opSectionsList() {
+  return Word.run(async (context) => {
+    const { items, sections } = await loadSectionMap(context);
+    const bodySha256 = await requireFreshBody(context);
+    const counts = new Map();
+    sections.forEach(s => counts.set(s.slug, (counts.get(s.slug) || 0) + 1));
+    const listed = [];
+    for (const s of sections) {
+      listed.push({
+        section_key: s.section_key, slug: s.slug, heading_text: s.heading_text, level: s.level,
+        paragraph_count: s.end - s.start, slug_unique: counts.get(s.slug) === 1,
+        sectionSha256: await sectionSha(items, s),
+      });
+    }
+    return { sections: listed, bodySha256 };
+  });
+}
+function refuseDocumentWide(payload, what) {
+  if ((payload.forbiddenSections || []).length)
+    throw refusalError(`${what} are document-wide and another client holds a section lock`, "LOCKED_BY_OTHER_CLIENT");
+  if ((payload.ownSections || []).length)
+    throw refusalError(`${what} are document-wide; release your section locks first`, "OUTSIDE_LOCKED_SECTION");
+}
+// Word.LocationRelation values. Fail closed: only a range wholly before/after (or merely
+// adjacent to) a section is outside it; anything else, including "Unrelated", touches it.
+const SECTION_OUTSIDE = new Set(["Before", "AdjacentBefore", "After", "AdjacentAfter"]);
+const SECTION_WITHIN = new Set(["Inside", "InsideStart", "InsideEnd", "Equal"]);
+async function sectionGuard(context, payload) {
+  const forbiddenSlugs = payload.forbiddenSections || [];
+  const own = payload.ownSections || [];
+  if (!forbiddenSlugs.length && !own.length) return { active: false, async check() {} };
+  if (payload.scope && payload.scope !== "body")
+    throw refusalError("Section locks do not cover text-box scopes; release the locks first", "OUTSIDE_LOCKED_SECTION");
+  const { items, sections } = await loadSectionMap(context);
+  const resolve = (slug) => {
+    const hits = sections.filter(s => s.slug === slug);
+    if (hits.length !== 1)
+      throw refusalError(`Locked section ${JSON.stringify(slug)} ${hits.length ? "is ambiguous" : "was not found"}; ` +
+        "its owner must release and re-lock", "LOCK_SCOPE_UNRESOLVED");
+    return hits[0];
+  };
+  // Whole paragraphs, paragraph marks included: a paragraph's "End" point sits before its
+  // mark, so a whole-paragraph target would not count as inside a section built from it.
+  const rangeOf = s => items[s.start].getRange("Whole").expandTo(items[s.end - 1].getRange("Whole"));
+  const forbidden = forbiddenSlugs.map(slug => ({ slug, range: rangeOf(resolve(slug)) }));
+  const mine = [];
+  for (const o of own) {
+    const section = resolve(o.slug);
+    if (o.expectedSha256 && (await sectionSha(items, section)) !== o.expectedSha256)
+      throw refusalError(`Section ${JSON.stringify(o.slug)} changed since it was read; nothing was written. Re-read and retry.`, "stale");
+    mine.push({ slug: o.slug, range: rangeOf(section) });
+  }
+  return {
+    active: true,
+    async check(targetsOrThunk) {
+      const targets = typeof targetsOrThunk === "function" ? targetsOrThunk() : targetsOrThunk;
+      const forbiddenRels = targets.map(t => forbidden.map(f => t.compareLocationWith(f.range)));
+      const ownRels = targets.map(t => mine.map(m => t.compareLocationWith(m.range)));
+      try {
+        await context.sync();
+      } catch (err) {
+        // Fail closed: an unverifiable target is never written.
+        throw refusalError(`Could not verify the write target against section locks; nothing was written: ` +
+          `${err && err.message ? err.message : err} ${JSON.stringify((err && err.debugInfo) || {})}`, "LOCK_SCOPE_UNRESOLVED");
+      }
+      targets.forEach((_, i) => {
+        const hit = forbidden.findIndex((f, j) => !SECTION_OUTSIDE.has(forbiddenRels[i][j].value));
+        if (hit >= 0)
+          throw refusalError(`Section ${JSON.stringify(forbidden[hit].slug)} is locked by another client; nothing was written`,
+            "LOCKED_BY_OTHER_CLIENT");
+        if (mine.length && !mine.some((m, j) => SECTION_WITHIN.has(ownRels[i][j].value)))
+          throw refusalError("The target is outside the sections you have locked; nothing was written", "OUTSIDE_LOCKED_SECTION");
+      });
+    },
+  };
+}
+
 // -- search -------------------------------------------------------------
 
 async function opSearch(payload) {
@@ -854,6 +973,7 @@ async function opReplace(payload) {
     await context.sync();
     const preHash = await sha256Hex(body.text || "");
 
+    const guard = await sectionGuard(context, payload);
     const matchItems = await searchScoped(context, payload);
 
     if (matchItems.length !== expectedMatches) {
@@ -862,6 +982,7 @@ async function opReplace(payload) {
       );
     }
 
+    await guard.check(matchItems);
     await guardAnchoredParagraphs(context, matchItems);
     await guardRevisions(context, matchItems);
     const shapeBodies = await scopeShapeBodies(context, payload.scope);
@@ -944,6 +1065,7 @@ async function opFormat(payload) {
     await context.sync();
     const preHash = await sha256Hex(body.text || "");
 
+    const guard = await sectionGuard(context, payload);
     const matchItems = await searchScoped(context, payload);
 
     if (matchItems.length !== expectedMatches) {
@@ -952,6 +1074,7 @@ async function opFormat(payload) {
       );
     }
 
+    await guard.check(matchItems);
     if (payload.scope && payload.scope !== "body") {
       await guardRevisions(context, matchItems);
       await guardComments(context, matchItems, false, await scopeShapeBodies(context, payload.scope));
@@ -1134,6 +1257,7 @@ async function opCellSet(payload) {
       );
     }
 
+    await (await sectionGuard(context, payload)).check(() => [cell.body.getRange("Whole")]);
     await guardAnchoredBodies(context, [cell.body]);
     let previousMode = null;
     if (payload.track_changes) {
@@ -1380,6 +1504,16 @@ async function opTableInsert(payload) {
       }
     }
 
+    const guard = await sectionGuard(context, payload);
+    if (guard.active) {
+      // "before" a heading would land outside the section the anchor is in.
+      if (anchor && anchor.paragraph_text !== undefined && anchor.position === "before")
+        throw refusalError("Under section locks insert tables after an anchor, not before it", "OUTSIDE_LOCKED_SECTION");
+      const anchorRange = target
+        ? target.getRange()
+        : context.document.body.paragraphs.getLast().getRange();
+      await guard.check([anchorRange]);
+    }
     const emptyValues = payload.rows.map((row) => row.map(() => ""));
     let newTable = null;
     await withTracking(context, payload.track_changes, async () => {
@@ -1479,6 +1613,7 @@ async function opCellsSet(payload) {
       );
     }
 
+    await (await sectionGuard(context, payload)).check(() => cells.map(c => c.body.getRange("Whole")));
     await guardAnchoredBodies(context, cells.map(c => c.body));
     await withTracking(context, payload.track_changes, async () => {
       payload.cells.forEach((spec, i) => writeCellParagraphs(cells[i], spec.paragraphs || []));
@@ -1549,6 +1684,8 @@ async function opCommentAdd(payload) {
       );
     }
 
+    const guard = await sectionGuard(context, payload);
+    await guard.check(() => [results.items[0]]);
     const comment = results.items[0].insertComment(payload.text);
     comment.load("id");
     await context.sync();
@@ -1571,6 +1708,7 @@ async function opCommentReply(payload) {
     const comment = comments.items.find((c) => c.id === payload.comment_id);
     if (!comment) throw refusalError(`no comment with id ${JSON.stringify(payload.comment_id)}`);
     await verifyCommentIdentity(context, comment, payload.identity);
+    await (await sectionGuard(context, payload)).check(() => [comment.getRange()]);
     const reply = comment.reply(payload.text);
     reply.load("id");
     await context.sync();
@@ -1587,6 +1725,7 @@ async function opCommentResolve(payload) {
     const comment = comments.items.find((c) => c.id === payload.comment_id);
     if (!comment) throw refusalError(`no comment with id ${JSON.stringify(payload.comment_id)}`);
     await verifyCommentIdentity(context, comment, payload.identity);
+    await (await sectionGuard(context, payload)).check(() => [comment.getRange()]);
     comment.resolved = !!payload.resolved;
     await context.sync();
     return { resolved: !!payload.resolved };
@@ -1740,6 +1879,7 @@ async function opRevisionsMutate(payload, action) {
     return entry.change;
   });
   if (!revisionsSupported()) throw refusalError("WordApi 1.6 required", "LIVE_CAPABILITY_MISSING");
+  refuseDocumentWide(payload, "Revision changes");
   const execute = async context => {
     await requireFreshBody(context, payload.expectedBodySha256);
     const changes = await revisionObjects(context, context.document.body);
@@ -1959,10 +2099,11 @@ async function opParagraphDelete(payload) {
     const target = paragraphs.items[index];
     if (index === before.length-1 || target.tableNestingLevel !== 0)
       throw refusalError('Cannot delete final or table-cell paragraph', 'STRUCTURAL_BOUNDARY');
+    const range = target.getRange(Word.RangeLocation.whole);
+    await (await sectionGuard(context, payload)).check(() => [range]);
     const xml = target.getOoxml();
     await context.sync();
     inspectDeleteParagraph(xml.value);
-    const range = target.getRange(Word.RangeLocation.whole);
     await guardComments(context,[range],false);
     await guardRevisions(context,[range]);
     await withTracking(context,payload.track_changes,async () => {

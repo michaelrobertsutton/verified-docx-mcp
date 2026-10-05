@@ -1172,24 +1172,60 @@ on Office for Mac and it needs admin deployment. A shared-runtime startup
 behaviour (`Office.addin.setStartupBehavior`) is also document-scoped and was
 not tried.
 
-## Experimental shared bridge (#47 draft)
+## Shared bridge: several agent sessions, one Word pane (#47)
 
-Set `VERIFIED_DOCX_SHARED_BRIDGE=1` in **each** MCP server's environment and
-restart the servers. Call `live_status` in each process before using live tools.
-The first process owns the normal HTTPS/WSS ports; the others use a private
-same-user Unix socket. Reopen the pane to load `shared_queue`. Windows shared
-transport is unsupported; the normal non-shared bridge remains unchanged.
+Opt-in and POSIX-only (macOS). Set `VERIFIED_DOCX_SHARED_BRIDGE=1` in **each** MCP
+server's environment and restart the servers. Call `live_status` in each process
+before using live tools. The first process owns the normal HTTPS/WSS ports; the
+others attach over a private same-user Unix socket. Reopen the pane so it loads the
+`shared_queue` and `section_locks` capabilities. With the variable unset nothing
+changes. Windows shared transport is unsupported.
 
-`live_status.shared` reports your `client_id`, attached clients, and active
-leases. The pane activity log includes the originating client ID. Read the live
-body before writing. After `LIVE_STALE`, re-read and reconsider the edit.
-`live_document_lock(path, lease_s=60)` acquires or renews a **whole-document**
-lease; `live_document_lock(path, release=true)` releases it. Reads remain
-available to other clients. Leases expire after 1-300 seconds. Hold a lease
-across a multi-call edit/verification workflow to exclude other agent writers.
-There are no independent section locks in this draft.
+**Identity and visibility.** Every process gets a `client_id`; the pane's activity log
+labels each operation with its client. `live_status.shared` lists attached clients and
+every active lock. Any number of clients may read without a lock.
 
-If the owner exits, writes are not retried. Call `live_status` to reattach/elect
-an owner, wait for the pane, and re-read before deciding whether a previous
-operation needs repeating. A timeout can mean an edit applied but its reply
-was lost. See the [research, limitations and Claude acceptance checklist](acceptance/47-shared-bridge-handoff.md).
+**Optimistic concurrency.** A shared write needs a read baseline. Read the live body
+(`read_document source="live"`) before writing; only that explicit read acknowledges
+other clients' writes (a write tool's own internal read does not). After another
+client writes, your next write fails `LIVE_STALE` until you read again. Pre-write
+refusals do not stale anyone; a write that may have applied (timeout, verification
+failure) does. A pane queue serializes whole operations, including across reconnects.
+
+**Section locks** let several agents write different sections of one document in
+parallel. `live_list_sections(path)` returns the pane's heading sections (the
+`find_sections` convention: heading slug plus ordinal, a section runs to the next
+heading). `live_section_lock(path, section_keys=[...], lease_s=60,
+include_subsections=False)` locks them; `release=true` releases (all of yours if the
+list is empty). While you hold a lock:
+
+- other clients' writes touching your sections fail `LOCKED_BY_OTHER_CLIENT`; reads stay open;
+- your writes are confined to your sections (`OUTSIDE_LOCKED_SECTION`) and are checked
+  against a per-section hash, so other clients' edits elsewhere never stale you. Do not
+  pass `revision_before`; an explicit live read or your own write re-baselines your
+  sections, and renewing a lock never does;
+- revision accept/reject and text-box scopes are document-wide and are refused while any
+  section lock exists.
+
+The pane resolves each locked heading from the live document and checks the real
+mutation target (replace, format, cells, tables, paragraph delete, comments) before
+writing anything; it never trusts a caller-supplied label. A section can only be
+locked if its heading text is unique. If a locked heading is renamed, removed or
+duplicated, writes fail closed with `LOCK_SCOPE_UNRESOLVED` until the owner releases
+and re-locks. Tables can only be inserted *after* an anchor under locks. Leases last
+1-300 s. Locks end on release, expiry, client expiry, or pane reconnect.
+
+**Document leases.** `live_document_lock(path, lease_s=60)` excludes every other
+writer from the whole document; it cannot coexist with another client's section locks.
+Use a lease or section locks across a multi-call read/edit/verify workflow, because
+operation serialization alone does not make a multi-call tool atomic.
+
+**Failure behaviour.** The first process owns the listeners; if it exits, the others get
+`LIVE_DISCONNECTED` and no write is replayed. Call `live_status` to elect a new owner,
+wait for the pane to reconnect, and re-read before deciding whether an earlier
+operation needs repeating. A timeout can mean an edit applied but its reply was lost;
+later operations never interleave with it because the pane runs one operation at a time.
+
+**Limits.** Optimistic checks cover edits made by participating clients. A human or
+co-author changing formatting or comments outside a lock is not detected by the text
+hash. See the [acceptance record](acceptance/47-shared-bridge-handoff.md).
