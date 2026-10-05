@@ -745,6 +745,82 @@ def live_document_lock(path: str, release: bool = False, lease_s: float = 60) ->
 
 
 @mcp.tool()
+def live_list_sections(path: str) -> dict[str, Any]:
+    """List the live document's heading sections as the Word pane sees them.
+
+    Each entry has ``section_key`` (the find_sections convention: heading slug plus
+    ordinal), ``heading_text``, ``level``, ``paragraph_count``, ``slug_unique`` and
+    ``sectionSha256``. Only sections with ``slug_unique`` true can be locked with
+    live_section_lock. Needs a pane that reports ``section_locks``; works with or
+    without the shared bridge.
+    """
+    from .live import comments_live, write_mode
+    from .live.session import LiveError
+
+    try:
+        session = write_mode.live_session_for(path)
+        write_mode.require_capability(session, "section_locks", feature_description="live_list_sections")
+        return comments_live._request(session, "sections_list", {})
+    except LiveError as exc:
+        try:
+            comments_live._raise_from_live_error(exc)
+        except VerifyError as error:
+            _raise_tool_error(error)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def live_section_lock(
+    path: str,
+    section_keys: list[str],
+    release: bool = False,
+    lease_s: float = 60,
+    include_subsections: bool = False,
+) -> dict[str, Any]:
+    """Acquire/renew or release this client's lock on heading SECTIONS of a shared live document.
+
+    ``section_keys`` come from live_list_sections. While you hold a lock, other
+    clients' writes that touch the section fail LOCKED_BY_OTHER_CLIENT (reads stay
+    open), and your own writes are confined to your locked sections
+    (OUTSIDE_LOCKED_SECTION otherwise) but are NOT staled by other clients' edits
+    elsewhere. Do not pass revision_before while locked: freshness is checked per
+    section, and an explicit live read or your own write re-baselines it. A section
+    heading must have unique text; if its heading is renamed or duplicated the lock
+    fails closed (LOCK_SCOPE_UNRESOLVED) until the owner releases it. Leases last
+    1-300 s and renew by locking again; renewing never re-baselines. Revision,
+    text-box-scope and other document-wide operations are refused under section
+    locks. ``release=true`` releases the named sections (all of yours if
+    ``section_keys`` is empty). Requires VERIFIED_DOCX_SHARED_BRIDGE=1.
+    ``include_subsections`` also locks the deeper-level sections that follow.
+    """
+    from .live import comments_live, write_mode
+    from .live.session import LiveError
+
+    try:
+        session = write_mode.live_session_for(path)
+        if not hasattr(session, "client"):
+            raise _make_error(ErrorCode.LIVE_UNAVAILABLE, "Enable shared bridge and call live_status first")
+        if release:
+            return session.client.rpc("section_unlock", **session.target(), sections=section_keys)
+        return session.client.rpc(
+            "section_lock",
+            **session.target(),
+            sections=section_keys,
+            lease_s=lease_s,
+            include_subsections=include_subsections,
+            rpc_timeout=30,
+        )
+    except LiveError as exc:
+        try:
+            comments_live._raise_from_live_error(exc)
+        except VerifyError as error:
+            _raise_tool_error(error)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
 def live_status() -> dict[str, Any]:
     """Report live-bridge state: whether it is running, its ports, and
     every currently connected Word task-pane session.
