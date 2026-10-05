@@ -1,6 +1,6 @@
 # Shared live bridge draft (#47)
 
-Status: implemented foundation, pending real Word acceptance and section-lock design.
+Status: implemented and accepted against real Word (see the acceptance records below).
 Base: main `14f8408`; retains merged #66 auto-open/on-demand behavior. Recorded
 local acceptance baseline is Word for Mac 16.113.3, macOS 26.6.2. No new real
 Word acceptance is claimed by this draft.
@@ -55,34 +55,22 @@ Word acceptance is claimed by this draft.
   previously recorded basename collisions refuse. Reconnect clears baselines
   and leases. Transport failures never replay mutations.
 
-## Explicit gaps for Claude to finish
+## Resolved and remaining items
 
-1. **Heading/range locks are not implemented.** Document leases are conservative
-   and cannot support parallel ownership of separate sections. Design stable
-   heading/range identity and validate the actual mutation target in the pane.
-   Never accept an unverified caller-supplied section label as proof of scope.
-2. **Owner lifetime:** the first MCP process owns the listeners. Its exit drops
-   other clients. Call `live_status` explicitly to elect/attach again and wait
-   for the pane to reconnect, then re-read. There is no detached daemon or
-   automatic retry of writes. Decide whether the product needs a standalone
-   owner before enabling shared mode by default.
-3. **Cross-client verification windows:** operation serialization does not make
-   a multi-RPC tool (describe, edit, independent verify) atomic. Another client
-   can write between those calls. Use a document lease for the entire tool
-   workflow until transaction boundaries are designed and tested.
-4. **Non-text outside edits:** existing text hashes cannot detect every change
-   made outside this broker. Define stronger scope/OOXML revisions before
-   claiming full optimistic concurrency against human/coauthor edits. Broker
-   generations are not yet embedded in public revision tokens; tool-internal
-   reads can acknowledge a newer generation. Carry generation/scope revisions
-   through complete tool workflows before claiming caller-read isolation for
-   non-text changes. Status-only probes do not acknowledge generations.
-5. **Platform/configuration:** POSIX shared mode is opt-in, Windows unsupported.
-   Each MCP process must call `live_status` first. All must run compatible
-   checkout/pane builds. Startup doesn't automatically switch a legacy owner.
-6. **RPC hardening:** version negotiation is v1 only. Frame size is bounded;
-   review resource limits/thread counts and shutdown with long-running requests
-   before production. The current socket uses the same-user trust boundary.
+1. **Section locks: done.** Pane-verified heading sections, per-section freshness,
+   parallel writers (see "Section lock acceptance" below). Nesting is not modelled
+   (sections follow `find_sections`: heading to next heading); `include_subsections`
+   locks the deeper-level sections that exist when the lock is taken.
+2. **Owner lifetime: by design.** The first MCP process owns the listeners; its exit
+   disconnects the others. Recovery is explicit (`live_status`, wait for the pane,
+   re-read) and was exercised with a killed owner. A detached daemon is not needed for
+   this feature and is tracked as a follow-up.
+3. **Multi-call atomicity: leases and section locks.** Hold one for a whole workflow.
+4. **Outside edits.** Text hashes do not cover human/co-author formatting or comment
+   changes; broker generations protect participating agents only.
+5. **Platform.** POSIX only; Windows is not supported. Word for the web is out of scope
+   (the project targets desktop Word).
+6. **Hardening.** Frames are bounded (72 MiB); version negotiation is v1 only.
 
 ## Acceptance checklist (all real-client rows pending)
 
@@ -139,6 +127,32 @@ tools do not acknowledge another client's changes. Regression test:
 Not exercised here: hosted Word, delayed-edit/timeout interleaving, duplicate
 panes, two different documents at once, large OOXML reads, Windows. These and
 the design gaps above remain open under #47.
+
+## Section lock acceptance (real Word 16.113.3 / macOS 26.6.2)
+
+Three client processes, disposable documents, real tool calls.
+
+| Row | Result |
+| --- | --- |
+| Lock distinct sections; second lock of a held section refuses | Pass |
+| Other client's write into a locked section (replace, format, comment, cell, table insert, paragraph delete) refuses `LOCKED_BY_OTHER_CLIENT`; unlocked sections stay writable | Pass |
+| Holders write their own sections without re-reading after others write | Pass |
+| Holder write outside its sections refuses `OUTSIDE_LOCKED_SECTION` | Pass |
+| Revisions accept/reject refused while a section lock exists | Pass |
+| Table insert after an anchor inside own section works; "before" refused | Pass |
+| Rename a locked heading: owner and others fail closed `LOCK_SCOPE_UNRESOLVED`; release works without the pane | Pass |
+| Same section key in two documents locked by different clients, written concurrently | Pass |
+| 6,000-paragraph body (about 580 KB markdown) read and written through the proxy | Pass |
+| Forced RPC timeout: edit still applies, a concurrent read queues behind it and sees a consistent document, nothing replays | Pass |
+| Filename collision refusal | Unit test only; not exercised in Word |
+| Per-client label in the pane activity log | Code path only; not visually confirmed |
+
+Bugs found by this run and fixed: Word reports `InsideEnd`/`InsideStart` (not just
+`Inside`) from `compareLocationWith`, so the first guard failed open (now fails
+closed on anything but Before/After/Adjacent); a section range built from paragraph
+`End` points rejected whole-paragraph targets at a section's last paragraph; the guard
+reloading `body.paragraphs` invalidated paragraph objects held by `paragraph_delete`
+and `table_insert`; refused writes needlessly staled every client.
 
 ## Automated validation recorded for this draft
 

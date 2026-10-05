@@ -557,3 +557,16 @@ def test_renewing_a_lock_does_not_rebaseline(sections):
     call(a, action="section_lock", sections=["scope-1"])
     call(a, "replace")
     assert _last_write(pane)["ownSections"][0]["expectedSha256"] == "s-scope"
+
+
+def test_basename_collision_refuses_every_request(setup_broker):
+    pane, broker, a, _, call = setup_broker
+    call(a)
+    broker.registry.collisions = lambda: [
+        {"kind": "basename_collision", "document_name": pane.document_name}
+    ]
+    for op in ("describe", "replace"):
+        with pytest.raises(LiveOpFailed, match="LIVE_SESSION_MISMATCH"):
+            call(a, op)
+    with pytest.raises(LiveOpFailed, match="LIVE_SESSION_MISMATCH"):
+        call(a, action="lock")
