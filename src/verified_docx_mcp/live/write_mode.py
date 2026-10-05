@@ -279,7 +279,12 @@ def live_session_for(path: str) -> LiveSession:
             {"document_name": document_name, "path": path},
         )
     _check_session_identity(path, session)
-    return session
+    # Shared bridge: tool-internal reads (a write tool fetching the body before
+    # it edits) must not acknowledge another client's write. Only the caller's
+    # explicit read (reads_live) advances its baseline, so a stale writer is
+    # refused with LIVE_STALE instead of silently re-baselined.
+    view = getattr(session, "status_view", None)
+    return view() if view is not None else session
 
 
 def require_capability(session: LiveSession, capability: str, *, feature_description: str) -> None:

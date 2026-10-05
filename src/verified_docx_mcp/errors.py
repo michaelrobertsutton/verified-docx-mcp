@@ -37,6 +37,7 @@ from typing import Any
 class ErrorCode(Enum):
     # Generic
     INVALID_INPUT = "INVALID_INPUT"
+    LOCKED_BY_OTHER_CLIENT = "LOCKED_BY_OTHER_CLIENT"
 
     # Path safety (paths.py: the $DOCS containment rule + allowlist)
     DOCX_PATH_ESCAPE = "DOCX_PATH_ESCAPE"

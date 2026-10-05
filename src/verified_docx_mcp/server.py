@@ -697,7 +697,7 @@ def execute_live_status() -> dict[str, Any]:
                 "requirement_sets": session.hello.requirement_sets,
                 "instance_id": session.hello.instance_id,
                 "platform": session.hello.platform,
-                **_revision_status(session),
+                **_revision_status(session.status_view() if hasattr(session, "status_view") else session),
             }
         )
 
@@ -714,7 +714,34 @@ def execute_live_status() -> dict[str, Any]:
         # such basename collision is recorded here so it is visible
         # rather than a silent misroute -- empty when none have happened.
         "session_collisions": registry.collisions(),
+        "shared": registry.status() if hasattr(registry, "status") else None,
     }
+
+
+@mcp.tool()
+def live_document_lock(path: str, release: bool = False, lease_s: float = 60) -> dict[str, Any]:
+    """Acquire/renew or release this client's shared live DOCUMENT lock.
+
+    Requires VERIFIED_DOCX_SHARED_BRIDGE=1 and live_status in each MCP process.
+    Lease is 1-300 seconds; reads remain available to every client. This draft
+    supports whole-document locks only, not independent heading/range locks.
+    Other clients' writes fail LOCKED_BY_OTHER_CLIENT while the lease is held.
+    """
+    from .live import comments_live, write_mode
+    from .live.session import LiveError
+
+    try:
+        session = write_mode.live_session_for(path)
+        if not hasattr(session, "client"):
+            raise _make_error(ErrorCode.LIVE_UNAVAILABLE, "Enable shared bridge and call live_status first")
+        return session.client.rpc("unlock" if release else "lock", **session.target(), lease_s=lease_s)
+    except LiveError as exc:
+        try:
+            comments_live._raise_from_live_error(exc)
+        except VerifyError as error:
+            _raise_tool_error(error)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
 
 
 @mcp.tool()

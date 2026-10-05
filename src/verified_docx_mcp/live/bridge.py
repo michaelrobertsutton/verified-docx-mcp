@@ -326,7 +326,22 @@ _singleton_lock = threading.Lock()
 _singleton: _RunningBridge | None = None
 
 
-def start_in_background(
+def start_in_background(**kwargs):
+    """Start/attach to the experimental shared owner when explicitly enabled.
+
+    Custom-port test/CLI bridges retain their existing isolated behavior.
+    """
+    import os
+
+    if os.environ.get("VERIFIED_DOCX_SHARED_BRIDGE") == "1" and not kwargs:
+        if sys.platform == "win32":
+            raise RuntimeError("Shared bridge requires POSIX Unix sockets; Windows is unsupported")
+        from . import shared
+        return shared.connect(_start_local)
+    return _start_local(**kwargs)
+
+
+def _start_local(
     *,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -434,6 +449,9 @@ def stop(*, timeout: float = 5.0) -> None:
         running = _singleton
         _singleton = None
     if running is None:
+        if sys.platform != "win32":
+            from . import shared
+            shared.stop()
         return
 
     try:
@@ -444,6 +462,10 @@ def stop(*, timeout: float = 5.0) -> None:
     running.ops_loop.call_soon_threadsafe(running.ops_server.close)
     running.http_thread.join(timeout=timeout)
     running.ops_thread.join(timeout=timeout)
+    # Keep the election lock until both listeners have stopped.
+    if sys.platform != "win32":
+        from . import shared
+        shared.stop()
 
 
 def current_registry() -> SessionRegistry | None:
@@ -454,12 +476,20 @@ def current_registry() -> SessionRegistry | None:
     starts the bridge lazily, so it calls `start_in_background()`
     directly and only falls back to this for symmetry in tests that want
     to check bridge state without starting one."""
+    if sys.platform != "win32":
+        from . import shared
+        if shared.current() is not None:
+            return shared.current()
     with _singleton_lock:
         return _singleton.registry if _singleton is not None else None
 
 
 def current_ports() -> tuple[int, int] | None:
     """(port, ops_port) of the running bridge, or None if not running."""
+    if sys.platform != "win32":
+        from . import shared
+        if shared.current() is not None:
+            return DEFAULT_PORT, DEFAULT_OPS_PORT
     with _singleton_lock:
         return (_singleton.port, _singleton.ops_port) if _singleton is not None else None
 

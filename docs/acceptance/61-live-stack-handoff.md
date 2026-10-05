@@ -147,3 +147,8 @@ Evidence is in the acceptance comments on PR #62 (revisions), #64 (shapes), #68
 
 ### How the injected-failure rows were run
 Each used a disposable copy of the pane (`taskpane.js`) in a scratch directory served by a separate bridge, never a branch: one fixed patch per variant (capability not advertised; shape read throws first time / always; shape `insertText` made a no-op; paragraph OOXML replaced by `<broken`). The real Word session then ran the real tool calls against it.
+
+## Shared-agent draft follow-up (#47)
+
+The [shared bridge handoff](47-shared-bridge-handoff.md) adds a separate pending
+multi-process matrix. Existing #61 results do not establish shared-mode safety.
