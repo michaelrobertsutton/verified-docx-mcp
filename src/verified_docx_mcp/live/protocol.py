@@ -288,6 +288,8 @@ VALID_OPS: frozenset[str] = frozenset(
         # issue #66: tag a document so Word opens the Live pane with it
         "autoopen_get",
         "autoopen_set",
+        # issue #47: heading sections (key, level, hash) for section locks
+        "sections_list",
     }
 )
 

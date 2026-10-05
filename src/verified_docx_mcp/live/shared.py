@@ -38,6 +38,20 @@ READ_OPS = frozenset(
         "scope_describe",
         "revisions_list",
         "autoopen_get",
+        "sections_list",
+    }
+)
+# Pane refusals raised before any mutation; they must not stale other clients.
+PRE_MUTATION_REFUSALS = frozenset(
+    {
+        "stale",
+        "LIVE_STALE",
+        "LOCKED_BY_OTHER_CLIENT",
+        "OUTSIDE_LOCKED_SECTION",
+        "LOCK_SCOPE_UNRESOLVED",
+        "LIVE_CAPABILITY_MISSING",
+        "zero_match",
+        "match_count_mismatch",
     }
 )
 MAX_FRAME = 72 * 2**20  # body_ooxml can return 48 MiB, with JSON escaping
@@ -45,6 +59,13 @@ CLIENT_TTL = 300.0
 _client = None
 _owner = None
 _init_lock = threading.Lock()
+
+
+def _lease_duration(request: dict) -> float:
+    duration = request.get("lease_s", 60)
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not 1 <= duration <= 300:
+        raise ValueError("lease_s must be between 1 and 300")
+    return duration
 
 
 def enabled() -> bool:
@@ -80,6 +101,7 @@ class Broker:
         self.registry = registry
         self.clients: dict[str, dict] = {}
         self.locks: dict[str, dict] = {}
+        self.section_locks: dict[str, dict[str, dict]] = {}
         self.mutex = threading.RLock()
         self.doc_mutexes: dict[str, threading.Lock] = {}
         self.versions: dict[str, int] = {}
@@ -99,6 +121,15 @@ class Broker:
             for key, value in self.locks.items()
             if value["expires"] > now and value["client_id"] in self.clients
         }
+        for doc, held in list(self.section_locks.items()):
+            for slug in [
+                slug
+                for slug, v in held.items()
+                if v["expires"] <= now or v["client_id"] not in self.clients
+            ]:
+                held.pop(slug)
+            if not held:
+                self.section_locks.pop(doc)
         self.seen = {key: value for key, value in self.seen.items() if key[0] in self.clients}
         self.hashes = {key: value for key, value in self.hashes.items() if key[0] in self.clients}
 
@@ -134,13 +165,25 @@ class Broker:
                             "remaining_s": v["expires"] - time.monotonic(),
                         }
                         for key, v in self.locks.items()
+                    ]
+                    + [
+                        {
+                            "document_url": doc,
+                            "client_id": v["client_id"],
+                            "scope": "section",
+                            "section_key": v["key"],
+                            "heading_text": v["heading_text"],
+                            "remaining_s": v["expires"] - time.monotonic(),
+                        }
+                        for doc, held in self.section_locks.items()
+                        for v in held.values()
                     ],
                 }
         if action == "list":
             return [self.snapshot(s) for s in self.registry.list()]
         if action == "collisions":
             return self.registry.collisions()
-        if action not in {"request", "lock", "unlock"}:
+        if action not in {"request", "lock", "unlock", "section_lock", "section_unlock"}:
             raise ValueError("Unknown shared bridge action")
         session = self.registry.get(request["document_name"])
         if session is None:
@@ -177,6 +220,7 @@ class Broker:
                     self.seen = {k: v for k, v in self.seen.items() if k[1] != key}
                     self.hashes = {k: v for k, v in self.hashes.items() if k[1] != key}
                     self.locks.pop(key, None)
+                    self.section_locks.pop(key, None)
                 lease = self.locks.get(key)
                 if action in {"lock", "unlock"}:
                     if lease and lease["client_id"] != client_id:
@@ -186,31 +230,47 @@ class Broker:
                     if action == "unlock":
                         self.locks.pop(key, None)
                         return {"released": True}
-                    duration = request.get("lease_s", 60)
-                    if (
-                        isinstance(duration, bool)
-                        or not isinstance(duration, (int, float))
-                        or not 1 <= duration <= 300
+                    duration = _lease_duration(request)
+                    if any(
+                        v["client_id"] != client_id for v in self.section_locks.get(key, {}).values()
                     ):
-                        raise ValueError("lease_s must be between 1 and 300")
+                        raise LiveOpFailed(
+                            "LOCKED_BY_OTHER_CLIENT", "Another client holds section locks here"
+                        )
+                    if any(v["client_id"] == client_id for v in self.section_locks.get(key, {}).values()):
+                        raise ValueError("Release your section locks before taking a document lease")
                     self.locks[key] = {
                         "client_id": client_id,
                         "expires": time.monotonic() + duration,
                     }
                     return {"client_id": client_id, "scope": "document", "lease_s": duration}
+                if action == "section_unlock":
+                    return self._section_unlock(key, client_id, request.get("sections"))
+            if action == "section_lock":
+                return self._section_lock(session, key, client_id, request, lease, timeout)
+            if action != "request":
+                raise ValueError("Unknown shared bridge action")
             op = request["op"]
             if op not in VALID_OPS:
                 raise ValueError("Unknown pane operation")
             write = op not in READ_OPS
             payload = dict(request.get("payload") or {})
+            # Only the broker may scope a write; never trust caller-supplied scopes.
+            payload.pop("forbiddenSections", None)
+            payload.pop("ownSections", None)
             with self.mutex:
                 version = self.versions.get(key, 0)
+                held = self.section_locks.get(key, {})
+                own = {s: v for s, v in held.items() if v["client_id"] == client_id}
+                forbidden = [s for s, v in held.items() if v["client_id"] != client_id]
                 if write:
                     if lease and lease["client_id"] != client_id:
                         raise LiveOpFailed(
                             "LOCKED_BY_OTHER_CLIENT", "Document is locked by another client"
                         )
-                    if self.seen.get((client_id, key)) != version:
+                    # A section-lock holder is confined to its sections and checked per
+                    # section, so other clients' edits elsewhere never stale it.
+                    if not own and self.seen.get((client_id, key)) != version:
                         raise LiveOpFailed(
                             "LIVE_STALE", "Read the live document after the other client's write"
                         )
@@ -220,39 +280,174 @@ class Broker:
                         "LIVE_CAPABILITY_MISSING",
                         "Reopen the pane to load shared_queue before shared writes",
                     )
-                expected = request.get("expected_body_sha256") or payload.get("expectedBodySha256")
-                # Never silently refresh a client's old read baseline at write time.
-                if not expected:
-                    with self.mutex:
-                        expected = self.hashes.get((client_id, key))
-                if not expected:
+                if (own or forbidden) and "section_locks" not in session.hello.capabilities:
                     raise LiveOpFailed(
-                        "LIVE_STALE", "Read the live document body before a shared write"
+                        "LIVE_CAPABILITY_MISSING",
+                        "Reopen the pane to load section_locks before writing under section locks",
                     )
-                payload["expectedBodySha256"] = expected
+                if own:
+                    payload.pop("expectedBodySha256", None)
+                    payload["ownSections"] = [
+                        {"slug": s, "expectedSha256": v["sha"]} for s, v in own.items()
+                    ]
+                else:
+                    expected = request.get("expected_body_sha256") or payload.get(
+                        "expectedBodySha256"
+                    )
+                    # Never silently refresh a client's old read baseline at write time.
+                    if not expected:
+                        with self.mutex:
+                            expected = self.hashes.get((client_id, key))
+                    if not expected:
+                        raise LiveOpFailed(
+                            "LIVE_STALE", "Read the live document body before a shared write"
+                        )
+                    payload["expectedBodySha256"] = expected
+                if forbidden:
+                    payload["forbiddenSections"] = forbidden
             payload["clientId"] = client_id
+            mutated = True
             try:
                 result = session.request_threadsafe(
                     op,
                     payload,
                     timeout=timeout,
-                    expected_body_sha256=request.get("expected_body_sha256"),
+                    expected_body_sha256=None if own else request.get("expected_body_sha256"),
                 )
+            except LiveOpFailed as exc:
+                # Only a refusal the pane raises before touching the document is safe to
+                # ignore; anything else (timeout, verification failure) may have applied.
+                if exc.code in PRE_MUTATION_REFUSALS:
+                    mutated = False
+                raise
             finally:
-                if write:
+                if write and mutated:
                     # Failure may be post-mutation. Invalidate other baselines
                     # even when the pane times out or reports verification failure.
                     with self.mutex:
                         self.versions[key] = version + 1
+                    if own:
+                        self._refresh_baselines(session, key, client_id, timeout)
             with self.mutex:
                 if write or request.get("observe", True):
                     self.seen[(client_id, key)] = self.versions.get(key, 0)
                     body_hash = result.get("bodySha256") or result.get("post")
                     if body_hash:
                         self.hashes[(client_id, key)] = body_hash
+            if not write and own and op == "body_ooxml" and request.get("observe", True):
+                # An explicit read of the body re-baselines the reader's own sections.
+                self._refresh_baselines(session, key, client_id, timeout)
             return result
         finally:
             gate.release()
+
+    def _refresh_baselines(self, session, key, client_id, timeout):
+        """Re-read this client's section hashes from the pane. On failure keep the
+        old baselines: the next write then refuses as stale until an explicit read."""
+        try:
+            listed = session.request_threadsafe("sections_list", {}, timeout=timeout)
+        except (LiveDisconnected, LiveOpFailed):
+            return
+        current = {sec["slug"]: sec for sec in listed.get("sections", []) if sec.get("slug_unique")}
+        with self.mutex:
+            for slug, lock in self.section_locks.get(key, {}).items():
+                if lock["client_id"] == client_id and slug in current:
+                    lock["sha"] = current[slug]["sectionSha256"]
+
+    def _section_lock(self, session, key, client_id, request, lease, timeout):
+        if lease and lease["client_id"] != client_id:
+            raise LiveOpFailed("LOCKED_BY_OTHER_CLIENT", "Document is locked by another client")
+        if lease:
+            raise ValueError("Release your document lease before taking section locks")
+        if "section_locks" not in session.hello.capabilities:
+            raise LiveOpFailed(
+                "LIVE_CAPABILITY_MISSING", "Reopen the pane to load section_locks before locking"
+            )
+        duration = _lease_duration(request)
+        wanted = request.get("sections")
+        if not isinstance(wanted, list) or not wanted or not all(isinstance(k, str) for k in wanted):
+            raise ValueError("sections must be a non-empty list of section_key strings")
+        listed = session.request_threadsafe("sections_list", {}, timeout=timeout)
+        sections = listed["sections"]
+        by_key = {sec["section_key"]: (i, sec) for i, sec in enumerate(sections)}
+        chosen: dict[str, dict] = {}
+        for want in wanted:
+            if want not in by_key:
+                raise LiveOpFailed(
+                    "LOCK_SCOPE_UNRESOLVED", f"No section {want!r}; call live_list_sections"
+                )
+            index, first = by_key[want]
+            group = [first]
+            if request.get("include_subsections"):
+                for later in sections[index + 1 :]:
+                    if later["level"] <= first["level"]:
+                        break
+                    group.append(later)
+            for sec in group:
+                if not sec["slug_unique"]:
+                    raise LiveOpFailed(
+                        "LOCK_SCOPE_UNRESOLVED",
+                        f"Heading text of {sec['section_key']!r} is not unique, so it cannot be "
+                        "identified safely; rename it or use live_document_lock",
+                    )
+                chosen[sec["slug"]] = sec
+        with self.mutex:
+            self._expire()
+            held = self.section_locks.setdefault(key, {})
+            for slug in chosen:
+                if slug in held and held[slug]["client_id"] != client_id:
+                    raise LiveOpFailed(
+                        "LOCKED_BY_OTHER_CLIENT", f"Section {slug!r} is locked by another client"
+                    )
+            expires = time.monotonic() + duration
+            for slug, sec in chosen.items():
+                existing = held.get(slug)
+                # Renewing never re-baselines: only a read or the holder's own write does.
+                sha = existing["sha"] if existing else sec["sectionSha256"]
+                held[slug] = {
+                    "client_id": client_id,
+                    "expires": expires,
+                    "key": sec["section_key"],
+                    "heading_text": sec["heading_text"],
+                    "sha": sha,
+                }
+        return {
+            "client_id": client_id,
+            "scope": "section",
+            "lease_s": duration,
+            "sections": [
+                {
+                    "section_key": sec["section_key"],
+                    "heading_text": sec["heading_text"],
+                    "sectionSha256": sec["sectionSha256"],
+                }
+                for sec in chosen.values()
+            ],
+        }
+
+    def _section_unlock(self, key, client_id, sections):
+        held = self.section_locks.get(key, {})
+        mine = {s: v for s, v in held.items() if v["client_id"] == client_id}
+        if sections:
+            wanted = set(sections)
+            targets = [s for s, v in mine.items() if s in wanted or v["key"] in wanted]
+            foreign = [
+                w
+                for w in wanted
+                if w not in mine and all(v["key"] != w for v in mine.values())
+                and any(w in (s, v["key"]) for s, v in held.items())
+            ]
+            if foreign:
+                raise LiveOpFailed(
+                    "LOCKED_BY_OTHER_CLIENT", "Section is locked by another client"
+                )
+        else:
+            targets = list(mine)
+        for slug in targets:
+            held.pop(slug)
+        if not held:
+            self.section_locks.pop(key, None)
+        return {"released": sorted(mine[s]["key"] for s in targets)}
 
     @staticmethod
     def snapshot(session):

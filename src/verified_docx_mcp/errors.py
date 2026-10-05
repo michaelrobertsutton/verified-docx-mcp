@@ -38,6 +38,8 @@ class ErrorCode(Enum):
     # Generic
     INVALID_INPUT = "INVALID_INPUT"
     LOCKED_BY_OTHER_CLIENT = "LOCKED_BY_OTHER_CLIENT"
+    OUTSIDE_LOCKED_SECTION = "OUTSIDE_LOCKED_SECTION"  # shared live write by a section-lock holder landed outside its locked sections (or on a document-wide op / text-box scope)
+    LOCK_SCOPE_UNRESOLVED = "LOCK_SCOPE_UNRESOLVED"  # a section lock's heading is missing, renamed, or no longer unique, so its scope cannot be verified; writes fail closed until the owner re-locks
 
     # Path safety (paths.py: the $DOCS containment rule + allowlist)
     DOCX_PATH_ESCAPE = "DOCX_PATH_ESCAPE"
