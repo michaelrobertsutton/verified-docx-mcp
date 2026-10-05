@@ -209,6 +209,22 @@ def test_pane_queue_and_stale_preflight():
     )
 
 
+def test_pane_section_guard():
+    import shutil
+    from pathlib import Path
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node unavailable")
+    root = Path(__file__).resolve().parents[2]
+    subprocess.run(
+        [node, str(root / "tests/unit/js/section_guard_harness.mjs"), str(root / "addin/taskpane.js")],
+        check=True,
+        capture_output=True,
+        timeout=15,
+    )
+
+
 def test_reconnect_invalidates_client_baselines(setup_broker):
     pane, _, a, _, call = setup_broker
     call(a)
@@ -319,3 +335,225 @@ def test_write_tool_session_does_not_acknowledge_other_writes(setup_broker, monk
     with pytest.raises(LiveOpFailed, match="LIVE_STALE"):
         session.request_threadsafe("replace")
     assert sum(op == "replace" for op, _ in pane.calls) == 1
+
+
+# -- section locks (#47) ---------------------------------------------------------
+
+
+class SectionPane(Pane):
+    hello = HelloMessage(
+        Pane.document_url,
+        "Word",
+        "Mac",
+        {},
+        "initial",
+        frozenset({"shared_queue", "section_locks"}),
+        "pane-1",
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.refuse = None
+        self.sent = []
+        self.sha = {"intro": "s-intro", "scope": "s-scope", "scope-detail": "s-detail", "dup": "s-dup"}
+        self.sections = [
+            ("intro", 1, True),
+            ("scope", 1, True),
+            ("scope-detail", 2, True),
+            ("dup", 1, False),
+        ]
+
+    def request_threadsafe(self, op, payload=None, **kwargs):
+        if op == "sections_list":
+            self.calls.append((op, payload))
+            return {
+                "bodySha256": self.last_body_sha256,
+                "sections": [
+                    {
+                        "section_key": f"{slug}-1",
+                        "slug": slug,
+                        "heading_text": slug,
+                        "level": level,
+                        "slug_unique": unique,
+                        "sectionSha256": self.sha[slug],
+                    }
+                    for slug, level, unique in self.sections
+                ],
+            }
+        if self.refuse and op not in shared.READ_OPS:
+            self.calls.append((op, payload))
+            self.sent.append((op, dict(payload)))
+            raise LiveOpFailed(self.refuse, "refused")
+        self.kwargs = kwargs
+        self.sent.append((op, dict(payload)))
+        if op not in shared.READ_OPS:
+            payload = {**payload}
+            payload.setdefault("expectedBodySha256", self.last_body_sha256)
+        return super().request_threadsafe(op, payload, **kwargs)
+
+
+@pytest.fixture
+def sections():
+    pane = SectionPane()
+    registry = SimpleNamespace(
+        get=lambda name: pane if name == pane.document_name else None,
+        list=lambda: [pane],
+        collisions=list,
+    )
+    broker = shared.Broker(registry)
+    a = broker.dispatch({"action": "attach"})["client_id"]
+    b = broker.dispatch({"action": "attach"})["client_id"]
+
+    def call(client, op="describe", action="request", **kwargs):
+        return broker.dispatch(
+            {
+                "action": action,
+                "client_id": client,
+                "document_name": pane.document_name,
+                "document_url": pane.document_url,
+                "connected_since": pane.connected_since,
+                "op": op,
+                **kwargs,
+            }
+        )
+
+    return pane, broker, a, b, call
+
+
+def _last_write(pane):
+    return [p for op, p in pane.sent if op == "replace"][-1]
+
+
+def test_section_locks_conflict_and_forward_scopes(sections):
+    pane, _, a, b, call = sections
+    call(a, action="section_lock", sections=["scope-1"])
+    call(b, action="section_lock", sections=["intro-1"])
+    with pytest.raises(LiveOpFailed, match="LOCKED_BY_OTHER_CLIENT"):
+        call(b, action="section_lock", sections=["scope-1"])
+    call(a, "replace")
+    own = _last_write(pane)
+    assert own["ownSections"] == [{"slug": "scope", "expectedSha256": "s-scope"}]
+    assert own["forbiddenSections"] == ["intro"]
+    assert "expectedBodySha256" not in own
+
+
+def test_section_holder_is_not_staled_by_other_clients_writes(sections):
+    pane, _, a, b, call = sections
+    call(a, action="section_lock", sections=["scope-1"])
+    call(b)  # B has no lock: explicit read baseline
+    call(b, "replace")
+    call(a, "replace")  # A never read, but is not stale: checked per section
+    assert pane.kwargs["expected_body_sha256"] is None
+    call(a, "replace")
+
+
+def test_lock_requires_unique_heading_known_key_and_capability(sections):
+    pane, _, a, _, call = sections
+    with pytest.raises(LiveOpFailed, match="LOCK_SCOPE_UNRESOLVED"):
+        call(a, action="section_lock", sections=["dup-1"])
+    with pytest.raises(LiveOpFailed, match="LOCK_SCOPE_UNRESOLVED"):
+        call(a, action="section_lock", sections=["nope-1"])
+    with pytest.raises(ValueError, match="sections"):
+        call(a, action="section_lock", sections=[])
+    pane.hello = HelloMessage(pane.document_url, "Word", "Mac", {}, "initial", frozenset({"shared_queue"}))
+    with pytest.raises(LiveOpFailed, match="LIVE_CAPABILITY_MISSING"):
+        call(a, action="section_lock", sections=["intro-1"])
+
+
+def test_include_subsections_stops_at_same_or_higher_level(sections):
+    _, _, a, _, call = sections
+    result = call(a, action="section_lock", sections=["scope-1"], include_subsections=True)
+    assert [s["section_key"] for s in result["sections"]] == ["scope-1", "scope-detail-1"]
+
+
+def test_document_lease_and_section_locks_exclude_each_other(sections):
+    _, _, a, b, call = sections
+    call(a, action="section_lock", sections=["intro-1"])
+    with pytest.raises(LiveOpFailed, match="LOCKED_BY_OTHER_CLIENT"):
+        call(b, action="lock")
+    with pytest.raises(ValueError, match="Release your section locks"):
+        call(a, action="lock")
+    call(a, action="section_unlock")
+    call(b, action="lock")
+    with pytest.raises(LiveOpFailed, match="LOCKED_BY_OTHER_CLIENT"):
+        call(a, action="section_lock", sections=["intro-1"])
+    call(b, action="unlock")
+    call(a, action="lock")
+    with pytest.raises(ValueError, match="Release your document lease"):
+        call(a, action="section_lock", sections=["intro-1"])
+
+
+def test_unlock_by_key_foreign_refused_and_status_lists_locks(sections):
+    _, broker, a, b, call = sections
+    call(a, action="section_lock", sections=["intro-1", "scope-1"])
+    with pytest.raises(LiveOpFailed, match="LOCKED_BY_OTHER_CLIENT"):
+        call(b, action="section_unlock", sections=["intro-1"])
+    status = broker.dispatch({"action": "status", "client_id": a})["locks"]
+    assert {lock["section_key"] for lock in status if lock["scope"] == "section"} == {
+        "intro-1",
+        "scope-1",
+    }
+    assert call(a, action="section_unlock", sections=["intro-1"])["released"] == ["intro-1"]
+    assert call(a, action="section_unlock")["released"] == ["scope-1"]
+
+
+def test_section_lock_expiry_and_reconnect_release(sections):
+    pane, broker, a, b, call = sections
+    call(a, action="section_lock", sections=["intro-1"], lease_s=5)
+    broker.section_locks[pane.document_url]["intro"]["expires"] = time.monotonic() - 1
+    call(b, action="section_lock", sections=["intro-1"])
+    pane.connected_since = 2.0
+    call(b)
+    assert pane.document_url not in broker.section_locks
+
+
+def test_caller_supplied_scopes_are_stripped(sections):
+    pane, _, a, _, call = sections
+    call(a)
+    call(a, "replace", payload={"forbiddenSections": [], "ownSections": [{"slug": "x"}]})
+    sent = _last_write(pane)
+    assert "ownSections" not in sent and "forbiddenSections" not in sent
+
+
+def test_pre_mutation_refusal_does_not_stale_anyone_but_failure_does(sections):
+    pane, _, a, b, call = sections
+    call(a)
+    call(b)
+    pane.refuse = "LOCKED_BY_OTHER_CLIENT"
+    with pytest.raises(LiveOpFailed, match="LOCKED_BY_OTHER_CLIENT"):
+        call(a, "replace")
+    pane.refuse = None
+    call(b, "replace")  # B's baseline survived A's refused attempt
+    call(a)
+    pane.refuse = "VERIFICATION_FAILED"
+    with pytest.raises(LiveOpFailed, match="VERIFICATION_FAILED"):
+        call(a, "replace")
+    pane.refuse = None
+    with pytest.raises(LiveOpFailed, match="LIVE_STALE"):
+        call(b, "replace")
+
+
+def test_holder_baseline_refreshes_on_own_write_and_explicit_read(sections):
+    pane, _, a, _, call = sections
+    call(a, action="section_lock", sections=["scope-1"])
+    pane.sha["scope"] = "after-write"
+    call(a, "replace")
+    call(a, "replace")
+    assert _last_write(pane)["ownSections"][0]["expectedSha256"] == "after-write"
+    pane.sha["scope"] = "human-edit"
+    call(a, "body_ooxml")
+    call(a, "replace")
+    assert _last_write(pane)["ownSections"][0]["expectedSha256"] == "human-edit"
+    pane.sha["scope"] = "unseen-edit"
+    call(a, "describe")  # not an explicit body read: baseline stays
+    call(a, "replace")
+    assert _last_write(pane)["ownSections"][0]["expectedSha256"] == "human-edit"
+
+
+def test_renewing_a_lock_does_not_rebaseline(sections):
+    pane, _, a, _, call = sections
+    call(a, action="section_lock", sections=["scope-1"])
+    pane.sha["scope"] = "changed-behind-our-back"
+    call(a, action="section_lock", sections=["scope-1"])
+    call(a, "replace")
+    assert _last_write(pane)["ownSections"][0]["expectedSha256"] == "s-scope"
