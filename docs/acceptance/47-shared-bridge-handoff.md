@@ -109,6 +109,37 @@ Word/OS version, epoch, sanitized URL and before/after evidence.
 
 Keep #47 open. This draft intentionally uses `Refs #47`, not an auto-close keyword.
 
+## Real-Word acceptance run (2026-10-05, Word for Mac 16.113.3, macOS 26.6.2)
+
+Two separate Python processes (`VERIFIED_DOCX_SHARED_BRIDGE=1`) called the real
+server tool functions (`live_status`, `live_open_pane`, `read_document`,
+`replace_text`, `live_document_lock`) against disposable copies of
+`tests/fixtures/sections.docx`. Branch tip at start: `51e95fe`.
+
+| Row | Result |
+| --- | --- |
+| Two processes, one owner of 53135/53136, distinct client IDs | Pass |
+| `live_open_pane` cold-open connects pane advertising `shared_queue` | Pass |
+| A edits; B's stale `replace_text` refuses `LIVE_STALE`, document unchanged | **Failed on `51e95fe`** (B's write applied); fixed, now Pass |
+| B re-reads, then edits successfully | Pass |
+| Lease: B reads, B write and B unlock refuse `LOCKED_BY_OTHER_CLIENT`; expiry frees writes; holder lock/unlock | Pass |
+| SIGKILL owner: B write refuses `LiveDisconnected` with no change; `live_status` re-elects; pane reconnects; stale write refuses until re-read; then succeeds | Pass |
+| Env var unset: single process live status/open/edit unchanged, `shared: null` | Pass |
+
+**Bug found and fixed.** Write tools read the live body internally before
+editing. The broker counted that tool-internal read as the client observing the
+latest generation, so a stale client's write silently re-baselined and applied.
+`write_mode.live_session_for` now returns a non-observing view in shared mode;
+only an explicit read (`read_document source="live"`) advances a client's
+baseline. Consequence: in shared mode a client must read the live document
+before its first write (documented behaviour), and reads made by non-`reads_live`
+tools do not acknowledge another client's changes. Regression test:
+`test_write_tool_session_does_not_acknowledge_other_writes`.
+
+Not exercised here: hosted Word, delayed-edit/timeout interleaving, duplicate
+panes, two different documents at once, large OOXML reads, Windows. These and
+the design gaps above remain open under #47.
+
 ## Automated validation recorded for this draft
 
 - Full unit suite: 836 passed, 23 failed, 217 subtests passed. The 23 failures

@@ -298,3 +298,24 @@ def test_lease_rejects_bool_and_out_of_range(setup_broker):
         with pytest.raises(ValueError, match="lease_s"):
             call(a, action="lock", lease_s=bad)
     assert call(a, action="lock", lease_s=5)["lease_s"] == 5
+
+
+def test_write_tool_session_does_not_acknowledge_other_writes(setup_broker, monkeypatch):
+    """A write tool's internal body read must not re-baseline a stale client."""
+    from verified_docx_mcp.live import bridge, write_mode
+
+    pane, broker, a, b, call = setup_broker
+    call(a)
+    call(b)
+    call(a, "replace")
+
+    client = SimpleNamespace(rpc=lambda action, **kw: broker.dispatch({"action": action, "client_id": b, **kw}))
+    remote = shared.RemoteSession(client, broker.snapshot(pane))
+    monkeypatch.setattr(bridge, "current_registry", lambda: SimpleNamespace(get=lambda n: remote))
+    monkeypatch.setattr(write_mode, "_check_session_identity", lambda path, session: None)
+    monkeypatch.setattr(write_mode, "_document_name", lambda path: "Proposal.docx")
+    session = write_mode.live_session_for("/x/Proposal.docx")
+    session.request_threadsafe("body_ooxml")  # tool-internal read
+    with pytest.raises(LiveOpFailed, match="LIVE_STALE"):
+        session.request_threadsafe("replace")
+    assert sum(op == "replace" for op, _ in pane.calls) == 1
