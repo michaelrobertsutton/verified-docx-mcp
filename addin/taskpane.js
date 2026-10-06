@@ -240,7 +240,8 @@ const OP_LOG_LIMIT = 20;
 // writes multi-paragraph/line-break content correctly and self-checks/restores.
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
 // issue #39: "comment_counts" = comments_list reports counts/scope/observed_at.
-const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen"];
+// issue #77: "paragraph_insert" = the paragraph_insert op (styled, optionally tracked paragraphs).
+const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -497,11 +498,12 @@ function summarizeResult(op, result) {
   if (op === "table_get") return `${(result.rows || []).length} row(s)`;
   if (op === "table_insert") return `table_index=${result.table_index}`;
   if (op === "cells_set") return `applied=${result.applied}`;
+  if (op === "paragraph_insert") return `inserted=${(result.inserted || []).length}`;
   return "";
 }
 
 const SHAPE_GUARDED_OPS = new Set(["replace", "format", "cell_set", "cells_set",
-  "table_insert", "paragraph_delete", "revisions_accept", "revisions_reject",
+  "table_insert", "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
   "comment_add", "comment_reply", "comment_resolve", "save"]);
 
 // One queue across reconnects. A timed-out write can still be running in Word;
@@ -584,6 +586,8 @@ async function dispatchOpUnchecked(op, payload) {
       return opCellsSet(payload);
     case "paragraph_delete":
       return opParagraphDelete(payload);
+    case "paragraph_insert":
+      return opParagraphInsert(payload);
     case "textboxes_list":
       return opTextboxesList();
     case "textboxes_read":
@@ -2238,6 +2242,136 @@ async function opParagraphDelete(payload) {
     if (JSON.stringify(after) !== JSON.stringify(expected))
       throw refusalError(`Paragraph deletion read-back failed; observed effects: ${JSON.stringify(result)}`, 'VERIFICATION_FAILED');
     return result;
+  });
+}
+
+// -- live paragraph insertion (issue #77) ------------------------------------
+
+// Resolves one paragraph spec's style BEFORE any write, so an unknown style
+// never leaves a half-inserted paragraph behind. Returns {kind, value}: kind
+// "name" is assigned to Paragraph.style, kind "builtin" to styleBuiltIn.
+async function resolveParagraphStyle(context, spec) {
+  const builtins = Word.BuiltInStyleName || {};
+  if (!spec.style) return { kind: "builtin", value: builtins.normal || "Normal" };
+  if (Office.context.requirements.isSetSupported("WordApi", "1.5")) {
+    const found = context.document.getStyles().getByNameOrNullObject(spec.style);
+    found.load("isNullObject,type");
+    await context.sync();
+    if (!found.isNullObject) {
+      if (found.type !== "Paragraph")
+        throw refusalError(`style ${JSON.stringify(spec.style)} is a ${found.type} style; paragraph styles only`, "UNSUPPORTED_STYLE_TYPE");
+      return { kind: "name", value: spec.style };
+    }
+  }
+  const squashed = spec.style.replace(/\s+/g, "").toLowerCase();
+  const key = Object.keys(builtins).find(k => k.toLowerCase() === squashed || String(builtins[k]).toLowerCase() === squashed);
+  if (key) return { kind: "builtin", value: builtins[key] };
+  throw refusalError(`paragraph style ${JSON.stringify(spec.style)} was not found in the document`, "STYLE_NOT_FOUND");
+}
+
+async function opParagraphInsert(payload) {
+  return Word.run(async context => {
+    const pre = await requireFreshBody(context, payload.expectedBodySha256);
+    const specs = payload.paragraphs || [];
+    if (!specs.length) throw refusalError("No paragraphs to insert", "INVALID_INPUT");
+    const styles = [];
+    for (const spec of specs) styles.push(await resolveParagraphStyle(context, spec));
+
+    const found = context.document.body.search(payload.anchor, { matchCase: true, matchWholeWord: false });
+    found.load("items");
+    await context.sync();
+    if (found.items.length !== payload.expected_matches)
+      throw refusalError(`expected ${payload.expected_matches} match(es) for ${JSON.stringify(payload.anchor)}, found ${found.items.length}`,
+        found.items.length === 0 ? "ZERO_MATCH" : "MATCH_COUNT_MISMATCH");
+
+    const anchorPara = found.items[0].paragraphs.getFirst();
+    anchorPara.load("text,tableNestingLevel");
+    const all = context.document.body.paragraphs;
+    all.load("items/text,items/tableNestingLevel");
+    await context.sync();
+    if (anchorPara.tableNestingLevel !== 0)
+      throw refusalError("The anchor is inside a table cell; anchor on a body paragraph", "STRUCTURAL_BOUNDARY");
+    const before = all.items.map(q => q.text);
+    let candidates = before.map((t, i) => (t === anchorPara.text ? i : -1)).filter(i => i >= 0);
+    if (candidates.length > 1) {
+      const rels = candidates.map(i => all.items[i].getRange().compareLocationWith(anchorPara.getRange()));
+      await context.sync();
+      candidates = candidates.filter((_, j) => rels[j].value === "Equal");
+    }
+    if (candidates.length !== 1)
+      throw refusalError("Could not resolve the anchor to exactly one body paragraph", "STRUCTURAL_BOUNDARY");
+    const index = candidates[0];
+    const position = payload.position === "before" ? "before" : "after";
+
+    const guard = await sectionGuard(context, payload);
+    if (guard.active) {
+      if (position === "before")
+        throw refusalError("Under section locks insert paragraphs after an anchor, not before it", "OUTSIDE_LOCKED_SECTION");
+      await guard.check([anchorPara.getRange()]);
+    }
+
+    const inserted = [];
+    await withTracking(context, payload.track_changes, async () => {
+      let previous = null;
+      specs.forEach((spec, i) => {
+        const para = previous
+          ? previous.insertParagraph(spec.text, Word.InsertLocation.after)
+          : anchorPara.insertParagraph(spec.text, position === "before" ? Word.InsertLocation.before : Word.InsertLocation.after);
+        if (styles[i].kind === "name") para.style = styles[i].value;
+        else para.styleBuiltIn = styles[i].value;
+        if (spec.color) para.font.color = withHash(spec.color);
+        inserted.push(para);
+        previous = para;
+      });
+      await context.sync();
+    });
+
+    inserted.forEach(para => { para.load("text,style,styleBuiltIn"); para.font.load("color"); });
+    const fresh = context.document.body.paragraphs;
+    fresh.load("items/text");
+    context.document.body.load("text");
+    await context.sync();
+
+    const observed = inserted.map((para, i) => ({
+      text: String(para.text || "").replace(/[\r\n]+$/, ""),
+      style: para.style,
+      style_builtin: para.styleBuiltIn,
+      color: para.font.color,
+      requested_style: styles[i],
+    }));
+    const at = position === "before" ? index : index + 1;
+    const expected = [...before.slice(0, at), ...specs.map(spec => spec.text), ...before.slice(at)];
+    const after = fresh.items.map(q => q.text);
+    const problems = [];
+    observed.forEach((o, i) => {
+      if (o.text !== specs[i].text) problems.push(`paragraph ${i + 1} text`);
+      const styleOk = styles[i].kind === "name" ? o.style === styles[i].value : o.style_builtin === styles[i].value;
+      if (!styleOk) problems.push(`paragraph ${i + 1} style`);
+      if (specs[i].color && String(o.color || "").toLowerCase() !== withHash(specs[i].color).toLowerCase())
+        problems.push(`paragraph ${i + 1} color`);
+    });
+    if (JSON.stringify(after) !== JSON.stringify(expected)) problems.push("paragraph list");
+    if (problems.length) {
+      const detail = `${problems.join(", ")}; observed: ${JSON.stringify(observed)}`;
+      if (payload.track_changes)
+        throw refusalError(`Paragraph insertion did not read back as written (${detail}); the insertions are tracked changes -- reject them in Word's Review pane`, "VERIFICATION_FAILED");
+      let rolledBack = false;
+      try {
+        inserted.forEach(para => para.delete());
+        await context.sync();
+        const restored = context.document.body.paragraphs;
+        restored.load("items/text");
+        await context.sync();
+        rolledBack = JSON.stringify(restored.items.map(q => q.text)) === JSON.stringify(before);
+      } catch (err) {
+        rolledBack = false;
+      }
+      throw refusalError(`Paragraph insertion did not read back as written (${detail}); ` +
+        (rolledBack ? "the inserted paragraphs were removed" : "the inserted paragraphs could NOT be removed -- fix the document by hand"),
+        "VERIFICATION_FAILED");
+    }
+    return { applied: true, position, anchor_index: index + 1, inserted: observed,
+      before_count: before.length, after_count: after.length, pre, post: await sha256Hex(context.document.body.text || "") };
   });
 }
 

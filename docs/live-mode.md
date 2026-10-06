@@ -577,6 +577,44 @@ same-named documents open at once can misroute; check
 
 Result: _not yet run._
 
+## Live paragraph insertion (issue #77)
+
+`insert_paragraphs(path, anchor, paragraphs, expected_matches, position,
+track_changes, ...)` adds new paragraphs or headings before/after one body
+paragraph of a document a co-author has open, optionally as tracked changes. It
+routes like `replace_text` (`write_mode` auto/file/live); live mode sends the
+pane's `paragraph_insert` op and requires the `paragraph_insert` capability
+(reload the pane, `taskpane.js?v=54`, if `live_status` does not list it).
+
+- **Anchor:** `anchor` is located with `body.search` and must match exactly once
+  (`expected_matches` is always 1; 0 / >1 matches are `ZERO_MATCH` /
+  `MATCH_COUNT_MISMATCH`, refused before any write). It must be in a top-level
+  body paragraph, not a table cell (`STRUCTURAL_BOUNDARY`). Under section locks
+  only `position="after"` is allowed.
+- **Paragraphs:** each `{text, style, color}` is one paragraph. `style` is a
+  paragraph style name; it is resolved before anything is written
+  (`STYLE_NOT_FOUND` / `UNSUPPORTED_STYLE_TYPE`). Omitted `style` is written as
+  Normal, because Word's `insertParagraph` would otherwise inherit the anchor's
+  style (a heading, say). Omitted `color` is not set, and Word may carry the
+  anchor's run color across: pass a color to pin it.
+- **Writes:** the first paragraph is inserted from the anchor paragraph and each
+  later one is chained "After" the previous (the after-chain pattern from the
+  #75 cell writes), then style and font color are set, in one sync. With
+  `track_changes` the mode is forced to `trackAll` for the insert and restored
+  in a `finally`.
+- **Verification:** the pane re-reads each inserted paragraph's text, style and
+  color and the whole paragraph list; the server checks the same read-back again.
+  An untracked write that fails is deleted by the pane (the error says whether the
+  list was restored); a tracked one is left for the Review pane. A failure after
+  the write is audit-logged as `insert_paragraphs:verification_failed`.
+- **File mode:** same request, edited in the OOXML body. Tracked file-mode
+  insertions wrap the new runs in `w:ins` under the configured author; the
+  paragraph marks themselves are not tracked.
+
+The pane logic is tested against a mock only
+(`tests/unit/js/paragraph_insert_harness.mjs`); the real-Word checklist is
+[`docs/acceptance/77-insert-paragraphs.md`](acceptance/77-insert-paragraphs.md).
+
 ## WP-1 result (2026-09-16, Word for Mac 16.112.4)
 
 Recorded from the issue's WP-1 comment

@@ -56,6 +56,7 @@ from . import (
     geometry,
     images,
     mutations,
+    paragraph_insert,
     paths,
     projection,
     tables,
@@ -3587,6 +3588,69 @@ def delete_paragraph(path: str, anchor_text: str, revision_before: str,
 
     try:
         return execute(path, anchor_text, revision_before, track_changes)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def insert_paragraphs(
+    path: str,
+    anchor: str,
+    paragraphs: list[dict[str, Any]],
+    expected_matches: int,
+    position: str = "after",
+    revision_before: str | None = None,
+    track_changes: bool = False,
+    write_mode: str = "auto",
+    allow_concurrent_editor: bool = False,
+) -> dict[str, Any]:
+    """Insert new paragraphs (and headings) before or after the body paragraph
+    containing `anchor`, optionally as tracked changes (issue #77).
+
+    `paragraphs` is a list of 1-50 objects `{"text": str, "style": str | None,
+    "color": str | None}`: one paragraph each (no newlines in `text`), `style`
+    a paragraph style name such as "Heading 2" or "Body Text", `color` six hex
+    digits such as "7030A0". Omitted `style` means the document's default
+    (Normal) paragraph style, never the anchor's. Omitted `color` is not set:
+    in live mode Word may carry the anchor's run color onto the new paragraph,
+    so pass a color to pin it. Every inserted paragraph's text, style and color
+    is read back; the evidence lists them under `inserted`.
+
+    `anchor` is located like `replace_text`'s `find` and must match exactly
+    once (`expected_matches` must be 1); the anchor must sit in a top-level
+    body paragraph, not a table cell. `position` is "after" (default) or
+    "before"; under live section locks only "after" is allowed.
+
+    `track_changes=True`: live mode records the insertions as Word's
+    signed-in user; file mode wraps the new runs in `w:ins` under the
+    configured author (the paragraph marks themselves are not tracked).
+
+    `write_mode` ("auto" | "file" | "live", default "auto") routes exactly as
+    in `replace_text`: see its docstring. A live write that fails the pane's
+    read-back is deleted again when untracked (the message says whether that
+    worked); a tracked one is left for Word's Review pane. Live
+    `revision_before`/`revision_after` are `"live:sha256:<hex>"` body hashes.
+
+    Errors:
+      INVALID_INPUT, ZERO_MATCH, MATCH_COUNT_MISMATCH, STRUCTURAL_BOUNDARY,
+      STYLE_NOT_FOUND, UNSUPPORTED_STYLE_TYPE, OUTSIDE_LOCKED_SECTION,
+      VERIFICATION_FAILED, LIVE_UNAVAILABLE, LIVE_SESSION_ACTIVE,
+      LIVE_SESSION_MISMATCH, LIVE_DISCONNECTED, LIVE_STALE,
+      LIVE_CAPABILITY_MISSING, DOCX_LOCKED, SYNC_IN_FLIGHT, REVISION_CONFLICT,
+      EXTERNAL_EDITOR_ACTIVE, OPC_INVALID
+    """
+    try:
+        return paragraph_insert.execute_insert_paragraphs(
+            path,
+            anchor,
+            paragraphs,
+            expected_matches,
+            position=position,
+            revision_before=revision_before,
+            track_changes=track_changes,
+            write_mode=write_mode,
+            allow_concurrent_editor=allow_concurrent_editor,
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
