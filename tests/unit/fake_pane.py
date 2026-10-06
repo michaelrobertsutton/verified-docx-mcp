@@ -178,6 +178,13 @@ class FakeDocument:
         # fake's analogue of a write Word dropped, for the server's
         # independent read-back to catch.
         self.dropped_cell_writes: set[tuple[int, int, int]] = set()
+        # Issue #75 knobs. merge_cell_paragraphs reproduces the real-Word bug:
+        # cell_set joins the paragraphs with no separator and appends an empty
+        # trailing paragraph. cell_set_failure = (code, message) makes cell_set
+        # refuse with that pane error (the pane's rolled-back / not-rolled-back
+        # self-check outcomes).
+        self.merge_cell_paragraphs = False
+        self.cell_set_failure: tuple[str, str] | None = None
         # Issue #34 (live tables). table_meta is parallel to `tables`; the
         # other three are fake-only knobs.
         self.table_meta: list[dict[str, Any]] = []
@@ -214,7 +221,8 @@ class FakeDocument:
 
     def cell_get(self, payload: dict[str, Any]) -> dict[str, Any]:
         t, r, c = self._cell(payload)
-        return {"text": self.tables[t][r][c]}
+        text = self.tables[t][r][c]
+        return {"text": text, "paragraphs": text.split("\n")}
 
     def cell_set(self, payload: dict[str, Any]) -> dict[str, Any]:
         pre = self.sha256()
@@ -229,11 +237,17 @@ class FakeDocument:
                 "nothing was written",
             )
         if (t, r, c) not in self.dropped_cell_writes:
+            # A hard break is Word's manual line break (\x0b), not a paragraph mark.
             paragraphs = [
-                "".join("\n" if run.get("hard_break") else run["text"] for run in runs)
+                "".join("\x0b" if run.get("hard_break") else run["text"] for run in runs)
                 for runs in payload["paragraphs"]
             ]
-            self.tables[t][r][c] = "\n".join(paragraphs)
+            if self.cell_set_failure is not None:
+                raise OpRefused(*self.cell_set_failure)
+            if self.merge_cell_paragraphs:
+                self.tables[t][r][c] = "".join(paragraphs) + "\n"
+            else:
+                self.tables[t][r][c] = "\n".join(paragraphs)
         return {"applied": True, "before": before, "after": self.tables[t][r][c], "pre": pre, "post": self.sha256()}
 
     # -- live tables (issue #34) --------------------------------------
@@ -668,7 +682,7 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts"]
+            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts"]
             if capabilities is None
             else list(capabilities)
         )

@@ -423,15 +423,40 @@ autosave. `replace_cell_markdown` with `write_mode="live"` (or `"auto"`
 with a pane connected) sends `cell_get` then `cell_set` over the ops
 channel:
 
-- **Subset**: paragraphs with bold/italic/links only. Lists, headings,
+- **Subset**: one or more paragraphs and hard line breaks (two trailing
+  spaces, then a newline), with bold/italic/links. Lists, headings,
   tables, quotes and code are refused with `INVALID_INPUT` before anything
   is sent. Use `write_mode="file"` (with the document closed) for those.
+  More than one paragraph, or a line break, also needs the pane's
+  `"cell_multiline"` capability (`LIVE_CAPABILITY_MISSING` before anything
+  is sent; reload the pane after upgrading). Issue #75, observed on
+  Word for Mac: text written through a not-yet-synced paragraph proxy
+  (`insertParagraph`'s return value, or `getLast()` in the same batch) lands
+  in an earlier paragraph, and `insertBreak` rejects `"End"`. The pane
+  therefore inserts the empty paragraphs, syncs, writes into the loaded
+  paragraph items, and breaks with `"After"`.
 - **Compare-and-set**: `cell_set` carries the text `cell_get` just read;
   the pane refuses (`LIVE_OP_FAILED`) if the cell changed in between, so
   a co-author typing in the same cell is not overwritten.
+- **Pane self-check and restore** (issue #75): after writing, the pane
+  re-reads the cell's paragraphs. On a mismatch it retries with a second
+  write strategy, then writes the old paragraphs back as plain text
+  (character formatting may differ; OOXML is never used) and refuses; the
+  server reports
+  `VERIFICATION_FAILED` with `diagnostics.rolled_back: true`. A tracked
+  write (`track_changes=true`) is never restored (reject it in Word's Review
+  pane), and a restore that does not take reports `rolled_back: false` and
+  is audit-logged: fix the cell by hand.
 - **Independent read-back**: after `cell_set` the server calls `cell_get`
-  again and compares it with the intended text (modulo whitespace); it
-  does not trust the pane's own `applied: true`.
+  again and compares paragraph count and each paragraph with the intended
+  text (modulo whitespace); it does not trust the pane's own
+  `applied: true`. A failure here leaves the write in place, is
+  audit-logged, and reports `rolled_back: false`.
+- **1-based indices and `expected_before`**: `row_index` and `cell_index`
+  are 1-based in both modes (row 1 is the table's first row, usually the
+  header). Pass `expected_before` (plain text or markdown) to refuse with
+  `CELL_TEXT_MISMATCH`, writing nothing, when the addressed cell is not what
+  you expect, for example after a 0-based index.
 - **Nested tables are refused.** `table_id` numbers nested tables in
   document order; the pane cannot map `body.tables` onto that reliably.
 - `force` does not apply; `before`/`after` are plain text, not markdown;

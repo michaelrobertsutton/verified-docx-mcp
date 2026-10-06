@@ -575,7 +575,7 @@ def parse_paragraph_runs(markdown_text: str) -> list[list[RunSpec]]:
             construct = tok.type.removesuffix("_open").removesuffix("_close")
             raise _make_error(
                 ErrorCode.INVALID_INPUT,
-                f"live cell edits support paragraphs with bold/italic/links only; the markdown contains "
+                f"live cell edits support paragraphs (with line breaks) and bold/italic/links only; the markdown contains "
                 f"{construct!r}. Use write_mode='file' (close the document in Word first) for lists, "
                 "headings, tables, and other block structure.",
                 {"unsupported_block": tok.type},

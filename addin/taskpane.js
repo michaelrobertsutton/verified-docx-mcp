@@ -236,9 +236,11 @@ const OP_LOG_LIMIT = 20;
 // issue #31: "comments_by_id" = comments_list accepts `ids` / `include_anchor`.
 // issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
 // find_sections / list_tables).
+// issue #75: "cell_multiline" = cell_get returns per-paragraph text, cell_set
+// writes multi-paragraph/line-break content correctly and self-checks/restores.
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
 // issue #39: "comment_counts" = comments_list reports counts/scope/observed_at.
-const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen"];
+const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -1205,36 +1207,115 @@ async function resolveTableCell(context, payload) {
   return cell;
 }
 
-// Queues (does not sync) the clear + per-run writes for one cell. Shared by
-// cell_set, cells_set and table_insert so a cell is always written one way.
-function writeCellParagraphs(cell, paragraphs) {
-  cell.body.clear();
-  paragraphs.forEach((runs, i) => {
-    // After clear() the cell holds one empty paragraph: fill it first,
-    // append the rest.
-    const paragraph =
-      i === 0 ? cell.body.paragraphs.getFirst() : cell.body.insertParagraph("", Word.InsertLocation.end);
-    (runs || []).forEach((run) => {
-      if (run.hard_break) {
-        paragraph.insertBreak(Word.BreakType.line, Word.InsertLocation.end);
-        return;
-      }
-      const range = paragraph.insertText(run.text, Word.InsertLocation.end);
-      range.font.bold = !!run.bold;
-      range.font.italic = !!run.italic;
-      if (run.link) {
-        range.hyperlink = run.link;
-      }
-    });
+// Writes one cell's paragraphs. Shared by cell_set, cells_set and table_insert
+// so a cell is always written one way. A single-paragraph cell is only QUEUED
+// (the caller syncs); a multi-paragraph cell needs syncs in the middle, so
+// callers must await this.
+//
+// issue #75, what real Word (Mac) does to a table cell:
+//  * Paragraph.insertBreak / Range.insertBreak accept only "Before"/"After";
+//    "End" is InvalidArgument. Break after the last inserted range.
+//  * Writing text through the proxy that body.insertParagraph("", "End")
+//    returns (or through paragraphs.getLast() queued in the same batch) put
+//    paragraph 2's text into paragraph 1 and left an empty trailing
+//    paragraph. So no write ever depends on how a not-yet-synced proxy
+//    resolves. Strategies (opCellSet tries them in order and verifies each):
+//      "load-items": insert the empty paragraphs, sync, load the REAL
+//                    paragraph list, then write into items[i] by position.
+//      "after-chain": paragraph.insertParagraph("", "After") from the
+//                    previous paragraph's own proxy.
+const CELL_WRITE_STRATEGIES = ["load-items", "after-chain"];
+
+function writeRunsInto(paragraph, runs) {
+  let lastRange = null;
+  (runs || []).forEach((run) => {
+    if (run.hard_break) {
+      const anchor = lastRange || paragraph.getRange("Start");
+      anchor.insertBreak(Word.BreakType.line, Word.InsertLocation.after);
+      return;
+    }
+    const range = paragraph.insertText(run.text, Word.InsertLocation.end);
+    range.font.bold = !!run.bold;
+    range.font.italic = !!run.italic;
+    if (run.link) {
+      range.hyperlink = run.link;
+    }
+    lastRange = range;
   });
+}
+
+async function writeCellParagraphs(context, cell, paragraphs, strategy = CELL_WRITE_STRATEGIES[0]) {
+  cell.body.clear();
+  // After clear() the cell holds one empty paragraph.
+  if (paragraphs.length <= 1) {
+    writeRunsInto(cell.body.paragraphs.getFirst(), paragraphs[0]);
+    return;
+  }
+  if (strategy === "after-chain") {
+    let paragraph = cell.body.paragraphs.getFirst();
+    paragraphs.forEach((runs, i) => {
+      if (i > 0) paragraph = paragraph.insertParagraph("", Word.InsertLocation.after);
+      writeRunsInto(paragraph, runs);
+    });
+    return;
+  }
+  for (let i = 1; i < paragraphs.length; i++) cell.body.insertParagraph("", Word.InsertLocation.end);
+  await context.sync();
+  cell.body.paragraphs.load("items");
+  await context.sync();
+  const items = cell.body.paragraphs.items;
+  paragraphs.forEach((runs, i) => {
+    if (items[i]) writeRunsInto(items[i], runs);
+  });
+}
+
+const normCellText = (s) => String(s).replace(/\s+/g, " ").trim();
+
+// One string per intended paragraph; a hard break reads back as whitespace
+// (Word reports a line break as \v), so it is rendered as "\n" here and the
+// comparison normalizes whitespace. An empty write leaves one empty paragraph.
+function intendedCellParagraphs(paragraphs) {
+  const out = (paragraphs || []).map((runs) =>
+    (runs || []).map((run) => (run.hard_break ? "\n" : run.text)).join("")
+  );
+  return out.length ? out : [""];
+}
+
+async function readCellParagraphs(context, cell) {
+  cell.body.paragraphs.load("items/text");
+  await context.sync();
+  return cell.body.paragraphs.items.map((p) => p.text || "");
+}
+
+const sameParagraphs = (want, got) =>
+  want.length === got.length && want.every((w, i) => normCellText(w) === normCellText(got[i]));
+
+// Rewrites a cell as plain paragraphs of `texts` (character formatting is not
+// preserved) and returns true only if it reads back as those texts. Used when
+// a write failed its self-check; it never uses OOXML (a getOoxml/insertOoxml
+// round trip put the neighbouring cell's text into this one on real Word).
+async function restoreCellText(context, cell, texts) {
+  const specs = texts.map((t) => [{ text: String(t).replace(/[\r\n\v]+$/, ""), bold: false, italic: false }]);
+  for (const strategy of CELL_WRITE_STRATEGIES) {
+    try {
+      await writeCellParagraphs(context, cell, specs, strategy);
+      await context.sync();
+      const got = await readCellParagraphs(context, cell);
+      if (sameParagraphs(texts, got)) return true;
+    } catch (err) {
+      // try the next strategy
+    }
+  }
+  return false;
 }
 
 async function opCellGet(payload) {
   return Word.run(async (context) => {
     const cell = await resolveTableCell(context, payload);
     cell.body.load("text");
+    cell.body.paragraphs.load("items/text");
     await context.sync();
-    return { text: cell.body.text || "" };
+    return { text: cell.body.text || "", paragraphs: cell.body.paragraphs.items.map((p) => p.text || "") };
   });
 }
 
@@ -1267,14 +1348,50 @@ async function opCellSet(payload) {
       context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
     }
 
+    // The cell's paragraphs before the write, for the restore below (issue #75).
+    const beforeParagraphs = await readCellParagraphs(context, cell);
+    const want = intendedCellParagraphs(payload.paragraphs);
+
+    // Write, then self-check: the cell must hold exactly the intended
+    // paragraphs. An untracked write that does not is retried with the next
+    // strategy (each starts with clear()); if none works the old TEXT is
+    // written back. A tracked write is tried once and never rewritten (the
+    // user can reject it in the Review pane).
+    let usedStrategy = null;
+    let got = [];
     try {
-      writeCellParagraphs(cell, payload.paragraphs || []);
-      await context.sync();
+      const strategies = payload.track_changes ? CELL_WRITE_STRATEGIES.slice(0, 1) : CELL_WRITE_STRATEGIES;
+      for (const strategy of strategies) {
+        await writeCellParagraphs(context, cell, payload.paragraphs || [], strategy);
+        await context.sync();
+        got = await readCellParagraphs(context, cell);
+        if (sameParagraphs(want, got)) {
+          usedStrategy = strategy;
+          break;
+        }
+      }
     } finally {
       if (previousMode !== null) {
         context.document.changeTrackingMode = previousMode;
         await context.sync();
       }
+    }
+    if (usedStrategy === null) {
+      const detail = `expected ${JSON.stringify(want.map(normCellText))}, found ${JSON.stringify(got.map(normCellText))}`;
+      if (payload.track_changes) {
+        throw refusalError(
+          `the cell did not read back as written (${detail}); the write is a tracked change -- reject it in Word's Review pane`,
+          "cell_write_not_rolled_back"
+        );
+      }
+      const rolledBack = await restoreCellText(context, cell, beforeParagraphs);
+      throw refusalError(
+        `the cell did not read back as written (${detail}); ` +
+          (rolledBack
+            ? "the previous text was written back (character formatting may differ)"
+            : "the previous content could NOT be restored -- fix the cell by hand"),
+        rolledBack ? "cell_write_rolled_back" : "cell_write_not_rolled_back"
+      );
     }
 
     cell.body.load("text");
@@ -1283,7 +1400,7 @@ async function opCellSet(payload) {
     await context.sync();
     const postHash = await sha256Hex(postBody.text || "");
 
-    return { applied: true, before, after: cell.body.text || "", pre: preHash, post: postHash };
+    return { applied: true, before, after: cell.body.text || "", pre: preHash, post: postHash, strategy: usedStrategy };
   });
 }
 
@@ -1528,18 +1645,18 @@ async function opTableInsert(payload) {
       if (styleChoice.styleBuiltIn) newTable.styleBuiltIn = styleChoice.styleBuiltIn;
       newTable.headerRowCount = payload.header_rows || 0;
       const grid = await loadRowsAndCells(context, newTable);
-      payload.rows.forEach((row, r) =>
-        row.forEach((spec, c) => {
+      for (const [r, row] of payload.rows.entries()) {
+        for (const [c, spec] of row.entries()) {
           const cell = grid[r][c];
-          writeCellParagraphs(cell, spec.paragraphs || []);
+          await writeCellParagraphs(context, cell, spec.paragraphs || []);
           if (spec.bold) cell.body.font.bold = true;
           if (spec.color) cell.body.font.color = withHash(spec.color);
           if (spec.fill) cell.shadingColor = withHash(spec.fill);
           if (spec.align) cell.horizontalAlignment = H_ALIGN_TO_WORD[spec.align];
           if (spec.valign) cell.verticalAlignment = V_ALIGN_TO_WORD[spec.valign];
           if (payload.column_widths_pt) cell.columnWidth = payload.column_widths_pt[c];
-        })
-      );
+        }
+      }
       if (payload.font_size_pt) newTable.font.size = payload.font_size_pt;
       await context.sync();
     });
@@ -1616,7 +1733,7 @@ async function opCellsSet(payload) {
     await (await sectionGuard(context, payload)).check(() => cells.map(c => c.body.getRange("Whole")));
     await guardAnchoredBodies(context, cells.map(c => c.body));
     await withTracking(context, payload.track_changes, async () => {
-      payload.cells.forEach((spec, i) => writeCellParagraphs(cells[i], spec.paragraphs || []));
+      for (const [i, spec] of payload.cells.entries()) await writeCellParagraphs(context, cells[i], spec.paragraphs || []);
       await context.sync();
     });
 

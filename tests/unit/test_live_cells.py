@@ -14,6 +14,7 @@ manual sideload check in docs/live-mode.md.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -25,11 +26,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_pane import FakeDocument
 from test_live_write_mode import LiveWriteBridgeTestCase
 
-from verified_docx_mcp import markdown_to_ooxml, mutations, tables
+from verified_docx_mcp import audit, markdown_to_ooxml, mutations, tables
 from verified_docx_mcp.errors import ErrorCode, VerifyError
 from verified_docx_mcp.live import protocol
 
 mutations._QUIESCE_INTERVAL_SECONDS = 0.02
+
+
+def _audit_tools() -> list[str]:
+    path = audit._state_dir() / "audit.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line).get("tool") for line in path.read_text().splitlines() if line.strip()]
 
 
 def _two_by_two() -> FakeDocument:
@@ -127,6 +135,67 @@ class ReplaceCellLiveTests(LiveWriteBridgeTestCase):
         self.assertIn("Nothing to roll back", envelope.message)
         self.assertEqual(envelope.diagnostics["actual"], "R1C1")
 
+    async def test_two_paragraphs_and_a_hard_break_round_trip(self) -> None:
+        doc = _two_by_two()
+        await self.connect_pane(doc)
+        evidence = await self.replace("**Session 2.** Build a list.\n\n*Pre-read: SOO 4.3*", row=2, cell=2)
+        self.assertTrue(evidence["applied"])
+        self.assertEqual(doc.tables[0][1][1], "Session 2. Build a list.\nPre-read: SOO 4.3")
+        evidence = await self.replace("line one  \nline two\n\nsecond", row=2, cell=1)
+        self.assertTrue(evidence["applied"])
+        self.assertEqual(doc.tables[0][1][0], "line one\x0bline two\nsecond")
+
+    async def test_multiline_needs_the_cell_multiline_capability_and_sends_nothing(self) -> None:
+        doc = _two_by_two()
+        await self.connect_pane(doc, capabilities=["cell_edit", "shape_guard"])
+        for markdown in ("one\n\ntwo", "one  \ntwo"):
+            with self.subTest(markdown=markdown):
+                envelope = await self.assertRefusedWith(ErrorCode.LIVE_CAPABILITY_MISSING, markdown)
+                self.assertIn("multi-paragraph", envelope.message)
+        self.assertEqual(doc.tables[0][0][0], "R1C1")
+        # a single paragraph still works on an older pane
+        self.assertTrue((await self.replace("single"))["applied"])
+
+    async def test_merged_paragraphs_fail_the_paragraph_aware_readback_and_are_audited(self) -> None:
+        doc = _two_by_two()
+        await self.connect_pane(doc)
+        doc.merge_cell_paragraphs = True  # the real-Word bug: joined paragraphs + empty trailing one
+        records = len(_audit_tools())
+        envelope = await self.assertRefusedWith(ErrorCode.VERIFICATION_FAILED, "first.\n\nsecond")
+        self.assertIn("paragraph", envelope.message)
+        self.assertFalse(envelope.diagnostics["rolled_back"])
+        self.assertIn("replace_cell_markdown:verification_failed", _audit_tools()[records:])
+
+    async def test_pane_reports_rolled_back(self) -> None:
+        doc = _two_by_two()
+        await self.connect_pane(doc)
+        doc.cell_set_failure = ("cell_write_rolled_back", "the cell did not read back as written")
+        envelope = await self.assertRefusedWith(ErrorCode.VERIFICATION_FAILED, "a\n\nb")
+        self.assertTrue(envelope.diagnostics["rolled_back"])
+        self.assertIn("previous text", envelope.message)
+        self.assertEqual(doc.tables[0][0][0], "R1C1")
+
+    async def test_pane_reports_not_rolled_back_and_it_is_audited(self) -> None:
+        doc = _two_by_two()
+        await self.connect_pane(doc)
+        doc.cell_set_failure = ("cell_write_not_rolled_back", "could not restore")
+        records = len(_audit_tools())
+        envelope = await self.assertRefusedWith(ErrorCode.VERIFICATION_FAILED, "a\n\nb")
+        self.assertFalse(envelope.diagnostics["rolled_back"])
+        self.assertIn("by hand", envelope.message)
+        self.assertIn("replace_cell_markdown:verification_failed", _audit_tools()[records:])
+
+    async def test_expected_before_guards_a_wrong_index(self) -> None:
+        doc = _two_by_two()
+        await self.connect_pane(doc)
+        envelope = await self.assertRefusedWith(ErrorCode.CELL_TEXT_MISMATCH, "x", row=2, cell=2, expected_before="R1C1")
+        self.assertIn("1-based", envelope.message)
+        self.assertEqual(envelope.diagnostics["actual"], "R2C2")
+        self.assertEqual(doc.tables[0][1][1], "R2C2")
+        evidence = await self.replace("ok", row=2, cell=2, expected_before="**R2C2**")
+        self.assertTrue(evidence["applied"])
+        self.assertEqual(doc.tables[0][1][1], "ok")
+
     async def test_nested_table_document_is_refused(self) -> None:
         doc = _two_by_two()
         doc.has_nested_table = True
@@ -218,6 +287,11 @@ class ParagraphRunParserTests(unittest.TestCase):
         self.assertEqual([(r.text, r.bold, r.italic) for r in paragraphs[0]],
                          [("a ", False, False), ("b", True, False), (" ", False, False), ("c", False, True)])
         self.assertEqual([r.text for r in paragraphs[1]], ["second"])
+
+    def test_hard_break_is_a_break_run(self):
+        paragraphs = markdown_to_ooxml.parse_paragraph_runs("one  \ntwo")
+        self.assertEqual(len(paragraphs), 1)
+        self.assertEqual([(r.text, r.hard_break) for r in paragraphs[0] if r.hard_break or r.text], [("one", False), ("", True), ("two", False)])
 
     def test_empty_markdown_is_no_paragraphs(self):
         self.assertEqual(markdown_to_ooxml.parse_paragraph_runs(""), [])

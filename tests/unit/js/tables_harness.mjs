@@ -157,21 +157,66 @@ function makeContext(model) {
       bold: (v) => (cell.bold = v),
       color: (v) => (cell.color = v),
     });
+    // Word's real rules that issue #75 tripped over (model.macCellQuirk, on by
+    // default): insertBreak accepts only Before/After, and insertParagraph's
+    // returned proxy in a table cell resolves to the PREVIOUS paragraph.
+    const quirk = () => model.macCellQuirk !== false;
+    const invalidArgument = (what) => {
+      const e = new Error(`${what}: InvalidArgument`);
+      e.code = "InvalidArgument";
+      return e;
+    };
+    const makeRange = (idxRef) => ({
+      font: { set bold(v) {}, set italic(v) {} },
+      set hyperlink(v) {},
+      insertBreak: (type, where) => {
+        log(`range.insertBreak(${type},${where})`);
+        ctx.queue.push(() => {
+          if (where !== "Before" && where !== "After") throw invalidArgument("range.insertBreak");
+          cell.paras[idxRef.i] += "\v";
+        });
+      },
+    });
     const makePara = (idxRef) => {
       const pImpl = {
+        get text() { return cell.paras[idxRef.i]; },
         insertText: (text, where) => {
           log(`paragraph.insertText(${JSON.stringify(text)},${where})`);
-          const r = { font: { set bold(v) {}, set italic(v) {} }, set hyperlink(v) {} };
-          ctx.queue.push(() => (cell.paras[idxRef.i] += text));
-          return r;
+          ctx.queue.push(() => {
+            if (model.dropParagraphText === idxRef.i) return; // simulate a write Word loses
+            cell.paras[idxRef.i] += text;
+          });
+          return makeRange(idxRef);
         },
         insertBreak: (type, where) => {
           log(`paragraph.insertBreak(${type},${where})`);
-          ctx.queue.push(() => (cell.paras[idxRef.i] += "\n"));
+          ctx.queue.push(() => {
+            if (where !== "Before" && where !== "After") throw invalidArgument("paragraph.insertBreak");
+            cell.paras[idxRef.i] += "\v";
+          });
+        },
+        insertParagraph: (text, where) => {
+          log(`paragraph.insertParagraph(${JSON.stringify(text)},${where})`);
+          const ref2 = { i: null };
+          ctx.queue.push(() => {
+            cell.paras.splice(idxRef.i + 1, 0, text);
+            ref2.i = idxRef.i + 1;
+          });
+          return makePara(ref2);
+        },
+        getRange: () => makeRange(idxRef),
+        delete: () => {
+          log("paragraph.delete()");
+          ctx.queue.push(() => cell.paras.splice(idxRef.i, 1));
         },
       };
-      return pImpl;
+      return node("paragraph", ["text"], pImpl);
     };
+    const paragraphs = collection("cell.body.paragraphs", () => cell.paras.map((_, i) => makePara({ i })));
+    paragraphs.getFirst = () => makePara({ i: 0 });
+    // Real Word (observed, issue #75): a getLast() queued in the same batch as an insert resolves
+    // against the paragraphs as of the last sync, so writes through it land in an earlier paragraph.
+    paragraphs.getLast = () => makePara({ get i() { return quirk() ? Math.min(cell.paras.length, cell.__synced ?? cell.paras.length) - 1 : cell.paras.length - 1; } });
     const impl = {
       get text() {
         const value = cellText(cell);
@@ -186,20 +231,28 @@ function makeContext(model) {
         log("cell.body.clear()");
         ctx.queue.push(() => (cell.paras = [""]));
       },
-      paragraphs: {
-        getFirst: () => makePara({ i: 0 }),
-      },
+      paragraphs,
       insertParagraph: (text, where) => {
         log(`cell.body.insertParagraph(${JSON.stringify(text)},${where})`);
         const ref = { i: null };
         ctx.queue.push(() => {
           cell.paras.push(text);
-          ref.i = cell.paras.length - 1;
+          if (model.insertParagraphDoublesEmpty) cell.paras.push(""); // a Word build whose insert adds an extra mark
+          ref.i = quirk() ? cell.paras.length - 2 : cell.paras.length - 1;
         });
         return makePara(ref);
       },
+      insertOoxml: (_xml, where) => {
+        log(`cell.body.insertOoxml(${where})`);
+        // Word's getOoxml round-trip leaves one extra empty paragraph.
+        ctx.queue.push(() => (cell.paras = [...(cell.__snap || [""]), ""]));
+      },
     };
-    impl.getOoxml = () => clientResult(() => EMPTY);
+    impl.getOoxml = () =>
+      clientResult(() => {
+        cell.__snap = cell.paras.slice();
+        return EMPTY;
+      });
     return node("cell.body", ["text"], impl);
   }
 
@@ -309,6 +362,8 @@ function makeContext(model) {
     const q = ctx.queue;
     ctx.queue = [];
     for (const fn of q) fn();
+    // what a later batch's not-yet-synced getLast() resolves against (issue #75)
+    model.tables.forEach((t) => t.rows.forEach((r) => r.forEach((c) => (c.__synced = c.paras.length))));
   };
   return ctx;
 }
@@ -335,7 +390,7 @@ function loadPane(model) {
     },
     Word: {
       run: (fn) => fn(makeContext(model)),
-      InsertLocation: { end: "End", replace: "Replace" },
+      InsertLocation: { end: "End", replace: "Replace", before: "Before", after: "After" },
       BreakType: { line: "Line" },
       ChangeTrackingMode: { trackAll: "TrackAll", off: "Off" },
       BuiltInStyleName: { gridTable4_Accent1: "GridTable4_Accent1", tableGrid: "TableGrid" },
@@ -344,7 +399,7 @@ function loadPane(model) {
   vm.createContext(sandbox);
   vm.runInContext(
     src +
-      "\n;globalThis.__ops = { opTableInsert, opTableGet, opCellsSet, opCellSet, dispatchOp, PANE_CAPABILITIES };",
+      "\n;globalThis.__ops = { opTableInsert, opTableGet, opCellsSet, opCellSet, opCellGet, dispatchOp, PANE_CAPABILITIES };",
     sandbox
   );
   return sandbox.__ops;
@@ -600,6 +655,59 @@ const writes = (model) => model.calls.filter((c) => /insertTable|insertText|clea
   check("dispatch: table_insert routed", i.ok && i.value.applied === true, JSON.stringify(i));
   const c = await run(() => ops.dispatchOp("cells_set", { cells: [{ table_index: 1, row_index: 1, cell_index: 1, paragraphs: [para("z")], expected_before_text: "a" }], track_changes: false }));
   check("dispatch: cells_set routed", c.ok && c.value.applied === true, JSON.stringify(c));
+}
+
+// 12. issue #75: multi-paragraph / hard-break writes under real Word's quirks
+{
+  const hb = { text: "", bold: false, italic: false, link: null, hard_break: true };
+  const set = (ops, paragraphs, extra = {}) =>
+    run(() => ops.opCellSet({ table_index: 1, row_index: 1, cell_index: 1, paragraphs, expected_before_text: "old", track_changes: false, ...extra }));
+
+  // (a) two paragraphs: no merge, no trailing empty paragraph
+  const m1 = makeModel({ tables: [{ rows: [["old"]] }] });
+  const r1 = await set(loadPane(m1), [para("Session 2. Build a long list."), para("Pre-read: SOO 4.3", false)]);
+  check("cell_set #75: two paragraphs stay two paragraphs", r1.ok && m1.tables[0].rows[0][0].paras.join("|") === "Session 2. Build a long list.|Pre-read: SOO 4.3", JSON.stringify(r1) + JSON.stringify(m1.tables[0].rows));
+
+  // (b) hard break: Before/After only, lands inside one paragraph
+  const m2 = makeModel({ tables: [{ rows: [["old"]] }] });
+  const r2 = await set(loadPane(m2), [[...para("line one"), hb, ...para("line two")]]);
+  check("cell_set #75: hard break inserts a line break in one paragraph", r2.ok && m2.tables[0].rows[0][0].paras.length === 1 && m2.tables[0].rows[0][0].paras[0] === "line one\vline two", JSON.stringify(r2) + JSON.stringify(m2.tables[0].rows));
+  check("cell_set #75: insertBreak uses After, never End", m2.calls.some((c) => c === "range.insertBreak(Line,After)") && !m2.calls.some((c) => /insertBreak\(Line,End\)/.test(c)), m2.calls.join(" | "));
+
+  // 3 paragraphs
+  const m2b = makeModel({ tables: [{ rows: [["old"]] }] });
+  const r2b = await set(loadPane(m2b), [para("a"), para("b"), para("c")]);
+  check("cell_set #75: three paragraphs", r2b.ok && m2b.tables[0].rows[0][0].paras.join("|") === "a|b|c", JSON.stringify(r2b) + JSON.stringify(m2b.tables[0].rows));
+
+  // (c) a write Word loses on every strategy -> old text written back, typed code
+  const m3 = makeModel({ tables: [{ rows: [["old"]] }] });
+  m3.dropParagraphText = 1;
+  const r3 = await set(loadPane(m3), [para("first"), para("second")]);
+  check("cell_set #75: a failed self-check is rolled back with a typed code", !r3.ok && r3.code === "cell_write_rolled_back" && m3.tables[0].rows[0][0].paras.join("|") === "old", JSON.stringify(r3) + JSON.stringify(m3.tables[0].rows));
+  check("cell_set #75: the restore never uses OOXML", !m3.calls.some((c) => /insertOoxml/.test(c)), m3.calls.join(" | "));
+
+  // (d) the same under track_changes -> tried once, never rewritten
+  const m4 = makeModel({ tables: [{ rows: [["old"]] }] });
+  m4.dropParagraphText = 1;
+  const r4 = await set(loadPane(m4), [para("first"), para("second")], { track_changes: true });
+  check("cell_set #75: tracked write is not restored", !r4.ok && r4.code === "cell_write_not_rolled_back" && m4.calls.filter((c) => c === "cell.body.clear()").length === 1, JSON.stringify(r4) + m4.calls.join(" | "));
+
+  // (c2) first strategy yields a stray empty paragraph -> the next strategy succeeds
+  const m6 = makeModel({ tables: [{ rows: [["old"]] }] });
+  m6.insertParagraphDoublesEmpty = true;
+  const r6 = await set(loadPane(m6), [para("first"), para("second")]);
+  check("cell_set #75: falls back to after-chain when load-items misreads", r6.ok && r6.value.strategy === "after-chain" && m6.tables[0].rows[0][0].paras.join("|") === "first|second", JSON.stringify(r6) + JSON.stringify(m6.tables[0].rows));
+  const r6b = await set(loadPane(makeModel({ tables: [{ rows: [["old"]] }] })), [para("first"), para("second")]);
+  check("cell_set #75: load-items is the first strategy", r6b.ok && r6b.value.strategy === "load-items", JSON.stringify(r6b));
+
+  // (e) cell_get returns paragraphs
+  const m5 = makeModel({ tables: [{ rows: [["x"]] }] });
+  m5.tables[0].rows[0][0].paras = ["one", "two"];
+  const r5 = await run(() => loadPane(m5).opCellGet({ table_index: 1, row_index: 1, cell_index: 1 }));
+  check("cell_get #75: returns per-paragraph text", r5.ok && JSON.stringify(r5.value.paragraphs) === '["one","two"]' && r5.value.text === "one\ntwo", JSON.stringify(r5));
+
+  // (f) capability
+  check("capabilities #75: cell_multiline is reported", loadPane(m5).PANE_CAPABILITIES.includes("cell_multiline"), "");
 }
 
 console.log(JSON.stringify({ results }));

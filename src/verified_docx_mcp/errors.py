@@ -98,6 +98,7 @@ class ErrorCode(Enum):
     TABLE_ROW_NOT_FOUND = "TABLE_ROW_NOT_FOUND"  # row_index out of range for the named table
     TABLE_CELL_NOT_FOUND = "TABLE_CELL_NOT_FOUND"  # cell_index out of range for the named row
     MERGED_OR_NESTED_TABLE = "MERGED_OR_NESTED_TABLE"  # replace_table_row's refusal: the target table has a w:gridSpan/w:vMerge cell or a nested w:tbl anywhere in it -- use replace_cell_markdown instead
+    CELL_TEXT_MISMATCH = "CELL_TEXT_MISMATCH"  # replace_cell_markdown's expected_before does not match the addressed cell's current text (usually a wrong/0-based row_index or cell_index); nothing was written
 
     # Images (images.py; issue #28 WP-15a). GoogleDocs-MCP's 18th code,
     # IMAGE_SOURCE_UNSUPPORTED (source must be a public URL, not a local

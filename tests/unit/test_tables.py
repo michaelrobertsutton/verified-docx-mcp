@@ -301,6 +301,27 @@ class ReplaceCellMarkdownTests(_TempFixtureCase):
         result = tables.get_table_impl(self.target, 1)
         self.assertEqual(result["rows"][0][0]["text"], "**Bold** content")
 
+    def test_expected_before_match_is_tolerant_of_markdown_marks(self):
+        tables.execute_replace_cell_markdown(str(self.target), 1, 1, 1, "**Bold** x")
+        evidence = tables.execute_replace_cell_markdown(
+            str(self.target), 1, 1, 1, "next", expected_before="Bold x"  # plain text of the markdown cell
+        )
+        self.assertTrue(evidence["applied"])
+        evidence = tables.execute_replace_cell_markdown(
+            str(self.target), 1, 1, 1, "again", expected_before="next"
+        )
+        self.assertTrue(evidence["applied"])
+
+    def test_expected_before_mismatch_writes_nothing(self):
+        before = self.target.read_bytes()
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_replace_cell_markdown(str(self.target), 1, 1, 1, "x", expected_before="not the cell")
+        envelope = ctx.exception.envelope
+        self.assertEqual(envelope.error_code, ErrorCode.CELL_TEXT_MISMATCH)
+        self.assertIn("1-based", envelope.message)
+        self.assertEqual(envelope.diagnostics["expected_before"], "not the cell")
+        self.assertEqual(self.target.read_bytes(), before)
+
     def test_cell_out_of_range(self):
         with self.assertRaises(VerifyError) as ctx:
             tables.execute_replace_cell_markdown(str(self.target), 1, 1, 99, "x")

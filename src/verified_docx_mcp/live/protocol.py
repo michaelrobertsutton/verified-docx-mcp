@@ -176,6 +176,21 @@ pane must honor.
                      -- ``before``/``after`` are the cell's own
                      ``body.text`` read before/after; ``pre``/``post`` are
                      the whole-body SHA-256 as for ``replace``.
+                     Issue #75 (pane capability ``"cell_multiline"``):
+                     ``cell_get`` also returns ``paragraphs`` (one string
+                     per paragraph); paragraphs 2+ are written via
+                     ``paragraphs.getLast()`` and a hard break via
+                     ``insertBreak(line, "After")`` (Word rejects "End").
+                     Paragraphs 2+ are written by inserting the empty
+                     paragraphs, syncing, and writing into the loaded
+                     items (fallback: chained ``insertParagraph("After")``).
+                     After writing, the pane re-reads the paragraphs; on a
+                     mismatch it retries the other strategy, then rewrites
+                     the old paragraphs as plain text (untracked writes
+                     only; never OOXML) and refuses with
+                     ``OP_ERROR_CELL_WRITE_ROLLED_BACK`` or, if the restore
+                     did not take (or the write was tracked),
+                     ``OP_ERROR_CELL_WRITE_NOT_ROLLED_BACK``.
 
   table_get       -- ``TableGetPayload`` (table_index, 1-based, numbered like
                      ``list_tables``' ``table_id``). Issue #34; REQUIRES the
@@ -307,6 +322,10 @@ OP_ERROR_MATCH_COUNT_MISMATCH = "match_count_mismatch"
 # Issue #34: the pane refused BEFORE writing because its own body hash no
 # longer equals the caller's expectedBodySha256 (maps to LIVE_STALE), and a
 # table style that does not exist (maps to STYLE_NOT_FOUND).
+# Issue #75: cell_set's pane-side self-check failed; the cell was restored /
+# could not be restored (both map to VERIFICATION_FAILED server-side).
+OP_ERROR_CELL_WRITE_ROLLED_BACK = "cell_write_rolled_back"
+OP_ERROR_CELL_WRITE_NOT_ROLLED_BACK = "cell_write_not_rolled_back"
 OP_ERROR_STALE = "stale"
 OP_ERROR_STYLE_NOT_FOUND = "style_not_found"
 
