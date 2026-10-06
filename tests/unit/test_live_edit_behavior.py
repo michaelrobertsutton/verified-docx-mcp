@@ -22,3 +22,7 @@ def test_replacement_and_format_readback():
 
 def test_delete_paragraph_guards_and_verification():
     run_harness("paragraph_harness.mjs")
+
+
+def test_insert_paragraphs_guards_and_verification():
+    run_harness("paragraph_insert_harness.mjs")
