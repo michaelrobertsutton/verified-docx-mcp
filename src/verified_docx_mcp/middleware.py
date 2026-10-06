@@ -66,6 +66,8 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         "apply_style",
         # issue #106 WP-3 (live_status is read-only, not listed here):
         "live_save",
+        # issue #77:
+        "insert_paragraphs",
     }
 )
 
