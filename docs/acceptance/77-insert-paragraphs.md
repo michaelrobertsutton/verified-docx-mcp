@@ -45,5 +45,17 @@ this branch, pane loaded `taskpane.js?v=54`). All steps PASS:
 7. A stale `revision_before` refused with `LIVE_STALE`, body unchanged.
 8. The tracking mode was `false` after every path.
 
+Follow-up run, same day: the registered MCP tool was called through an in-process
+FastMCP client (`Client(server.mcp)`: registration, input schema, evidence
+middleware) against a live pane. A tracked `insert_paragraphs` returned the
+verified evidence (`write_mode: "live"`, per-paragraph style and color), and an
+unknown style came back through MCP as `STYLE_NOT_FOUND`. A desktop screenshot of
+the same document showed the three paragraphs as Word tracked insertions (underlined
+inserted text, change bars, revision balloons) with the heading in the heading
+style. The inserted text appears in Word's revision color while markup is shown, so
+the purple and green are confirmed from the pane read-back and the saved XML above,
+not by eye.
+
 Not exercised in real Word: the rollback of an untracked write that fails read-back
-(mock harness only) and section locks.
+(mock harness only), section locks, and a call through the separately running MCP
+server (it runs the main checkout, not this branch; it needs a restart after merge).
