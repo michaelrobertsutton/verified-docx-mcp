@@ -426,6 +426,15 @@ before the error is raised. The pane logic is tested against a mock only; see
 [`docs/live-mode.md`](docs/live-mode.md#live-tables-issue-34) for the limits
 and the manual runbook.
 
+Issue #77: `insert_paragraphs` adds styled, optionally colored paragraphs or
+headings before/after one anchored body paragraph, optionally as tracked
+changes, in a document a co-author has open (`write_mode`, like `replace_text`).
+Live mode sends the pane's `paragraph_insert` op; the style is resolved before
+anything is written, every inserted paragraph's text, style and color is read
+back, and an untracked write that fails the read-back is removed again. The pane
+logic is tested against a mock only; see
+[`docs/live-mode.md`](docs/live-mode.md#live-paragraph-insertion-issue-77).
+
 Issue #154: every OTHER mutating tool — `apply_style`,
 `insert_image`,
 `replace_range_markdown`, `replace_body_markdown`, `append_markdown`,
