@@ -196,6 +196,10 @@ class FakeDocument:
         self.known_styles: set[str] = {"Table Grid", "Grid Table 4 - Accent 1"}
         # 0-based indices of tables the fake reports as containing a merged cell.
         self.merged_tables: set[int] = set()
+        # Issue #77: paragraph styles the document "has", and a knob that makes
+        # paragraph_insert silently drop the requested color (server read-back test).
+        self.known_paragraph_styles: set[str] = {"Normal", "Heading 1", "Heading 2", "Heading 3", "Body Text"}
+        self.drop_paragraph_color = False
 
     def sha256(self) -> str:
         payload = self.text
@@ -387,6 +391,48 @@ class FakeDocument:
         # Merged-table flags are by index: shift those at/after the insertion.
         self.merged_tables = {m + 1 if m >= index else m for m in self.merged_tables}
         return {"applied": True, "table_index": index + 1, "pre": pre, "post": self.sha256()}
+
+    def paragraph_insert(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Issue #77: insert styled paragraphs before/after the anchor's line.
+        Every refusal happens before the text is touched, like the real pane."""
+        pre = self._check_fresh(payload)
+        anchor = payload["anchor"]
+        expected = int(payload["expected_matches"])
+        found = self.text.count(anchor)
+        if found != expected:
+            raise OpRefused(
+                "ZERO_MATCH" if found == 0 else "MATCH_COUNT_MISMATCH",
+                f"expected {expected} match(es) for {anchor!r}, found {found}",
+            )
+        specs = payload["paragraphs"]
+        requested: list[dict[str, str]] = []
+        for spec in specs:
+            style = spec.get("style")
+            if not style:
+                requested.append({"kind": "builtin", "value": "Normal"})
+            elif style in self.known_paragraph_styles:
+                requested.append({"kind": "name", "value": style})
+            else:
+                raise OpRefused("STYLE_NOT_FOUND", f"paragraph style {style!r} was not found in the document")
+        lines = self.text.split("\n")
+        index = next(i for i, line in enumerate(lines) if anchor in line)
+        position = "before" if payload.get("position") == "before" else "after"
+        at = index if position == "before" else index + 1
+        lines[at:at] = [spec["text"] for spec in specs]
+        before_count = len(lines) - len(specs)
+        self.text = "\n".join(lines)
+        inserted = []
+        for spec, req in zip(specs, requested, strict=True):
+            color = "" if self.drop_paragraph_color or not spec.get("color") else "#" + spec["color"].upper()
+            inserted.append({
+                "text": spec["text"],
+                "style": req["value"],
+                "style_builtin": req["value"] if req["kind"] == "builtin" else "",
+                "color": color,
+                "requested_style": req,
+            })
+        return {"applied": True, "position": position, "anchor_index": index + 1, "inserted": inserted,
+                "before_count": before_count, "after_count": len(lines), "pre": pre, "post": self.sha256()}
 
     def cells_set(self, payload: dict[str, Any]) -> dict[str, Any]:
         pre = self._check_fresh(payload)
@@ -682,7 +728,7 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts"]
+            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert"]
             if capabilities is None
             else list(capabilities)
         )
@@ -692,6 +738,8 @@ class FakePane:
         # Issue #34: every table_get / table_insert payload received.
         self.table_get_payloads: list[dict[str, Any]] = []
         self.table_insert_payloads: list[dict[str, Any]] = []
+        # Issue #77: every paragraph_insert payload received.
+        self.paragraph_insert_payloads: list[dict[str, Any]] = []
         # Ops named here are received but never answered -- lets a test
         # simulate an unresponsive pane (for LIVE_DISCONNECTED-by-timeout)
         # without needing a full socket-level failure injection.
@@ -835,6 +883,9 @@ class FakePane:
         if op == "table_insert":
             self.table_insert_payloads.append(dict(payload))
             return doc.table_insert(payload)
+        if op == "paragraph_insert":
+            self.paragraph_insert_payloads.append(dict(payload))
+            return doc.paragraph_insert(payload)
         if op == "cells_set":
             return doc.cells_set(payload)
         if op == "save":

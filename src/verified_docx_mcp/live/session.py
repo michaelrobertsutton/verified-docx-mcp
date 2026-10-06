@@ -51,6 +51,8 @@ OP_TIMEOUTS: dict[str, float] = {
     "table_get": 60.0,
     "table_insert": 90.0,
     "cells_set": 60.0,
+    # #77: several inserts, a read-back, and a possible rollback.
+    "paragraph_insert": 60.0,
     # #48: revision ops walk every tracked change and serialize the body for the
     # coverage cross-check; a timeout here would report a possibly-applied
     # accept/reject as disconnected.
@@ -288,7 +290,7 @@ class LiveSession:
         ``request()``. Not called directly by anything outside this
         class."""
         guarded = {"replace", "format", "cell_set", "cells_set", "table_insert",
-                   "paragraph_delete", "revisions_accept", "revisions_reject",
+                   "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
                    "comment_add", "comment_reply", "comment_resolve", "save"}
         if op in guarded and "shape_guard" not in self.hello.capabilities:
             raise LiveOpFailed("LIVE_CAPABILITY_MISSING",

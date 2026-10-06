@@ -235,6 +235,33 @@ pane must honor.
                      ``ClientResult``: ``.value`` is read after sync). Reply
                      result: ``{applied, table_index, pre, post}``.
 
+  paragraph_insert -- (anchor, expected_matches, position, paragraphs
+                     [{text, style, color}], track_changes,
+                     expectedBodySha256). Issue #77; REQUIRES the pane's
+                     ``"paragraph_insert"`` capability. The pane refuses
+                     BEFORE any write with: ``stale`` (body hash moved),
+                     ``STYLE_NOT_FOUND`` / ``UNSUPPORTED_STYLE_TYPE`` (a
+                     style the document lacks, or a non-paragraph style),
+                     ``ZERO_MATCH`` / ``MATCH_COUNT_MISMATCH`` (the anchor
+                     must match exactly ``expected_matches``),
+                     ``STRUCTURAL_BOUNDARY`` (anchor in a table cell) and
+                     ``OUTSIDE_LOCKED_SECTION`` (``before`` under section
+                     locks). Word calls: ``Paragraph.insertParagraph``
+                     (the first from the anchor paragraph, each later one
+                     chained "After" the previous so every write lands in a
+                     synced proxy), ``Paragraph.style`` / ``styleBuiltIn``
+                     (``styleBuiltIn = Normal`` when no style is given, so a
+                     heading anchor's style is not inherited) and
+                     ``font.color``. Every inserted paragraph's text, style
+                     and color, and the whole paragraph list, are read back.
+                     A mismatch is pane code ``VERIFICATION_FAILED``: an
+                     untracked write is deleted again (the message says
+                     whether that restored the list); a tracked write is
+                     left for the Review pane. Reply result: ``{applied,
+                     position, anchor_index, inserted: [{text, style,
+                     style_builtin, color, requested_style: {kind, value}}],
+                     before_count, after_count, pre, post}``.
+
   cells_set       -- ``CellsSetPayload`` (cells, track_changes,
                      expectedBodySha256). Issue #34; REQUIRES ``"table_edit"``.
                      ``cells`` is a list of ``{table_index, row_index,
@@ -252,7 +279,7 @@ pane must honor.
 Staleness (``expected_body_sha256``)
 -------------------------------------
 ``search``/``replace``/``format``/``comment_add``/``cell_set``/
-``table_insert``/``cells_set`` payloads
+``table_insert``/``cells_set``/``paragraph_insert`` payloads
 carry an optional ``expected_body_sha256``. The pane does not act on it -- it is
 read by ``live/session.py``'s ``LiveSession.request`` after the reply
 comes back: if the caller supplied one and the reply's ``result["pre"]``
@@ -292,6 +319,7 @@ VALID_OPS: frozenset[str] = frozenset(
         "table_insert",
         "cells_set",
         "paragraph_delete",
+        "paragraph_insert",
         "shapes_list",
         "textboxes_list",
         "textboxes_read",
