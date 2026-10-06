@@ -429,16 +429,20 @@ channel:
   is sent. Use `write_mode="file"` (with the document closed) for those.
   More than one paragraph, or a line break, also needs the pane's
   `"cell_multiline"` capability (`LIVE_CAPABILITY_MISSING` before anything
-  is sent; reload the pane after upgrading). Issue #75: Word's
-  `insertParagraph("", "End")` proxy resolves to the previous paragraph in a
-  table cell and `insertBreak` rejects `"End"`, so the pane writes later
-  paragraphs through `paragraphs.getLast()` and breaks with `"After"`.
+  is sent; reload the pane after upgrading). Issue #75, observed on
+  Word for Mac: text written through a not-yet-synced paragraph proxy
+  (`insertParagraph`'s return value, or `getLast()` in the same batch) lands
+  in an earlier paragraph, and `insertBreak` rejects `"End"`. The pane
+  therefore inserts the empty paragraphs, syncs, writes into the loaded
+  paragraph items, and breaks with `"After"`.
 - **Compare-and-set**: `cell_set` carries the text `cell_get` just read;
   the pane refuses (`LIVE_OP_FAILED`) if the cell changed in between, so
   a co-author typing in the same cell is not overwritten.
 - **Pane self-check and restore** (issue #75): after writing, the pane
-  re-reads the cell's paragraphs. On a mismatch it restores the cell from a
-  pre-write OOXML snapshot and refuses; the server reports
+  re-reads the cell's paragraphs. On a mismatch it retries with a second
+  write strategy, then writes the old paragraphs back as plain text
+  (character formatting may differ; OOXML is never used) and refuses; the
+  server reports
   `VERIFICATION_FAILED` with `diagnostics.rolled_back: true`. A tracked
   write (`track_changes=true`) is never restored (reject it in Word's Review
   pane), and a restore that does not take reports `rolled_back: false` and

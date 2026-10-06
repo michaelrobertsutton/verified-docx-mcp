@@ -172,7 +172,7 @@ class ReplaceCellLiveTests(LiveWriteBridgeTestCase):
         doc.cell_set_failure = ("cell_write_rolled_back", "the cell did not read back as written")
         envelope = await self.assertRefusedWith(ErrorCode.VERIFICATION_FAILED, "a\n\nb")
         self.assertTrue(envelope.diagnostics["rolled_back"])
-        self.assertIn("restored", envelope.message)
+        self.assertIn("previous text", envelope.message)
         self.assertEqual(doc.tables[0][0][0], "R1C1")
 
     async def test_pane_reports_not_rolled_back_and_it_is_audited(self) -> None:

@@ -181,9 +181,13 @@ pane must honor.
                      per paragraph); paragraphs 2+ are written via
                      ``paragraphs.getLast()`` and a hard break via
                      ``insertBreak(line, "After")`` (Word rejects "End").
+                     Paragraphs 2+ are written by inserting the empty
+                     paragraphs, syncing, and writing into the loaded
+                     items (fallback: chained ``insertParagraph("After")``).
                      After writing, the pane re-reads the paragraphs; on a
-                     mismatch it restores the cell from a pre-write OOXML
-                     snapshot (untracked writes only) and refuses with
+                     mismatch it retries the other strategy, then rewrites
+                     the old paragraphs as plain text (untracked writes
+                     only; never OOXML) and refuses with
                      ``OP_ERROR_CELL_WRITE_ROLLED_BACK`` or, if the restore
                      did not take (or the write was tracked),
                      ``OP_ERROR_CELL_WRITE_NOT_ROLLED_BACK``.

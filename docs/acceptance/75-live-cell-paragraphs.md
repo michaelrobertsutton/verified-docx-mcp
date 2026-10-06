@@ -10,8 +10,11 @@ behavior of `paragraphs.getLast()`, `Range.insertBreak(After)` and the
 ## Root causes
 
 - `Paragraph.insertBreak(line, "End")` is `InvalidArgument` (Before/After only).
-- Writing paragraph 2+ through `body.insertParagraph("", "End")`'s returned
-  proxy merged its text into paragraph 1 and left the real new paragraph empty.
+- Writing paragraph 2+ through a not-yet-synced proxy (`body.insertParagraph`'s
+  return value, and also `paragraphs.getLast()` in the same batch) merged its
+  text into paragraph 1 and left the real new paragraph empty (first attempt at
+  a fix used `getLast()` and failed on real Word; the OOXML restore also
+  corrupted the cell). Fix: insert, sync, write into loaded items.
 - The server's whitespace-collapsing read-back could not see paragraph
   boundaries, so the bad write was reported but never undone.
 

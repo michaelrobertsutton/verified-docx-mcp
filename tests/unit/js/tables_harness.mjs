@@ -195,6 +195,15 @@ function makeContext(model) {
             cell.paras[idxRef.i] += "\v";
           });
         },
+        insertParagraph: (text, where) => {
+          log(`paragraph.insertParagraph(${JSON.stringify(text)},${where})`);
+          const ref2 = { i: null };
+          ctx.queue.push(() => {
+            cell.paras.splice(idxRef.i + 1, 0, text);
+            ref2.i = idxRef.i + 1;
+          });
+          return makePara(ref2);
+        },
         getRange: () => makeRange(idxRef),
         delete: () => {
           log("paragraph.delete()");
@@ -205,7 +214,9 @@ function makeContext(model) {
     };
     const paragraphs = collection("cell.body.paragraphs", () => cell.paras.map((_, i) => makePara({ i })));
     paragraphs.getFirst = () => makePara({ i: 0 });
-    paragraphs.getLast = () => makePara({ get i() { return cell.paras.length - 1; } });
+    // Real Word (observed, issue #75): a getLast() queued in the same batch as an insert resolves
+    // against the paragraphs as of the last sync, so writes through it land in an earlier paragraph.
+    paragraphs.getLast = () => makePara({ get i() { return quirk() ? Math.min(cell.paras.length, cell.__synced ?? cell.paras.length) - 1 : cell.paras.length - 1; } });
     const impl = {
       get text() {
         const value = cellText(cell);
@@ -226,6 +237,7 @@ function makeContext(model) {
         const ref = { i: null };
         ctx.queue.push(() => {
           cell.paras.push(text);
+          if (model.insertParagraphDoublesEmpty) cell.paras.push(""); // a Word build whose insert adds an extra mark
           ref.i = quirk() ? cell.paras.length - 2 : cell.paras.length - 1;
         });
         return makePara(ref);
@@ -350,6 +362,8 @@ function makeContext(model) {
     const q = ctx.queue;
     ctx.queue = [];
     for (const fn of q) fn();
+    // what a later batch's not-yet-synced getLast() resolves against (issue #75)
+    model.tables.forEach((t) => t.rows.forEach((r) => r.forEach((c) => (c.__synced = c.paras.length))));
   };
   return ctx;
 }
@@ -665,17 +679,26 @@ const writes = (model) => model.calls.filter((c) => /insertTable|insertText|clea
   const r2b = await set(loadPane(m2b), [para("a"), para("b"), para("c")]);
   check("cell_set #75: three paragraphs", r2b.ok && m2b.tables[0].rows[0][0].paras.join("|") === "a|b|c", JSON.stringify(r2b) + JSON.stringify(m2b.tables[0].rows));
 
-  // (c) a write Word loses -> restored, typed code
+  // (c) a write Word loses on every strategy -> old text written back, typed code
   const m3 = makeModel({ tables: [{ rows: [["old"]] }] });
   m3.dropParagraphText = 1;
   const r3 = await set(loadPane(m3), [para("first"), para("second")]);
   check("cell_set #75: a failed self-check is rolled back with a typed code", !r3.ok && r3.code === "cell_write_rolled_back" && m3.tables[0].rows[0][0].paras.join("|") === "old", JSON.stringify(r3) + JSON.stringify(m3.tables[0].rows));
+  check("cell_set #75: the restore never uses OOXML", !m3.calls.some((c) => /insertOoxml/.test(c)), m3.calls.join(" | "));
 
-  // (d) the same under track_changes -> never restored
+  // (d) the same under track_changes -> tried once, never rewritten
   const m4 = makeModel({ tables: [{ rows: [["old"]] }] });
   m4.dropParagraphText = 1;
   const r4 = await set(loadPane(m4), [para("first"), para("second")], { track_changes: true });
-  check("cell_set #75: tracked write is not restored", !r4.ok && r4.code === "cell_write_not_rolled_back" && !m4.calls.some((c) => c.startsWith("cell.body.insertOoxml")), JSON.stringify(r4) + m4.calls.join(" | "));
+  check("cell_set #75: tracked write is not restored", !r4.ok && r4.code === "cell_write_not_rolled_back" && m4.calls.filter((c) => c === "cell.body.clear()").length === 1, JSON.stringify(r4) + m4.calls.join(" | "));
+
+  // (c2) first strategy yields a stray empty paragraph -> the next strategy succeeds
+  const m6 = makeModel({ tables: [{ rows: [["old"]] }] });
+  m6.insertParagraphDoublesEmpty = true;
+  const r6 = await set(loadPane(m6), [para("first"), para("second")]);
+  check("cell_set #75: falls back to after-chain when load-items misreads", r6.ok && r6.value.strategy === "after-chain" && m6.tables[0].rows[0][0].paras.join("|") === "first|second", JSON.stringify(r6) + JSON.stringify(m6.tables[0].rows));
+  const r6b = await set(loadPane(makeModel({ tables: [{ rows: [["old"]] }] })), [para("first"), para("second")]);
+  check("cell_set #75: load-items is the first strategy", r6b.ok && r6b.value.strategy === "load-items", JSON.stringify(r6b));
 
   // (e) cell_get returns paragraphs
   const m5 = makeModel({ tables: [{ rows: [["x"]] }] });

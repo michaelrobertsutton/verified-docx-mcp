@@ -810,7 +810,7 @@ def execute_replace_cell_markdown_live(
     except LiveOpFailed as exc:
         rolled_back = exc.code == live_protocol.OP_ERROR_CELL_WRITE_ROLLED_BACK
         if rolled_back:
-            note = "the pane restored the cell's previous content"
+            note = "the pane wrote the cell's previous text back (character formatting may differ)"
         else:
             note = "the pane could not restore the cell -- inspect and fix it by hand"
             live_write_mode.audit_live_failure(
