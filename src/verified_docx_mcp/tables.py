@@ -532,6 +532,7 @@ def execute_replace_cell_markdown(
     allow_concurrent_editor: bool = False,
     track_changes: bool = False,
     write_mode: str = "auto",
+    expected_before: str | None = None,
 ) -> dict[str, Any]:
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
@@ -543,6 +544,7 @@ def execute_replace_cell_markdown(
             markdown,
             revision_before=revision_before,
             track_changes=track_changes,
+            expected_before=expected_before,
         )
 
     own_author = resolve_author_name()
@@ -567,6 +569,9 @@ def execute_replace_cell_markdown(
     styles = projection.list_styles_impl(resolved)
     styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
     before_text = projection._table_cell_markdown(tc, styles_by_id, table_id, [])
+    _check_expected_before(
+        expected_before, before_text, table_id=table_id, row_index=row_index, cell_index=cell_index
+    )
 
     old_children = _cell_content_children(tc)
     hazards = mutations._scan_range_hazards(old_children)
@@ -646,9 +651,12 @@ def execute_replace_cell_markdown(
 # ---------------------------------------------------------------------------
 
 _CELL_EDIT_CAPABILITY = "cell_edit"
+_CELL_MULTILINE_CAPABILITY = "cell_multiline"  # issue #75
 
 
-def _live_cell_request(session: Any, op: str, payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+def _live_cell_request(
+    session: Any, op: str, payload: dict[str, Any], *, passthrough_codes: tuple[str, ...] = (), **kwargs: Any
+) -> dict[str, Any]:
     try:
         return session.request_threadsafe(op, payload, **kwargs)
     except LiveStale as exc:
@@ -656,6 +664,8 @@ def _live_cell_request(session: Any, op: str, payload: dict[str, Any], **kwargs:
             ErrorCode.LIVE_STALE, str(exc), {"expected": exc.expected, "actual": exc.actual}
         ) from exc
     except LiveOpFailed as exc:
+        if exc.code in passthrough_codes:
+            raise
         raise _make_error(
             live_write_mode.classify_op_failed(exc), exc.message, {"pane_code": exc.code}
         ) from exc
@@ -679,6 +689,44 @@ def _runs_to_wire(paragraphs: list[list[markdown_to_ooxml.RunSpec]]) -> list[lis
     ]
 
 
+def _intended_cell_paragraphs(paragraphs: list[list[markdown_to_ooxml.RunSpec]]) -> list[str]:
+    """One string per intended paragraph (a hard break reads as "\\n"); an empty
+    write leaves the cell's one empty paragraph."""
+    out = ["".join("\n" if run.hard_break else run.text for run in paragraph) for paragraph in paragraphs]
+    return out or [""]
+
+
+_MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_MD_MARKS = re.compile(r"[*_`]")
+
+
+def _norm_cell_text(text: str) -> str:
+    return " ".join(_MD_MARKS.sub("", _MD_LINK.sub(r"\1", text)).split())
+
+
+def _check_expected_before(
+    expected: str | None, actual: str, *, table_id: int, row_index: int, cell_index: int
+) -> None:
+    """Issue #75: refuse (nothing written) when the caller's expected_before
+    does not match the cell's current text. Compared modulo markdown marks and
+    whitespace, so a get_table markdown cell or a live plain-text read both work."""
+    if expected is None or _norm_cell_text(expected) == _norm_cell_text(actual):
+        return
+    raise _make_error(
+        ErrorCode.CELL_TEXT_MISMATCH,
+        f"expected_before does not match table_id {table_id} row {row_index} cell {cell_index} "
+        "(row_index and cell_index are 1-based; row 1 is the table's first row, usually the header). "
+        "Nothing was written.",
+        {
+            "expected_before": expected,
+            "actual": actual,
+            "table_id": table_id,
+            "row_index": row_index,
+            "cell_index": cell_index,
+        },
+    )
+
+
 def _intended_cell_text(paragraphs: list[list[markdown_to_ooxml.RunSpec]]) -> str:
     return "\n".join(
         "".join("\n" if run.hard_break else run.text for run in paragraph) for paragraph in paragraphs
@@ -694,30 +742,42 @@ def execute_replace_cell_markdown_live(
     *,
     revision_before: str | None = None,
     track_changes: bool = False,
+    expected_before: str | None = None,
 ) -> dict[str, Any]:
-    """Live-mode ``replace_cell_markdown`` (issue #27).
+    """Live-mode ``replace_cell_markdown`` (issue #27, #75).
 
-    Flow: parse the markdown (paragraphs with bold/italic/links only --
-    ``INVALID_INPUT`` otherwise, BEFORE anything is sent) -> capability
-    check (``"cell_edit"``) -> ``describe`` (pre body hash + ``LIVE_STALE``
-    check) -> ``cell_get`` (the cell's current text) -> ``cell_set`` as a
-    compare-and-set against that text, so a co-author's edit landing in
-    between is refused by the pane instead of overwritten -> an
-    INDEPENDENT second ``cell_get`` (not the pane's own reply) compared
-    with the intended text modulo whitespace -> live evidence envelope.
+    Flow: parse the markdown (paragraphs, hard line breaks and
+    bold/italic/links only -- ``INVALID_INPUT`` otherwise, BEFORE anything
+    is sent) -> capability check (``"cell_edit"``, plus ``"cell_multiline"``
+    for more than one paragraph or a line break) -> ``describe`` (pre body
+    hash + ``LIVE_STALE`` check) -> ``cell_get`` (the cell's current text;
+    ``expected_before`` guard) -> ``cell_set`` as a compare-and-set against
+    that text, so a co-author's edit landing in between is refused by the
+    pane instead of overwritten. The pane re-reads the paragraphs itself and
+    restores the cell if they do not match (``VERIFICATION_FAILED`` with
+    ``rolled_back``). -> an INDEPENDENT second ``cell_get`` compared
+    paragraph by paragraph (modulo whitespace) with the intended text ->
+    live evidence envelope.
 
     ``force`` has no live analogue and is not accepted; ``before``/
     ``after`` in the evidence are the cell's plain text (Word's own
-    ``body.text``), not markdown. Nothing to roll back on a verification
-    failure -- Word, not this server, owns the document.
+    ``body.text``), not markdown. If the server's own read-back fails, the
+    write has landed and is audit-logged: Word, not this server, owns the
+    document.
     """
     paragraphs = markdown_to_ooxml.parse_paragraph_runs(markdown)
     intended = _intended_cell_text(paragraphs)
+    intended_paragraphs = _intended_cell_paragraphs(paragraphs)
+    needs_multiline = len(paragraphs) > 1 or any(run.hard_break for paragraph in paragraphs for run in paragraph)
 
     session = live_write_mode.live_session_for(path)
     live_write_mode.require_capability(
         session, _CELL_EDIT_CAPABILITY, feature_description="live table cell edits"
     )
+    if needs_multiline:
+        live_write_mode.require_capability(
+            session, _CELL_MULTILINE_CAPABILITY, feature_description="live multi-paragraph / line-break cell edits"
+        )
     document_name = session.document_name
     address = {"table_index": table_id, "row_index": row_index, "cell_index": cell_index}
 
@@ -728,17 +788,45 @@ def execute_replace_cell_markdown_live(
     live_write_mode.check_not_stale(revision_before, pre_hash)
 
     before_text = _live_cell_request(session, "cell_get", address)["text"]
-    result = _live_cell_request(
-        session,
-        "cell_set",
-        {
-            **address,
-            "paragraphs": _runs_to_wire(paragraphs),
-            "expected_before_text": before_text,
-            "track_changes": track_changes,
-        },
-        expected_body_sha256=pre_hash,
+    _check_expected_before(
+        expected_before, before_text, table_id=table_id, row_index=row_index, cell_index=cell_index
     )
+    try:
+        result = _live_cell_request(
+            session,
+            "cell_set",
+            {
+                **address,
+                "paragraphs": _runs_to_wire(paragraphs),
+                "expected_before_text": before_text,
+                "track_changes": track_changes,
+            },
+            expected_body_sha256=pre_hash,
+            passthrough_codes=(
+                live_protocol.OP_ERROR_CELL_WRITE_ROLLED_BACK,
+                live_protocol.OP_ERROR_CELL_WRITE_NOT_ROLLED_BACK,
+            ),
+        )
+    except LiveOpFailed as exc:
+        rolled_back = exc.code == live_protocol.OP_ERROR_CELL_WRITE_ROLLED_BACK
+        if rolled_back:
+            note = "the pane restored the cell's previous content"
+        else:
+            note = "the pane could not restore the cell -- inspect and fix it by hand"
+            live_write_mode.audit_live_failure(
+                tool="replace_cell_markdown",
+                path=path,
+                document_name=document_name,
+                pre_body_sha256=pre_hash,
+                post_body_sha256=None,
+                reason="live cell write failed the pane's self-check and was not rolled back",
+                detail={"pane_message": exc.message},
+            )
+        raise _make_error(
+            ErrorCode.VERIFICATION_FAILED,
+            f"live cell edit did not verify: {exc.message}; {note}.",
+            {"rolled_back": rolled_back, "pane_message": exc.message, "pane_code": exc.code},
+        ) from exc
     if not result.get("applied"):
         raise _make_error(
             ErrorCode.VERIFICATION_FAILED,
@@ -747,16 +835,28 @@ def execute_replace_cell_markdown_live(
             {"applied": result.get("applied")},
         )
 
-    after_text = _live_cell_request(session, "cell_get", address)["text"]
-    diff = mutations._diff_modulo_whitespace(intended, after_text)
-    if diff:
-        raise _make_error(
-            ErrorCode.VERIFICATION_FAILED,
-            "live cell edit did not verify: re-reading the cell does not match the intended text "
-            f"modulo whitespace: {diff}. Nothing to roll back in live mode -- Word, not this "
-            "server, owns the document.",
-            {"intended": intended, "actual": after_text},
+    after = _live_cell_request(session, "cell_get", address)
+    after_text = after["text"]
+    after_paragraphs = after.get("paragraphs")
+    if after_paragraphs is None:  # a pane predating cell_multiline reports whole-cell text only
+        problems = list(mutations._diff_modulo_whitespace(intended, after_text))
+    else:
+        problems = []
+        if len(after_paragraphs) != len(intended_paragraphs):
+            problems.append(
+                f"paragraph count: expected {len(intended_paragraphs)}, got {len(after_paragraphs)}"
+            )
+        for n, (want, got) in enumerate(zip(intended_paragraphs, after_paragraphs), start=1):
+            diff = mutations._diff_modulo_whitespace(want, got)
+            if diff:
+                problems.append(f"paragraph {n}: {' '.join(diff)}")
+    if problems:
+        err = _fail_live_verification(
+            tool="replace_cell_markdown", path=path, document_name=document_name, pre_hash=pre_hash,
+            session=session, problems=problems, what="live cell edit did not verify on re-read",
         )
+        err.envelope.diagnostics.update({"intended": intended, "actual": after_text, "rolled_back": False})
+        raise err
 
     return live_write_mode.live_evidence(
         shape_result=result,

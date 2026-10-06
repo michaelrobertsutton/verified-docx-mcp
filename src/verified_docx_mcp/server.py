@@ -2611,7 +2611,8 @@ def replace_table_row(
 ) -> dict[str, Any]:
     """Replace one table row's cell content wholesale, one markdown string
     per cell (cells must have exactly as many entries as the row has
-    cells).
+    cells). row_index is 1-based in both modes; row 1 is the table's first
+    row (usually the header).
 
     `write_mode` (issue #34, "auto" | "file" | "live", default "auto"):
     "auto" routes through the Live pane when one is connected, else writes
@@ -2694,6 +2695,7 @@ def replace_cell_markdown(
     track_changes: bool = False,
     allow_concurrent_editor: bool = False,
     write_mode: str = "auto",
+    expected_before: str | None = None,
 ) -> dict[str, Any]:
     """Replace one table cell's content with rendered markdown, leaving
     its own w:tcPr byte-identical -- the only write path safe on a merged
@@ -2706,17 +2708,30 @@ def replace_cell_markdown(
     cell in a document a co-author has open in Office Online: a live edit
     is a co-authoring edit, where a file write races that editor's
     autosave and is likely to be silently reverted. LIVE MODE IS A SUBSET:
-    paragraphs with bold/italic/links only (lists, headings, tables and
-    other block structure -> INVALID_INPUT, nothing sent); the cell is
+    one or more paragraphs and hard line breaks (two trailing spaces then
+    a newline), with bold/italic/links (lists, headings, tables and other
+    block structure -> INVALID_INPUT, nothing sent); more than one
+    paragraph or a line break also needs the pane's "cell_multiline"
+    capability (LIVE_CAPABILITY_MISSING before anything is sent -- reload
+    the pane); the cell is
     edited compare-and-set against the text just read, so a co-author's
     concurrent edit to the same cell is refused (LIVE_OP_FAILED) rather
-    than overwritten; a document containing a NESTED table is refused
-    (the pane cannot map table_id onto nested tables); `force` does not
-    apply; before/after are the cell's plain text, not markdown;
+    than overwritten; the pane re-reads the cell's paragraphs after
+    writing and restores the previous content if they do not match
+    (VERIFICATION_FAILED, diagnostics.rolled_back=true; false means the
+    cell needs a manual look); a document containing a NESTED table is
+    refused (the pane cannot map table_id onto nested tables); `force`
+    does not apply; before/after are the cell's plain text, not markdown;
     revision_before/revision_after are "live:sha256:<hex>" body hashes;
     and the connected pane must report the "cell_edit" capability
     (LIVE_CAPABILITY_MISSING otherwise -- reload the pane). Requires the
     pane on the same machine as this server (docs/live-mode.md).
+
+    row_index and cell_index are 1-based in BOTH modes: row 1 is the
+    table's first row (usually the header), cell 1 its first cell. Pass
+    `expected_before` (the cell's current text, plain or markdown; compared
+    modulo markdown marks and whitespace) to guard against a wrong index or
+    a stale read: a mismatch is CELL_TEXT_MISMATCH and nothing is written.
 
     Supports multi-level bulleted/numbered markdown inside the cell
     (issue #28 WP-16a): rendered through the SAME markdown_to_ooxml
@@ -2741,11 +2756,13 @@ def replace_cell_markdown(
       TABLE_NOT_FOUND          - table_id does not match any table
       TABLE_ROW_NOT_FOUND      - row_index out of range for this table
       TABLE_CELL_NOT_FOUND     - cell_index out of range for this row
+      CELL_TEXT_MISMATCH       - expected_before does not match the cell's current text; nothing written
       COMMENT_ANCHORS_IN_RANGE / TRACKED_CHANGES_PRESENT - a hazard in the cell; force=True to proceed
       OPC_INVALID              - the rendered .docx failed OPC validation
       VERIFICATION_FAILED      - post-write verification failed (including w:tcPr drift); rolled
                                  back (file mode), or the pane's read-back did not confirm the
-                                 edit, with nothing to roll back (live mode)
+                                 edit (live mode; diagnostics.rolled_back says whether the pane
+                                 restored the cell)
       LIVE_UNAVAILABLE / LIVE_SESSION_ACTIVE / LIVE_SESSION_MISMATCH / LIVE_DISCONNECTED /
       LIVE_STALE / LIVE_CAPABILITY_MISSING / LIVE_OP_FAILED - as replace_text (issue #154);
                                  LIVE_OP_FAILED here also covers a cell whose text changed between
@@ -2756,6 +2773,7 @@ def replace_cell_markdown(
             path, table_id, row_index, cell_index, markdown,
             revision_before=revision_before, force=force, track_changes=track_changes,
             allow_concurrent_editor=allow_concurrent_editor, write_mode=write_mode,
+            expected_before=expected_before,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
