@@ -1,11 +1,23 @@
 # Live cell paragraphs and line breaks (#75)
 
-Status: implemented; **pending real-Word acceptance**. The JS harness
-(`tests/unit/js/tables_harness.mjs`) models Word's two quirks (`insertBreak`
-accepts only Before/After; the `insertParagraph` proxy in a table cell resolves
-to the previous paragraph) and fails on the pre-fix pane code, but real-Word
-behavior of `paragraphs.getLast()`, `Range.insertBreak(After)` and the
-`insertOoxml` restore is not verified until the checklist below is run.
+Status: accepted against real Word for steps 1-4 (Word for Mac 16.113.3, 2026-10-06,
+scratch copy of tests/fixtures/tables.docx, row 2 cell 2). Steps 5-6 (forced
+mismatch restore, tracked write) are not run against real Word.
+
+Results:
+
+1. Two paragraphs (the issue's repro): pass. Read back as
+   `Session 2: ... use cases.\rPre-read: SOO Obj 4.3, 5.3` (two paragraphs, no
+   trailing empty paragraph).
+2. Hard line break: pass (`line one\vline two`, one paragraph).
+3. `**a**  \nb\n\nsecond\n\nthird`: pass (`a\vb\rsecond\rthird`).
+4. Wrong `expected_before`: pass (`CELL_TEXT_MISMATCH`, nothing written).
+
+History: a first fix (write through `paragraphs.getLast()`, OOXML restore) failed
+on real Word -- paragraphs still merged and the restore put a neighbouring cell's
+text into the cell. The shipped approach inserts the empty paragraphs, syncs,
+and writes into the loaded items; the restore rewrites plain text (no OOXML).
+The JS mock now models the observed `getLast()` behaviour and fails the first fix.
 
 ## Root causes
 
