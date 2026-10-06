@@ -157,21 +157,55 @@ function makeContext(model) {
       bold: (v) => (cell.bold = v),
       color: (v) => (cell.color = v),
     });
+    // Word's real rules that issue #75 tripped over (model.macCellQuirk, on by
+    // default): insertBreak accepts only Before/After, and insertParagraph's
+    // returned proxy in a table cell resolves to the PREVIOUS paragraph.
+    const quirk = () => model.macCellQuirk !== false;
+    const invalidArgument = (what) => {
+      const e = new Error(`${what}: InvalidArgument`);
+      e.code = "InvalidArgument";
+      return e;
+    };
+    const makeRange = (idxRef) => ({
+      font: { set bold(v) {}, set italic(v) {} },
+      set hyperlink(v) {},
+      insertBreak: (type, where) => {
+        log(`range.insertBreak(${type},${where})`);
+        ctx.queue.push(() => {
+          if (where !== "Before" && where !== "After") throw invalidArgument("range.insertBreak");
+          cell.paras[idxRef.i] += "\v";
+        });
+      },
+    });
     const makePara = (idxRef) => {
       const pImpl = {
+        get text() { return cell.paras[idxRef.i]; },
         insertText: (text, where) => {
           log(`paragraph.insertText(${JSON.stringify(text)},${where})`);
-          const r = { font: { set bold(v) {}, set italic(v) {} }, set hyperlink(v) {} };
-          ctx.queue.push(() => (cell.paras[idxRef.i] += text));
-          return r;
+          ctx.queue.push(() => {
+            if (model.dropParagraphText === idxRef.i) return; // simulate a write Word loses
+            cell.paras[idxRef.i] += text;
+          });
+          return makeRange(idxRef);
         },
         insertBreak: (type, where) => {
           log(`paragraph.insertBreak(${type},${where})`);
-          ctx.queue.push(() => (cell.paras[idxRef.i] += "\n"));
+          ctx.queue.push(() => {
+            if (where !== "Before" && where !== "After") throw invalidArgument("paragraph.insertBreak");
+            cell.paras[idxRef.i] += "\v";
+          });
+        },
+        getRange: () => makeRange(idxRef),
+        delete: () => {
+          log("paragraph.delete()");
+          ctx.queue.push(() => cell.paras.splice(idxRef.i, 1));
         },
       };
-      return pImpl;
+      return node("paragraph", ["text"], pImpl);
     };
+    const paragraphs = collection("cell.body.paragraphs", () => cell.paras.map((_, i) => makePara({ i })));
+    paragraphs.getFirst = () => makePara({ i: 0 });
+    paragraphs.getLast = () => makePara({ get i() { return cell.paras.length - 1; } });
     const impl = {
       get text() {
         const value = cellText(cell);
@@ -186,20 +220,27 @@ function makeContext(model) {
         log("cell.body.clear()");
         ctx.queue.push(() => (cell.paras = [""]));
       },
-      paragraphs: {
-        getFirst: () => makePara({ i: 0 }),
-      },
+      paragraphs,
       insertParagraph: (text, where) => {
         log(`cell.body.insertParagraph(${JSON.stringify(text)},${where})`);
         const ref = { i: null };
         ctx.queue.push(() => {
           cell.paras.push(text);
-          ref.i = cell.paras.length - 1;
+          ref.i = quirk() ? cell.paras.length - 2 : cell.paras.length - 1;
         });
         return makePara(ref);
       },
+      insertOoxml: (_xml, where) => {
+        log(`cell.body.insertOoxml(${where})`);
+        // Word's getOoxml round-trip leaves one extra empty paragraph.
+        ctx.queue.push(() => (cell.paras = [...(cell.__snap || [""]), ""]));
+      },
     };
-    impl.getOoxml = () => clientResult(() => EMPTY);
+    impl.getOoxml = () =>
+      clientResult(() => {
+        cell.__snap = cell.paras.slice();
+        return EMPTY;
+      });
     return node("cell.body", ["text"], impl);
   }
 
@@ -335,7 +376,7 @@ function loadPane(model) {
     },
     Word: {
       run: (fn) => fn(makeContext(model)),
-      InsertLocation: { end: "End", replace: "Replace" },
+      InsertLocation: { end: "End", replace: "Replace", before: "Before", after: "After" },
       BreakType: { line: "Line" },
       ChangeTrackingMode: { trackAll: "TrackAll", off: "Off" },
       BuiltInStyleName: { gridTable4_Accent1: "GridTable4_Accent1", tableGrid: "TableGrid" },
@@ -344,7 +385,7 @@ function loadPane(model) {
   vm.createContext(sandbox);
   vm.runInContext(
     src +
-      "\n;globalThis.__ops = { opTableInsert, opTableGet, opCellsSet, opCellSet, dispatchOp, PANE_CAPABILITIES };",
+      "\n;globalThis.__ops = { opTableInsert, opTableGet, opCellsSet, opCellSet, opCellGet, dispatchOp, PANE_CAPABILITIES };",
     sandbox
   );
   return sandbox.__ops;
@@ -600,6 +641,50 @@ const writes = (model) => model.calls.filter((c) => /insertTable|insertText|clea
   check("dispatch: table_insert routed", i.ok && i.value.applied === true, JSON.stringify(i));
   const c = await run(() => ops.dispatchOp("cells_set", { cells: [{ table_index: 1, row_index: 1, cell_index: 1, paragraphs: [para("z")], expected_before_text: "a" }], track_changes: false }));
   check("dispatch: cells_set routed", c.ok && c.value.applied === true, JSON.stringify(c));
+}
+
+// 12. issue #75: multi-paragraph / hard-break writes under real Word's quirks
+{
+  const hb = { text: "", bold: false, italic: false, link: null, hard_break: true };
+  const set = (ops, paragraphs, extra = {}) =>
+    run(() => ops.opCellSet({ table_index: 1, row_index: 1, cell_index: 1, paragraphs, expected_before_text: "old", track_changes: false, ...extra }));
+
+  // (a) two paragraphs: no merge, no trailing empty paragraph
+  const m1 = makeModel({ tables: [{ rows: [["old"]] }] });
+  const r1 = await set(loadPane(m1), [para("Session 2. Build a long list."), para("Pre-read: SOO 4.3", false)]);
+  check("cell_set #75: two paragraphs stay two paragraphs", r1.ok && m1.tables[0].rows[0][0].paras.join("|") === "Session 2. Build a long list.|Pre-read: SOO 4.3", JSON.stringify(r1) + JSON.stringify(m1.tables[0].rows));
+
+  // (b) hard break: Before/After only, lands inside one paragraph
+  const m2 = makeModel({ tables: [{ rows: [["old"]] }] });
+  const r2 = await set(loadPane(m2), [[...para("line one"), hb, ...para("line two")]]);
+  check("cell_set #75: hard break inserts a line break in one paragraph", r2.ok && m2.tables[0].rows[0][0].paras.length === 1 && m2.tables[0].rows[0][0].paras[0] === "line one\vline two", JSON.stringify(r2) + JSON.stringify(m2.tables[0].rows));
+  check("cell_set #75: insertBreak uses After, never End", m2.calls.some((c) => c === "range.insertBreak(Line,After)") && !m2.calls.some((c) => /insertBreak\(Line,End\)/.test(c)), m2.calls.join(" | "));
+
+  // 3 paragraphs
+  const m2b = makeModel({ tables: [{ rows: [["old"]] }] });
+  const r2b = await set(loadPane(m2b), [para("a"), para("b"), para("c")]);
+  check("cell_set #75: three paragraphs", r2b.ok && m2b.tables[0].rows[0][0].paras.join("|") === "a|b|c", JSON.stringify(r2b) + JSON.stringify(m2b.tables[0].rows));
+
+  // (c) a write Word loses -> restored, typed code
+  const m3 = makeModel({ tables: [{ rows: [["old"]] }] });
+  m3.dropParagraphText = 1;
+  const r3 = await set(loadPane(m3), [para("first"), para("second")]);
+  check("cell_set #75: a failed self-check is rolled back with a typed code", !r3.ok && r3.code === "cell_write_rolled_back" && m3.tables[0].rows[0][0].paras.join("|") === "old", JSON.stringify(r3) + JSON.stringify(m3.tables[0].rows));
+
+  // (d) the same under track_changes -> never restored
+  const m4 = makeModel({ tables: [{ rows: [["old"]] }] });
+  m4.dropParagraphText = 1;
+  const r4 = await set(loadPane(m4), [para("first"), para("second")], { track_changes: true });
+  check("cell_set #75: tracked write is not restored", !r4.ok && r4.code === "cell_write_not_rolled_back" && !m4.calls.some((c) => c.startsWith("cell.body.insertOoxml")), JSON.stringify(r4) + m4.calls.join(" | "));
+
+  // (e) cell_get returns paragraphs
+  const m5 = makeModel({ tables: [{ rows: [["x"]] }] });
+  m5.tables[0].rows[0][0].paras = ["one", "two"];
+  const r5 = await run(() => loadPane(m5).opCellGet({ table_index: 1, row_index: 1, cell_index: 1 }));
+  check("cell_get #75: returns per-paragraph text", r5.ok && JSON.stringify(r5.value.paragraphs) === '["one","two"]' && r5.value.text === "one\ntwo", JSON.stringify(r5));
+
+  // (f) capability
+  check("capabilities #75: cell_multiline is reported", loadPane(m5).PANE_CAPABILITIES.includes("cell_multiline"), "");
 }
 
 console.log(JSON.stringify({ results }));

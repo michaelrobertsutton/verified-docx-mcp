@@ -236,9 +236,11 @@ const OP_LOG_LIMIT = 20;
 // issue #31: "comments_by_id" = comments_list accepts `ids` / `include_anchor`.
 // issue #33: "body_ooxml" = the body_ooxml op (live reads for read_document /
 // find_sections / list_tables).
+// issue #75: "cell_multiline" = cell_get returns per-paragraph text, cell_set
+// writes multi-paragraph/line-break content correctly and self-checks/restores.
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
 // issue #39: "comment_counts" = comments_list reports counts/scope/observed_at.
-const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen"];
+const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -1207,16 +1209,27 @@ async function resolveTableCell(context, payload) {
 
 // Queues (does not sync) the clear + per-run writes for one cell. Shared by
 // cell_set, cells_set and table_insert so a cell is always written one way.
+//
+// issue #75, two Word quirks this must respect (real Word for Mac):
+//  * insertParagraph("", "End") on a cell body returns a proxy that can
+//    resolve to the PREVIOUS paragraph (the new mark lands before the
+//    end-of-cell mark), so text written through it merges into paragraph 1
+//    and the real new paragraph stays empty. Write through getLast() instead:
+//    it is resolved in queue order, after the insert.
+//  * Paragraph.insertBreak / Range.insertBreak accept only "Before"/"After";
+//    "End" is InvalidArgument. Break after the last inserted range.
 function writeCellParagraphs(cell, paragraphs) {
   cell.body.clear();
   paragraphs.forEach((runs, i) => {
     // After clear() the cell holds one empty paragraph: fill it first,
     // append the rest.
-    const paragraph =
-      i === 0 ? cell.body.paragraphs.getFirst() : cell.body.insertParagraph("", Word.InsertLocation.end);
+    if (i > 0) cell.body.insertParagraph("", Word.InsertLocation.end);
+    const paragraph = i === 0 ? cell.body.paragraphs.getFirst() : cell.body.paragraphs.getLast();
+    let lastRange = null;
     (runs || []).forEach((run) => {
       if (run.hard_break) {
-        paragraph.insertBreak(Word.BreakType.line, Word.InsertLocation.end);
+        const anchor = lastRange || paragraph.getRange("Start");
+        anchor.insertBreak(Word.BreakType.line, Word.InsertLocation.after);
         return;
       }
       const range = paragraph.insertText(run.text, Word.InsertLocation.end);
@@ -1225,16 +1238,52 @@ function writeCellParagraphs(cell, paragraphs) {
       if (run.link) {
         range.hyperlink = run.link;
       }
+      lastRange = range;
     });
   });
+}
+
+const normCellText = (s) => String(s).replace(/\s+/g, " ").trim();
+
+// One string per intended paragraph; a hard break reads back as whitespace
+// (Word reports a line break as \v), so it is rendered as "\n" here and the
+// comparison normalizes whitespace. An empty write leaves one empty paragraph.
+function intendedCellParagraphs(paragraphs) {
+  const out = (paragraphs || []).map((runs) =>
+    (runs || []).map((run) => (run.hard_break ? "\n" : run.text)).join("")
+  );
+  return out.length ? out : [""];
+}
+
+// Puts a cell back as it was after a write that failed its self-check.
+// Returns true only if the cell's text reads back as the original.
+async function restoreCell(context, cell, beforeOoxml, beforeParas, beforeText) {
+  try {
+    cell.body.insertOoxml(beforeOoxml.value, Word.InsertLocation.replace);
+    await context.sync();
+    cell.body.paragraphs.load("items/text");
+    await context.sync();
+    const items = cell.body.paragraphs.items;
+    // Word's getOoxml round-trip appends one empty paragraph.
+    if (items.length > beforeParas && !items[items.length - 1].text) {
+      cell.body.paragraphs.getLast().delete();
+      await context.sync();
+    }
+    cell.body.load("text");
+    await context.sync();
+    return normCellText(cell.body.text || "") === normCellText(beforeText);
+  } catch (err) {
+    return false;
+  }
 }
 
 async function opCellGet(payload) {
   return Word.run(async (context) => {
     const cell = await resolveTableCell(context, payload);
     cell.body.load("text");
+    cell.body.paragraphs.load("items/text");
     await context.sync();
-    return { text: cell.body.text || "" };
+    return { text: cell.body.text || "", paragraphs: cell.body.paragraphs.items.map((p) => p.text || "") };
   });
 }
 
@@ -1267,6 +1316,12 @@ async function opCellSet(payload) {
       context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
     }
 
+    // Snapshot for the self-check/restore below (issue #75).
+    const beforeOoxml = cell.body.getOoxml();
+    cell.body.paragraphs.load("items/text");
+    await context.sync();
+    const beforeParas = cell.body.paragraphs.items.length;
+
     try {
       writeCellParagraphs(cell, payload.paragraphs || []);
       await context.sync();
@@ -1275,6 +1330,31 @@ async function opCellSet(payload) {
         context.document.changeTrackingMode = previousMode;
         await context.sync();
       }
+    }
+
+    // Self-check: the cell must now hold exactly the intended paragraphs. If
+    // not, put the old content back rather than leave a malformed cell in a
+    // co-author's open document. A tracked write is never restored (the user
+    // can reject it in the Review pane); an untracked one is restored from the
+    // pre-write OOXML snapshot.
+    cell.body.paragraphs.load("items/text");
+    await context.sync();
+    const want = intendedCellParagraphs(payload.paragraphs).map(normCellText);
+    const got = cell.body.paragraphs.items.map((p) => normCellText(p.text || ""));
+    if (want.length !== got.length || want.some((w, i) => w !== got[i])) {
+      const detail = `expected ${JSON.stringify(want)}, found ${JSON.stringify(got)}`;
+      if (payload.track_changes) {
+        throw refusalError(
+          `the cell did not read back as written (${detail}); the write is a tracked change -- reject it in Word's Review pane`,
+          "cell_write_not_rolled_back"
+        );
+      }
+      const rolledBack = await restoreCell(context, cell, beforeOoxml, beforeParas, before);
+      throw refusalError(
+        `the cell did not read back as written (${detail}); ` +
+          (rolledBack ? "the previous content was restored" : "the previous content could NOT be restored -- fix the cell by hand"),
+        rolledBack ? "cell_write_rolled_back" : "cell_write_not_rolled_back"
+      );
     }
 
     cell.body.load("text");
