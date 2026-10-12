@@ -56,7 +56,7 @@ from xml.etree import ElementTree as ET
 
 from . import audit, mutations, paths, projection, text_edit, tracked_changes
 from .author import resolve_author_name
-from .errors import ErrorCode, _make_error
+from .errors import ErrorCode, VerifyError, _make_error
 from .locate import LocateResult, locate
 from .projection import DEFAULT_PART, W_NS
 
@@ -1073,5 +1073,317 @@ def execute_resolve_comment(
     }
     mutations._merge_conflict_sweep(evidence, conflict_sweep)  # issue #28 WP-10
     logged, _ = audit.append_audit(path=str(resolved), tool="resolve_comment", evidence=evidence)
+    evidence["audit_logged"] = logged
+    return evidence
+
+
+# ---------------------------------------------------------------------------
+# delete_comment / delete_resolved_comments -- issue #80.
+# ---------------------------------------------------------------------------
+
+_DELETE_ANCHOR_TAGS = ("commentRangeStart", "commentRangeEnd", "commentReference")
+_DELETE_PART_KEYS = (
+    # (part name, element local name, identifying attribute)
+    (_COMMENTS_PART, "comment", "id"),
+    (_COMMENTS_EXT_PART, "commentEx", "paraId"),
+    (_COMMENTS_IDS_PART, "commentId", "paraId"),
+    (_COMMENTS_CEX_PART, "commentExtensible", "durableId"),
+)
+
+
+def _canon(elem: Any) -> str:
+    return ET.canonicalize(ET.tostring(elem, encoding="unicode"))
+
+
+def _part_snapshot(root: Any, tag: str, attr: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for child in root:
+        if projection._ln(child) != tag:
+            continue
+        key = projection._attr(child, attr)
+        if key is not None:
+            out[key] = _canon(child)
+    return out
+
+
+def _anchor_multiset(document_root: Any, skip_ids: set[str]) -> dict[tuple[str, str], int]:
+    counts: dict[tuple[str, str], int] = {}
+    for node in document_root.iter():
+        tag = projection._ln(node)
+        if tag in _DELETE_ANCHOR_TAGS:
+            cid = projection._attr(node, "id")
+            if cid is not None and cid not in skip_ids:
+                counts[(tag, cid)] = counts.get((tag, cid), 0) + 1
+    return counts
+
+
+def _strip_thread_anchors(document_root: Any, w_ids: set[str]) -> None:
+    """Remove the three anchor elements for every id in *w_ids* and drop
+    the reference run Word leaves behind (a ``w:r`` holding only ``rPr``
+    once its ``w:commentReference`` is gone)."""
+    parents = {child: parent for parent in document_root.iter() for child in parent}
+    ref_runs = [
+        node
+        for node in document_root.iter()
+        if projection._ln(node) == "r"
+        and any(
+            projection._ln(c) == "commentReference" and projection._attr(c, "id") in w_ids for c in node
+        )
+    ]
+    mutations._strip_comment_anchors_recursive(document_root, w_ids)
+    for run in ref_runs:
+        if all(projection._ln(c) == "rPr" for c in run):
+            parent = parents.get(run)
+            if parent is not None:
+                parent.remove(run)
+
+
+def execute_delete_comments(
+    path: str,
+    comment_ids: list[str],
+    *,
+    tool_name: str,
+    require_resolved: bool,
+    revision_before: str | None = None,
+    allow_concurrent_editor: bool = False,
+) -> dict[str, Any]:
+    """Delete whole comment threads (root + every descendant reply) from the
+    .docx, atomically. Shared by ``delete_comment`` and
+    ``delete_resolved_comments``.
+
+    Thread roots only: a reply id is refused (INVALID_INPUT naming its
+    root). *comment_ids* are resolved (durableId first, then raw w:id),
+    deduplicated by root, and validated as a set before anything is
+    written: any unknown id, reply id, or (with *require_resolved*)
+    unresolved root refuses the whole call, listing every offender.
+
+    Writes only document.xml and the comment parts that already exist and
+    changed; people.xml, rels and [Content_Types].xml are never touched.
+    ``post_verify`` re-reads the written package and fails (rolling back)
+    if a removed id survives anywhere, or if any surviving comment element
+    or anchor differs from the original.
+    """
+    if not comment_ids:
+        raise _make_error(ErrorCode.INVALID_INPUT, "comment_ids must not be empty", {})
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
+    pre_revision = mutations._guard_before_write(
+        resolved,
+        revision_before,
+        allow_concurrent_editor=allow_concurrent_editor,
+        live_capable=True,
+    )
+
+    document_root, raw_xml = mutations._load_document(resolved)
+    document_decls = mutations._capture_source_namespaces(raw_xml)
+    proj = projection.project_document_root(document_root)
+    parts = _CommentParts(resolved)
+
+    # Originals, parsed independently of the roots we are about to edit.
+    original_part_bytes: dict[str, bytes] = {}
+    with zipfile.ZipFile(resolved) as zf:
+        for part_name, _tag, _attr in _DELETE_PART_KEYS:
+            data = _read_part_or_none(zf, part_name)
+            if data is not None:
+                original_part_bytes[part_name] = data
+    original_snapshots = {
+        part_name: _part_snapshot(ET.fromstring(original_part_bytes[part_name]), tag, attr)
+        for part_name, tag, attr in _DELETE_PART_KEYS
+        if part_name in original_part_bytes
+    }
+
+    ext_by_para: dict[str, Any] = {}
+    children_by_parent: dict[str, list[str]] = {}
+    for child in parts.ext_root:
+        if projection._ln(child) != "commentEx":
+            continue
+        pid = projection._attr(child, "paraId")
+        if not pid:
+            continue
+        ext_by_para[pid] = child
+        parent_pid = projection._attr(child, "paraIdParent")
+        if parent_pid:
+            children_by_parent.setdefault(parent_pid, []).append(pid)
+    parent_of = {
+        pid: projection._attr(ex, "paraIdParent") for pid, ex in ext_by_para.items() if projection._attr(ex, "paraIdParent")
+    }
+    durable_by_para = {
+        projection._attr(c, "paraId"): projection._attr(c, "durableId")
+        for c in parts.ids_root
+        if projection._ln(c) == "commentId" and projection._attr(c, "paraId") and projection._attr(c, "durableId")
+    }
+    comment_by_w_id = {
+        projection._attr(c, "id"): c for c in parts.comments_root if projection._ln(c) == "comment"
+    }
+    w_id_by_para: dict[str, str] = {}
+    for w_id, elem in comment_by_w_id.items():
+        for p in elem:
+            if projection._ln(p) == "p" and projection._attr(p, "paraId"):
+                w_id_by_para[projection._attr(p, "paraId")] = w_id
+
+    def _comment_para_ids(w_id: str) -> set[str]:
+        return {
+            projection._attr(p, "paraId")
+            for p in comment_by_w_id[w_id]
+            if projection._ln(p) == "p" and projection._attr(p, "paraId")
+        }
+
+    offenders: list[dict[str, Any]] = []
+    resolutions: list[dict[str, Any]] = []
+    root_w_ids: list[str] = []
+    for raw_id in comment_ids:
+        try:
+            w_id, via = parts.resolve_w_id(raw_id)
+        except VerifyError:  # unknown id
+            offenders.append({"comment_id": raw_id, "reason": "unknown"})
+            continue
+        para_id = parts.para_id_for_w_id(w_id)
+        if para_id is not None and para_id in parent_of:
+            # A reply: walk up (cycle-safe) to name its root.
+            seen = {para_id}
+            cur = para_id
+            while cur in parent_of and parent_of[cur] not in seen:
+                cur = parent_of[cur]
+                seen.add(cur)
+            offenders.append({
+                "comment_id": raw_id,
+                "reason": "reply",
+                "root_comment_id": durable_by_para.get(cur) or w_id_by_para.get(cur),
+            })
+            continue
+        if require_resolved:
+            ex = ext_by_para.get(para_id) if para_id else None
+            if ex is None or projection._attr(ex, "done") != "1":
+                offenders.append({"comment_id": raw_id, "reason": "not_resolved"})
+                continue
+        resolutions.append({
+            "input": raw_id,
+            "resolved_via": via,
+            "root_w_id": w_id,
+            "durable_id": durable_by_para.get(para_id) if para_id else None,
+        })
+        if w_id not in root_w_ids:
+            root_w_ids.append(w_id)
+    if offenders:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"cannot delete: {len(offenders)} comment id(s) are unknown, replies, or not resolved",
+            {"offenders": offenders},
+        )
+
+    # Descendant closure per root (cycle-safe), expanded to w:ids.
+    thread_w_ids: list[str] = []
+    for root_w_id in root_w_ids:
+        members = [root_w_id]
+        queue = [root_w_id]
+        while queue:
+            current = queue.pop(0)
+            for parent_para in _comment_para_ids(current):
+                for child_para in children_by_parent.get(parent_para, []):
+                    child_w_id = w_id_by_para.get(child_para)
+                    if child_w_id is None:
+                        continue
+                    if child_w_id in members:
+                        continue  # each commentEx has one parent, so this only guards malformed threading
+                    members.append(child_w_id)
+                    queue.append(child_w_id)
+        thread_w_ids.extend(m for m in members if m not in thread_w_ids)
+
+    delete_w_ids = set(thread_w_ids)
+    delete_paras: set[str] = set()
+    for w_id in delete_w_ids:
+        delete_paras |= _comment_para_ids(w_id)
+    delete_durables = {durable_by_para[p] for p in delete_paras if p in durable_by_para}
+
+    quotes: list[str] = []
+    for root_w_id in root_w_ids:
+        span = _anchor_span_for_w_id(proj, root_w_id)
+        quotes.append(proj.text[span[0]:span[1]] if span else "")
+
+    comments_before = len(comment_by_w_id)
+    anchors_expected = _anchor_multiset(document_root, delete_w_ids)
+
+    for w_id in delete_w_ids:
+        parts.comments_root.remove(comment_by_w_id[w_id])
+    for root, tag, attr, doomed in (
+        (parts.ext_root, "commentEx", "paraId", delete_paras),
+        (parts.ids_root, "commentId", "paraId", delete_paras),
+        (parts.cex_root, "commentExtensible", "durableId", delete_durables),
+    ):
+        for child in list(root):
+            if projection._ln(child) == tag and projection._attr(child, attr) in doomed:
+                root.remove(child)
+    _strip_thread_anchors(document_root, delete_w_ids)
+
+    overrides: dict[str, bytes] = {DEFAULT_PART: mutations._serialize_xml(document_root, document_decls)}
+    live_roots = {
+        _COMMENTS_PART: parts.comments_root,
+        _COMMENTS_EXT_PART: parts.ext_root,
+        _COMMENTS_IDS_PART: parts.ids_root,
+        _COMMENTS_CEX_PART: parts.cex_root,
+    }
+    for part_name, root in live_roots.items():
+        original = original_part_bytes.get(part_name)
+        if original is None:
+            continue  # never create a part a delete does not need
+        before_count = len(ET.fromstring(original))
+        if len(root) != before_count:
+            overrides[part_name] = mutations._serialize_xml(root, mutations._capture_source_namespaces(original))
+
+    def _post_verify(written_path: Path) -> None:
+        with zipfile.ZipFile(written_path) as zf:
+            for part_name, tag, attr in _DELETE_PART_KEYS:
+                if part_name not in original_snapshots:
+                    continue
+                written = ET.fromstring(zf.read(part_name))
+                after = _part_snapshot(written, tag, attr)
+                doomed = {
+                    _COMMENTS_PART: delete_w_ids,
+                    _COMMENTS_EXT_PART: delete_paras,
+                    _COMMENTS_IDS_PART: delete_paras,
+                    _COMMENTS_CEX_PART: delete_durables,
+                }[part_name]
+                survived = doomed & set(after)
+                if survived:
+                    raise ValueError(f"{part_name}: deleted entries still present: {sorted(survived)}")
+                expected = {k: v for k, v in original_snapshots[part_name].items() if k not in doomed}
+                if after != expected:
+                    changed = sorted(set(after) ^ set(expected) | {k for k in after if after[k] != expected.get(k)})
+                    raise ValueError(f"{part_name}: surviving entries differ from the original: {changed}")
+            written_doc = ET.fromstring(zf.read(DEFAULT_PART))
+        leftover = _anchor_multiset(written_doc, set())
+        if any(cid in delete_w_ids for _tag, cid in leftover):
+            raise ValueError("document.xml still carries anchors for a deleted comment")
+        if leftover != anchors_expected:
+            raise ValueError("document.xml anchors for surviving comments changed")
+
+    conflict_sweep = mutations.atomic_replace_docx_parts(resolved, overrides, post_verify=_post_verify)
+
+    post_revision = {"token": conflict_sweep["revision_after"]}  # issue #27: the STAGED token
+    deleted_ids = [
+        next((durable_by_para[p] for p in sorted(_comment_para_ids(w)) if p in durable_by_para), w) for w in thread_w_ids
+    ]
+    evidence: dict[str, Any] = {
+        "applied": True,
+        "match_count": len(root_w_ids),
+        "rung": "delete",
+        "before": quotes[0] if len(quotes) == 1 else quotes,
+        "after": "deleted",
+        "revision_before": pre_revision["token"],
+        "revision_after": post_revision["token"],
+        "audit_logged": False,
+        "write_mode": "file",
+        "resolutions": resolutions,
+        "deleted_thread_count": len(root_w_ids),
+        "deleted_reply_count": len(thread_w_ids) - len(root_w_ids),
+        "deleted_comment_ids": deleted_ids,
+        "comments_before": comments_before,
+        "comments_after": comments_before - len(thread_w_ids),
+        "other_comments_unchanged": True,
+    }
+    if len(resolutions) == 1:
+        evidence["comment_id"] = resolutions[0]["input"]
+        evidence["comment_id_resolved_via"] = resolutions[0]["resolved_via"]
+    mutations._merge_conflict_sweep(evidence, conflict_sweep)  # issue #28 WP-10
+    logged, _ = audit.append_audit(path=str(resolved), tool=tool_name, evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence

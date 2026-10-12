@@ -938,6 +938,41 @@ placeholder — the same token shape `replace_text`/`format_text`/
 read equal, since neither a reply nor a resolve edits body text
 (mirrors `format_text`'s own `revision_before == revision_after` case).
 
+### Deleting threads (issue #80)
+
+`delete_comment` / `delete_resolved_comments` with `write_mode="live"` send
+`comment_delete` (payload `comment_id`, `require_resolved`, `session_epoch`,
+`identity`; reply `{deleted, reply_count, still_present}`) to the pane, which
+calls `Comment.delete()` on the top-level comment. The pane refuses a stale
+epoch or changed identity (`COMMENT_ID_STALE`), an open comment when
+`require_resolved` is set, and a missing id, before deleting. It loads
+`resolved` explicitly (Office.js throws on an unloaded property) and
+reports `still_present` from its own re-read without throwing; the server
+decides.
+
+The server never trusts that reply. It takes ONE full `comments_list`
+(replies included) before the first op, resolves every id against it, and
+takes ONE more after the last op:
+
+- A target missing from a validated re-list is `deleted`; one still there
+  is `remaining`, and after an ok reply that is `COMMENT_STILL_PRESENT`.
+- A re-list that is malformed, from another epoch, or fails leaves the
+  thread `unknown` (`LIVE_OP_FAILED`); absence in an untrusted read is
+  never taken as proof.
+- Every other comment (id, content, resolved, author, each reply's id and
+  content) must be unchanged, or `VERIFICATION_FAILED` names the ones that
+  moved. Nothing is rolled back in live mode.
+- A failure part-way stops the loop. The error carries `deleted`,
+  `remaining`, `unknown` and `drifted_comments` as `live:<id>` handles, and
+  an audit record is written before it is raised.
+
+Coverage is the body comment collection (`scope: "body"`), like
+`list_open_items(source="live")`: comments in headers, footers and text
+boxes are neither listed nor deleted. A reply cannot be addressed (the
+pane lists top-level comments), so only thread roots can be deleted. A
+pane that predates the capability fails with `LIVE_CAPABILITY_MISSING`
+before any op is sent.
+
 ### Large comment loads and timeouts (issue #31)
 
 On a co-authored doc with ~100 comments, `comments_list` used to exceed the

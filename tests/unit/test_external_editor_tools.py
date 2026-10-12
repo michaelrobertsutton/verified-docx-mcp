@@ -51,6 +51,8 @@ GUARDED_TOOLS: dict[str, dict[str, Any]] = {
     "add_anchored_comment": {"quote": "R1C2", "text": "hi", "expected_matches": 1, "write_mode": "file"},
     "reply_to_comment": {"comment_id": "nope", "text": "hi", "write_mode": "file"},
     "resolve_comment": {"comment_id": "nope", "write_mode": "file"},
+    "delete_comment": {"comment_id": "nope", "write_mode": "file"},
+    "delete_resolved_comments": {"comment_ids": ["nope"], "write_mode": "file"},
     "replace_table_row": {"table_id": 1, "row_index": 1, "cells": ["a", "b"]},
     "replace_cell_markdown": {
         "table_id": 1, "row_index": 1, "cell_index": 2, "markdown": "z", "write_mode": "file",

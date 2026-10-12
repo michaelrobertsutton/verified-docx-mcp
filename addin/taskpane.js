@@ -241,7 +241,8 @@ const OP_LOG_LIMIT = 20;
 // issue #34: "table_edit" = the table_get/table_insert/cells_set ops.
 // issue #39: "comment_counts" = comments_list reports counts/scope/observed_at.
 // issue #77: "paragraph_insert" = the paragraph_insert op (styled, optionally tracked paragraphs).
-const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert"];
+// issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
+const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -499,12 +500,13 @@ function summarizeResult(op, result) {
   if (op === "table_insert") return `table_index=${result.table_index}`;
   if (op === "cells_set") return `applied=${result.applied}`;
   if (op === "paragraph_insert") return `inserted=${(result.inserted || []).length}`;
+  if (op === "comment_delete") return `deleted=${result.deleted} still_present=${result.still_present}`;
   return "";
 }
 
 const SHAPE_GUARDED_OPS = new Set(["replace", "format", "cell_set", "cells_set",
   "table_insert", "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
-  "comment_add", "comment_reply", "comment_resolve", "save"]);
+  "comment_add", "comment_reply", "comment_resolve", "comment_delete", "save"]);
 
 // One queue across reconnects. A timed-out write can still be running in Word;
 // later commands must not overlap it, including commands on a new socket.
@@ -574,6 +576,8 @@ async function dispatchOpUnchecked(op, payload) {
       return opCommentReply(payload);
     case "comment_resolve":
       return opCommentResolve(payload);
+    case "comment_delete":
+      return opCommentDelete(payload);
     case "cell_get":
       return opCellGet(payload);
     case "cell_set":
@@ -1850,6 +1854,39 @@ async function opCommentResolve(payload) {
     comment.resolved = !!payload.resolved;
     await context.sync();
     return { resolved: !!payload.resolved };
+  });
+}
+
+// issue #80: delete a whole thread (Comment.delete() removes its replies).
+// The pane only reports what it re-read afterwards; the server decides
+// whether `still_present` is a failure.
+async function opCommentDelete(payload) {
+  return Word.run(async (context) => {
+    checkCommentEpoch(payload);
+    const comments = context.document.body.getComments();
+    comments.load("items/id");
+    await context.sync();
+    const comment = comments.items.find((c) => c.id === payload.comment_id);
+    if (!comment) throw refusalError(`no comment with id ${JSON.stringify(payload.comment_id)}`);
+    await verifyCommentIdentity(context, comment, payload.identity);
+    await (await sectionGuard(context, payload)).check(() => [comment.getRange()]);
+    comment.load("resolved");
+    const replies = comment.replies; // CommentReplyCollection is a property, not a method
+    replies.load("items/id");
+    await context.sync();
+    if (payload.require_resolved && !comment.resolved)
+      throw refusalError(`comment ${JSON.stringify(payload.comment_id)} is not resolved`);
+    const replyCount = replies.items.length;
+    comment.delete();
+    await context.sync();
+    const after = context.document.body.getComments();
+    after.load("items/id");
+    await context.sync();
+    return {
+      deleted: true,
+      reply_count: replyCount,
+      still_present: after.items.some((c) => c.id === payload.comment_id),
+    };
   });
 }
 

@@ -68,6 +68,9 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         "live_save",
         # issue #77:
         "insert_paragraphs",
+        # issue #80:
+        "delete_comment",
+        "delete_resolved_comments",
     }
 )
 

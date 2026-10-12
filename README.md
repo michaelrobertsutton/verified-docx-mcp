@@ -114,6 +114,23 @@ Tools implemented so far:
   `write_mode="live"` sends the same operation through a connected Word
   task pane instead (issue #106 WP-4 — see "Live mode" below), accepting
   either a `live:<id>` handle or a correlated durableId/w:id.
+- **`delete_comment(path, comment_id, write_mode="auto", ...)`**,
+  **`delete_resolved_comments(path, comment_ids, write_mode="auto")`** —
+  remove a comment thread (the root and all its replies) instead of only
+  marking it resolved (issue #80). Thread roots only: a reply id is
+  refused and names its root. The batch form takes resolved threads, resolves
+  and de-duplicates every id first, and refuses the whole call (listing
+  each offender) before deleting anything if one is unknown, a reply or
+  still open. File mode removes the `w:comment`, its
+  commentsExtended/commentsIds/commentsExtensible entries and the range
+  markers in one atomic write that touches no other part, then re-reads
+  the package and rolls back unless every other comment and anchor is
+  unchanged. Live mode (`Comment.delete()` through the pane, capability
+  `comment_delete`; reopen the Live pane to pick it up) verifies with an
+  independent re-list and cannot roll back, so a failure part-way reports
+  `deleted`/`remaining`/`unknown` threads. Evidence also carries
+  `deleted_thread_count`, `deleted_reply_count`, `comments_before`/
+  `comments_after` and `other_comments_unchanged`.
 - **Lock guard layers 0/3/4** — every mutating tool above now runs inside
   a same-machine `.jsclaim` mutex (`O_EXCL`, released even on failure)
   alongside a no-op `remote_checkout` seam for a future Microsoft Graph

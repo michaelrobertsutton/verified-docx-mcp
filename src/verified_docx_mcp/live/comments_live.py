@@ -975,3 +975,282 @@ def execute_get_comment_thread_live(path: str, comment_id: str | None = None,
     target = next(c for c in raw if c["id"] == handle[5:])
     target["session_epoch"] = address["session_epoch"]
     return _live_comment_record(target)
+
+
+# ---------------------------------------------------------------------------
+# delete_comment / delete_resolved_comments (issue #80)
+# ---------------------------------------------------------------------------
+
+COMMENT_DELETE_CAPABILITY = "comment_delete"
+_IDENTITY_FIELDS = ("content", "authorName", "anchorText", "anchorParagraphText")
+# Failures after which the pane may already have deleted the thread.
+_MAYBE_DELETED_CODES = frozenset({"LIVE_DISCONNECTED", "VERIFICATION_FAILED", "LIVE_UNAVAILABLE"})
+
+
+def _comment_fingerprint(comment: dict[str, Any]) -> tuple:
+    return (
+        comment.get("id"),
+        comment.get("content"),
+        bool(comment.get("resolved", False)),
+        comment.get("authorName"),
+        tuple((r.get("id"), r.get("content")) for r in (comment.get("replies") or [])),
+    )
+
+
+def _split_live_handle(comment_id: str) -> tuple[str | None, str]:
+    """``live:<id>`` or ``live:<epoch>:<id>`` -> (epoch_or_None, raw_id)."""
+    parts = comment_id.split(":", 2)
+    if len(parts) == 3:
+        return parts[1], parts[2]
+    return None, parts[1]
+
+
+def _pane_state_or_none(session: LiveSession, epoch: Any) -> list[dict[str, Any]] | None:
+    """A validated full re-list from the same pane epoch, or ``None`` when
+    the read fails or cannot be trusted. Absence in an untrusted read is
+    never evidence of deletion."""
+    try:
+        result = _request(session, "comments_list", {"include_anchor": False})
+        comments = _validated_pane_comments(result)
+    except Exception:  # noqa: BLE001 - any failure means "cannot confirm"
+        return None
+    if epoch is not None and result.get("session_epoch") != epoch:
+        return None
+    return comments
+
+
+def _delete_targets_live(
+    path: str,
+    session: LiveSession,
+    targets: list[dict[str, Any]],
+    pre_result: dict[str, Any],
+    *,
+    tool_name: str,
+    require_resolved: bool,
+    offenders: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate, delete and verify *targets* against one pre-snapshot
+    (*pre_result*, a full ``comments_list`` reply) and one post re-list.
+
+    Each target is ``{"input", "handle", "via", "address"}``. Outcomes are
+    reported as deleted / remaining / unknown; nothing is rolled back, and
+    a thread whose delete may have applied before an error is never
+    reported as remaining."""
+    from .. import audit
+    from ..errors import ErrorCode, _make_error
+
+    resolved_path, document_name = _document_name_and_path(path)
+    pre_comments = _validated_pane_comments(pre_result)
+    epoch = pre_result.get("session_epoch")
+    by_id = {c.get("id"): c for c in pre_comments}
+
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for target in targets:
+        handle = target["handle"]
+        address_epoch = (target.get("address") or {}).get("session_epoch")
+        if address_epoch is not None and epoch is not None and address_epoch != epoch:
+            raise _make_error(ErrorCode.COMMENT_ID_STALE, "Comment belongs to an earlier pane epoch", {"comment_id": target["input"]})
+        comment = by_id.get(handle)
+        if comment is None:
+            offenders.append({"comment_id": target["input"], "reason": "unknown_or_reply"})
+            continue
+        if require_resolved and not comment.get("resolved", False):
+            offenders.append({"comment_id": target["input"], "reason": "not_resolved"})
+            continue
+        if handle not in seen:
+            seen.add(handle)
+            unique.append(target)
+    if offenders:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"cannot delete: {len(offenders)} comment id(s) are unknown, replies, or not resolved",
+            {"offenders": offenders},
+        )
+
+    pre_body_sha256 = _request(session, "describe").get("bodySha256")
+
+    ok_replies: dict[str, dict[str, Any]] = {}
+    maybe_deleted: set[str] = set()
+    attempted: list[str] = []
+    failure = None
+    for target in unique:
+        handle = target["handle"]
+        attempted.append(handle)
+        address = target.get("address") or {}
+        identity = address.get("identity")
+        if identity is None:
+            identity = {k: by_id[handle][k] for k in _IDENTITY_FIELDS if k in by_id[handle]}
+        payload = {
+            "comment_id": handle,
+            "require_resolved": require_resolved,
+            "session_epoch": epoch,
+            "identity": identity,
+        }
+        try:
+            ok_replies[handle] = _request(session, "comment_delete", payload)
+        except Exception as exc:  # noqa: BLE001 - classified below
+            failure = exc
+            code = getattr(getattr(exc, "envelope", None), "error_code", None)
+            if code is not None and code.value in _MAYBE_DELETED_CODES:
+                maybe_deleted.add(handle)
+            break
+
+    target_ids = {t["handle"] for t in unique}
+    post_comments = _pane_state_or_none(session, epoch)
+    deleted: list[str] = []
+    remaining: list[str] = []
+    unknown: list[str] = []
+    drift: list[str] = []
+    for handle in (t["handle"] for t in unique):
+        if handle not in attempted:
+            remaining.append(handle)
+        elif post_comments is None:
+            (unknown if (handle in ok_replies or handle in maybe_deleted) else remaining).append(handle)
+        elif handle in {c.get("id") for c in post_comments}:
+            remaining.append(handle)
+        else:
+            deleted.append(handle)
+    if post_comments is not None:
+        post_by_id = {c.get("id"): c for c in post_comments}
+        for cid, comment in by_id.items():
+            if cid in target_ids:
+                continue
+            after = post_by_id.get(cid)
+            if after is None or _comment_fingerprint(after) != _comment_fingerprint(comment):
+                drift.append(cid)
+
+    still_present = [h for h in remaining if h in ok_replies]
+    live_ids = lambda handles: [f"{_LIVE_HANDLE_PREFIX}{h}" for h in handles]  # noqa: E731
+
+    if failure is not None or still_present or drift or post_comments is None:
+        evidence: dict[str, Any] = {
+            "applied": bool(deleted) or bool(unknown),
+            "rung": "delete",
+            "write_mode": "live",
+            "deleted": live_ids(deleted),
+            "remaining": live_ids(remaining),
+            "unknown": live_ids(unknown),
+            "drifted_comments": live_ids(drift),
+        }
+        diagnostics = {k: evidence[k] for k in ("deleted", "remaining", "unknown", "drifted_comments")}
+        if failure is not None:
+            code = getattr(getattr(failure, "envelope", None), "error_code", ErrorCode.LIVE_OP_FAILED)
+            evidence["error_code"] = code.value
+            audit.append_audit(path=str(resolved_path), tool=tool_name, evidence=evidence)
+            envelope = getattr(failure, "envelope", None)
+            raise _make_error(
+                code,
+                f"{envelope.message if envelope else failure}; thread(s) may or may not have been deleted -- see deleted/remaining/unknown",
+                {**(envelope.diagnostics if envelope else {}), **diagnostics},
+            ) from failure
+        if post_comments is None:
+            evidence["error_code"] = ErrorCode.LIVE_OP_FAILED.value
+            audit.append_audit(path=str(resolved_path), tool=tool_name, evidence=evidence)
+            raise _make_error(
+                ErrorCode.LIVE_OP_FAILED,
+                "the pane replied ok to the delete but its comment list could not be re-read or trusted; the thread(s) are reported as unknown",
+                diagnostics,
+            )
+        code = ErrorCode.COMMENT_STILL_PRESENT if still_present else ErrorCode.VERIFICATION_FAILED
+        evidence["error_code"] = code.value
+        audit.append_audit(path=str(resolved_path), tool=tool_name, evidence=evidence)
+        message = (
+            "a deleted thread is still present in the pane's re-listed comments"
+            if still_present
+            else "other comments changed during the delete (not rolled back)"
+        )
+        raise _make_error(code, message, diagnostics)
+
+    post_body_sha256 = _request(session, "describe").get("bodySha256")
+    quotes = [by_id[t["handle"]].get("anchorText", "") for t in unique]
+    reply_count = sum(len(by_id[t["handle"]].get("replies") or []) for t in unique)
+    evidence = {
+        "applied": True,
+        "match_count": len(unique),
+        "rung": "delete",
+        "before": quotes[0] if len(quotes) == 1 else quotes,
+        "after": "deleted",
+        "revision_before": f"live:sha256:{pre_body_sha256}" if pre_body_sha256 else None,
+        "revision_after": f"live:sha256:{post_body_sha256}" if post_body_sha256 else None,
+        "audit_logged": False,
+        "write_mode": "live",
+        "verified_via": "word-addin",
+        "document_name": document_name,
+        "author": "word-signed-in-user",
+        "resolutions": [
+            {"input": t["input"], "resolved_via": t["via"], "live_id": f"{_LIVE_HANDLE_PREFIX}{t['handle']}"}
+            for t in targets
+        ],
+        "deleted_thread_count": len(unique),
+        "deleted_reply_count": reply_count,
+        "deleted_comment_ids": live_ids(deleted),
+        "comments_before": len(pre_comments),
+        "comments_after": len(post_comments),
+        "other_comments_unchanged": True,
+        "scope": pre_result.get("scope", "body"),
+        "session_epoch": epoch,
+    }
+    if len(targets) == 1:
+        evidence["comment_id"] = f"{_LIVE_HANDLE_PREFIX}{targets[0]['handle']}"
+        evidence["comment_id_resolved_via"] = targets[0]["via"]
+    for reply in ok_replies.values():
+        evidence.update(write_mode.shape_counts(reply))
+    logged, _reason = audit.append_audit(path=str(resolved_path), tool=tool_name, evidence=evidence)
+    evidence["audit_logged"] = logged
+    return evidence
+
+
+def execute_delete_comment_live(path: str, comment_id: str | None, handle: str, address: dict[str, Any]) -> dict[str, Any]:
+    """``write_mode="live"`` path for ``delete_comment``. *handle*/*address*
+    come from ``address_comment`` (fresh-ID, epoch and identity rules)."""
+    session = _session_for(path)
+    write_mode.require_capability(session, COMMENT_DELETE_CAPABILITY, feature_description="comment deletion")
+    pre_result = _request(session, "comments_list")
+    if comment_id and comment_id.startswith(_LIVE_HANDLE_PREFIX):
+        via = "live-handle"
+    elif comment_id:
+        via = "correlation"
+    else:
+        via = "match_spec"
+    target = {"input": comment_id or handle, "handle": handle[len(_LIVE_HANDLE_PREFIX):], "via": via, "address": address}
+    return _delete_targets_live(
+        path, session, [target], pre_result, tool_name="delete_comment", require_resolved=False, offenders=[]
+    )
+
+
+def execute_delete_resolved_comments_live(path: str, comment_ids: list[str]) -> dict[str, Any]:
+    """``write_mode="live"`` path for ``delete_resolved_comments``: every id
+    is resolved against ONE pane snapshot, then verified by ONE re-list."""
+    from ..errors import ErrorCode, VerifyError
+
+    if not comment_ids:
+        raise _make_error(ErrorCode.INVALID_INPUT, "comment_ids must not be empty", {})
+    session = _session_for(path)
+    write_mode.require_capability(session, COMMENT_DELETE_CAPABILITY, feature_description="comment deletion")
+    raw_comments, correlation, pane_result, _file_result = _live_state_full(path, session)
+    epoch = pane_result.get("session_epoch")
+    by_id = {c.get("id"): c for c in raw_comments}
+    targets: list[dict[str, Any]] = []
+    offenders: list[dict[str, Any]] = []
+    for cid in comment_ids:
+        try:
+            if cid.startswith(_LIVE_HANDLE_PREFIX):
+                handle_epoch, raw_id = _split_live_handle(cid)
+                if handle_epoch is not None and epoch is not None and handle_epoch != epoch:
+                    raise _make_error(ErrorCode.COMMENT_ID_STALE, "Comment belongs to an earlier pane epoch", {})
+                via = "live-handle"
+            else:
+                raw_id, via = _resolve_comment_handle(cid, correlation)
+        except VerifyError as exc:
+            offenders.append({"comment_id": cid, "reason": exc.envelope.error_code.value.lower()})
+            continue
+        comment = by_id.get(raw_id)
+        address = {"session_epoch": epoch}
+        if comment is not None:
+            address["identity"] = {k: comment[k] for k in _IDENTITY_FIELDS if k in comment}
+        targets.append({"input": cid, "handle": raw_id, "via": via, "address": address})
+    return _delete_targets_live(
+        path, session, targets, pane_result,
+        tool_name="delete_resolved_comments", require_resolved=True, offenders=offenders,
+    )

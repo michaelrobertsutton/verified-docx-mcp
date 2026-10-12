@@ -138,3 +138,45 @@ class LiveTableOpsTests(unittest.TestCase):
         for result in self.results:
             with self.subTest(result["name"]):
                 self.assertTrue(result["pass"], result["detail"])
+
+
+DELETE_HARNESS = Path(__file__).resolve().parent / "js" / "comment_delete_harness.mjs"
+
+
+@unittest.skipUnless(NODE, "node not found on PATH")
+class OpCommentDeleteTests(unittest.TestCase):
+    """issue #80: the pane's comment_delete op."""
+
+    @classmethod
+    def setUpClass(cls):
+        proc = subprocess.run(
+            [NODE, str(DELETE_HARNESS), str(REPO / "addin" / "taskpane.js")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"harness failed:\n{proc.stderr}")
+        cls.out = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_deletes_and_reports_reply_count_and_absence(self):
+        # `resolved` is read only after an explicit load, or the stub throws.
+        self.assertEqual(self.out["ok"]["result"], {"deleted": True, "reply_count": 1, "still_present": False})
+        self.assertEqual(self.out["ok"]["deleted"], ["c1"])
+
+    def test_require_resolved_refuses_an_open_comment_before_deleting(self):
+        self.assertIn("not resolved", self.out["openRefused"]["error"])
+        self.assertEqual(self.out["openRefused"]["deleted"], [])
+        self.assertTrue(self.out["openAllowedWhenNotRequired"]["result"]["deleted"])
+
+    def test_missing_stale_and_changed_comments_are_refused(self):
+        self.assertIn("no comment with id", self.out["missing"]["error"])
+        self.assertEqual(self.out["staleEpoch"]["code"], "COMMENT_ID_STALE")
+        self.assertEqual(self.out["identityMismatch"]["code"], "COMMENT_ID_STALE")
+        for key in ("missing", "staleEpoch", "identityMismatch"):
+            self.assertEqual(self.out[key]["deleted"], [], key)
+
+    def test_still_present_is_reported_not_thrown(self):
+        self.assertTrue(self.out["notDeleted"]["result"]["still_present"])
+
