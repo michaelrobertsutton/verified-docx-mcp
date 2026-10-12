@@ -589,6 +589,196 @@ class DefaultAutoDispatchRegressionTests(LiveCommentsTestCase):
 
 
 # ---------------------------------------------------------------------------
+# delete_comment / delete_resolved_comments (issue #80)
+# ---------------------------------------------------------------------------
+
+TEXT = "The quick brown fox jumps over the lazy dog."
+
+
+class _DeleteLiveMixin:
+    fixture_name = "frag.docx"
+
+    async def expect_error(self, fn, *args, **kwargs):
+        """server.* tools raise a FastMCP ToolError carrying the JSON envelope."""
+        import json
+
+        from fastmcp.exceptions import ToolError
+
+        with self.assertRaises(ToolError) as cm:
+            await self.call(fn, *args, **kwargs)
+        return json.loads(str(cm.exception))
+
+    async def _two(self):
+        doc = FakeDocument(text=TEXT)
+        pane = await self.connect_pane(document=doc)
+        a = (await self.call(comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "A", 1))["comment_id"]
+        b = (await self.call(comments_live.execute_add_anchored_comment_live, str(self.target), "lazy dog", "B", 1))["comment_id"]
+        return doc, pane, a, b
+
+
+class DeleteCommentLiveTests(_DeleteLiveMixin, LiveCommentsTestCase):
+    async def test_delete_via_live_handle_with_replies_and_evidence(self):
+        doc, _pane, a, b = await self._two()
+        await self.call(comments_live.execute_reply_to_comment_live, str(self.target), a, "reply")
+
+        ev = await self.call(server.delete_comment, str(self.target), a)
+
+        self.assertTrue(ev["applied"])
+        self.assertEqual(ev["write_mode"], "live")
+        self.assertEqual(ev["rung"], "delete")
+        self.assertEqual(ev["after"], "deleted")
+        self.assertEqual(ev["before"], "brown fox")
+        self.assertEqual(ev["comment_id"], a)
+        self.assertEqual(ev["comment_id_resolved_via"], "live-handle")
+        self.assertEqual(ev["deleted_comment_ids"], [a])
+        self.assertEqual(ev["deleted_reply_count"], 1)
+        self.assertEqual((ev["comments_before"], ev["comments_after"]), (2, 1))
+        self.assertTrue(ev["other_comments_unchanged"])
+        self.assertEqual(ev["scope"], "body")
+        self.assertTrue(ev["revision_before"].startswith("live:sha256:"))
+        self.assertEqual([c.id for c in doc.comments], [b[len("live:"):]])
+
+    async def test_open_comment_may_be_deleted_by_the_single_tool(self):
+        doc, _pane, a, _b = await self._two()
+        self.assertFalse(doc.comments[0].resolved)
+        ev = await self.call(server.delete_comment, str(self.target), a)
+        self.assertTrue(ev["applied"])
+
+    async def test_pane_without_the_capability_is_refused_before_any_op(self):
+        doc = FakeDocument(text=TEXT)
+        pane = await self.connect_pane(document=doc, capabilities=["comments_by_id", "shape_guard"])
+        doc.comments.append(FakeComment("c9", "x", "A", "d", "brown fox"))
+        env = await self.expect_error(server.delete_comment, str(self.target), "live:c9")
+        self.assertEqual(env["error_code"], ErrorCode.LIVE_CAPABILITY_MISSING.value)
+        self.assertEqual(pane.comment_delete_payloads, [])
+        self.assertEqual(len(doc.comments), 1)
+
+    async def test_pane_that_does_not_delete_raises_comment_still_present(self):
+        doc, _pane, a, _b = await self._two()
+        doc.undeletable_ids.add(a[len("live:"):])
+        env = await self.expect_error(server.delete_comment, str(self.target), a)
+        self.assertEqual(env["error_code"], ErrorCode.COMMENT_STILL_PRESENT.value)
+        self.assertEqual(env["diagnostics"]["remaining"], [a])
+        self.assertEqual(env["diagnostics"]["deleted"], [])
+
+    async def test_another_comments_reply_changing_is_verification_failed(self):
+        doc, _pane, a, b = await self._two()
+        await self.call(comments_live.execute_reply_to_comment_live, str(self.target), b, "keep me")
+
+        def corrupt(document):
+            other = next(c for c in document.comments if c.id == b[len("live:"):])
+            other.replies[0].content = "silently edited"
+
+        doc.after_comment_delete = corrupt
+        env = await self.expect_error(server.delete_comment, str(self.target), a)
+        self.assertEqual(env["error_code"], ErrorCode.VERIFICATION_FAILED.value)
+        self.assertEqual(env["diagnostics"]["drifted_comments"], [b])
+        self.assertEqual(env["diagnostics"]["deleted"], [a])
+
+    async def test_error_after_the_delete_applied_is_reconciled_not_reported_as_remaining(self):
+        doc, _pane, a, _b = await self._two()
+        doc.fail_after_delete_ids.add(a[len("live:"):])
+        env = await self.expect_error(server.delete_comment, str(self.target), a)
+        self.assertEqual(env["error_code"], ErrorCode.VERIFICATION_FAILED.value)
+        self.assertEqual(env["diagnostics"]["deleted"], [a])
+        self.assertEqual(env["diagnostics"]["remaining"], [])
+
+    async def test_untrusted_readback_leaves_the_thread_unknown_never_deleted(self):
+        doc, pane, a, _b = await self._two()
+        calls = {"n": 0}
+
+        def malformed_after_first(reply):
+            calls["n"] += 1
+            # 1: address_comment, 2: pre-snapshot, 3+: the post re-list.
+            return {k: v for k, v in reply.items() if k != "comments"} if calls["n"] >= 3 else reply
+
+        pane.comments_list_transform = malformed_after_first
+        env = await self.expect_error(server.delete_comment, str(self.target), a)
+        self.assertEqual(env["error_code"], ErrorCode.LIVE_OP_FAILED.value)
+        self.assertEqual(env["diagnostics"]["unknown"], [a])
+        self.assertEqual(env["diagnostics"]["deleted"], [])
+
+    async def test_handle_from_another_pane_epoch_is_stale(self):
+        doc, _pane, a, _b = await self._two()
+        doc.session_epoch = "epoch-2"
+        env = await self.expect_error(server.delete_comment, str(self.target), a, session_epoch="epoch-1")
+        self.assertEqual(env["error_code"], ErrorCode.COMMENT_ID_STALE.value)
+        self.assertEqual(len(doc.comments), 2)
+
+    async def test_a_reply_cannot_be_addressed(self):
+        doc, _pane, a, _b = await self._two()
+        await self.call(comments_live.execute_reply_to_comment_live, str(self.target), a, "reply")
+        reply_handle = f"live:{doc.comments[0].replies[0].id}"
+        env = await self.expect_error(server.delete_comment, str(self.target), reply_handle)
+        self.assertEqual(env["error_code"], ErrorCode.INVALID_INPUT.value)
+        self.assertEqual(len(doc.comments), 2)
+
+
+class DeleteResolvedCommentsLiveTests(_DeleteLiveMixin, LiveCommentsTestCase):
+    async def test_batch_deletes_resolved_threads_with_one_snapshot_and_one_relist(self):
+        doc, pane, a, b = await self._two()
+        for c in doc.comments:
+            c.resolved = True
+        before = len(pane.comments_list_payloads)
+
+        ev = await self.call(server.delete_resolved_comments, str(self.target), [a, b, a])
+
+        self.assertEqual(ev["deleted_thread_count"], 2)
+        self.assertEqual(ev["match_count"], 2)
+        self.assertEqual(sorted(ev["deleted_comment_ids"]), sorted([a, b]))
+        self.assertEqual(len(ev["resolutions"]), 3)
+        self.assertEqual(ev["before"], ["brown fox", "lazy dog"])
+        self.assertEqual(doc.comments, [])
+        self.assertEqual(len(pane.comments_list_payloads) - before, 2)
+        self.assertEqual(len(pane.comment_delete_payloads), 2)
+        self.assertTrue(all(p["require_resolved"] for p in pane.comment_delete_payloads))
+
+    async def test_open_or_unknown_ids_refuse_the_whole_batch(self):
+        doc, pane, a, b = await self._two()
+        doc.comments[0].resolved = True
+        env = await self.expect_error(server.delete_resolved_comments, str(self.target), [a, b, "live:nope"])
+        self.assertEqual(env["error_code"], ErrorCode.INVALID_INPUT.value)
+        reasons = {o["comment_id"]: o["reason"] for o in env["diagnostics"]["offenders"]}
+        self.assertEqual(reasons, {b: "not_resolved", "live:nope": "unknown_or_reply"})
+        self.assertEqual(pane.comment_delete_payloads, [])
+        self.assertEqual(len(doc.comments), 2)
+
+    async def test_empty_list_is_refused(self):
+        await self._two()
+        env = await self.expect_error(server.delete_resolved_comments, str(self.target), [])
+        self.assertEqual(env["error_code"], ErrorCode.INVALID_INPUT.value)
+
+    async def test_failure_part_way_reports_deleted_and_remaining(self):
+        doc, pane, a, b = await self._two()
+        for c in doc.comments:
+            c.resolved = True
+        doc.fail_after_delete_ids.add(a[len("live:"):])
+        env = await self.expect_error(server.delete_resolved_comments, str(self.target), [a, b])
+        self.assertEqual(env["diagnostics"]["deleted"], [a])
+        self.assertEqual(env["diagnostics"]["remaining"], [b])
+        self.assertEqual(len(pane.comment_delete_payloads), 1)
+        self.assertEqual([c.id for c in doc.comments], [b[len("live:"):]])
+
+
+class DeleteResolvedCommentsLiveCorrelationTests(LiveCommentsTestCase):
+    fixture_name = "comments/multipara-comment.docx"
+
+    async def test_batch_resolves_a_durable_id_through_correlation(self):
+        doc = FakeDocument(text="", author_name=ROOT_AUTHOR)
+        doc.comments = [
+            FakeComment("c-root", ROOT_CONTENT_LIVE, ROOT_AUTHOR, ROOT_DATE, ROOT_ANCHOR, resolved=True),
+            FakeComment("c-single", SINGLE_CONTENT_LIVE, ROOT_AUTHOR, ROOT_DATE, SINGLE_ANCHOR, resolved=False),
+        ]
+        await self.connect_pane(document=doc)
+
+        ev = await self.call(server.delete_resolved_comments, str(self.target), [ROOT_DURABLE_ID])
+
+        self.assertEqual(ev["resolutions"][0]["resolved_via"], "durableId-correlation")
+        self.assertEqual(ev["comment_id"], "live:c-root")
+        self.assertEqual([c.id for c in doc.comments], ["c-single"])
+
+
+# ---------------------------------------------------------------------------
 # write_mode resolution: LIVE_UNAVAILABLE / auto without an owner file.
 # ---------------------------------------------------------------------------
 

@@ -161,6 +161,16 @@ class FakeDocument:
         # durably stick. Empty by default (every existing test's behavior is
         # unchanged); a test opts a specific comment id in.
         self.stuck_ids: set[str] = set()
+        # Issue #80 comment_delete knobs. session_epoch is echoed by
+        # comments_list and enforced by comment_delete when set.
+        # undeletable_ids: delete replies ok but the comment stays.
+        # fail_after_delete_ids: delete, then refuse VERIFICATION_FAILED.
+        # after_comment_delete: called with this document after a delete
+        # (lets a test corrupt another comment).
+        self.session_epoch: str | None = None
+        self.undeletable_ids: set[str] = set()
+        self.fail_after_delete_ids: set[str] = set()
+        self.after_comment_delete: Any = None
         # Issue #27: a minimal table model for cell_get/cell_set --
         # tables[t][r][c] is the plain text of that cell (all 0-based here,
         # the wire is 1-based). Empty by default, so every existing test's
@@ -627,6 +637,7 @@ class FakeDocument:
             },
             "scope": "body",
             "observed_at": "2026-10-01T12:00:00.000Z",
+            **({"session_epoch": self.session_epoch} if self.session_epoch else {}),
         }
 
     def comment_add(self, find: str, expected_matches: int, text: str) -> dict[str, Any]:
@@ -673,6 +684,27 @@ class FakeDocument:
         # confirm (rather than trusting this reply) catches it -- see
         # comments_live.py's COMMENT_STILL_OPEN path.
         return {"resolved": comment.resolved}
+
+    def comment_delete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        comment_id = payload["comment_id"]
+        if payload.get("session_epoch") and self.session_epoch and payload["session_epoch"] != self.session_epoch:
+            raise OpRefused("COMMENT_ID_STALE", "Comment handle is from another pane epoch")
+        comment = self._find_comment(comment_id)
+        actual = {"content": comment.content, "authorName": comment.author_name, "anchorText": comment.anchor_text}
+        norm = lambda v: " ".join(str(v or "").split())  # noqa: E731
+        for key, value in (payload.get("identity") or {}).items():
+            if key in actual and norm(actual[key]) != norm(value):
+                raise OpRefused("COMMENT_ID_STALE", "Comment identity changed; re-list before editing")
+        if payload.get("require_resolved") and not comment.resolved:
+            raise OpRefused("LIVE_OP_FAILED", f"comment {comment_id!r} is not resolved")
+        reply_count = len(comment.replies)
+        if comment_id not in self.undeletable_ids:
+            self.comments.remove(comment)
+        if self.after_comment_delete is not None:
+            self.after_comment_delete(self)
+        if comment_id in self.fail_after_delete_ids:
+            raise OpRefused("VERIFICATION_FAILED", "simulated failure after the delete applied")
+        return {"deleted": True, "reply_count": reply_count, "still_present": comment in self.comments}
 
     def save(self) -> dict[str, Any]:
         self.saved = True
@@ -728,13 +760,14 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert"]
+            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert", "comment_delete"]
             if capabilities is None
             else list(capabilities)
         )
         # Every comments_list payload received, in order (issue #31 tests
         # assert reply/resolve send an ids-filtered one).
         self.comments_list_payloads: list[dict[str, Any]] = []
+        self.comment_delete_payloads: list[dict[str, Any]] = []
         # Issue #34: every table_get / table_insert payload received.
         self.table_get_payloads: list[dict[str, Any]] = []
         self.table_insert_payloads: list[dict[str, Any]] = []
@@ -873,6 +906,9 @@ class FakePane:
             return doc.comment_reply(payload["comment_id"], payload["text"])
         if op == "comment_resolve":
             return doc.comment_resolve(payload["comment_id"], bool(payload["resolved"]))
+        if op == "comment_delete":
+            self.comment_delete_payloads.append(dict(payload))
+            return doc.comment_delete(payload)
         if op == "cell_get":
             return doc.cell_get(payload)
         if op == "cell_set":
