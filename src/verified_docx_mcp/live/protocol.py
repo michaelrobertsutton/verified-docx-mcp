@@ -144,6 +144,15 @@ pane must honor.
                      Word calls: ``comment.resolved = payload.resolved``.
                      Reply result: ``{"resolved": <bool>}``.
 
+  comment_delete  -- (comment_id, require_resolved, session_epoch, identity)
+                     (issue #80; REQUIRES the pane's ``"comment_delete"``
+                     capability). Word calls ``comment.delete()`` on the
+                     top-level ``Comment`` (which removes its replies).
+                     ``require_resolved`` makes the pane refuse an open
+                     comment. Reply result: ``{"deleted": True,
+                     "reply_count": <int>, "still_present": <bool>}`` --
+                     the pane reports what it re-read; the server decides.
+
   cell_get        -- ``CellGetPayload`` (table_index, row_index, cell_index;
                      all 1-based, table_index numbered exactly like
                      ``list_tables``' ``table_id``). Issue #27; REQUIRES
@@ -313,6 +322,7 @@ VALID_OPS: frozenset[str] = frozenset(
         "comment_add",
         "comment_reply",
         "comment_resolve",
+        "comment_delete",
         "cell_get",
         "cell_set",
         "table_get",

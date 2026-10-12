@@ -2508,6 +2508,143 @@ def resolve_comment(
         _raise_tool_error(exc)
 
 
+@mcp.tool()
+def delete_comment(
+    path: str,
+    comment_id: str | None = None,
+    write_mode: str = "auto",
+    allow_concurrent_editor: bool = False,
+    session_epoch: str | None = None,
+    match_spec: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Delete a comment thread (the root comment and every reply), atomically
+    -- issue #80. resolve_comment only marks a thread done and Word keeps
+    resolved threads visible; this removes the thread.
+
+    Thread roots only: a reply id is refused with INVALID_INPUT naming its
+    root. *comment_id* takes a durableId, a raw w:id, or (live mode) a
+    `live:<id>` handle, with the same fresh-ID/epoch/identity rules as
+    resolve_comment (session_epoch and match_spec are live-mode addressing).
+    The comment need not be resolved.
+
+    write_mode "auto" | "file" | "live" as resolve_comment. File mode
+    removes the w:comment, its commentsExtended/commentsIds/
+    commentsExtensible entries, and the range markers/reference run in
+    word/document.xml; people.xml, relationships and content types are not
+    touched. The written package is re-read and rolled back unless the
+    thread is gone and every other comment and anchor is unchanged. Live
+    mode sends `comment_delete` to the Word pane and verifies with an
+    independent re-list; it cannot roll back.
+
+    Returns the eight evidence keys (rung "delete", before = the thread's
+    anchor text, after "deleted"), plus comment_id,
+    comment_id_resolved_via, resolutions, deleted_thread_count,
+    deleted_reply_count, deleted_comment_ids, comments_before,
+    comments_after and other_comments_unchanged. Live evidence also
+    carries write_mode, verified_via, document_name, author, scope
+    ("body": comments outside the main body are not covered) and
+    session_epoch.
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, an empty list, or an id that is
+                         unknown, a reply (only thread roots can be deleted; the error names the
+                         root) or, for delete_resolved_comments, still open. diagnostics.offenders
+                         lists every one and nothing is deleted.
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard (file mode only)
+      EXTERNAL_EDITOR_ACTIVE            - file mode only (issue #27); see replace_body_markdown
+      OPC_INVALID, VERIFICATION_FAILED  - file mode: the written package failed validation, a removed
+                         id survived, or a surviving comment/anchor differed from the original;
+                         rolled back. Live mode: another comment changed during the delete (NOT
+                         rolled back; see diagnostics).
+      COMMENT_STILL_PRESENT             - live mode: the pane's independent re-list still shows a
+                         deleted thread
+      LIVE_UNAVAILABLE, LIVE_SESSION_ACTIVE, LIVE_SESSION_MISMATCH, LIVE_DISCONNECTED - as resolve_comment
+      LIVE_CAPABILITY_MISSING           - the pane predates comment_delete: close and reopen the Live pane
+      COMMENT_ID_STALE                  - live mode: the handle is from an earlier pane epoch, or the
+                         comment's identity changed
+      LIVE_OP_FAILED                    - live mode: the pane's re-list could not be read or trusted, or
+                         the pane refused; diagnostics.deleted/remaining/unknown say what is known.
+                         A delete that errored part-way is never rolled back.
+    """
+    try:
+        mode = comments_live._resolve_write_mode(path, write_mode)
+        if mode == "live":
+            handle, address = comments_live.address_comment(path, comment_id, match_spec, session_epoch)
+            return comments_live.execute_delete_comment_live(path, comment_id, handle, address)
+        if comment_id is None or match_spec is not None or session_epoch is not None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "File comment writes require comment_id only")
+        return comments.execute_delete_comments(
+            path,
+            [comment_id],
+            tool_name="delete_comment",
+            require_resolved=False,
+            allow_concurrent_editor=allow_concurrent_editor,
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def delete_resolved_comments(
+    path: str,
+    comment_ids: list[str],
+    write_mode: str = "auto",
+    allow_concurrent_editor: bool = False,
+) -> dict[str, Any]:
+    """Delete several RESOLVED comment threads in one call -- issue #80. Use
+    it after resolve_comment to clear the threads a push just resolved.
+
+    Every id is resolved, deduplicated by thread root (a durableId and a
+    w:id naming the same comment count once) and validated BEFORE anything
+    is deleted: an empty list, an unknown id, a reply id or a still-open
+    thread refuses the whole call (INVALID_INPUT, diagnostics.offenders
+    lists every offender). File mode deletes all threads in one atomic
+    write. Live mode resolves every id against one pane snapshot, deletes
+    them in turn and verifies with one re-list; if a delete fails part-way,
+    the error's diagnostics list `deleted`, `remaining` and `unknown`
+    (deleted before the error but unconfirmed) live handles and nothing is
+    rolled back.
+
+    Evidence is delete_comment's, with match_count and
+    deleted_thread_count = threads deleted, `before` = the list of anchor
+    texts, and `resolutions` = one entry per input id.
+
+    Errors:
+      INVALID_INPUT, DOCX_PATH_ESCAPE, DOCX_ROOT_NOT_FOUND - a bad path, an empty list, or an id that is
+                         unknown, a reply (only thread roots can be deleted; the error names the
+                         root) or, for delete_resolved_comments, still open. diagnostics.offenders
+                         lists every one and nothing is deleted.
+      DOCX_LOCKED, SYNC_IN_FLIGHT       - the write guard (file mode only)
+      EXTERNAL_EDITOR_ACTIVE            - file mode only (issue #27); see replace_body_markdown
+      OPC_INVALID, VERIFICATION_FAILED  - file mode: the written package failed validation, a removed
+                         id survived, or a surviving comment/anchor differed from the original;
+                         rolled back. Live mode: another comment changed during the delete (NOT
+                         rolled back; see diagnostics).
+      COMMENT_STILL_PRESENT             - live mode: the pane's independent re-list still shows a
+                         deleted thread
+      LIVE_UNAVAILABLE, LIVE_SESSION_ACTIVE, LIVE_SESSION_MISMATCH, LIVE_DISCONNECTED - as resolve_comment
+      LIVE_CAPABILITY_MISSING           - the pane predates comment_delete: close and reopen the Live pane
+      COMMENT_ID_STALE                  - live mode: the handle is from an earlier pane epoch, or the
+                         comment's identity changed
+      LIVE_OP_FAILED                    - live mode: the pane's re-list could not be read or trusted, or
+                         the pane refused; diagnostics.deleted/remaining/unknown say what is known.
+                         A delete that errored part-way is never rolled back.
+    """
+    try:
+        mode = comments_live._resolve_write_mode(path, write_mode)
+        if mode == "live":
+            return comments_live.execute_delete_resolved_comments_live(path, comment_ids)
+        return comments.execute_delete_comments(
+            path,
+            comment_ids,
+            tool_name="delete_resolved_comments",
+            require_resolved=True,
+            allow_concurrent_editor=allow_concurrent_editor,
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
 # ---------------------------------------------------------------------------
 # Tables (issue #28 WP-14): list_tables, get_table (read-only), and
 # replace_table_row / replace_cell_markdown / insert_table (mutating, in
