@@ -92,6 +92,7 @@ class ErrorCode(Enum):
     # Google's version, which guards a real Drive-API eventual-consistency
     # hazard this backend has no analogue of.
     COMMENT_STILL_OPEN = "COMMENT_STILL_OPEN"  # resolve_comment's own post-write re-read did not confirm w15:done="1"
+    COMMENT_STILL_PRESENT = "COMMENT_STILL_PRESENT"  # live delete_comment: the pane's independent re-list still shows a deleted thread (file mode reports VERIFICATION_FAILED and rolls back instead)
 
     # Tables (tables.py; issue #28 WP-14)
     TABLE_NOT_FOUND = "TABLE_NOT_FOUND"  # table_id does not match any table (call list_tables)
