@@ -62,7 +62,7 @@ from .errors import ErrorCode, _make_error
 from .live import protocol as live_protocol
 from .live import reads_live
 from .live import write_mode as live_write_mode
-from .live.session import LiveDisconnected, LiveOpFailed, LiveStale
+from .live.session import LiveDisconnected, LiveOpFailed, LiveStale, LiveStaleAfterWrite
 from .projection import DEFAULT_PART, W_NS, TableBoundaryEvent
 
 _CELL_CONTENT_TAGS = frozenset({"p", "tbl", "sdt"})
@@ -659,6 +659,13 @@ def _live_cell_request(
 ) -> dict[str, Any]:
     try:
         return session.request_threadsafe(op, payload, **kwargs)
+    except LiveStaleAfterWrite as exc:
+        raise _make_error(
+            ErrorCode.LIVE_STALE_AFTER_WRITE,
+            "the pane applied the op, but its body hash before the op differed from the expected one: "
+            "the write ALREADY LANDED -- do not retry; re-read the live document.",
+            {"expected": exc.expected, "actual": exc.actual},
+        ) from exc
     except LiveStale as exc:
         raise _make_error(
             ErrorCode.LIVE_STALE, str(exc), {"expected": exc.expected, "actual": exc.actual}

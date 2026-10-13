@@ -242,7 +242,8 @@ const OP_LOG_LIMIT = 20;
 // issue #39: "comment_counts" = comments_list reports counts/scope/observed_at.
 // issue #77: "paragraph_insert" = the paragraph_insert op (styled, optionally tracked paragraphs).
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
-const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete"];
+// issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
+const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -996,7 +997,7 @@ async function opReplace(payload) {
     await guardAnchoredParagraphs(context, matchItems);
     await guardRevisions(context, matchItems);
     const shapeBodies = await scopeShapeBodies(context, payload.scope);
-    const commentsBefore = await guardComments(context, matchItems, payload.allow_comment_loss, shapeBodies);
+    const commentsBefore = await guardComments(context, matchItems, payload.allow_comment_loss, shapeBodies, payload.allow_comment_loss_ids);
     const policy = payload.inherit_format || "replaced";
     if (!["replaced", "previous", "none"].includes(policy)) throw refusalError("Invalid inherit_format", "INVALID_INPUT");
     if (policy === "none" && !Office.context.requirements.isSetSupported("WordApiDesktop", "1.3"))
@@ -2112,9 +2113,12 @@ async function shapeCommentIds(context, body) {
   }
   return [...new Set([...xml.matchAll(/<w:comment(?:RangeStart|RangeEnd|Reference)\b[^>]*\bw:id="([^"]*)"/g)].map(m => m[1]))];
 }
-async function guardShapeComments(context, shapeBodies, allowLoss) {
+async function guardShapeComments(context, shapeBodies, allowLoss, allowIds) {
   const found = [];
   for (const body of shapeBodies) found.push(...await shapeCommentIds(context, body));
+  // Shape scopes only know comment ids (no resolved state or reply counts), so per-thread consent cannot be checked.
+  if (found.length && Array.isArray(allowIds))
+    throw refusalError(`allow_comment_loss_ids is not supported for text-box scopes; comments in shape text: ${JSON.stringify(found)}`, "WOULD_DELETE_COMMENTS");
   if (found.length && allowLoss !== true)
     throw refusalError(`Replacement overlaps comments in shape text: ${JSON.stringify(found)}`, "WOULD_DELETE_COMMENTS");
   return found.map(id => ({id}));
@@ -2125,8 +2129,27 @@ async function scopeShapeBodies(context, scope) {
   return (await resolveScopes(context, scope, true)).bodies.filter(b => b.scope !== "body").map(b => b.body);
 }
 
-async function guardComments(context, ranges, allowLoss, shapeBodies) {
-  if (shapeBodies && shapeBodies.length) return guardShapeComments(context, shapeBodies, allowLoss);
+// issue #82: per-thread consent. Every overlapping thread must be listed, resolved, and have the listed reply count.
+function enforceCommentLossIds(affected, allowIds) {
+  for (const entry of allowIds)
+    if (!entry || typeof entry.comment_id !== "string" || !Number.isInteger(entry.reply_count) || entry.reply_count < 0)
+      throw refusalError("allow_comment_loss_ids entries must be {comment_id, reply_count}", "INVALID_INPUT");
+  const byId = new Map(allowIds.map(e => [e.comment_id, e]));
+  for (const c of affected) {
+    const entry = byId.get(c.id);
+    if (!entry)
+      throw refusalError(`Replacement overlaps comment ${c.id} which is not in allow_comment_loss_ids`, "WOULD_DELETE_COMMENTS");
+    if (c.resolved !== true)
+      throw refusalError(`Comment ${c.id} is listed in allow_comment_loss_ids but is not resolved`, "WOULD_DELETE_COMMENTS");
+    if (c.replies.length !== entry.reply_count)
+      throw refusalError(`Comment ${c.id} has ${c.replies.length} reply(ies), allow_comment_loss_ids expected ${entry.reply_count}`, "WOULD_DELETE_COMMENTS");
+  }
+}
+
+async function guardComments(context, ranges, allowLoss, shapeBodies, allowIds) {
+  if (Array.isArray(allowIds) && allowLoss === true)
+    throw refusalError("allow_comment_loss and allow_comment_loss_ids are mutually exclusive", "INVALID_INPUT");
+  if (shapeBodies && shapeBodies.length) return guardShapeComments(context, shapeBodies, allowLoss, allowIds);
   const affected = new Map();
   for (const range of ranges) {
     const comments = range.getComments();
@@ -2147,6 +2170,10 @@ async function guardComments(context, ranges, allowLoss, shapeBodies) {
     }));
   }
   const result = [...affected.values()];
+  if (Array.isArray(allowIds)) {
+    enforceCommentLossIds(result, allowIds);
+    return result;
+  }
   if (result.length && allowLoss !== true)
     throw refusalError(`Replacement overlaps comments: ${JSON.stringify(result)}`, "WOULD_DELETE_COMMENTS");
   return result;

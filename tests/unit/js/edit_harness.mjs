@@ -46,5 +46,18 @@ if(process.argv[1].endsWith('edit_harness.mjs')) {
   assert.equal(f.state.text,'Heading. new text');
   const partial=fixture(process.argv[2]);
   await assert.rejects(()=>partial.sandbox.api.opReplace({find:'plain',replace:'new',expected_matches:1}),e=>e.code==='WOULD_DELETE_COMMENTS');
+  // issue #82: per-thread consent (allow_comment_loss_ids)
+  const edit={find:'plain sentence',replace:'new text',expected_matches:1};
+  const ids=fixture(process.argv[2]);
+  await assert.rejects(()=>ids.sandbox.api.opReplace({...edit,allow_comment_loss_ids:[]}),e=>e.code==='WOULD_DELETE_COMMENTS'&&/not in allow_comment_loss_ids/.test(e.message));
+  await assert.rejects(()=>ids.sandbox.api.opReplace({...edit,allow_comment_loss_ids:[{comment_id:'other',reply_count:1}]}),e=>e.code==='WOULD_DELETE_COMMENTS');
+  await assert.rejects(()=>ids.sandbox.api.opReplace({...edit,allow_comment_loss_ids:[{comment_id:'c1',reply_count:1}]}),e=>e.code==='WOULD_DELETE_COMMENTS'&&/not resolved/.test(e.message));
+  ids.state.comments[0].resolved=true;
+  await assert.rejects(()=>ids.sandbox.api.opReplace({...edit,allow_comment_loss_ids:[{comment_id:'c1',reply_count:0}]}),e=>e.code==='WOULD_DELETE_COMMENTS'&&/reply/.test(e.message));
+  await assert.rejects(()=>ids.sandbox.api.opReplace({...edit,allow_comment_loss:true,allow_comment_loss_ids:[{comment_id:'c1',reply_count:1}]}),e=>e.code==='INVALID_INPUT');
+  assert.equal(ids.state.text,'Heading. plain sentence');
+  const exact=await ids.sandbox.api.opReplace({...edit,allow_comment_loss_ids:[{comment_id:'c1',reply_count:1}]});
+  assert.equal(exact.comments_removed[0].id,'c1');
+  assert.equal(ids.state.text,'Heading. new text');
   console.log('comment preservation passed');
 }

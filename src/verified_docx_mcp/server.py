@@ -1541,6 +1541,7 @@ def replace_text(
     allow_comment_loss: bool = False,
     inherit_format: str = "replaced",
     scope: str = "body",
+    allow_comment_loss_ids: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
 
@@ -1638,6 +1639,16 @@ def replace_text(
     the connected pane report the "row_scope" capability -- see
     LIVE_CAPABILITY_MISSING below.
 
+    allow_comment_loss_ids (issue #82, optional, LIVE ONLY): per-thread
+    consent to delete comment threads the match overlaps, instead of the
+    all-or-nothing allow_comment_loss=True. A list of
+    {"comment_id": str, "reply_count": int} (both required); each listed
+    thread must be RESOLVED and still have exactly that many replies, and
+    any overlapping thread NOT listed refuses the edit with
+    WOULD_DELETE_COMMENTS. Mutually exclusive with allow_comment_loss=True
+    (INVALID_INPUT), refused in file mode (INVALID_INPUT), and not supported
+    for text-box scopes. Requires the pane's "comment_loss_ids" capability.
+
     Returns the eight evidence keys (before/after are ±200-character
     excerpts around the first match, not the whole document), plus
     runs_before/runs_after (each match's overlapping run(s), clipped to the
@@ -1678,7 +1689,11 @@ def replace_text(
                                            than risk mutating the wrong document (issue #154)
       LIVE_DISCONNECTED                 - the pane's socket closed, or an op timed out, mid-call
       LIVE_STALE                        - a "live:sha256:..." revision_before no longer matches the
-                                           pane's current body hash
+                                           pane's current body hash, or the pane refused because the
+                                           document moved (nothing was written)
+      LIVE_STALE_AFTER_WRITE            - the pane applied the edit but its pre-op body hash differed
+                                           from the expected one: the write LANDED. Not retryable;
+                                           re-read and verify (an audit record is written)
       LIVE_CAPABILITY_MISSING           - within_row_containing given, live mode, but the connected
                                            pane did not report the "row_scope" capability (an old
                                            pane build predating this feature) -- reload the pane
@@ -1696,8 +1711,73 @@ def replace_text(
             within_row_containing=within_row_containing,
             scope=scope,
             allow_comment_loss=allow_comment_loss,
+            allow_comment_loss_ids=allow_comment_loss_ids,
             inherit_format=inherit_format,
             allow_concurrent_editor=allow_concurrent_editor,
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def replace_text_batch(
+    path: str,
+    edits: list[dict[str, Any]],
+    revision_before: str,
+    write_mode: str = "live",
+    track_changes: bool = False,
+    inherit_format: str = "replaced",
+) -> dict[str, Any]:
+    """Apply 1..50 replace_text edits to the LIVE Word document in order, in one call (issue #82).
+
+    LIVE ONLY: needs a connected Word pane (call `live_open_pane` first if
+    there is none); `write_mode` must be "live" (or "auto" with a connected
+    pane), never "file". `revision_before` is required and must be a
+    "live:sha256:<hex>" revision from a live read.
+
+    `edits` is a list of {"find", "replace", "expected_matches",
+    "allow_comment_loss_ids"?} objects; semantics per edit are those of
+    `replace_text` (expected_matches required, row/scope options not
+    available). `allow_comment_loss_ids` is [{"comment_id", "reply_count"}]
+    (see replace_text); `allow_comment_loss` inside an edit is refused.
+    `track_changes` and `inherit_format` apply to every edit.
+
+    Edits run strictly in order. One describe + the LIVE_STALE check against
+    `revision_before` happens first; each edit is then sent guarded by the
+    body hash the previous edit produced, so the pane refuses (nothing
+    written) if the document moves mid-batch. The first failure stops the
+    batch; NOTHING IS EVER RETRIED. Under a section lock the shared broker
+    drops body-hash checks for the lock holder (see docs/live-mode.md), so
+    the hash chain may not apply there.
+
+    Returns `batch_status`: "complete" (every edit applied), "partial" (>=1
+    applied, then a known pre-write refusal), "none_applied" (the first edit,
+    or the start-of-batch staleness check, was refused; the document is
+    unchanged), or "unknown" (a failure after dispatch whose outcome cannot
+    be proven: disconnect, timeout, LIVE_OP_FAILED, VERIFICATION_FAILED,
+    LIVE_STALE_AFTER_WRITE -- re-read the document before doing anything).
+    `results` has one entry per edit: {index, status, evidence?, code?} with
+    status "applied" | "refused_before_write" | "unknown" | "not_attempted".
+    Only an explicit allowlist of codes counts as refused_before_write
+    (LIVE_STALE from the pane, MATCH_COUNT_MISMATCH/ZERO_MATCH,
+    ANCHORED_SHAPES, WOULD_DELETE_COMMENTS, capability and section-lock
+    refusals). `revision_before`, `revision_after` ("live:sha256:<hex>" of the
+    last applied edit; the original when none applied; null when unknown),
+    `applied` (true only for "complete"), `applied_count`, `edit_count`. One
+    audit record is written per batch, with per-edit statuses.
+
+    Errors (nothing was sent): INVALID_INPUT (bad edits, >50 edits, a
+    non-live write_mode, a malformed revision_before), LIVE_UNAVAILABLE,
+    LIVE_CAPABILITY_MISSING, LIVE_DISCONNECTED (before the first op).
+    """
+    try:
+        return text_edit.execute_replace_text_batch_live(
+            path,
+            edits,
+            revision_before,
+            write_mode=write_mode,
+            track_changes=track_changes,
+            inherit_format=inherit_format,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1816,7 +1896,10 @@ def live_open_pane(path: str, timeout_s: float = 60) -> dict[str, Any]:
     document next time.
 
     Returns `document_name`, `method` and `opened`. Errors: LIVE_UNAVAILABLE with a
-    message saying what to do by hand when the pane could not be opened.
+    message saying what to do by hand when the pane could not be opened. Its
+    diagnostics carry `reason` ("ribbon_unreachable" | "front_failed" | "not_mac" |
+    "other") and a `hint`; the error is `retryable` only for ribbon_unreachable and
+    front_failed (unlock the screen, bring Word to the front, retry).
     """
     from .live.open_pane_live import execute_open_pane
 

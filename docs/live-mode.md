@@ -1218,6 +1218,69 @@ handled by accept/reject-all, which also covers them. Older panes and hosts
 without WordApiDesktop 1.4 keep the previous behaviour.
 
 
+### Batch replace, per-thread comment loss, and the two stale codes (issue #82)
+
+**`replace_text_batch(path, edits, revision_before, ...)`** (live only) applies
+1..50 `{find, replace, expected_matches, allow_comment_loss_ids?}` edits in
+order in one call, for the case where ten `replace_text` round trips are too
+slow. One `describe` plus the `LIVE_STALE` check against `revision_before` (a
+`live:sha256:` revision from a live read; required) runs first. Edit *k* is then
+sent with `expectedBodySha256` set to the body hash edit *k-1* produced, so the
+pane refuses (nothing written) if anything moved between two edits. The first
+failure stops the batch and nothing is ever retried. `write_mode` must be
+`live` (or `auto` with a pane connected); `allow_comment_loss` inside an edit is
+refused (use `allow_comment_loss_ids`).
+
+Result: `batch_status` is `complete`, `partial` (at least one edit applied, then
+a known refusal), `none_applied` (first edit or the start-of-batch check
+refused; the document is unchanged) or `unknown`. `results` has one
+`{index, status, evidence?, code?}` per edit, `status` being `applied`,
+`refused_before_write`, `unknown` or `not_attempted`. Only an explicit allowlist
+counts as `refused_before_write`: `LIVE_STALE` from the pane,
+`MATCH_COUNT_MISMATCH`/`ZERO_MATCH`, `ANCHORED_SHAPES`, `WOULD_DELETE_COMMENTS`,
+capability and section-lock refusals. Everything else after dispatch (generic
+`LIVE_OP_FAILED`, `LIVE_DISCONNECTED`, `LIVE_STALE_AFTER_WRITE`,
+`VERIFICATION_FAILED`, unknown codes) is `unknown`: the batch becomes `unknown`,
+`revision_after` is `null` and the rest are `not_attempted`. Re-read the
+document before doing anything else. `revision_after` is the last applied edit's
+body hash (`live:sha256:<hex>`), the original one when none applied. `applied`
+is true only for `complete`. One audit record is written per batch, with the
+per-edit statuses (no document text; the audit's excerpt redaction only covers
+top-level keys). Bad arguments, a missing pane or a disconnect before the first
+op raise instead of returning a result.
+
+Section locks: when the shared broker removes body-hash checks for a client
+that holds section locks (the lock holder is confined to its sections and
+checked per section), the hash chain above may not be enforced for that client.
+The batch does not special-case this; take the lock into account when batching.
+
+**`allow_comment_loss_ids`** on `replace_text` (live only) replaces the
+all-or-nothing `allow_comment_loss=True` with per-thread consent: a list of
+`{"comment_id", "reply_count"}`. The pane (`comment_loss_ids` capability)
+refuses `WOULD_DELETE_COMMENTS` for an overlapping thread that is not listed,
+for a listed thread that is not resolved, and for a listed thread whose reply
+count differs from the entry. It is mutually exclusive with
+`allow_comment_loss=True`, refused in file mode, and not supported for text-box
+scopes (the shape guard only knows comment ids). `allow_comment_loss=True`
+behaves exactly as before.
+
+**`LIVE_STALE` vs `LIVE_STALE_AFTER_WRITE`.** `LIVE_STALE` means the pane refused
+because the document had moved (pane codes `stale`/`LIVE_STALE`, mapped the same
+way by every live tool, including comments, `delete_paragraph` and revisions):
+nothing was written. `LIVE_STALE_AFTER_WRITE` means the pane answered ok but its
+own pre-op body hash differed from the one the call expected: the write already
+landed. It is not retryable; `replace_text` and `format_text` write an audit
+record (`<tool>:verification_failed`). In shared mode the broker serializes it as
+`LIVE_STALE_AFTER_WRITE` and the client raises the same exception.
+
+**`live_open_pane` diagnostics.** A failure is `LIVE_UNAVAILABLE` with
+`diagnostics.reason` (`ribbon_unreachable`, `front_failed`, `not_mac`, `other`)
+and a `hint` (unlock the screen, bring Word to the front, retry, or open the
+pane by hand: Home > Add-ins > Developer Add-ins > verified-docx-mcp). Only
+`ribbon_unreachable` and `front_failed` set `retryable: true`; `LIVE_UNAVAILABLE`
+is not retryable in general. If a batch finds no pane, call `live_open_pane` and
+retry.
+
 ### Opening the pane automatically (#66)
 
 The pane has to be opened by hand **once per document**. Then call

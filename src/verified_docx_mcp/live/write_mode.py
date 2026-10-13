@@ -371,7 +371,7 @@ def classify_op_failed(exc: LiveOpFailed) -> ErrorCode:
         return ErrorCode.MATCH_COUNT_MISMATCH
     # Issue #34: the pane refused before writing (body hash moved / unknown
     # table style).
-    if pane_code == "stale":
+    if pane_code in ("stale", "live_stale"):
         return ErrorCode.LIVE_STALE
     if pane_code == "style_not_found":
         return ErrorCode.STYLE_NOT_FOUND
@@ -392,11 +392,12 @@ def live_evidence(
     before: str,
     after: str,
     pre_body_sha256: str,
-    post_body_sha256: str,
+    post_body_sha256: str | None,
     document_name: str,
     tool: str,
     path: str,
     shape_result: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build + audit-log the live-mode evidence envelope for one mutating
     live op, and return it.
@@ -426,6 +427,10 @@ def live_evidence(
     revision token to read until ``live_save`` writes the file back to
     disk -- see that tool for the bridge to file-mode's own tokens).
 
+    ``post_body_sha256=None`` (an outcome the caller could not verify) yields
+    ``revision_after: None``; ``extra`` is merged into the evidence BEFORE the
+    audit write (replace_text_batch's per-edit records).
+
     ``tool``/``path`` go straight to ``audit.append_audit`` (the same
     audit log every file-mode mutating tool writes to) so a live edit is
     not invisible to the audit trail just because it did not go through
@@ -438,7 +443,7 @@ def live_evidence(
         "before": before,
         "after": after,
         "revision_before": f"{_LIVE_REVISION_PREFIX}{pre_body_sha256}",
-        "revision_after": f"{_LIVE_REVISION_PREFIX}{post_body_sha256}",
+        "revision_after": f"{_LIVE_REVISION_PREFIX}{post_body_sha256}" if post_body_sha256 is not None else None,
         "audit_logged": False,
         "write_mode": "live",
         "verified_via": "word-addin",
@@ -447,6 +452,7 @@ def live_evidence(
         "orphaned_comment_ids": [],
     }
     evidence.update(shape_counts(shape_result or {}))
+    evidence.update(extra or {})
     logged, _ = audit.append_audit(path=path, tool=tool, evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence

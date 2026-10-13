@@ -168,6 +168,9 @@ class FakeDocument:
         # after_comment_delete: called with this document after a delete
         # (lets a test corrupt another comment).
         self.session_epoch: str | None = None
+        # Issue #82: when set, `replace` reports this as its own pre-op body hash (an ok reply
+        # whose "pre" disagrees with the caller's expected hash -> LIVE_STALE_AFTER_WRITE).
+        self.report_pre: str | None = None
         self.undeletable_ids: set[str] = set()
         self.fail_after_delete_ids: set[str] = set()
         self.after_comment_delete: Any = None
@@ -532,14 +535,38 @@ class FakeDocument:
         *,
         track_changes: bool = False,
         row_anchor: str | None = None,
+        expected_body_sha256: str | None = None,
+        allow_comment_loss_ids: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         pre = self.sha256()
+        # Issue #82: the real pane refuses a stale caller before touching anything.
+        if expected_body_sha256 and expected_body_sha256 != pre:
+            raise OpRefused("stale", "the document changed since it was read; nothing was written.")
         positions = self._scoped_positions(find, row_anchor)
         if len(positions) != expected_matches:
             raise OpRefused(
                 "LIVE_OP_FAILED",
                 f"expected {expected_matches} match(es) for {find!r}, found {len(positions)}",
             )
+        removed: list[dict[str, Any]] = []
+        if allow_comment_loss_ids is not None:
+            allowed = {e["comment_id"]: e["reply_count"] for e in allow_comment_loss_ids}
+            for comment in self.comments:
+                anchor_at = self.text.find(comment.anchor_text) if comment.anchor_text else -1
+                if anchor_at < 0:
+                    continue
+                anchor_end = anchor_at + len(comment.anchor_text)
+                if not any(start < anchor_end and anchor_at < end for start, end in positions):
+                    continue
+                if comment.id not in allowed:
+                    raise OpRefused("WOULD_DELETE_COMMENTS", f"comment {comment.id} is not in allow_comment_loss_ids")
+                if not comment.resolved:
+                    raise OpRefused("WOULD_DELETE_COMMENTS", f"comment {comment.id} is not resolved")
+                if len(comment.replies) != allowed[comment.id]:
+                    raise OpRefused("WOULD_DELETE_COMMENTS", f"comment {comment.id} reply count differs")
+                removed.append(comment.to_dict())
+            gone = {c["id"] for c in removed}
+            self.comments = [c for c in self.comments if c.id not in gone]
         previous_mode = self.change_tracking_mode
         if track_changes:
             self.change_tracking_mode = "TrackAll"
@@ -551,13 +578,16 @@ class FakeDocument:
             self.text = new_text
         finally:
             self.change_tracking_mode = previous_mode
-        return {
+        result = {
             "applied": True,
             "match_count": len(positions),
             "matches": matches_result,
-            "pre": pre,
+            "pre": self.report_pre or pre,
             "post": self.sha256(),
         }
+        if allow_comment_loss_ids is not None:
+            result["comments_removed"] = removed
+        return result
 
     def format(
         self,
@@ -760,7 +790,7 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert", "comment_delete"]
+            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert", "comment_delete", "comment_loss_ids"]
             if capabilities is None
             else list(capabilities)
         )
@@ -777,6 +807,10 @@ class FakePane:
         # simulate an unresponsive pane (for LIVE_DISCONNECTED-by-timeout)
         # without needing a full socket-level failure injection.
         self.drop_ops: set[str] = set()
+        # Issue #82: close the socket without answering the Nth `replace` request (1-based),
+        # simulating a pane that dies mid-batch.
+        self.disconnect_on_replace: int | None = None
+        self.replace_count = 0
         self._ws: Any = None
         self._recv_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
@@ -835,6 +869,11 @@ class FakePane:
                 op = message["op"]
                 if op in self.drop_ops:
                     continue
+                if op == "replace":
+                    self.replace_count += 1
+                    if self.disconnect_on_replace == self.replace_count:
+                        await self._ws.close()
+                        return
                 reply = self._handle_op(request_id, op, message.get("payload") or {})
                 await self._ws.send(json.dumps(reply))
         except (asyncio.CancelledError, ConnectionClosed):
@@ -881,6 +920,8 @@ class FakePane:
                 payload["replace"],
                 track_changes=bool(payload.get("track_changes", False)),
                 row_anchor=payload.get("rowAnchor"),
+                expected_body_sha256=payload.get("expectedBodySha256"),
+                allow_comment_loss_ids=payload.get("allow_comment_loss_ids"),
             )
         if op == "format":
             return doc.format(

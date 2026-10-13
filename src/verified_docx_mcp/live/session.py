@@ -133,6 +133,13 @@ class LiveStale(LiveError):
         self.actual = actual
 
 
+class LiveStaleAfterWrite(LiveStale):
+    """The pane replied ok, but its own ``result["pre"]`` differed from the
+    caller's expected body hash: the op ALREADY ran against a document that had
+    moved. Unlike a plain ``LiveStale`` (the pane refused, nothing written), this
+    must never be retried blindly -- the caller has to re-read and verify."""
+
+
 class PaneTransport(Protocol):
     """The minimum surface ``LiveSession`` needs from a WebSocket-like
     object. ``websockets.asyncio.server.ServerConnection`` satisfies this
@@ -245,8 +252,9 @@ class LiveSession:
         ``LiveDisconnected`` if the socket closes while sending or before
         a reply arrives (including a plain timeout -- see that
         exception's docstring), ``LiveOpFailed`` if the pane replies
-        ``ok=false``, and ``LiveStale`` if ``expected_body_sha256`` is
-        given and disagrees with the reply's own ``result["pre"]``.
+        ``ok=false``, and ``LiveStaleAfterWrite`` (a ``LiveStale``) if
+        ``expected_body_sha256`` is given and disagrees with the ok reply's own
+        ``result["pre"]`` (the write already landed).
         Returns the reply's ``result`` dict (``{}`` if the pane sent
         none, e.g. a bare ``ping``).
         """
@@ -333,7 +341,7 @@ class LiveSession:
         if expected_body_sha256 is not None:
             pre = result.get("pre")
             if pre is not None and pre != expected_body_sha256:
-                raise LiveStale(expected_body_sha256, pre)
+                raise LiveStaleAfterWrite(expected_body_sha256, pre)
         return result
 
     def resolve_reply(self, reply: OpReply) -> bool:

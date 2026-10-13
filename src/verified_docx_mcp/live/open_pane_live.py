@@ -3,7 +3,7 @@ import subprocess
 import time
 from typing import Any
 
-from ..errors import ErrorCode, _make_error
+from ..errors import ErrorCode, _make_retryable_error
 from . import bridge as live_bridge
 from . import open_pane_mac, write_mode
 
@@ -28,6 +28,13 @@ def execute_open_pane(path: str, timeout_s: float = 60) -> dict[str, Any]:
                 time.sleep(1)
         method = open_pane_mac.open_pane(name, lambda: registry.get(name) is not None, timeout_s)
     except (open_pane_mac.OpenPaneError, subprocess.SubprocessError, OSError) as exc:
-        raise _make_error(ErrorCode.LIVE_UNAVAILABLE, str(exc), {"document_name": name}) from exc
+        reason = exc.reason if isinstance(exc, open_pane_mac.OpenPaneError) else open_pane_mac.REASON_OTHER
+        # LIVE_UNAVAILABLE is not retryable in general; only the transient open-pane causes are.
+        raise _make_retryable_error(
+            ErrorCode.LIVE_UNAVAILABLE,
+            str(exc),
+            {"document_name": name, "reason": reason, "hint": open_pane_mac.HINT},
+            retryable=reason in open_pane_mac.RETRYABLE_REASONS,
+        ) from exc
     return {"opened": method != "already-connected", "already_connected": method == "already-connected",
             "document_name": name, "method": method}

@@ -101,8 +101,28 @@ end tell
 """
 
 
+# Why opening failed. ribbon_unreachable / front_failed are transient (locked screen, Word not
+# frontmost, ribbon not exposed yet) and worth a retry; not_mac / other are not.
+REASON_RIBBON_UNREACHABLE = "ribbon_unreachable"
+REASON_FRONT_FAILED = "front_failed"
+REASON_NOT_MAC = "not_mac"
+REASON_OTHER = "other"
+RETRYABLE_REASONS = frozenset({REASON_RIBBON_UNREACHABLE, REASON_FRONT_FAILED})
+
+HINT = (
+    "Unlock the screen, bring Word to the front, and retry live_open_pane; or open the pane by hand: "
+    "Home > Add-ins > Developer Add-ins > verified-docx-mcp."
+)
+
+
 class OpenPaneError(RuntimeError):
-    """The pane could not be opened; the message says what to do by hand."""
+    """The pane could not be opened; the message says what to do by hand.
+
+    ``reason`` is one of the REASON_* values above (``other`` by default)."""
+
+    def __init__(self, message: str, reason: str = REASON_OTHER) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _osascript(script: str, *args: str, language: str | None = None, timeout: float = 30) -> str:
@@ -133,14 +153,19 @@ def _wait(is_connected: Callable[[], bool], seconds: float) -> bool:
 def open_pane(document_name: str, is_connected: Callable[[], bool], timeout_s: float = 60) -> str:
     """Open the Live pane for the open Word document *document_name*; return the method used."""
     if platform.system() != "Darwin":
-        raise OpenPaneError("Opening the Live pane automatically is only implemented for Word for Mac")
+        raise OpenPaneError(
+            "Opening the Live pane automatically is only implemented for Word for Mac", REASON_NOT_MAC
+        )
     deadline = time.monotonic() + timeout_s
     problems: list[str] = []
+    reason = REASON_RIBBON_UNREACHABLE
     for attempt in range(1, 4):
         if time.monotonic() > deadline:
             break
         try:
+            reason = REASON_FRONT_FAILED  # until Word is frontmost with the target window raised
             _osascript(_PREPARE, document_name)
+            reason = REASON_RIBBON_UNREACHABLE
             if is_connected():
                 return "already-connected"
             if _osascript(_PRESS_LIVE_PANE) == "clicked" and _wait(is_connected, 8):
@@ -168,5 +193,6 @@ def open_pane(document_name: str, is_connected: Callable[[], bool], timeout_s: f
             pass
     raise OpenPaneError(
         "Could not open the Live pane automatically (" + "; ".join(problems[-3:]) + "). "
-        "Open it by hand: Home > Add-ins > Developer Add-ins > verified-docx-mcp, and check that the calling "
-        "app has macOS Accessibility permission.")
+        + HINT + " Also check that the calling app has macOS Accessibility permission.",
+        reason,
+    )

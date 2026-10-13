@@ -82,7 +82,7 @@ from . import audit, mutations, paths, projection, tables, tracked_changes
 from .author import resolve_author_name
 from .errors import ErrorCode, VerifyError, _make_error
 from .live import write_mode as live_write_mode
-from .live.session import LiveDisconnected, LiveOpFailed, LiveStale
+from .live.session import LiveDisconnected, LiveOpFailed, LiveStale, LiveStaleAfterWrite
 from .locate import LocateResult, locate
 from .projection import W_NS, RunEvent
 
@@ -761,80 +761,78 @@ def _live_describe(session, path: str, revision_before: str | None) -> str:
 _ROW_SCOPE_CAPABILITY = "row_scope"
 
 
-def execute_replace_text_live(
-    path: str,
-    find: str,
-    replace: str,
-    expected_matches: int,
-    *,
-    revision_before: str | None = None,
-    track_changes: bool = False,
-    within_row_containing: str | None = None,
-    allow_comment_loss: bool = False,
-    inherit_format: str = "replaced",
-    scope: str = "body",
-) -> dict[str, Any]:
-    """Live-mode ``replace_text`` (issue #106 WP-3): sends a ``replace``
-    op over the pane's WSS ops channel instead of editing the .docx file.
+_COMMENT_LOSS_IDS_CAPABILITY = "comment_loss_ids"
 
-    Flow: ``describe`` (record ``pre`` body hash + ``LIVE_STALE`` check)
-    -> ``replace`` (with ``expected_body_sha256=pre`` so the session layer
-    itself also re-checks staleness against the reply) -> verify
-    (``post`` differs from ``pre``, and every match's ``after`` equals
-    *replace* exactly) -> build the live evidence envelope
-    (``live/write_mode.py``'s ``live_evidence``).
 
-    ``force`` has no live-mode analogue (there is no tracked-change/
-    comment-anchor override to force here -- Word owns the document, not
-    this server) and is not accepted; a caller that wants a forced
-    override uses ``write_mode="file"`` with the file's own ``force``
-    instead.
+def validate_comment_loss_ids(value: Any) -> list[dict[str, Any]] | None:
+    """Validate ``allow_comment_loss_ids`` (live-only, per-thread comment-loss consent).
 
-    ``within_row_containing`` (issue #22 B2): sent as the ``replace`` op's
-    ``rowAnchor`` field -- requires the connected pane to report the
-    ``"row_scope"`` capability in its own ``hello``
-    (``live_write_mode.require_capability``, checked BEFORE this op is
-    sent), or ``LIVE_CAPABILITY_MISSING``. See ``text_edit.py``'s own
-    ``_resolve_row_span_filter`` docstring (the file-mode equivalent) for
-    the anchor-uniqueness contract; the pane resolves the SAME contract
-    against the live document instead of a projection.
-
-    Raises ``LIVE_UNAVAILABLE``/``LIVE_DISCONNECTED``/``LIVE_STALE`` (see
-    ``live/session.py``'s exceptions of the same names), ``ZERO_MATCH``/
-    ``MATCH_COUNT_MISMATCH``/``LIVE_OP_FAILED`` (the pane refused the
-    ``expected_matches`` gate -- see ``live/write_mode.py``'s
-    ``classify_op_failed``), ``LIVE_CAPABILITY_MISSING`` (see above), or
-    ``VERIFICATION_FAILED`` (the pane's own read-back after the op did
-    not confirm the intended change -- nothing to roll back in live mode,
-    since Word, not this server, owns the file; the diagnostics say so
-    explicitly).
+    ``None`` means "not used"; a list (even empty) switches the pane's comment guard to
+    ids mode: each entry ``{"comment_id": str, "reply_count": int}`` names one RESOLVED
+    thread the caller accepts losing, with the reply count it saw. Returns a normalized copy.
     """
-    if inherit_format not in ("replaced", "previous", "none"):
-        raise _make_error(ErrorCode.INVALID_INPUT, "Invalid inherit_format")
-    if not find:
-        raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise _make_error(ErrorCode.INVALID_INPUT, "allow_comment_loss_ids must be a list of {comment_id, reply_count}")
+    out: list[dict[str, Any]] = []
+    for i, entry in enumerate(value):
+        if not isinstance(entry, dict) or set(entry) != {"comment_id", "reply_count"}:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"allow_comment_loss_ids[{i}] must be exactly {{comment_id, reply_count}}",
+            )
+        cid, count = entry["comment_id"], entry["reply_count"]
+        if not isinstance(cid, str) or not cid:
+            raise _make_error(ErrorCode.INVALID_INPUT, f"allow_comment_loss_ids[{i}].comment_id must be a non-empty string")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT, f"allow_comment_loss_ids[{i}].reply_count must be a non-negative integer"
+            )
+        out.append({"comment_id": cid, "reply_count": count})
+    return out
 
-    session = live_write_mode.live_session_for(path)
-    document_name = session.document_name
+
+def _require_live_replace_capabilities(
+    session, *, within_row_containing: str | None, allow_comment_loss_ids: list[dict[str, Any]] | None
+) -> None:
     live_write_mode.require_capability(session, "replacement_formatting", feature_description="replacement formatting")
     live_write_mode.require_capability(session, "comment_loss_guard", feature_description="comment loss protection")
     if within_row_containing:
         live_write_mode.require_capability(
             session, _ROW_SCOPE_CAPABILITY, feature_description="within_row_containing"
         )
+    if allow_comment_loss_ids is not None:
+        live_write_mode.require_capability(
+            session, _COMMENT_LOSS_IDS_CAPABILITY, feature_description="allow_comment_loss_ids"
+        )
 
-    try:
-        if scope != "body":
-            from .live.scopes_live import scope_state
-            scope_info = scope_state(session, scope, revision_before)
-            pre_hash = scope_info["bodySha256"]
-        else:
-            scope_info = None
-            pre_hash = _live_describe(session, path, revision_before)
-    except LiveDisconnected as exc:
-        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
 
-    payload = {
+def _live_replace_once(
+    session,
+    *,
+    find: str,
+    replace: str,
+    expected_matches: int,
+    pre_hash: str,
+    track_changes: bool = False,
+    allow_comment_loss: bool = False,
+    allow_comment_loss_ids: list[dict[str, Any]] | None = None,
+    within_row_containing: str | None = None,
+    inherit_format: str = "replaced",
+    scope: str = "body",
+    scope_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Send ONE pane ``replace`` guarded by ``expectedBodySha256=pre_hash`` and verify it.
+
+    Shared by ``execute_replace_text_live`` and ``execute_replace_text_batch_live``.
+    Returns the pane's verified result (``post`` is the new body hash). Raises a
+    ``VerifyError``: a pane-side refusal keeps its own code (nothing written), while
+    ``LIVE_STALE_AFTER_WRITE`` (the pane applied the op against a body that had moved) and
+    ``VERIFICATION_FAILED`` mean the write may have landed. Never retries and never audits;
+    the caller owns both.
+    """
+    payload: dict[str, Any] = {
         "find": find,
         "expected_matches": expected_matches,
         "replace": replace,
@@ -842,6 +840,8 @@ def execute_replace_text_live(
         "allow_comment_loss": allow_comment_loss,
         "inherit_format": inherit_format,
     }
+    if allow_comment_loss_ids is not None:
+        payload["allow_comment_loss_ids"] = allow_comment_loss_ids
     payload["scope"] = scope
     payload["expectedBodySha256"] = pre_hash
     if scope_info:
@@ -850,6 +850,14 @@ def execute_replace_text_live(
         payload["rowAnchor"] = within_row_containing
     try:
         result = session.request_threadsafe("replace", payload, expected_body_sha256=pre_hash)
+    except LiveStaleAfterWrite as exc:
+        raise _make_error(
+            ErrorCode.LIVE_STALE_AFTER_WRITE,
+            "the pane applied the replace, but its body hash before the op differed from the one "
+            "this call expected: the document moved between the read and the write. The write "
+            "ALREADY LANDED -- do not retry; re-read the live document and verify it.",
+            {"expected": exc.expected, "actual": exc.actual},
+        ) from exc
     except LiveStale as exc:
         raise _make_error(
             ErrorCode.LIVE_STALE, str(exc), {"expected": exc.expected, "actual": exc.actual}
@@ -862,7 +870,6 @@ def execute_replace_text_live(
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
 
     matches = result.get("matches") or []
-    match_count = result.get("match_count", len(matches))
     post_hash = result.get("post")
 
     if not result.get("applied") or (result.get("scope_post") == scope_info["scopeSha256"] if scope_info else post_hash == pre_hash):
@@ -883,7 +890,128 @@ def execute_replace_text_live(
                 "live mode -- Word, not this server, owns the document.",
                 {"matches": matches},
             )
+    return result
 
+
+def _audit_stale_after_write(exc: VerifyError, *, tool: str, path: str, document_name: str, pre_hash: str) -> None:
+    """The write landed but its read-back could not complete: leave an audit trail."""
+    live_write_mode.audit_live_failure(
+        tool=tool,
+        path=path,
+        document_name=document_name,
+        pre_body_sha256=pre_hash,
+        post_body_sha256=None,
+        reason=exc.envelope.message,
+        detail=exc.envelope.diagnostics,
+    )
+
+
+def execute_replace_text_live(
+    path: str,
+    find: str,
+    replace: str,
+    expected_matches: int,
+    *,
+    revision_before: str | None = None,
+    track_changes: bool = False,
+    within_row_containing: str | None = None,
+    allow_comment_loss: bool = False,
+    allow_comment_loss_ids: list[dict[str, Any]] | None = None,
+    inherit_format: str = "replaced",
+    scope: str = "body",
+) -> dict[str, Any]:
+    """Live-mode ``replace_text`` (issue #106 WP-3): sends a ``replace``
+    op over the pane's WSS ops channel instead of editing the .docx file.
+
+    Flow: ``describe`` (record ``pre`` body hash + ``LIVE_STALE`` check)
+    -> ``replace`` (with ``expected_body_sha256=pre`` so the session layer
+    itself also re-checks staleness against the reply; see
+    ``_live_replace_once``) -> verify (``post`` differs from ``pre``, and
+    every match's ``after`` equals *replace* exactly) -> build the live
+    evidence envelope (``live/write_mode.py``'s ``live_evidence``).
+
+    ``force`` has no live-mode analogue (there is no tracked-change/
+    comment-anchor override to force here -- Word owns the document, not
+    this server) and is not accepted; a caller that wants a forced
+    override uses ``write_mode="file"`` with the file's own ``force``
+    instead.
+
+    ``within_row_containing`` (issue #22 B2): sent as the ``replace`` op's
+    ``rowAnchor`` field -- requires the connected pane to report the
+    ``"row_scope"`` capability in its own ``hello``
+    (``live_write_mode.require_capability``, checked BEFORE this op is
+    sent), or ``LIVE_CAPABILITY_MISSING``. See ``text_edit.py``'s own
+    ``_resolve_row_span_filter`` docstring (the file-mode equivalent) for
+    the anchor-uniqueness contract; the pane resolves the SAME contract
+    against the live document instead of a projection.
+
+    ``allow_comment_loss_ids`` (issue #82): per-thread comment-loss consent,
+    sent to the pane (``"comment_loss_ids"`` capability); see
+    ``validate_comment_loss_ids``.
+
+    Raises ``LIVE_UNAVAILABLE``/``LIVE_DISCONNECTED``/``LIVE_STALE`` (see
+    ``live/session.py``'s exceptions of the same names), ``ZERO_MATCH``/
+    ``MATCH_COUNT_MISMATCH``/``LIVE_OP_FAILED`` (the pane refused the
+    ``expected_matches`` gate -- see ``live/write_mode.py``'s
+    ``classify_op_failed``), ``LIVE_CAPABILITY_MISSING`` (see above),
+    ``LIVE_STALE_AFTER_WRITE`` (the write landed against a body that had
+    moved; audited), or ``VERIFICATION_FAILED`` (the pane's own read-back
+    after the op did not confirm the intended change -- nothing to roll
+    back in live mode, since Word, not this server, owns the file; the
+    diagnostics say so explicitly).
+    """
+    if inherit_format not in ("replaced", "previous", "none"):
+        raise _make_error(ErrorCode.INVALID_INPUT, "Invalid inherit_format")
+    if not find:
+        raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty")
+    allow_comment_loss_ids = validate_comment_loss_ids(allow_comment_loss_ids)
+    if allow_comment_loss and allow_comment_loss_ids is not None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT, "allow_comment_loss and allow_comment_loss_ids are mutually exclusive"
+        )
+
+    session = live_write_mode.live_session_for(path)
+    document_name = session.document_name
+    _require_live_replace_capabilities(
+        session, within_row_containing=within_row_containing, allow_comment_loss_ids=allow_comment_loss_ids
+    )
+
+    try:
+        if scope != "body":
+            from .live.scopes_live import scope_state
+            scope_info = scope_state(session, scope, revision_before)
+            pre_hash = scope_info["bodySha256"]
+        else:
+            scope_info = None
+            pre_hash = _live_describe(session, path, revision_before)
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+
+    try:
+        result = _live_replace_once(
+            session,
+            find=find,
+            replace=replace,
+            expected_matches=expected_matches,
+            pre_hash=pre_hash,
+            track_changes=track_changes,
+            allow_comment_loss=allow_comment_loss,
+            allow_comment_loss_ids=allow_comment_loss_ids,
+            within_row_containing=within_row_containing,
+            inherit_format=inherit_format,
+            scope=scope,
+            scope_info=scope_info,
+        )
+    except VerifyError as exc:
+        if exc.envelope.error_code == ErrorCode.LIVE_STALE_AFTER_WRITE:
+            _audit_stale_after_write(
+                exc, tool="replace_text", path=path, document_name=document_name, pre_hash=pre_hash
+            )
+        raise
+
+    matches = result.get("matches") or []
+    match_count = result.get("match_count", len(matches))
+    post_hash = result.get("post")
     before_text = "\n".join(m.get("before", "") for m in matches)
     after_text = "\n".join(m.get("after", "") for m in matches)
 
@@ -900,6 +1028,254 @@ def execute_replace_text_live(
         tool="replace_text",
         path=path,
     )
+    if scope_info:
+        evidence["revision_before"] = f"live:scope:{scope_info['scopeSha256']}"
+        evidence["revision_after"] = f"live:scope:{result['scope_post']}"
+    evidence["matches"] = matches
+    evidence["comments_removed"] = result.get("comments_removed", [])
+    return evidence
+
+
+# ---------------------------------------------------------------------------
+# replace_text_batch (issue #82): N live replaces, one hash chain, one audit record.
+#
+# The edits run strictly in order; edit k is sent with expectedBodySha256 = the body hash
+# edit k-1 produced, so the pane itself refuses ("stale", nothing written) if anything moved
+# between two edits. The first failure stops the batch and nothing is ever retried: after a
+# failure the caller cannot tell whether an op landed unless the failure is a KNOWN
+# pre-write refusal, so only an explicit allowlist counts as "refused_before_write" -- every
+# other failure is "unknown" and the caller must re-read the document before doing anything.
+# Section locks: the shared broker drops body-hash checks for a client holding section locks
+# (live/shared.py), so the hash chain may not be enforced there (docs/live-mode.md).
+# ---------------------------------------------------------------------------
+
+LIVE_BATCH_MAX_EDITS = 50
+
+# Codes (local or pane-side) that prove the pane refused BEFORE touching the document.
+_BATCH_REFUSED_CODES = frozenset(
+    {
+        ErrorCode.LIVE_STALE,
+        ErrorCode.MATCH_COUNT_MISMATCH,
+        ErrorCode.ZERO_MATCH,
+        ErrorCode.ANCHORED_SHAPES,
+        ErrorCode.WOULD_DELETE_COMMENTS,
+        ErrorCode.LIVE_CAPABILITY_MISSING,
+        ErrorCode.LOCKED_BY_OTHER_CLIENT,
+        ErrorCode.OUTSIDE_LOCKED_SECTION,
+        ErrorCode.INVALID_INPUT,
+    }
+)
+_BATCH_REFUSED_PANE_CODES = frozenset(
+    {"LOCK_SCOPE_UNRESOLVED", "WOULD_DELETE_COMMENTS", "ANCHORED_SHAPES", "zero_match", "match_count_mismatch", "stale"}
+)
+
+
+def _batch_refused_before_write(exc: VerifyError) -> bool:
+    env = exc.envelope
+    if env.error_code in _BATCH_REFUSED_CODES:
+        return True
+    return env.error_code == ErrorCode.LIVE_OP_FAILED and env.diagnostics.get("pane_code") in _BATCH_REFUSED_PANE_CODES
+
+
+def _validate_batch_edits(edits: Any) -> list[dict[str, Any]]:
+    if not isinstance(edits, list) or not 1 <= len(edits) <= LIVE_BATCH_MAX_EDITS:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT, f"edits must be a list of 1..{LIVE_BATCH_MAX_EDITS} edit objects"
+        )
+    out: list[dict[str, Any]] = []
+    for i, edit in enumerate(edits):
+        if not isinstance(edit, dict):
+            raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}] must be an object")
+        if "allow_comment_loss" in edit:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"edits[{i}]: allow_comment_loss is not accepted in a batch; use allow_comment_loss_ids",
+            )
+        unknown = set(edit) - {"find", "replace", "expected_matches", "allow_comment_loss_ids"}
+        if unknown:
+            raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}]: unknown key(s) {sorted(unknown)}")
+        find, replace, expected = edit.get("find"), edit.get("replace"), edit.get("expected_matches")
+        if not isinstance(find, str) or not find:
+            raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}].find must be a non-empty string")
+        if not isinstance(replace, str):
+            raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}].replace must be a string")
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 1:
+            raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}].expected_matches must be a positive integer")
+        try:
+            ids = validate_comment_loss_ids(edit.get("allow_comment_loss_ids"))
+        except VerifyError as exc:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT, f"edits[{i}]: {exc.envelope.message}", exc.envelope.diagnostics
+            ) from exc
+        out.append({"find": find, "replace": replace, "expected_matches": expected, "allow_comment_loss_ids": ids})
+    return out
+
+
+def execute_replace_text_batch_live(
+    path: str,
+    edits: list[dict[str, Any]],
+    revision_before: str,
+    *,
+    write_mode: str = "live",
+    track_changes: bool = False,
+    inherit_format: str = "replaced",
+) -> dict[str, Any]:
+    """Live-only ``replace_text_batch`` (issue #82); see the block comment above.
+
+    Returns ``{batch_status, results, revision_before, revision_after, applied, ...}``.
+    ``batch_status`` is ``complete`` / ``partial`` / ``none_applied`` / ``unknown``;
+    each result's ``status`` is ``applied`` / ``refused_before_write`` / ``unknown`` /
+    ``not_attempted``. ``revision_after`` is the last applied edit's body hash, the original
+    one when nothing applied, and ``None`` when the outcome is unknown. Argument errors, a
+    missing pane, or a disconnect before the first op raise instead (nothing was sent).
+    """
+    if write_mode not in ("auto", "live"):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "replace_text_batch is live-only: write_mode must be 'live' (or 'auto' with a connected pane)",
+        )
+    if inherit_format not in ("replaced", "previous", "none"):
+        raise _make_error(ErrorCode.INVALID_INPUT, "Invalid inherit_format")
+    if not isinstance(revision_before, str) or not revision_before.startswith("live:sha256:"):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT, "revision_before must be a 'live:sha256:<hex>' revision from a live read"
+        )
+    checked = _validate_batch_edits(edits)
+
+    session = live_write_mode.live_session_for(path)
+    document_name = session.document_name
+    _require_live_replace_capabilities(
+        session,
+        within_row_containing=None,
+        allow_comment_loss_ids=[] if any(e["allow_comment_loss_ids"] is not None for e in checked) else None,
+    )
+
+    try:
+        pre_hash = session.request_threadsafe("describe")["bodySha256"]
+    except LiveDisconnected as exc:
+        raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+
+    results: list[dict[str, Any]] = []  # public: evidence per edit
+    audit_results: list[dict[str, Any]] = []  # audit: no document text (audit redaction is top-level only)
+    current = pre_hash
+    applied_count = 0
+    unknown = False
+
+    def _record(i: int, status: str, *, code: str | None = None, evidence: dict[str, Any] | None = None) -> None:
+        entry: dict[str, Any] = {"index": i, "status": status}
+        if code is not None:
+            entry["code"] = code
+        if evidence is not None:
+            entry["evidence"] = evidence
+        results.append(entry)
+        audit_entry = {k: v for k, v in entry.items() if k != "evidence"}
+        if evidence is not None:
+            audit_entry["evidence"] = {k: v for k, v in evidence.items() if k not in ("before", "after")}
+        audit_results.append(audit_entry)
+
+    try:
+        live_write_mode.check_not_stale(revision_before, pre_hash)
+    except VerifyError as exc:
+        _record(0, "refused_before_write", code=exc.envelope.error_code.value)
+        for i in range(1, len(checked)):
+            _record(i, "not_attempted")
+        return _finish_batch(
+            path, document_name, results, audit_results, pre_hash, pre_hash, 0,
+            unknown=False, total=len(checked), revision_before=revision_before,
+        )
+
+    for i, edit in enumerate(checked):
+        if unknown or (results and results[-1]["status"] in ("refused_before_write", "not_attempted")):
+            _record(i, "not_attempted")
+            continue
+        try:
+            result = _live_replace_once(
+                session,
+                find=edit["find"],
+                replace=edit["replace"],
+                expected_matches=edit["expected_matches"],
+                pre_hash=current,
+                track_changes=track_changes,
+                allow_comment_loss_ids=edit["allow_comment_loss_ids"],
+                inherit_format=inherit_format,
+            )
+        except VerifyError as exc:
+            code = exc.envelope.error_code.value
+            if _batch_refused_before_write(exc):
+                _record(i, "refused_before_write", code=code)
+            else:
+                unknown = True
+                _record(i, "unknown", code=code)
+            continue
+        except Exception:  # noqa: BLE001 - after dispatch, any other failure leaves the outcome unknown
+            unknown = True
+            _record(i, "unknown", code=ErrorCode.LIVE_OP_FAILED.value)
+            continue
+        matches = result.get("matches") or []
+        applied_count += 1
+        current = result["post"]
+        ev: dict[str, Any] = {
+            "match_count": result.get("match_count", len(matches)),
+            "before": "\n".join(m.get("before", "") for m in matches),
+            "after": "\n".join(m.get("after", "") for m in matches),
+            "revision_after": f"live:sha256:{current}",
+            "comments_removed": result.get("comments_removed", []),
+        }
+        ev.update(live_write_mode.shape_counts(result))
+        _record(i, "applied", evidence=ev)
+
+    return _finish_batch(
+        path, document_name, results, audit_results, pre_hash, current, applied_count,
+        unknown=unknown, total=len(checked), revision_before=revision_before,
+    )
+
+
+def _finish_batch(
+    path: str,
+    document_name: str,
+    results: list[dict[str, Any]],
+    audit_results: list[dict[str, Any]],
+    pre_hash: str,
+    current_hash: str,
+    applied_count: int,
+    *,
+    unknown: bool,
+    total: int,
+    revision_before: str,
+) -> dict[str, Any]:
+    if unknown:
+        batch_status = "unknown"
+    elif applied_count == total:
+        batch_status = "complete"
+    elif applied_count == 0:
+        batch_status = "none_applied"
+    else:
+        batch_status = "partial"
+    evidence = live_write_mode.live_evidence(
+        applied=batch_status == "complete",
+        match_count=sum(r["evidence"]["match_count"] for r in results if r["status"] == "applied"),
+        rung=2,
+        before="",
+        after="",
+        pre_body_sha256=pre_hash,
+        post_body_sha256=None if unknown else current_hash,
+        document_name=document_name,
+        tool="replace_text_batch",
+        path=path,
+        extra={
+            "batch_status": batch_status,
+            "applied_count": applied_count,
+            "edit_count": total,
+            "results": audit_results,
+        },
+    )
+    evidence["batch_status"] = batch_status
+    evidence["applied_count"] = applied_count
+    evidence["edit_count"] = total
+    evidence["results"] = results
+    # Echo the caller's own token (it may name an older body than the pane's describe on a stale start).
+    evidence["revision_before"] = revision_before
+    return evidence
 
 
 # ---------------------------------------------------------------------------
@@ -915,13 +1291,6 @@ def execute_replace_text_live(
 # identical `find` text remain inseparable -- a named, documented
 # limitation (see server.py's docstrings), not solved here.
 # ---------------------------------------------------------------------------
-
-    if scope_info:
-        evidence["revision_before"] = f"live:scope:{scope_info['scopeSha256']}"
-        evidence["revision_after"] = f"live:scope:{result['scope_post']}"
-    evidence["matches"] = matches
-    evidence["comments_removed"] = result.get("comments_removed", [])
-    return evidence
 
 
 def _paragraph_by_ref(proj: projection.Projection) -> dict[str, projection.ParagraphMeta]:
@@ -1013,8 +1382,20 @@ def execute_replace_text(
     allow_comment_loss: bool = False,
     inherit_format: str = "replaced",
     scope: str = "body",
+    allow_comment_loss_ids: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    allow_comment_loss_ids = validate_comment_loss_ids(allow_comment_loss_ids)
+    if allow_comment_loss and allow_comment_loss_ids is not None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT, "allow_comment_loss and allow_comment_loss_ids are mutually exclusive"
+        )
     mode = live_write_mode.resolve_write_mode(path, write_mode)
+    if allow_comment_loss_ids is not None and mode != "live":
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "allow_comment_loss_ids is live-only (it needs the Word pane's comment guard); in file mode "
+            "use allow_comment_loss=True or write_mode=\"live\"",
+        )
     if mode == "live":
         return execute_replace_text_live(
             path,
@@ -1026,6 +1407,7 @@ def execute_replace_text(
             within_row_containing=within_row_containing,
             scope=scope,
             allow_comment_loss=allow_comment_loss,
+            allow_comment_loss_ids=allow_comment_loss_ids,
             inherit_format=inherit_format,
         )
 
@@ -1176,6 +1558,17 @@ def execute_format_text_live(
         payload["rowAnchor"] = within_row_containing
     try:
         result = session.request_threadsafe("format", payload, expected_body_sha256=pre_hash)
+    except LiveStaleAfterWrite as exc:
+        error = _make_error(
+            ErrorCode.LIVE_STALE_AFTER_WRITE,
+            "the pane applied the format, but its body hash before the op differed from the one "
+            "this call expected: the write ALREADY LANDED -- do not retry; re-read the live document.",
+            {"expected": exc.expected, "actual": exc.actual},
+        )
+        _audit_stale_after_write(
+            error, tool="format_text", path=path, document_name=session.document_name, pre_hash=pre_hash
+        )
+        raise error from exc
     except LiveStale as exc:
         raise _make_error(
             ErrorCode.LIVE_STALE, str(exc), {"expected": exc.expected, "actual": exc.actual}
