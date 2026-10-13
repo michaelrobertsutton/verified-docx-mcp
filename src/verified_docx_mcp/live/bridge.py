@@ -56,16 +56,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import dataclasses
 import errno
 import functools
 import http.server
+import itertools
 import json
 import ssl
 import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +99,77 @@ DEFAULT_CERT_DIR = Path.home() / ".cache" / "verified-docx-mcp" / "live-cert"
 DEFAULT_REPORT_DIR = Path.home() / ".cache" / "verified-docx-mcp" / "live-report"
 CERT_FILENAME = "localhost.pem"
 KEY_FILENAME = "localhost-key.pem"
+
+# issue #84: one entry per pane boot (every `POST /report`), kept per process.
+# In shared mode the HTTP server runs only in the OWNER process, so clients read
+# this through the broker's `status` response (live/shared.py), not directly.
+_BOOT_LOG: collections.deque[dict[str, Any]] = collections.deque(maxlen=200)
+_BOOT_LOG_LOCK = threading.Lock()
+
+
+def record_boot(report: Any) -> None:
+    """Remember that a pane booted. Never raises: diagnostics must not fail a report."""
+    try:
+        if not isinstance(report, dict):
+            return
+        url = report.get("documentUrl")
+        events = report.get("previous_events")
+        kinds = (
+            sorted({str(e.get("kind")) for e in events if isinstance(e, dict) and e.get("kind")})
+            if isinstance(events, list)
+            else []
+        )
+        entry = {
+            "monotonic": time.monotonic(),
+            "received_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "documentUrl": url if isinstance(url, str) else None,
+            "boot_seq": report.get("boot_seq"),
+            "load_error": bool(report.get("load_error")),
+            "previous_event_kinds": kinds,
+        }
+        with _BOOT_LOG_LOCK:
+            _BOOT_LOG.append(entry)
+    except Exception:  # noqa: BLE001 - best-effort diagnostics
+        return
+
+
+def recent_boots(window_s: float = 300) -> list[dict[str, Any]]:
+    """Boots received in the last ``window_s`` seconds, grouped by document basename.
+
+    Each group: ``document_name``, ``count``, ``avg_interval_s`` (None below two
+    boots), ``previous_event_kinds`` (union) and ``boots`` (oldest first, each with
+    ``age_s`` so a caller in another process needs no shared clock).
+    """
+    now = time.monotonic()
+    with _BOOT_LOG_LOCK:
+        entries = [e for e in _BOOT_LOG if now - e["monotonic"] <= window_s]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for e in entries:
+        name = document_name_from_url(e["documentUrl"]) if e["documentUrl"] else "(unknown)"
+        groups.setdefault(name, []).append(e)
+    out: list[dict[str, Any]] = []
+    for name, items in groups.items():
+        times = [e["monotonic"] for e in items]
+        gaps = [b - a for a, b in itertools.pairwise(times)]
+        out.append(
+            {
+                "document_name": name,
+                "count": len(items),
+                "avg_interval_s": round(sum(gaps) / len(gaps), 1) if gaps else None,
+                "previous_event_kinds": sorted({k for e in items for k in e["previous_event_kinds"]}),
+                "boots": [
+                    {
+                        "received_at": e["received_at"],
+                        "age_s": round(now - e["monotonic"], 1),
+                        "boot_seq": e["boot_seq"],
+                        "load_error": e["load_error"],
+                        "previous_event_kinds": e["previous_event_kinds"],
+                    }
+                    for e in items
+                ],
+            }
+        )
+    return out
 
 
 def trust_command(cert_path: Path) -> str:
@@ -170,6 +244,7 @@ class _AddinRequestHandler(http.server.SimpleHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             self._send_json(400, {"ok": False, "error": f"body is not JSON: {exc}"})
             return
+        record_boot(report)
         self._report_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%dT%H%M%S")
         stamped = self._report_dir / f"report-{stamp}.json"

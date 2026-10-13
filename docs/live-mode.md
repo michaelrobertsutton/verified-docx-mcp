@@ -1415,6 +1415,42 @@ on Office for Mac and it needs admin deployment. A shared-runtime startup
 behaviour (`Office.addin.setStartupBehavior`) is also document-scoped and was
 not tried.
 
+### Pane reload loops (#84)
+
+On a SharePoint-synced, co-authored document the pane was seen opening, connecting
+and then reloading every 7 to 20 s, while a local copy stayed connected. The cause is
+not established; the pane now records enough to find it next time.
+
+What is recorded:
+
+- **In the pane** (`taskpane.js`): a ring buffer of the last 50 events (`error`,
+  `unhandledrejection`, `pagehide`, `beforeunload`, `visibilitychange`, `load_error`,
+  `boot`), each `{t, kind, message, stack}`, kept in `sessionStorage` key
+  `vdm_pane_events`. The next load of the pane reads it back, clears it, and sends it
+  as `previous_events` in its boot report. A reload that Word triggers shows up as a
+  `pagehide`/`beforeunload` (or an `error` just before it) at the end of that list.
+- **In the boot report** (`POST /report`, saved to
+  `~/.cache/verified-docx-mcp/live-report/latest.json` and a `report-<stamp>.json`):
+  `boot_seq` (a counter in `localStorage` key `vdm_boot_seq`, +1 per load),
+  `instance_id`, `previous_events`, and `boot_ms` (`office_ready`, `report_build`,
+  `ws_connect`; `null` until reached).
+- **Failures do not stop the pane.** The ops socket connects first and independently of
+  the report. The report build has a 15 s limit; if it throws or times out, a minimal
+  report `{generated_at, documentUrl, load_error, boot_seq, instance_id,
+  previous_events, boot_ms}` is posted instead.
+- **In the bridge** (`live/bridge.py`): every `POST /report` is logged in memory (last
+  200). `live_status` returns `recent_boots` (last 300 s, grouped by document file
+  name: `count`, `avg_interval_s`, `previous_event_kinds`, per-boot `age_s`,
+  `boot_seq`, `load_error`). In shared mode this comes from the owner process.
+
+When 3 or more boots of the same document arrive within 120 s, `live_status` adds a
+`warnings` entry with `code: "pane_reload_loop"` naming the document, the count, the
+average interval and the `previous_event_kinds` seen.
+
+If you see it: read `previous_events` in `latest.json`, copy the document to a local
+folder (not OneDrive/SharePoint-synced), open that copy, and see whether the loop
+stops. Report either result on issue #84, with the `previous_events`.
+
 ## Shared bridge: several agent sessions, one Word pane (#47)
 
 On by default on POSIX (macOS/Linux). Every MCP server process elects one owner for
