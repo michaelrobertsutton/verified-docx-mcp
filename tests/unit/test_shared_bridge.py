@@ -717,3 +717,47 @@ def test_sigterm_terminates_stdio_server():
         if proc.poll() is None:
             proc.kill()
         proc.communicate()
+
+
+def test_preflight_guard_refusal_does_not_invalidate_baselines(setup_broker):
+    pane, _, a, b, call = setup_broker
+    call(a)
+    call(b)
+    real = pane.request_threadsafe
+
+    def refuse(op, payload=None, **kwargs):
+        if op == "replace":
+            raise LiveOpFailed("ANCHORED_SHAPES", "paragraph anchors a shape")
+        return real(op, payload, **kwargs)
+
+    pane.request_threadsafe = refuse
+    with pytest.raises(LiveOpFailed, match="ANCHORED_SHAPES"):
+        call(a, "replace")
+    pane.request_threadsafe = real
+    call(a, "replace")  # nothing was written, so neither client needs a fresh read
+
+
+def test_lone_client_may_write_without_a_prior_read():
+    pane = Pane()
+    registry = SimpleNamespace(
+        get=lambda name: pane if name == pane.document_name else None,
+        list=lambda: [pane],
+        collisions=list,
+    )
+    broker = shared.Broker(registry)
+    only = broker.dispatch({"action": "attach"})["client_id"]
+    request = {
+        "action": "request",
+        "client_id": only,
+        "document_name": pane.document_name,
+        "document_url": pane.document_url,
+        "connected_since": pane.connected_since,
+        "op": "replace",
+    }
+    broker.dispatch(request)
+    assert [op for op, _ in pane.calls] == ["describe", "replace"]
+    assert pane.calls[-1][1]["expectedBodySha256"] == "initial"
+    # A second client attaching restores the strict rule for a client that never read.
+    other = broker.dispatch({"action": "attach"})["client_id"]
+    with pytest.raises(LiveOpFailed, match="LIVE_STALE"):
+        broker.dispatch({**request, "client_id": other})

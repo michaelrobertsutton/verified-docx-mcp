@@ -53,6 +53,9 @@ PRE_MUTATION_REFUSALS = frozenset(
         "LIVE_CAPABILITY_MISSING",
         "zero_match",
         "match_count_mismatch",
+        # Preflight guards in the pane: they refuse before any write is attempted.
+        "ANCHORED_SHAPES",
+        "WOULD_DELETE_COMMENTS",
     }
 )
 MAX_FRAME = 72 * 2**20  # body_ooxml can return 48 MiB, with JSON escaping
@@ -266,6 +269,7 @@ class Broker:
             payload.pop("ownSections", None)
             with self.mutex:
                 version = self.versions.get(key, 0)
+                lone = set(self.clients) <= {client_id}
                 held = self.section_locks.get(key, {})
                 own = {s: v for s, v in held.items() if v["client_id"] == client_id}
                 forbidden = [s for s, v in held.items() if v["client_id"] != client_id]
@@ -276,7 +280,14 @@ class Broker:
                         )
                     # A section-lock holder is confined to its sections and checked per
                     # section, so other clients' edits elsewhere never stale it.
-                    if not own and self.seen.get((client_id, key)) != version:
+                    # A lone client has nobody to race, so a write that never read first
+                    # takes an implicit baseline below (shared mode is the default, and
+                    # a solo session must behave like local mode).
+                    if (
+                        not own
+                        and self.seen.get((client_id, key)) != version
+                        and not (lone and (client_id, key) not in self.seen)
+                    ):
                         raise LiveOpFailed(
                             "LIVE_STALE", "Read the live document after the other client's write"
                         )
@@ -304,6 +315,8 @@ class Broker:
                     if not expected:
                         with self.mutex:
                             expected = self.hashes.get((client_id, key))
+                    if not expected and lone:
+                        expected = session.request_threadsafe("describe", timeout=timeout)["bodySha256"]
                     if not expected:
                         raise LiveOpFailed(
                             "LIVE_STALE", "Read the live document body before a shared write"
