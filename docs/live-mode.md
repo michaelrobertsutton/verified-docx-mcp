@@ -615,6 +615,63 @@ The pane logic is tested against a mock only
 (`tests/unit/js/paragraph_insert_harness.mjs`); the real-Word checklist is
 [`docs/acceptance/77-insert-paragraphs.md`](acceptance/77-insert-paragraphs.md).
 
+## Live table clean-up (issue #79)
+
+Found by inserting a table live: a new table can inherit list numbering, and
+there was no live way to undo or tidy a table. `taskpane.js?v=57`; all three new
+pane capabilities must appear in `live_status` (reload the pane otherwise).
+
+- **Numbering on a new table.** `insert_table` anchored after a numbered paragraph
+  used to leave every cell paragraph numbered. The pane now loads the new table's
+  paragraphs (`table.getRange().paragraphs`, `isListItem`), calls
+  `Paragraph.detachFromList()` (WordApi 1.3) on each list item, syncs, and
+  recounts. It reports `list_items_in_table` (the count AFTER detaching) and the
+  server fails `VERIFICATION_FAILED` when the field is present and above 0. A pane
+  that does not report the field is not failed (it is just older). The detach runs
+  inside the same tracking window as the insert; the anchor paragraph is never
+  written.
+- **`clear_numbering(path, table_id | paragraph_text, revision_before, write_mode="live")`**
+  (live only; capability `paragraphs_unlist`). Exactly one scope: every list-item
+  paragraph of one table, or the single paragraph whose WHOLE text equals
+  `paragraph_text` (`MATCH_COUNT_MISMATCH` unless exactly one does). Text never
+  changes, so the body hash must not move. Refused when tracked changes touch the
+  scope (`TRACKED_CHANGES_PRESENT`) or a section lock covers it. Evidence adds
+  `unlisted`; `0` is a verified no-op. The pane skips the comment guard because
+  detaching a list leaves comment anchors alone.
+- **`delete_table(path, table_id, expected_text, revision_before, track_changes=False, write_mode="live")`**
+  (live only; capability `table_delete`). `table_id` is the `list_tables` number
+  among top-level tables (a document with a nested table is refused).
+  `expected_text` is the table's text as `get_table` reports it, cells of a row
+  joined by a tab and rows by a newline; the comparison collapses whitespace and
+  straightens quotes, and a mismatch refuses `CELL_TEXT_MISMATCH` before any write.
+  Also refused for a table that anchors a shape (`ANCHORED_SHAPES`), overlaps
+  comments (`WOULD_DELETE_COMMENTS`) or contains tracked changes. Read-back: the
+  table count dropped by exactly one and the top-level paragraph texts are
+  unchanged. With `track_changes=true` Word keeps the table marked as deleted, so
+  the count is allowed to stay the same.
+- **`accept_tracked_changes` / `reject_tracked_changes` with `table_id`** (live
+  only; capability `revisions_scoped`). Accepts or rejects only what is inside that
+  table, through `table.getRange().getTrackedChanges().acceptAll()/rejectAll()`.
+  Mutually exclusive with `revision_ids`; file mode refuses it. An older pane
+  ignores `table_index` and treats a missing `revision_ids` as "all", so the
+  server checks the capability BEFORE sending (`LIVE_CAPABILITY_MISSING`), and the
+  pane itself refuses a scoped request when it cannot read the body OOXML. Like the
+  document-wide path it is refused while a section lock is held, and by the
+  anchored-shape check when shapes exist. Verification is from the body OOXML
+  (the API list undercounts): no revision remains inside the table, and the
+  multiset of revisions outside it (kind, author, text) is unchanged. Rejecting a
+  tracked table insertion removes the table; the result then carries
+  `table_removed: true` and the outside revisions are compared against the
+  whole document.
+- **Tracked insert, then reject.** The pane never writes to the anchor paragraph
+  in `table_insert`, and a scoped reject touches only the table's own revisions,
+  so the anchor's paragraph and run formatting stay as they were
+  (`tests/unit/js/tables_harness.mjs`, "anchor #79" checks).
+
+Mock-only tests: `tests/unit/js/tables_harness.mjs`,
+`tests/unit/test_live_table_cleanup.py`. The real-Word checklist is
+[`docs/acceptance/79-live-table-cleanup.md`](acceptance/79-live-table-cleanup.md).
+
 ## WP-1 result (2026-09-16, Word for Mac 16.112.4)
 
 Recorded from the issue's WP-1 comment

@@ -229,6 +229,8 @@ def _raise_from_live_error(exc: BaseException) -> None:
         if (code or "").strip().lower() in ("stale", "live_stale"):
             # the pane refused before writing (body hash moved)
             raise _make_error(ErrorCode.LIVE_STALE, exc.message, {"pane_error_code": code}) from exc
+        if (code or "").strip().lower() == "table_not_found":
+            raise _make_error(ErrorCode.TABLE_NOT_FOUND, exc.message, {"pane_error_code": code}) from exc
         if code in ErrorCode.__members__:
             raise _make_error(ErrorCode[code], exc.message, {"pane_error_code": code}) from exc
         if code == OP_ERROR_ZERO_MATCH:

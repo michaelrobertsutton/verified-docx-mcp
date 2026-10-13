@@ -61,6 +61,9 @@ OP_TIMEOUTS: dict[str, float] = {
     "revisions_list": 60.0,
     "revisions_accept": 60.0,
     "revisions_reject": 60.0,
+    # #79: both walk every paragraph/cell of a table and re-read the body.
+    "paragraphs_unlist": 60.0,
+    "table_delete": 60.0,
 }
 
 TIMEOUT_ENV = "VERIFIED_DOCX_LIVE_TIMEOUT_S"
@@ -301,7 +304,8 @@ class LiveSession:
         class."""
         guarded = {"replace", "format", "cell_set", "cells_set", "table_insert",
                    "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
-                   "comment_add", "comment_reply", "comment_resolve", "comment_delete", "save"}
+                   "comment_add", "comment_reply", "comment_resolve", "comment_delete", "save",
+                   "paragraphs_unlist", "table_delete"}
         if op in guarded and "shape_guard" not in self.hello.capabilities:
             raise LiveOpFailed("LIVE_CAPABILITY_MISSING",
                                "Reload the live pane: anchored-shape protection is required")

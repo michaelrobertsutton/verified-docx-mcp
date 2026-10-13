@@ -1295,6 +1295,14 @@ def execute_insert_table_live(
     )
     if style_builtin is not None and not table.get("style"):
         problems.append("the built-in table style did not take (the table reports no style)")
+    # Issue #79: cells inherit the anchor's list numbering unless the pane detaches it. Only a pane
+    # that reports the field is judged (an older pane omits it and must not fail).
+    listed = result.get("list_items_in_table")
+    if isinstance(listed, int) and not isinstance(listed, bool) and listed > 0:
+        problems.append(
+            f"{listed} cell paragraph(s) in the new table are still list items (numbering inherited from "
+            "the anchor); call clear_numbering with this table_id to remove it"
+        )
     if problems:
         raise _fail_live_verification(
             tool="insert_table", path=path, document_name=document_name, pre_hash=pre_hash,
@@ -1315,6 +1323,8 @@ def execute_insert_table_live(
         path=path,
     )
     evidence["table_id"] = new_table_id
+    if "list_items_in_table" in result:
+        evidence["list_items_in_table"] = result["list_items_in_table"]
     evidence["merged_cells"] = 0
     evidence["anchor_resolved"] = anchor_resolved
     return evidence

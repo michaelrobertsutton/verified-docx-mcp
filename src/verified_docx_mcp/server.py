@@ -2121,6 +2121,7 @@ def accept_tracked_changes(
     force: bool = False,
     write_mode: str = "auto",
     allow_concurrent_editor: bool = False,
+    table_id: int | None = None,
 ) -> dict[str, Any]:
     """Accept tracked changes (w:ins/w:del), atomically -- all of them, or
     only the ids named in revision_ids (from list_open_items'
@@ -2130,6 +2131,16 @@ def accept_tracked_changes(
     (the wrapper is removed, the text stays). Accepting a w:del makes the
     deletion permanent (the w:del element and its w:delText content are
     removed outright).
+
+    table_id (live only, issue #79): accept only the tracked changes inside
+    that table (list_tables numbering), leaving every other tracked change in
+    the document alone. Mutually exclusive with revision_ids; file mode refuses
+    it (LIVE_UNAVAILABLE); an older pane without the `revisions_scoped`
+    capability refuses it (LIVE_CAPABILITY_MISSING) rather than touching the
+    whole document. Like the document-wide live path it is refused while a
+    section lock is held. The pane verifies from the body OOXML that no
+    revision remains in the table and that the revisions outside it are
+    unchanged.
 
     Same guard/atomic-write mechanics as replace_text (lock_status first,
     then revision_before; a temp file OPC-validated before the original is
@@ -2158,8 +2169,12 @@ def accept_tracked_changes(
     try:
         from .live.revisions_live import mutate_revisions
 
+        if table_id is not None:
+            from .live import write_mode as live_write_mode
+
+            live_write_mode.require_live_only(path, write_mode, tool="accept_tracked_changes(table_id=...)")
         if comments_live._resolve_write_mode(path, write_mode) == "live":
-            return mutate_revisions(path, "accept", revision_ids, revision_before)
+            return mutate_revisions(path, "accept", revision_ids, revision_before, table_id)
         return tracked_changes.execute_accept_tracked_changes(
             path,
             revision_ids,
@@ -2179,6 +2194,7 @@ def reject_tracked_changes(
     force: bool = False,
     write_mode: str = "auto",
     allow_concurrent_editor: bool = False,
+    table_id: int | None = None,
 ) -> dict[str, Any]:
     """Reject tracked changes (w:ins/w:del), atomically -- all of them, or
     only the ids named in revision_ids.
@@ -2188,6 +2204,10 @@ def reject_tracked_changes(
     w:delText inside it is renamed back to w:t and the w:del wrapper is
     removed, so the previously-deleted text becomes live again).
 
+    table_id (live only, issue #79): reject only the tracked changes inside
+    that table. Rejecting a tracked table insertion removes the table; the
+    evidence then carries table_removed=true. See accept_tracked_changes.
+
     Same guard/atomic-write mechanics and evidence shape as
     accept_tracked_changes -- see that tool's docstring.
 
@@ -2196,8 +2216,12 @@ def reject_tracked_changes(
     try:
         from .live.revisions_live import mutate_revisions
 
+        if table_id is not None:
+            from .live import write_mode as live_write_mode
+
+            live_write_mode.require_live_only(path, write_mode, tool="reject_tracked_changes(table_id=...)")
         if comments_live._resolve_write_mode(path, write_mode) == "live":
-            return mutate_revisions(path, "reject", revision_ids, revision_before)
+            return mutate_revisions(path, "reject", revision_ids, revision_before, table_id)
         return tracked_changes.execute_reject_tracked_changes(
             path,
             revision_ids,
@@ -3815,6 +3839,63 @@ def delete_paragraph(path: str, anchor_text: str, revision_before: str,
 
     try:
         return execute(path, anchor_text, revision_before, track_changes)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def clear_numbering(
+    path: str,
+    table_id: int | None = None,
+    paragraph_text: str | None = None,
+    revision_before: str | None = None,
+    write_mode: str = "live",
+) -> dict[str, Any]:
+    """Remove list numbering/bullets from existing live content (issue #79).
+
+    LIVE ONLY: edits the document open in Word through the Live pane; file mode
+    refuses (LIVE_UNAVAILABLE). Pass exactly one of table_id (every list-item
+    paragraph in that table, list_tables numbering) or paragraph_text (the one
+    top-level-or-cell paragraph whose WHOLE text equals it; MATCH_COUNT_MISMATCH
+    unless exactly one does). Text is never changed. Refused while tracked
+    changes touch the scope (TRACKED_CHANGES_PRESENT) or a section lock covers
+    it. The pane re-reads the scope and the server fails VERIFICATION_FAILED
+    unless no list item remains. Evidence adds `unlisted` (how many paragraphs
+    were detached; 0 is a verified no-op).
+    """
+    from .live.paragraphs_live import clear_numbering as execute
+
+    try:
+        return execute(path, table_id, paragraph_text, revision_before, write_mode)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def delete_table(
+    path: str,
+    table_id: int,
+    expected_text: str,
+    revision_before: str | None = None,
+    track_changes: bool = False,
+    write_mode: str = "live",
+) -> dict[str, Any]:
+    """Delete one live top-level table (issue #79).
+
+    LIVE ONLY (file mode refuses with LIVE_UNAVAILABLE). table_id is the
+    list_tables / get_table number. expected_text must equal the table's current
+    text as get_table reports it: cells of a row joined by a tab, rows joined by
+    a newline (whitespace-insensitive, quote-normalized); a mismatch refuses
+    with CELL_TEXT_MISMATCH and nothing is written. Refused for tables that
+    anchor a shape, overlap comments, or contain tracked changes. The pane then
+    verifies the table count dropped by exactly one and that no paragraph
+    outside the table changed. With track_changes=true the table is only marked
+    deleted until the change is accepted.
+    """
+    from .live.paragraphs_live import delete_table as execute
+
+    try:
+        return execute(path, table_id, expected_text, revision_before, track_changes, write_mode)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

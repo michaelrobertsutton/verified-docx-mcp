@@ -167,7 +167,11 @@ def _markup_revisions(xml: str, epoch: str) -> list[dict[str, Any]]:
 
 
 def mutate_revisions(path: str, action: str, ids: list[str] | None,
-                     revision_before: str | None) -> dict[str, Any]:
+                     revision_before: str | None, table_id: int | None = None) -> dict[str, Any]:
+    if table_id is not None and ids is not None:
+        raise _make_error(ErrorCode.INVALID_INPUT, "table_id and revision_ids are mutually exclusive")
+    if table_id is not None and (isinstance(table_id, bool) or not isinstance(table_id, int) or table_id < 1):
+        raise _make_error(ErrorCode.INVALID_INPUT, f"table_id must be a positive integer, got {table_id!r}")
     if ids and any(i.startswith("revision-ooxml:") for i in ids):
         raise _make_error(ErrorCode.LIVE_CAPABILITY_MISSING,
                           "OOXML-only revisions cannot be edited individually; use accept/reject-all")
@@ -175,10 +179,27 @@ def mutate_revisions(path: str, action: str, ids: list[str] | None,
     write_mode.require_capability(session, "live_revisions", feature_description="live revisions")
     if ids is not None and (not ids or len(ids) != len(set(ids))):
         raise _make_error(ErrorCode.INVALID_INPUT, "revision_ids must be nonempty and unique")
+    if table_id is not None:
+        # An older pane ignores table_index and treats a missing revision_ids as "all": it must
+        # never receive a scoped request, so the capability is checked BEFORE anything is sent.
+        write_mode.require_capability(session, "revisions_scoped", feature_description="table-scoped revisions")
     pre = comments_live._request(session, "describe")["bodySha256"]
     write_mode.check_not_stale(revision_before, pre)
-    result = comments_live._request(session, f"revisions_{action}",
-                                    {"revision_ids": ids, "expectedBodySha256": pre})
+    payload: dict[str, Any] = {"revision_ids": ids, "expectedBodySha256": pre}
+    if table_id is not None:
+        payload["table_index"] = table_id
+    result = comments_live._request(session, f"revisions_{action}", payload)
+    if table_id is not None:
+        problems = [] if result.get("scoped") is True else ["the pane did not confirm a table-scoped result"]
+        if result.get("after_count"):
+            problems.append(f"{result['after_count']} revision(s) remain inside table {table_id}")
+        if problems:
+            write_mode.audit_live_failure(
+                tool=f"{action}_tracked_changes", path=path, document_name=session.document_name,
+                pre_body_sha256=pre, post_body_sha256=result.get("post"), reason="; ".join(problems))
+            raise _make_error(ErrorCode.VERIFICATION_FAILED,
+                              "live table-scoped revision change did not verify: " + "; ".join(problems),
+                              {"result": result})
     evidence = write_mode.live_evidence(
         shape_result=result,
         applied=True, match_count=result["changed_count"], rung=1,
