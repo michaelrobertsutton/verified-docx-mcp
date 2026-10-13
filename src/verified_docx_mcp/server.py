@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import difflib
 import glob
+import itertools
 import json
 import os
 import re
@@ -705,7 +706,14 @@ def execute_live_status() -> dict[str, Any]:
     shared_status = registry.status() if hasattr(registry, "status") else None
     pid = os.getpid()
     owner_pid = shared_status.get("owner_pid", pid) if shared_status is not None else pid
-    return {
+    # Issue #84: pane boots are recorded where the HTTP server runs (the owner), so a
+    # shared client reads them from the broker status instead of its own process.
+    recent_boots = (
+        list(shared_status.get("recent_boots", []))
+        if shared_status is not None
+        else live_bridge.recent_boots()
+    )
+    result: dict[str, Any] = {
         "bridge_running": True,
         "pid": pid,
         "owner_pid": owner_pid,
@@ -723,7 +731,47 @@ def execute_live_status() -> dict[str, Any]:
         # rather than a silent misroute -- empty when none have happened.
         "session_collisions": registry.collisions(),
         "shared": shared_status,
+        "recent_boots": recent_boots,
     }
+    boot_warnings = _pane_reload_loop_warnings(recent_boots)
+    if boot_warnings:
+        result.setdefault("warnings", []).extend(boot_warnings)
+    return result
+
+
+_RELOAD_LOOP_BOOTS = 3
+_RELOAD_LOOP_WINDOW_S = 120
+
+
+def _pane_reload_loop_warnings(recent_boots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Issue #84: warn when one document's pane booted >= 3 times within 120 s."""
+    warnings: list[dict[str, Any]] = []
+    for group in recent_boots:
+        boots = [b for b in group.get("boots", []) if b.get("age_s", 1e9) <= _RELOAD_LOOP_WINDOW_S]
+        if len(boots) < _RELOAD_LOOP_BOOTS:
+            continue
+        ages = sorted((b["age_s"] for b in boots), reverse=True)
+        gaps = [a - b for a, b in itertools.pairwise(ages)]
+        avg = round(sum(gaps) / len(gaps), 1)
+        kinds = sorted({k for b in boots for k in b.get("previous_event_kinds", [])})
+        name = group.get("document_name", "(unknown)")
+        warnings.append(
+            {
+                "code": "pane_reload_loop",
+                "document_name": name,
+                "boots": len(boots),
+                "avg_interval_s": avg,
+                "previous_event_kinds": kinds,
+                "message": (
+                    f"The task pane for {name} booted {len(boots)} times in the last "
+                    f"{_RELOAD_LOOP_WINDOW_S} s (average interval {avg} s; previous_event_kinds "
+                    f"seen: {', '.join(kinds) or 'none'}). Word is reloading the pane. Check "
+                    "previous_events in ~/.cache/verified-docx-mcp/live-report/latest.json, try a "
+                    "local copy of the document, and report on issue #84."
+                ),
+            }
+        )
+    return warnings
 
 
 @mcp.tool()

@@ -237,6 +237,24 @@ class ServeOnlyTests(unittest.TestCase):
         self.assertEqual(len(stamped), 1)
         self.assertEqual(json.loads(stamped[0].read_text(encoding="utf-8")), report)
 
+    def test_post_report_records_a_boot_for_recent_boots(self):
+        import json
+
+        with bridge._BOOT_LOG_LOCK:
+            bridge._BOOT_LOG.clear()
+        report = {
+            "documentUrl": "https://contoso.sharepoint.com/x/Row01.docx",
+            "boot_seq": 3,
+            "load_error": "report build timed out",
+            "previous_events": [{"kind": "pagehide"}],
+        }
+        self.assertEqual(self._post("/report", json.dumps(report).encode("utf-8")).status, 200)
+        (group,) = bridge.recent_boots()
+        self.assertEqual(group["document_name"], "Row01.docx")
+        self.assertEqual(group["boots"][0]["boot_seq"], 3)
+        self.assertTrue(group["boots"][0]["load_error"])
+        self.assertEqual(group["previous_event_kinds"], ["pagehide"])
+
     def test_post_report_rejects_non_json(self):
         resp = self._post("/report", b"not json")
         self.assertEqual(resp.status, 400)

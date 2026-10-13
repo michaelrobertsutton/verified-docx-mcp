@@ -202,3 +202,75 @@ class OpCommentDeleteTests(unittest.TestCase):
     def test_still_present_is_reported_not_thrown(self):
         self.assertTrue(self.out["notDeleted"]["result"]["still_present"])
 
+
+BOOT_DIAGNOSTICS_HARNESS = Path(__file__).resolve().parent / "js" / "boot_diagnostics_harness.mjs"
+
+
+@unittest.skipUnless(NODE, "node not found on PATH")
+class BootDiagnosticsTests(unittest.TestCase):
+    """Issue #84: lifecycle capture, previous_events, boot_seq, decoupled connect."""
+
+    @classmethod
+    def setUpClass(cls):
+        proc = subprocess.run(
+            [NODE, str(BOOT_DIAGNOSTICS_HARNESS), str(REPO / "addin" / "taskpane.js")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"harness failed:\n{proc.stderr}")
+        cls.out = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_ring_buffer_is_capped_and_persisted(self):
+        self.assertEqual(self.out["ringLength"], 50)
+        self.assertEqual((self.out["ringFirst"], self.out["ringLast"]), ("e70", "e119"))
+        self.assertEqual(self.out["ringStackLen"], 400)
+        self.assertEqual(self.out["ringKeys"], ["kind", "message", "stack", "t"])
+
+    def test_previous_events_reported_then_cleared(self):
+        self.assertEqual(
+            self.out["previousKinds"],
+            ["boot", "error", "unhandledrejection", "pagehide", "beforeunload", "visibilitychange"],
+        )
+        self.assertEqual(self.out["previousErrorMessage"], "kaboom")
+        # the key was cleared at load: only this load's own boot event is stored
+        self.assertEqual(self.out["afterSecondLoadStored"], ["boot"])
+        self.assertEqual(self.out["thirdPreviousKinds"], ["boot"])
+
+    def test_report_keeps_existing_fields_and_adds_diagnostics(self):
+        self.assertEqual(self.out["reportKeepsFields"], ["issue-106-wp1", "https://x.example/Row01.docx", 1, None])
+        self.assertTrue(self.out["reportHasInstance"])
+        self.assertEqual(self.out["reportBootMsKeys"], ["office_ready", "report_build", "ws_connect"])
+
+    def test_boot_seq_increments(self):
+        self.assertEqual(self.out["bootSeqs"], [1, 2, 3])
+
+    def test_throwing_storage_does_not_break_boot(self):
+        for key in ("throwingMethods", "throwingAccess"):
+            entry = self.out[key]
+            self.assertEqual(entry["posted"], 1, key)
+            self.assertIsNone(entry["bootSeq"], key)
+            self.assertEqual(entry["previous"], [], key)
+            self.assertEqual((entry["comments"], entry["sockets"]), (1, 1), key)
+
+    def test_connect_starts_before_and_regardless_of_report_build(self):
+        for mode in ("reject", "hang"):
+            self.assertEqual(self.out[f"{mode}SocketsImmediately"], 1, mode)
+            self.assertEqual(self.out[f"{mode}PostsImmediately"], 0, mode)
+
+    def test_failed_build_posts_minimal_report(self):
+        for mode in ("reject", "hang"):
+            entry = self.out[mode]
+            self.assertEqual(entry["posts"], 1, mode)
+            self.assertEqual(
+                entry["keys"],
+                ["boot_ms", "boot_seq", "documentUrl", "generated_at", "instance_id", "load_error", "previous_events"],
+            )
+            self.assertEqual(entry["documentUrl"], "https://x.example/Row01.docx")
+            self.assertEqual(entry["bootSeq"], 1)
+            self.assertIn("load_error", entry["storedKinds"])
+        self.assertIn("getComments blew up", self.out["reject"]["loadError"])
+        self.assertIn("timed out", self.out["hang"]["loadError"])
+

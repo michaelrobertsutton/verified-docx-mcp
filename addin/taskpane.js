@@ -19,6 +19,124 @@
 
 let lastReport = null;
 
+// issue #84: pane lifecycle diagnostics. A pane that Word reloads or kills
+// leaves no trace on its own, so every load keeps a small ring buffer of
+// errors and lifecycle events in sessionStorage; the NEXT load reads it back
+// as `previous_events` in its boot report, which is how a reload cause
+// becomes visible. Nothing in this block may ever throw into the pane.
+const PANE_EVENTS_KEY = "vdm_pane_events";
+const BOOT_SEQ_KEY = "vdm_boot_seq";
+const PANE_EVENTS_MAX = 50;
+let REPORT_TIMEOUT_MS = 15000;
+const SCRIPT_START_MS = Date.now();
+const bootTimings = { office_ready: null, report_build: null, ws_connect: null };
+let paneEvents = [];
+let wsConnectStartMs = null;
+
+function safeStorage(name) {
+  try {
+    return typeof globalThis[name] === "undefined" ? null : globalThis[name];
+  } catch (err) {
+    return null; // some hosts throw on mere access
+  }
+}
+
+function persistPaneEvents() {
+  try {
+    const store = safeStorage("sessionStorage");
+    if (store) store.setItem(PANE_EVENTS_KEY, JSON.stringify(paneEvents));
+  } catch (err) {
+    // sessionStorage unavailable or full: diagnostics are best-effort
+  }
+}
+
+function recordPaneEvent(kind, message, stack) {
+  try {
+    paneEvents.push({
+      t: new Date().toISOString(),
+      kind,
+      message: String(message === undefined || message === null ? "" : message).slice(0, 400),
+      stack: String(stack || "").slice(0, 400),
+    });
+    if (paneEvents.length > PANE_EVENTS_MAX) paneEvents = paneEvents.slice(-PANE_EVENTS_MAX);
+    persistPaneEvents();
+  } catch (err) {
+    // never let diagnostics break the pane
+  }
+}
+
+// Read (and clear) the previous load's events BEFORE any listener can
+// overwrite the key, and bump the per-profile boot counter.
+function takePreviousEvents() {
+  try {
+    const store = safeStorage("sessionStorage");
+    if (!store) return [];
+    const raw = store.getItem(PANE_EVENTS_KEY);
+    store.removeItem(PANE_EVENTS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.slice(-PANE_EVENTS_MAX) : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+function nextBootSeq() {
+  try {
+    const store = safeStorage("localStorage");
+    if (!store) return null;
+    const n = (parseInt(store.getItem(BOOT_SEQ_KEY), 10) || 0) + 1;
+    store.setItem(BOOT_SEQ_KEY, String(n));
+    return n;
+  } catch (err) {
+    return null;
+  }
+}
+
+const PREVIOUS_PANE_EVENTS = takePreviousEvents();
+const BOOT_SEQ = nextBootSeq();
+
+function installPaneDiagnostics() {
+  try {
+    if (typeof window !== "undefined" && window && typeof window.addEventListener === "function") {
+      window.addEventListener("error", (e) =>
+        recordPaneEvent("error", (e && e.message) || "error", e && e.error && e.error.stack)
+      );
+      window.addEventListener("unhandledrejection", (e) => {
+        const reason = e && e.reason;
+        recordPaneEvent("unhandledrejection", (reason && reason.message) || String(reason), reason && reason.stack);
+      });
+      window.addEventListener("pagehide", () => recordPaneEvent("pagehide", ""));
+      window.addEventListener("beforeunload", () => recordPaneEvent("beforeunload", ""));
+    }
+    if (typeof document !== "undefined" && document && typeof document.addEventListener === "function") {
+      document.addEventListener("visibilitychange", () =>
+        recordPaneEvent("visibilitychange", document.visibilityState || "")
+      );
+    }
+    recordPaneEvent("boot", `boot_seq=${BOOT_SEQ}`);
+  } catch (err) {
+    // diagnostics are best-effort
+  }
+}
+installPaneDiagnostics();
+
+function bootDiagnostics() {
+  return {
+    boot_seq: BOOT_SEQ,
+    instance_id: PANE_INSTANCE_ID,
+    previous_events: PREVIOUS_PANE_EVENTS,
+    boot_ms: { ...bootTimings },
+  };
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 function setStatus(text) {
   document.getElementById("status").textContent = text;
 }
@@ -143,8 +261,13 @@ async function buildReport() {
 
 async function runAndRender() {
   setStatus("Reading document…");
+  const buildStart = Date.now();
   try {
-    const report = await buildReport();
+    // issue #84: bounded, so a hung comments/body read still ends in a report
+    // (the ops socket starts first and independently of this).
+    const report = await withTimeout(buildReport(), REPORT_TIMEOUT_MS, "report build");
+    bootTimings.report_build = Date.now() - buildStart;
+    Object.assign(report, bootDiagnostics());
     lastReport = report;
     setOutput(report);
     renderSummary(report);
@@ -155,11 +278,30 @@ async function runAndRender() {
         `WordApi1.4=${report.requirementSets["1.4"]} comments=${report.comments.length}`
     );
   } catch (err) {
+    bootTimings.report_build = Date.now() - buildStart;
     lastReport = null;
-    document.getElementById("copy-json").disabled = true;
     const message = err && err.message ? err.message : String(err);
-    setOutput({ error: message, debugInfo: err && err.debugInfo ? err.debugInfo : undefined });
-    setStatus(`ERROR: ${message}`);
+    recordPaneEvent("load_error", message, err && err.stack);
+    try {
+      document.getElementById("copy-json").disabled = true;
+      setOutput({ error: message, debugInfo: err && err.debugInfo ? err.debugInfo : undefined });
+      setStatus(`ERROR: ${message}`);
+    } catch (uiErr) {
+      // the minimal report below matters more than the pane's own text
+    }
+    // issue #84: still tell the bridge this load happened, and why it failed.
+    let documentUrl = null;
+    try {
+      documentUrl = Office.context.document.url || null;
+    } catch (urlErr) {
+      // leave null
+    }
+    await postReport({
+      generated_at: new Date().toISOString(),
+      documentUrl,
+      load_error: message,
+      ...bootDiagnostics(),
+    });
   }
 }
 
@@ -374,6 +516,7 @@ function connectOpsSocket() {
     reconnectTimer = null;
   }
   setWsStatus("connecting…");
+  if (wsConnectStartMs === null) wsConnectStartMs = Date.now();
   let socket;
   try {
     socket = new WebSocket(`wss://localhost:${OPS_PORT}/ops`);
@@ -413,6 +556,7 @@ function connectOpsSocket() {
         })
       );
       setWsStatus("connected");
+      if (bootTimings.ws_connect === null) bootTimings.ws_connect = Date.now() - wsConnectStartMs;
       startHeartbeat();
     } catch (err) {
       setWsStatus(`hello failed (${err && err.message ? err.message : err})`);
@@ -1996,6 +2140,7 @@ async function opSave() {
 }
 
 Office.onReady((info) => {
+  bootTimings.office_ready = Date.now() - SCRIPT_START_MS;
   if (info.host !== Office.HostType.Word) {
     setStatus(`Loaded outside Word (host=${info.host}); this pane is Word-only.`);
     return;
@@ -2003,8 +2148,10 @@ Office.onReady((info) => {
   document.getElementById("copy-json").addEventListener("click", copyJson);
   document.getElementById("ping-bridge").addEventListener("click", pingBridge);
   document.getElementById("ping-bridge").disabled = false;
-  runAndRender();
+  // issue #84: the ops socket starts first and independently; the report
+  // build is bounded and non-fatal, so neither can delay or break the other.
   connectOpsSocket();
+  runAndRender();
 });
 
 // #48: handles are pane-epoch identities, not invented Office.js revision ids.

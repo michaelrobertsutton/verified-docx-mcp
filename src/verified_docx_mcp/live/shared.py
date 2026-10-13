@@ -160,8 +160,12 @@ class Broker:
                 self._expire()
                 return {}
             if action == "status":
+                from . import bridge  # lazy: bridge imports this module too
+
                 return {
                     "owner_pid": os.getpid(),
+                    # issue #84: pane boots are only ever recorded in the owner process
+                    "recent_boots": bridge.recent_boots(),
                     "clients": [
                         {"client_id": key, "idle_s": time.monotonic() - v["last_seen"]}
                         for key, v in self.clients.items()
