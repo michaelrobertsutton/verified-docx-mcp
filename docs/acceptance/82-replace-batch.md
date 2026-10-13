@@ -44,4 +44,17 @@ Needs a disposable scratch copy in Word for Mac with the Live pane reloaded
 
 ### Results
 
-pending
+Run 2026-10-13, Word for Mac, branch `issue-82-replace-batch`, pane loaded from the
+branch bridge (`taskpane.js?v=56`), scratch copy of `tests/fixtures/sections.docx`.
+
+| Check | Result |
+|---|---|
+| 3-edit batch lands: `batch_status: complete`, `applied: true`, read-back matches | PASS (8.0 s incl. first-call warmup) |
+| Mid-batch refusal: edit 2 has no match → `partial`; edit 1 applied, edit 2 `refused_before_write` (ZERO_MATCH), edit 3 `not_attempted`; document shows only edit 1 | PASS |
+| Stale `revision_before` → `none_applied`, edit 0 `refused_before_write` (LIVE_STALE), document unchanged | PASS |
+| 10-edit chained batch, each edit on the previous post hash | PASS, 26.7 s (about 2.7 s per edit versus about 4.7 s for single `replace_text` calls) |
+
+Not run in Word: `allow_comment_loss_ids` against a real comment thread (covered by the
+JS harness and fake-pane tests), `LIVE_STALE_AFTER_WRITE` and a mid-batch pane disconnect
+(covered by fake-pane and shared-broker tests; not safely reproducible on demand), and
+`live_open_pane` failure hints (needs a locked screen).
