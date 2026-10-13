@@ -243,7 +243,7 @@ const OP_LOG_LIMIT = 20;
 // issue #77: "paragraph_insert" = the paragraph_insert op (styled, optionally tracked paragraphs).
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
-const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids"];
+const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -507,7 +507,7 @@ function summarizeResult(op, result) {
 
 const SHAPE_GUARDED_OPS = new Set(["replace", "format", "cell_set", "cells_set",
   "table_insert", "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
-  "comment_add", "comment_reply", "comment_resolve", "comment_delete", "save"]);
+  "comment_add", "comment_reply", "comment_resolve", "comment_delete", "save", "table_delete", "paragraphs_unlist"]);
 
 // One queue across reconnects. A timed-out write can still be running in Word;
 // later commands must not overlap it, including commands on a new socket.
@@ -593,6 +593,10 @@ async function dispatchOpUnchecked(op, payload) {
       return opParagraphDelete(payload);
     case "paragraph_insert":
       return opParagraphInsert(payload);
+    case "paragraphs_unlist":
+      return opParagraphsUnlist(payload);
+    case "table_delete":
+      return opTableDelete(payload);
     case "textboxes_list":
       return opTextboxesList();
     case "textboxes_read":
@@ -1601,6 +1605,25 @@ function findAnchorParagraph(paragraphItems, anchor) {
   return matches[0];
 }
 
+// issue #79: Paragraph.detachFromList (WordApi 1.3). `getParagraphs` returns a FRESH collection
+// each call, so a recount after the detach never reads a stale proxy.
+async function detachListItems(context, getParagraphs) {
+  const paragraphs = getParagraphs();
+  paragraphs.load("items/isListItem");
+  await context.sync();
+  const listed = paragraphs.items.filter((p) => p.isListItem);
+  listed.forEach((p) => p.detachFromList());
+  if (listed.length) await context.sync();
+  return listed.length;
+}
+
+async function countListItems(context, getParagraphs) {
+  const paragraphs = getParagraphs();
+  paragraphs.load("items/isListItem");
+  await context.sync();
+  return paragraphs.items.filter((p) => p.isListItem).length;
+}
+
 async function opTableInsert(payload) {
   const rowCount = payload.rows.length;
   const colCount = payload.rows[0].length;
@@ -1642,6 +1665,7 @@ async function opTableInsert(payload) {
     }
     const emptyValues = payload.rows.map((row) => row.map(() => ""));
     let newTable = null;
+    let listItemsInTable = 0;
     await withTracking(context, payload.track_changes, async () => {
       if (target && anchor.paragraph_text !== undefined) {
         newTable = target.insertTable(rowCount, colCount, anchor.position === "before" ? "Before" : "After", emptyValues);
@@ -1668,6 +1692,9 @@ async function opTableInsert(payload) {
       }
       if (payload.font_size_pt) newTable.font.size = payload.font_size_pt;
       await context.sync();
+      // #79: a table inserted next to a list item can inherit its numbering in every cell paragraph.
+      await detachListItems(context, () => newTable.getRange().paragraphs);
+      listItemsInTable = await countListItems(context, () => newTable.getRange().paragraphs);
     });
 
     // The new table's own 1-based index (list_tables numbering): compare each
@@ -1689,7 +1716,7 @@ async function opTableInsert(payload) {
     postBody.load("text");
     await context.sync();
     const postHash = await sha256Hex(postBody.text || "");
-    return { applied: true, table_index: position + 1, pre: preHash, post: postHash };
+    return { applied: true, table_index: position + 1, list_items_in_table: listItemsInTable, pre: preHash, post: postHash };
   });
 }
 
@@ -2031,7 +2058,76 @@ async function guardRevisions(context, ranges) {
   const apart = new Set(["Before", "After", "AdjacentBefore", "AdjacentAfter"]);
   if (comparisons.some(c => !apart.has(c.value))) throw refuse();
 }
+// issue #79: revision markup split into "inside the Nth top-level table" and "everywhere else", read
+// from the body OOXML (the API list undercounts). Outside revisions are compared as a multiset of
+// kind|author|text, so ids and dates Word renumbers do not matter.
+const REVISION_KINDS = ["ins", "del", "moveFrom", "moveTo", "rPrChange", "pPrChange", "sectPrChange", "tblPrChange",
+  "trPrChange", "tcPrChange", "tblGridChange", "cellIns", "cellDel", "cellMerge", "numberingChange"];
+function tableRevisionInventory(xml, tableIndex) {
+  const body = shapeXml(xml);
+  const tables = [...body.getElementsByTagNameNS(SHAPE_W, "tbl")].filter(t => {
+    for (let p = t.parentNode; p && p !== body; p = p.parentNode)
+      if (p.namespaceURI === SHAPE_W && p.localName === "tbl") return false;
+    return true;
+  });
+  const target = tables[tableIndex - 1] || null;
+  const insideOf = node => {
+    for (let p = node.parentNode; p; p = p.parentNode) if (p === target) return true;
+    return false;
+  };
+  let inside = 0;
+  const outside = [];
+  REVISION_KINDS.forEach(kind => [...body.getElementsByTagNameNS(SHAPE_W, kind)].forEach(node => {
+    if (target && insideOf(node)) inside += 1;
+    else outside.push(`${kind}|${node.getAttribute("w:author") || ""}|${node.textContent || ""}`);
+  }));
+  return {tableCount: tables.length, inside, outside: outside.sort()};
+}
+async function opRevisionsMutateScoped(payload, action) {
+  return Word.run(async context => {
+    await requireFreshBody(context, payload.expectedBodySha256);
+    const tableItems = await loadTopLevelTables(context);
+    const table = tableItems[payload.table_index - 1];
+    if (!table) throw refusalError(`no table ${payload.table_index} (the document has ${tableItems.length})`, "table_not_found");
+    const range = table.getRange();
+    // Fail closed BEFORE any write: a pane that cannot scope or cannot verify must never run it.
+    if (typeof range.getTrackedChanges !== "function")
+      throw refusalError("This host cannot scope tracked changes to a table; nothing was changed", "LIVE_CAPABILITY_MISSING");
+    const xmlBefore = await bodyOoxmlOrNull(context);
+    if (xmlBefore === null)
+      throw refusalError("Scoped revision changes need the body OOXML, which could not be read; nothing was changed", "LIVE_CAPABILITY_MISSING");
+    const before = tableRevisionInventory(xmlBefore, payload.table_index);
+    const scoped = range.getTrackedChanges();
+    scoped[`${action}All`]();
+    await context.sync();
+    const xmlAfter = await bodyOoxmlOrNull(context);
+    context.document.body.load("text");
+    await context.sync();
+    const post = await sha256Hex(context.document.body.text || "");
+    if (xmlAfter === null)
+      throw refusalError(`Scoped ${action} was sent but the body could not be re-read; it may have applied. pre=${before.tableCount} table(s)`, "VERIFICATION_FAILED");
+    // Rejecting a tracked table insertion removes the table, which is the expected outcome.
+    const tableRemoved = tableRevisionInventory(xmlAfter, 0).tableCount === before.tableCount - 1;
+    // Index 0 matches no table, so every remaining revision counts as "outside".
+    const after = tableRevisionInventory(xmlAfter, tableRemoved ? 0 : payload.table_index);
+    const result = {applied: true, scoped: true, table_index: payload.table_index, table_removed: tableRemoved,
+      before_count: before.inside, after_count: tableRemoved ? 0 : after.inside, changed_count: before.inside,
+      outside_count: before.outside.length, tables_before: before.tableCount, tables_after: after.tableCount, post};
+    const verified = (tableRemoved || after.tableCount === before.tableCount) && result.after_count === 0 &&
+      JSON.stringify(after.outside) === JSON.stringify(before.outside);
+    if (!verified) throw refusalError(JSON.stringify(result), "VERIFICATION_FAILED");
+    return result;
+  });
+}
 async function opRevisionsMutate(payload, action) {
+  const scoped = payload.table_index !== undefined && payload.table_index !== null;
+  if (scoped && payload.revision_ids != null)
+    throw refusalError("table_index and revision_ids are mutually exclusive", "INVALID_INPUT");
+  if (scoped) {
+    if (!revisionsSupported()) throw refusalError("WordApi 1.6 required", "LIVE_CAPABILITY_MISSING");
+    refuseDocumentWide(payload, "Revision changes");
+    return opRevisionsMutateScoped(payload, action);
+  }
   const retained = payload.revision_ids == null ? [] : payload.revision_ids.map(id => {
     const entry = revisionHandles.get(id);
     if (!entry || entry.epoch !== paneEpoch) throw refusalError("Stale revision handle; list revisions again", "REVISION_ID_NOT_FOUND");
@@ -2305,6 +2401,108 @@ async function opParagraphDelete(payload) {
       before_paragraphs:before,after_paragraphs:after,pre,post:await sha256Hex(context.document.body.text || '')};
     if (JSON.stringify(after) !== JSON.stringify(expected))
       throw refusalError(`Paragraph deletion read-back failed; observed effects: ${JSON.stringify(result)}`, 'VERIFICATION_FAILED');
+    return result;
+  });
+}
+
+// -- clear_numbering / delete_table (issue #79) ------------------------------
+
+// Detaches every list-item paragraph in one table (table_index) or in the single paragraph
+// whose whole text equals paragraph_text. Detaching changes no text, so the body hash must not move.
+async function opParagraphsUnlist(payload) {
+  return Word.run(async context => {
+    const pre = await requireFreshBody(context, payload.expectedBodySha256);
+    const byTable = payload.table_index !== undefined && payload.table_index !== null;
+    let range, loadScope;
+    if (byTable) {
+      const tableItems = await loadTopLevelTables(context);
+      const table = tableItems[payload.table_index - 1];
+      if (!table) throw refusalError(`no table ${payload.table_index} (the document has ${tableItems.length})`, 'table_not_found');
+      range = table.getRange();
+      loadScope = async () => {
+        const paragraphs = table.getRange().paragraphs;
+        paragraphs.load('items/isListItem');
+        await context.sync();
+        return paragraphs.items;
+      };
+    } else {
+      const all = context.document.body.paragraphs;
+      all.load('items/text');
+      await context.sync();
+      const hits = all.items.filter(p => p.text === payload.paragraph_text);
+      if (hits.length !== 1) throw refusalError(`Expected unique whole paragraph, found ${hits.length}`, 'MATCH_COUNT_MISMATCH');
+      const target = hits[0];
+      range = target.getRange(Word.RangeLocation.whole);
+      loadScope = async () => {
+        target.load('isListItem');
+        await context.sync();
+        return [target];
+      };
+    }
+    await (await sectionGuard(context, payload)).check(() => [range]);
+    await guardRevisions(context, [range]);
+    const listed = (await loadScope()).filter(p => p.isListItem);
+    listed.forEach(p => p.detachFromList());
+    if (listed.length) await context.sync();
+    const remaining = (await loadScope()).filter(p => p.isListItem).length;
+    context.document.body.load('text');
+    await context.sync();
+    const post = await sha256Hex(context.document.body.text || '');
+    const result = {applied: true, unlisted: listed.length, remaining_list_items: remaining, pre, post};
+    if (remaining || post !== pre)
+      throw refusalError(`Numbering removal read-back failed; observed effects: ${JSON.stringify(result)}`, 'VERIFICATION_FAILED');
+    return result;
+  });
+}
+
+// Whole-table text as get_table reports it (cells joined by tab, rows by newline); the caller's
+// expected_text is compared whitespace-insensitively through normalizeAnchorText.
+function tableTextOf(grid) {
+  return grid.map(cells => cells.map(c => c.body.text || '').join('\t')).join('\n');
+}
+
+async function opTableDelete(payload) {
+  return Word.run(async context => {
+    const pre = await requireFreshBody(context, payload.expectedBodySha256);
+    const tableItems = await loadTopLevelTables(context);
+    const table = tableItems[payload.table_index - 1];
+    if (!table) throw refusalError(`no table ${payload.table_index} (the document has ${tableItems.length})`, 'table_not_found');
+    const grid = await loadRowsAndCells(context, table);
+    grid.forEach(cells => cells.forEach(cell => cell.body.load('text')));
+    await context.sync();
+    const actual = tableTextOf(grid);
+    if (normalizeAnchorText(actual) !== normalizeAnchorText(payload.expected_text))
+      throw refusalError(`Table ${payload.table_index} text does not match expected_text; nothing was deleted. Table reads: ${JSON.stringify(actual)}`, 'CELL_TEXT_MISMATCH');
+    const range = table.getRange();
+    await (await sectionGuard(context, payload)).check(() => [range]);
+    const xml = range.getOoxml();
+    await context.sync();
+    if (shapeNodes(shapeXml(xml.value)).length)
+      throw refusalError('Table anchors a shape; re-anchoring is not supported', 'ANCHORED_SHAPES');
+    await guardComments(context, [range], false);
+    await guardRevisions(context, [range]);
+    const outside = async () => {
+      const paragraphs = context.document.body.paragraphs;
+      paragraphs.load('items/text,items/tableNestingLevel');
+      await context.sync();
+      return paragraphs.items.filter(p => p.tableNestingLevel === 0).map(p => p.text);
+    };
+    const outsideBefore = await outside();
+    await withTracking(context, payload.track_changes, async () => {
+      table.delete();
+      await context.sync();
+    });
+    const tablesAfter = (await loadTopLevelTables(context)).length;
+    const outsideAfter = await outside();
+    context.document.body.load('text');
+    await context.sync();
+    const result = {applied: true, table_index: payload.table_index, tables_before: tableItems.length, tables_after: tablesAfter,
+      deleted_text: actual, tracked: !!payload.track_changes, pre, post: await sha256Hex(context.document.body.text || '')};
+    // A tracked table deletion leaves the (struck-through) table in the document until it is accepted.
+    const countOk = payload.track_changes ? tablesAfter === tableItems.length || tablesAfter === tableItems.length - 1
+      : tablesAfter === tableItems.length - 1;
+    if (!countOk || JSON.stringify(outsideBefore) !== JSON.stringify(outsideAfter))
+      throw refusalError(`Table deletion read-back failed; observed effects: ${JSON.stringify(result)}`, 'VERIFICATION_FAILED');
     return result;
   });
 }

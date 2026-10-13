@@ -330,6 +330,9 @@ VALID_OPS: frozenset[str] = frozenset(
         "cells_set",
         "paragraph_delete",
         "paragraph_insert",
+        # issue #79: clear_numbering / delete_table
+        "paragraphs_unlist",
+        "table_delete",
         "shapes_list",
         "textboxes_list",
         "textboxes_read",

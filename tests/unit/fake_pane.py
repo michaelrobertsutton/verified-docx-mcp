@@ -213,6 +213,22 @@ class FakeDocument:
         # paragraph_insert silently drop the requested color (server read-back test).
         self.known_paragraph_styles: set[str] = {"Normal", "Heading 1", "Heading 2", "Heading 3", "Body Text"}
         self.drop_paragraph_color = False
+        # Issue #79. list_items: 0-based table index -> how many of its cell paragraphs are list
+        # items; list_paragraphs: whole-paragraph texts that are list items. inherit_numbering makes
+        # table_insert create list-item cells (the anchor-inheritance bug); report_list_items=False
+        # models a pane that predates the list_items_in_table field; drop_unlist makes
+        # paragraphs_unlist accept but not take; drop_table_delete does the same for table_delete.
+        self.list_items: dict[int, int] = {}
+        self.list_paragraphs: set[str] = set()
+        self.inherit_numbering = False
+        self.report_list_items = True
+        self.drop_unlist = False
+        self.drop_table_delete = False
+        # 0-based indices of tables the fake reports as anchoring a shape.
+        self.shape_tables: set[int] = set()
+        # Tracked changes: {"kind", "author", "text", "table": 0-based index | None, "table_insert": bool}.
+        # Not part of the body hash (Word's body.text excludes revision markup).
+        self.revisions: list[dict[str, Any]] = []
 
     def sha256(self) -> str:
         payload = self.text
@@ -403,7 +419,95 @@ class FakeDocument:
         )
         # Merged-table flags are by index: shift those at/after the insertion.
         self.merged_tables = {m + 1 if m >= index else m for m in self.merged_tables}
-        return {"applied": True, "table_index": index + 1, "pre": pre, "post": self.sha256()}
+        self.list_items = {k + 1 if k >= index else k: v for k, v in self.list_items.items()}
+        self.shape_tables = {k + 1 if k >= index else k for k in self.shape_tables}
+        for rev in self.revisions:
+            if rev["table"] is not None and rev["table"] >= index:
+                rev["table"] += 1
+        if self.inherit_numbering:
+            self.list_items[index] = sum(len(row) for row in texts)
+        if payload.get("track_changes"):
+            self.revisions.append(
+                {"kind": "ins", "author": self.author_name, "text": "table", "table": index, "table_insert": True}
+            )
+        result = {"applied": True, "table_index": index + 1, "pre": pre, "post": self.sha256()}
+        if self.report_list_items:
+            result["list_items_in_table"] = self.list_items.get(index, 0)
+        return result
+
+    def _drop_table(self, t: int) -> None:
+        del self.tables[t]
+        del self.table_meta[t]
+        self.merged_tables = {m - 1 if m > t else m for m in self.merged_tables if m != t}
+        self.list_items = {k - 1 if k > t else k: v for k, v in self.list_items.items() if k != t}
+        self.shape_tables = {k - 1 if k > t else k for k in self.shape_tables if k != t}
+        self.revisions = [r for r in self.revisions if r["table"] != t]
+        for rev in self.revisions:
+            if rev["table"] is not None and rev["table"] > t:
+                rev["table"] -= 1
+
+    def paragraphs_unlist(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Issue #79: detach list numbering from a table's cells or one whole paragraph."""
+        pre = self._check_fresh(payload)
+        if payload.get("table_index") is not None:
+            t = int(payload["table_index"]) - 1
+            if not 0 <= t < len(self.tables):
+                raise OpRefused("table_not_found", f"no table {t + 1} (the document has {len(self.tables)})")
+            if any(r["table"] == t for r in self.revisions):
+                raise OpRefused("TRACKED_CHANGES_PRESENT", "Accept or reject intersecting revisions before replacing text")
+            found = self.list_items.get(t, 0)
+            if not self.drop_unlist:
+                self.list_items.pop(t, None)
+            remaining = self.list_items.get(t, 0)
+        else:
+            text = payload["paragraph_text"]
+            hits = [line for line in self.text.split("\n") if line == text]
+            if len(hits) != 1:
+                raise OpRefused("match_count_mismatch", f"Expected unique whole paragraph, found {len(hits)}")
+            found = 1 if text in self.list_paragraphs else 0
+            if not self.drop_unlist:
+                self.list_paragraphs.discard(text)
+            remaining = 1 if text in self.list_paragraphs else 0
+        return {"applied": True, "unlisted": found, "remaining_list_items": remaining, "pre": pre,
+                "post": self.sha256()}
+
+    def table_delete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Issue #79: delete one top-level table after comparing its text."""
+        self._ensure_meta()
+        pre = self._check_fresh(payload)
+        t = int(payload["table_index"]) - 1
+        if not 0 <= t < len(self.tables):
+            raise OpRefused("table_not_found", f"no table {t + 1} (the document has {len(self.tables)})")
+        actual = "\n".join("\t".join(row) for row in self.tables[t])
+        if " ".join(actual.split()) != " ".join(str(payload["expected_text"]).split()):
+            raise OpRefused("CELL_TEXT_MISMATCH", f"Table {t + 1} text does not match expected_text; nothing was deleted.")
+        if t in self.shape_tables:
+            raise OpRefused("ANCHORED_SHAPES", "Table anchors a shape; re-anchoring is not supported")
+        before = len(self.tables)
+        if not self.drop_table_delete:
+            self._drop_table(t)
+        return {"applied": True, "table_index": t + 1, "tables_before": before, "tables_after": len(self.tables),
+                "deleted_text": actual, "tracked": bool(payload.get("track_changes")), "pre": pre,
+                "post": self.sha256()}
+
+    def revisions_mutate(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Issue #79: accept/reject all revisions, or (table_index) only those inside one table.
+        Rejecting a tracked table insertion removes the table, as Word does."""
+        self._ensure_meta()
+        pre = self._check_fresh(payload)
+        scoped = payload.get("table_index") is not None
+        t = int(payload["table_index"]) - 1 if scoped else None
+        if scoped and not 0 <= t < len(self.tables):
+            raise OpRefused("table_not_found", f"no table {t + 1} (the document has {len(self.tables)})")
+        hit = [r for r in self.revisions if not scoped or r["table"] == t]
+        self.revisions = [r for r in self.revisions if r not in hit]
+        removed = False
+        if action == "reject" and scoped and any(r.get("table_insert") for r in hit):
+            self._drop_table(t)
+            removed = True
+        return {"applied": True, "scoped": scoped, "table_index": t + 1 if scoped else None,
+                "table_removed": removed, "before_count": len(hit), "after_count": 0, "changed_count": len(hit),
+                "outside_count": len(self.revisions), "pre": pre, "post": self.sha256()}
 
     def paragraph_insert(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Issue #77: insert styled paragraphs before/after the anchor's line.
@@ -790,7 +894,7 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert", "comment_delete", "comment_loss_ids"]
+            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped"]
             if capabilities is None
             else list(capabilities)
         )
@@ -803,6 +907,8 @@ class FakePane:
         self.table_insert_payloads: list[dict[str, Any]] = []
         # Issue #77: every paragraph_insert payload received.
         self.paragraph_insert_payloads: list[dict[str, Any]] = []
+        # Issue #79: every paragraphs_unlist / table_delete / revisions_* payload, by op name.
+        self.op_payloads: dict[str, list[dict[str, Any]]] = {}
         # Ops named here are received but never answered -- lets a test
         # simulate an unresponsive pane (for LIVE_DISCONNECTED-by-timeout)
         # without needing a full socket-level failure injection.
@@ -965,6 +1071,13 @@ class FakePane:
             return doc.paragraph_insert(payload)
         if op == "cells_set":
             return doc.cells_set(payload)
+        if op in ("paragraphs_unlist", "table_delete", "revisions_accept", "revisions_reject"):
+            self.op_payloads.setdefault(op, []).append(dict(payload))
+            if op == "paragraphs_unlist":
+                return doc.paragraphs_unlist(payload)
+            if op == "table_delete":
+                return doc.table_delete(payload)
+            return doc.revisions_mutate(op.removeprefix("revisions_"), payload)
         if op == "save":
             return doc.save()
         raise OpRefused("LIVE_OP_FAILED", f"fake pane does not implement op {op!r}")

@@ -25,7 +25,7 @@ const check = (name, pass, detail) => results.push({ name, pass: !!pass, detail:
 
 function makeModel(opts = {}) {
   const model = {
-    paragraphs: (opts.paragraphs || ["Intro", "Proof", "Tail"]).map((text) => ({ text })),
+    paragraphs: (opts.paragraphs || ["Intro", "Proof", "Tail"]).map((p) => (typeof p === "string" ? { text: p } : { ...p })),
     tables: [],
     order: [],
     mode: opts.mode || "Off",
@@ -34,6 +34,13 @@ function makeModel(opts = {}) {
     calls: [], // every queued call/assignment, in queue order
     failOnInsert: !!opts.failOnInsert,
     onSyncCount: null,
+    // issue #79 knobs
+    ooxmlMode: opts.ooxmlMode || "empty", // "revisions": body.getOoxml reflects model revisions
+    ooxmlUnreadable: false,
+    dropDetach: false, // detachFromList is accepted but does not take
+    dropTableDelete: false, // table.delete() is accepted but does not take
+    scopedRejectTouchesOutside: false,
+    onTableDelete: null,
   };
   model.paragraphs.forEach((p) => model.order.push({ kind: "p", ref: p }));
   (opts.tables || []).forEach((spec) => addTable(model, spec, null));
@@ -50,9 +57,11 @@ function addTable(model, spec, atOrderIndex) {
     headerRowCount: spec.headerRowCount ?? 0,
     nesting: spec.nesting ?? 1,
     rows: (spec.rows || [["x"]]).map((r) => r.map((text) => newCell(text))),
+    revs: spec.revs ? spec.revs.map((r) => ({ ...r })) : [],
     ooxml: spec.ooxml ?? '<pkg:package><pkg:part pkg:name="/word/document.xml"><w:tbl/></pkg:part></pkg:package>',
   };
   if (spec.hAlign) t.rows.forEach((r) => r.forEach((c) => (c.hAlign = spec.hAlign)));
+  if (spec.listed) t.rows.forEach((r) => r.forEach((c) => (c.listed = true)));
   model.tables.push(t);
   const item = { kind: "t", ref: t };
   if (atOrderIndex === null) model.order.push(item);
@@ -68,6 +77,21 @@ function bodyText(model) {
   return model.order
     .map((it) => (it.kind === "p" ? it.ref.text : it.ref.rows.map((r) => r.map(cellText).join("\t")).join("\n")))
     .join("\n");
+}
+
+const W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+const revXml = (r) => `<w:${r.kind} w:author="${r.author}"><w:r><w:t>${r.text}</w:t></w:r></w:${r.kind}>`;
+function revisionOoxml(model) {
+  const items = model.order.map((it) =>
+    it.kind === "p"
+      ? `<w:p>${(it.ref.revs || []).map(revXml).join("")}<w:r><w:t>${it.ref.text}</w:t></w:r></w:p>`
+      : `<w:tbl>${it.ref.rows
+          .map((r, ri) => `<w:tr>${ri === 0 ? `<w:trPr>${it.ref.revs.map(revXml).join("")}</w:trPr>` : ""}${r
+            .map((c) => `<w:tc><w:p><w:r><w:t>${cellText(c)}</w:t></w:r></w:p></w:tc>`)
+            .join("")}</w:tr>`)
+          .join("")}</w:tbl>`
+  );
+  return `<w:document ${W_NS}><w:body>${items.join("")}</w:body></w:document>`;
 }
 
 const topLevelTables = (model) => model.order.filter((i) => i.kind === "t").map((i) => i.ref);
@@ -139,10 +163,42 @@ function makeContext(model) {
     };
   }
 
+  function removeTable(t) {
+    model.tables.splice(model.tables.indexOf(t), 1);
+    model.order.splice(model.order.findIndex((i) => i.ref === t), 1);
+  }
+
+  function emptyCollection(label) {
+    return collection(label, () => []);
+  }
+
+  // A table's own tracked changes. Like Word, rejecting a tracked table insertion removes the table.
+  function tableChanges(t) {
+    const c = collection("table.trackedChanges", () => t.revs.map((r) => ({ ...r, load() {}, __seed() {} })));
+    c.acceptAll = () => {
+      log("table.trackedChanges.acceptAll()");
+      ctx.queue.push(() => (t.revs = []));
+    };
+    c.rejectAll = () => {
+      log("table.trackedChanges.rejectAll()");
+      ctx.queue.push(() => {
+        if (t.revs.some((r) => r.tableInsert)) removeTable(t);
+        else t.revs = [];
+        if (model.scopedRejectTouchesOutside) model.paragraphs.forEach((p) => (p.revs = []));
+      });
+    };
+    return c;
+  }
+
   function range(table) {
     return {
       compareLocationWith: (other) => clientResult(() => (other.__table === table ? "Equal" : "Before")),
       getOoxml: () => clientResult(() => table.ooxml),
+      paragraphs: collection("table.range.paragraphs", () =>
+        table.rows.flatMap((r) => r.flatMap((c) => c.paras.map((text) => makePara2({ text, __cell: c }, table.nesting))))
+      ),
+      getComments: () => emptyCollection("range.comments"),
+      getTrackedChanges: () => tableChanges(table),
       __table: table,
     };
   }
@@ -285,8 +341,16 @@ function makeContext(model) {
       rows: collection("table.rows", () => t.rows.map(makeRow)),
       font: { set size(v) { log(`table.font.size=${v}`); ctx.queue.push(() => t.rows.forEach((r) => r.forEach((c) => (c.size = v)))); } },
       getRange: () => range(t),
-      insertTable: (r, c, where, values) => insertTable(`table.insertTable`, where, r, c, () => model.order.findIndex((i) => i.ref === t) + 1),
-      delete: () => log("table.delete()"),
+      insertTable: (r, c, where, values) => insertTable(`table.insertTable`, where, r, c, () => model.order.findIndex((i) => i.ref === t) + 1, null),
+      delete: () => {
+        log("table.delete()");
+        ctx.queue.push(() => {
+          if (model.dropTableDelete) return;
+          if (model.onTableDelete) model.onTableDelete();
+          if (model.mode === "TrackAll") t.revs.push({ kind: "del", author: "Me", text: "" });
+          else removeTable(t);
+        });
+      },
       __table: t,
     };
     return node("table", ["style", "headerRowCount", "nestingLevel"], impl, {
@@ -296,35 +360,57 @@ function makeContext(model) {
     });
   }
 
-  function insertTable(label, where, rowCount, colCount, indexFn) {
+  function insertTable(label, where, rowCount, colCount, indexFn, anchorPara) {
     log(`${label}(${rowCount},${colCount},${where})`);
-    const t = { style: "Table Grid", headerRowCount: 0, nesting: 1, rows: Array.from({ length: rowCount }, () => Array.from({ length: colCount }, () => newCell(""))), ooxml: "" };
+    const t = { style: "Table Grid", headerRowCount: 0, nesting: 1, rows: Array.from({ length: rowCount }, () => Array.from({ length: colCount }, () => newCell(""))), ooxml: EMPTY, revs: [] };
     ctx.queue.push(() => {
       if (model.failOnInsert) throw new Error("simulated Word failure while inserting");
+      // issue #79: cells written next to a list item inherit its numbering; a tracked insert is one revision
+      if (anchorPara && anchorPara.listed) t.rows.forEach((r) => r.forEach((c) => (c.listed = true)));
+      if (model.mode === "TrackAll") t.revs.push({ kind: "ins", author: "Me", text: "", tableInsert: true });
       model.tables.push(t);
       model.order.splice(indexFn(), 0, { kind: "t", ref: t });
     });
     return makeTable(t);
   }
 
+  const makePara2 = (p, level) => makeParagraph(p, level);
+  const holder = (p) => p.__cell || p;
   function makeParagraph(p, level = 0) {
+    const who = p.watch ? "anchor" : "paragraph";
     const impl = {
       get text() { return p.text; },
       get tableNestingLevel() { return level; },
+      get isListItem() { return !!holder(p).listed; },
+      detachFromList: () => {
+        log(`${who}.detachFromList()`);
+        ctx.queue.push(() => { if (!model.dropDetach) holder(p).listed = false; });
+      },
+      getRange: () => ({
+        compareLocationWith: () => clientResult(() => "Before"),
+        getOoxml: () => clientResult(() => EMPTY),
+        paragraphs: emptyCollection("paragraph.range.paragraphs"),
+        getComments: () => emptyCollection("range.comments"),
+        getTrackedChanges: () => emptyCollection("range.trackedChanges"),
+        font: node(`${who}.font`, [], {}),
+      }),
       insertTable: (r, c, where) =>
         insertTable("paragraph.insertTable", where, r, c, () => {
           const at = model.order.findIndex((i) => i.ref === p);
           return where === "Before" ? at : at + 1;
-        }),
+        }, p),
     };
-    return node("paragraph", ["text", "tableNestingLevel"], impl);
+    return node(who, ["text", "tableNestingLevel", "isListItem"], impl);
   }
 
   const body = node(
     "body",
     ["text"],
     {
-      getOoxml: () => clientResult(() => EMPTY),
+      getOoxml: () => clientResult(() => {
+        if (model.ooxmlUnreadable) throw new Error("simulated unreadable body OOXML");
+        return model.ooxmlMode === "revisions" ? revisionOoxml(model) : EMPTY;
+      }),
       get text() { return bodyText(model); },
       // Like Word, body.paragraphs includes the paragraphs INSIDE table cells
       // (tableNestingLevel 1), in document order.
@@ -332,7 +418,7 @@ function makeContext(model) {
         model.order.flatMap((item) =>
           item.kind === "p"
             ? [makeParagraph(item.ref, 0)]
-            : item.ref.rows.flatMap((r) => r.flatMap((c) => c.paras.map((text) => makeParagraph({ text }, item.ref.nesting))))
+            : item.ref.rows.flatMap((r) => r.flatMap((c) => c.paras.map((text) => makeParagraph({ text, __cell: c }, item.ref.nesting))))
         )
       ),
       tables: collection("body.tables", () => topLevelTables(model).map(makeTable)),
@@ -392,6 +478,7 @@ function loadPane(model) {
       run: (fn) => fn(makeContext(model)),
       InsertLocation: { end: "End", replace: "Replace", before: "Before", after: "After" },
       BreakType: { line: "Line" },
+      RangeLocation: { whole: "Whole" },
       ChangeTrackingMode: { trackAll: "TrackAll", off: "Off" },
       BuiltInStyleName: { gridTable4_Accent1: "GridTable4_Accent1", tableGrid: "TableGrid" },
     },
@@ -399,7 +486,7 @@ function loadPane(model) {
   vm.createContext(sandbox);
   vm.runInContext(
     src +
-      "\n;globalThis.__ops = { opTableInsert, opTableGet, opCellsSet, opCellSet, opCellGet, dispatchOp, PANE_CAPABILITIES };",
+      "\n;globalThis.__ops = { opTableInsert, opTableGet, opCellsSet, opCellSet, opCellGet, opParagraphsUnlist, opTableDelete, opRevisionsMutate, dispatchOp, PANE_CAPABILITIES };",
     sandbox
   );
   return sandbox.__ops;
@@ -708,6 +795,187 @@ const writes = (model) => model.calls.filter((c) => /insertTable|insertText|clea
 
   // (f) capability
   check("capabilities #75: cell_multiline is reported", loadPane(m5).PANE_CAPABILITIES.includes("cell_multiline"), "");
+}
+
+// ------------------------------------------------- issue #79: table clean-up
+
+const anchorWrites = (model) => model.calls.filter((c) => c.startsWith("anchor."));
+const trackedCalls = (model) => model.calls.filter((c) => /trackedChanges\.(accept|reject)All|table\.delete/.test(c));
+
+// 13. a table inserted after a list item must not keep the numbering
+{
+  const model = makeModel({ paragraphs: ["Intro", { text: "Step one", listed: true, watch: true }, "Tail"] });
+  const ops = loadPane(model);
+  const r = await run(() => ops.opTableInsert({ rows: [[spec("a"), spec("b")], [spec("c"), spec("d")]], anchor: { paragraph_text: "Step one", position: "after" }, header_rows: 0 }));
+  check("numbering #79: insert after a list item succeeds", r.ok, r.message);
+  check("numbering #79: every cell paragraph was detached from the list", model.calls.filter((c) => c === "paragraph.detachFromList()").length === 4 && model.tables[0].rows.every((row) => row.every((c) => !c.listed)), model.calls.join(" | "));
+  check("numbering #79: list_items_in_table is reported as 0 after detaching", r.ok && r.value.list_items_in_table === 0, JSON.stringify(r.value));
+  check("numbering #79: the anchor paragraph is never written", anchorWrites(model).length === 0, model.calls.join(" | "));
+
+  const plain = makeModel();
+  const r2 = await run(() => loadPane(plain).opTableInsert({ rows: [[spec("a")]], anchor: { paragraph_text: "Proof", position: "after" }, header_rows: 0 }));
+  check("numbering #79: nothing to detach after a plain paragraph", r2.ok && r2.value.list_items_in_table === 0 && !plain.calls.includes("paragraph.detachFromList()"), JSON.stringify(r2) + plain.calls.join(" | "));
+
+  const stuck = makeModel({ paragraphs: ["Intro", { text: "Step one", listed: true }] });
+  stuck.dropDetach = true;
+  const r3 = await run(() => loadPane(stuck).opTableInsert({ rows: [[spec("a"), spec("b")]], anchor: { paragraph_text: "Step one", position: "after" }, header_rows: 0 }));
+  check("numbering #79: a detach that did not take is reported, not hidden", r3.ok && r3.value.list_items_in_table === 2, JSON.stringify(r3));
+}
+
+// 14. paragraphs_unlist
+{
+  const model = makeModel({ tables: [{ rows: [["a", "b"], ["c", "d"]], listed: true, ooxml: EMPTY }, { rows: [["x"]], ooxml: EMPTY }] });
+  const ops = loadPane(model);
+  const pre = await sha(bodyText(model));
+  const r = await run(() => ops.dispatchOp("paragraphs_unlist", { table_index: 1, expectedBodySha256: pre }));
+  check("unlist #79: table scope detaches every list-item cell paragraph", r.ok && r.value.unlisted === 4 && r.value.remaining_list_items === 0 && r.value.applied === true, JSON.stringify(r));
+  check("unlist #79: reports pre == post (no text changed)", r.ok && r.value.pre === pre && r.value.post === pre, JSON.stringify(r));
+  check("unlist #79: other tables untouched", model.calls.filter((c) => c === "paragraph.detachFromList()").length === 4, model.calls.join(" | "));
+  const again = await run(() => ops.opParagraphsUnlist({ table_index: 1 }));
+  check("unlist #79: a second run is a verified no-op", again.ok && again.value.unlisted === 0, JSON.stringify(again));
+  const missing = await run(() => ops.opParagraphsUnlist({ table_index: 7 }));
+  check("unlist #79: unknown table is table_not_found", !missing.ok && missing.code === "table_not_found", JSON.stringify(missing));
+
+  const pm = makeModel({ paragraphs: ["Intro", { text: "Item", listed: true }, "Tail"] });
+  const pr = await run(() => loadPane(pm).opParagraphsUnlist({ paragraph_text: "Item" }));
+  check("unlist #79: single paragraph scope", pr.ok && pr.value.unlisted === 1 && pm.paragraphs[1].listed === false, JSON.stringify(pr));
+  const dup = makeModel({ paragraphs: [{ text: "Item", listed: true }, { text: "Item", listed: true }, "Tail"] });
+  const dr = await run(() => loadPane(dup).opParagraphsUnlist({ paragraph_text: "Item" }));
+  check("unlist #79: ambiguous paragraph is MATCH_COUNT_MISMATCH with nothing written", !dr.ok && dr.code === "MATCH_COUNT_MISMATCH" && !dup.calls.includes("paragraph.detachFromList()"), JSON.stringify(dr));
+  const none = await run(() => loadPane(dup).opParagraphsUnlist({ paragraph_text: "Nope" }));
+  check("unlist #79: absent paragraph is MATCH_COUNT_MISMATCH", !none.ok && none.code === "MATCH_COUNT_MISMATCH", JSON.stringify(none));
+
+  const tracked = makeModel({ tables: [{ rows: [["a"]], listed: true, ooxml: EMPTY, revs: [{ kind: "ins", author: "Colleague", text: "a" }] }] });
+  const tr = await run(() => loadPane(tracked).opParagraphsUnlist({ table_index: 1 }));
+  check("unlist #79: tracked changes in the table refuse before any write", !tr.ok && tr.code === "TRACKED_CHANGES_PRESENT" && !tracked.calls.includes("paragraph.detachFromList()"), JSON.stringify(tr));
+
+  const stuck = makeModel({ tables: [{ rows: [["a"]], listed: true, ooxml: EMPTY }] });
+  stuck.dropDetach = true;
+  const sr = await run(() => loadPane(stuck).opParagraphsUnlist({ table_index: 1 }));
+  check("unlist #79: a detach that did not take is VERIFICATION_FAILED", !sr.ok && sr.code === "VERIFICATION_FAILED", JSON.stringify(sr));
+
+  const locked = makeModel({ tables: [{ rows: [["a"]], listed: true, ooxml: EMPTY }] });
+  const lr = await run(() => loadPane(locked).dispatchOp("paragraphs_unlist", { table_index: 1, clientId: "c", expectedBodySha256: "wrong" }));
+  check("unlist #79: a stale baseline refuses before any write", !lr.ok && lr.code === "stale" && !locked.calls.includes("paragraph.detachFromList()"), JSON.stringify(lr));
+}
+
+// 15. table_delete
+{
+  const mk = (extra = {}) => makeModel({ tables: [{ rows: [["R1C1", "R1C2"], ["R2C1", "R2C2"]], ooxml: EMPTY, ...extra }, { rows: [["keep"]], ooxml: EMPTY }] });
+  const model = mk();
+  const ops = loadPane(model);
+  const before = model.paragraphs.map((p) => p.text);
+  const r = await run(() => ops.dispatchOp("table_delete", { table_index: 1, expected_text: "R1C1\tR1C2\nR2C1\tR2C2" }));
+  check("table_delete #79: deletes the matching table", r.ok && r.value.applied === true && r.value.tables_before === 2 && r.value.tables_after === 1 && model.tables.length === 1, JSON.stringify(r));
+  check("table_delete #79: the other table and neighbour paragraphs are intact", cellText(model.tables[0].rows[0][0]) === "keep" && JSON.stringify(model.paragraphs.map((p) => p.text)) === JSON.stringify(before), JSON.stringify(model.tables));
+  check("table_delete #79: reports the deleted text for the evidence", r.ok && r.value.deleted_text === "R1C1\tR1C2\nR2C1\tR2C2", JSON.stringify(r));
+
+  const ws = mk();
+  const rw = await run(() => loadPane(ws).opTableDelete({ table_index: 1, expected_text: "  R1C1   R1C2\n R2C1\tR2C2 " }));
+  check("table_delete #79: expected_text is whitespace-insensitive", rw.ok, rw.message);
+
+  const mm = mk();
+  const rm = await run(() => loadPane(mm).opTableDelete({ table_index: 1, expected_text: "something else" }));
+  check("table_delete #79: text mismatch refuses with CELL_TEXT_MISMATCH and nothing is written", !rm.ok && rm.code === "CELL_TEXT_MISMATCH" && trackedCalls(mm).length === 0 && mm.tables.length === 2, JSON.stringify(rm));
+
+  const shaped = mk({ ooxml: '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><w:body><w:tbl><w:tr><w:tc><w:p><w:r><w:drawing><wp:anchor/></w:drawing></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>' });
+  const rs = await run(() => loadPane(shaped).opTableDelete({ table_index: 1, expected_text: "R1C1\tR1C2\nR2C1\tR2C2" }));
+  check("table_delete #79: a table anchoring a shape is refused (ANCHORED_SHAPES)", !rs.ok && rs.code === "ANCHORED_SHAPES" && trackedCalls(shaped).length === 0, JSON.stringify(rs));
+
+  const rev = mk({ revs: [{ kind: "ins", author: "Colleague", text: "x" }] });
+  const rr = await run(() => loadPane(rev).opTableDelete({ table_index: 1, expected_text: "R1C1\tR1C2\nR2C1\tR2C2" }));
+  check("table_delete #79: tracked changes inside the table are refused", !rr.ok && rr.code === "TRACKED_CHANGES_PRESENT" && trackedCalls(rev).length === 0, JSON.stringify(rr));
+
+  const gone = mk();
+  const rg = await run(() => loadPane(gone).opTableDelete({ table_index: 9, expected_text: "x" }));
+  check("table_delete #79: unknown table is table_not_found", !rg.ok && rg.code === "table_not_found", JSON.stringify(rg));
+
+  const nested = makeModel({ tables: [{ rows: [["a"]], nesting: 2, ooxml: EMPTY }] });
+  const rn = await run(() => loadPane(nested).opTableDelete({ table_index: 1, expected_text: "a" }));
+  check("table_delete #79: nested tables are refused", !rn.ok && /nested table/.test(rn.message) && trackedCalls(nested).length === 0, JSON.stringify(rn));
+
+  const dropped = mk();
+  dropped.dropTableDelete = true;
+  const rd = await run(() => loadPane(dropped).opTableDelete({ table_index: 1, expected_text: "R1C1\tR1C2\nR2C1\tR2C2" }));
+  check("table_delete #79: a delete that did not take is VERIFICATION_FAILED", !rd.ok && rd.code === "VERIFICATION_FAILED", JSON.stringify(rd));
+
+  const collateral = mk();
+  collateral.onTableDelete = () => (collateral.paragraphs[0].text = "Changed");
+  const rc = await run(() => loadPane(collateral).opTableDelete({ table_index: 1, expected_text: "R1C1\tR1C2\nR2C1\tR2C2" }));
+  check("table_delete #79: a changed neighbour paragraph is VERIFICATION_FAILED", !rc.ok && rc.code === "VERIFICATION_FAILED", JSON.stringify(rc));
+
+  const tracked = mk();
+  const rt = await run(() => loadPane(tracked).opTableDelete({ table_index: 1, expected_text: "R1C1\tR1C2\nR2C1\tR2C2", track_changes: true }));
+  check("table_delete #79: tracked delete leaves the table marked and restores the mode", rt.ok && rt.value.tracked === true && tracked.mode === "Off" && tracked.tables.length === 2, JSON.stringify(rt) + tracked.mode);
+}
+
+// 16. table-scoped accept / reject
+{
+  const colleague = [{ kind: "ins", author: "Colleague", text: "elsewhere" }];
+  const mk = (extra = {}) => makeModel({
+    ooxmlMode: "revisions",
+    paragraphs: ["Intro", { text: "Proof", revs: colleague }, "Tail"],
+    tables: [{ rows: [["T1"]], ooxml: EMPTY, revs: [{ kind: "ins", author: "Colleague", text: "in" }, { kind: "del", author: "Colleague", text: "gone" }] }, { rows: [["T2"]], ooxml: EMPTY, revs: [{ kind: "ins", author: "Other", text: "t2" }] }],
+    ...extra,
+  });
+  check("scoped #79: revisions_scoped, table_delete and paragraphs_unlist are reported", ["revisions_scoped", "table_delete", "paragraphs_unlist"].every((c) => loadPane(mk()).PANE_CAPABILITIES.includes(c)), "");
+
+  const model = mk();
+  const ops = loadPane(model);
+  const r = await run(() => ops.dispatchOp("revisions_accept", { table_index: 1 }));
+  check("scoped #79: accept only mutates the named table's revisions", r.ok && r.value.scoped === true && r.value.changed_count === 2 && model.tables[0].revs.length === 0 && model.tables[1].revs.length === 1 && model.paragraphs[1].revs.length === 1, JSON.stringify(r));
+  check("scoped #79: acceptAll is called on the table's own collection only", model.calls.filter((c) => /acceptAll/.test(c)).length === 1 && !model.calls.some((c) => /body/.test(c)), model.calls.join(" | "));
+  check("scoped #79: the table survives an accept (table_removed false)", r.ok && r.value.table_removed === false && model.tables.length === 2, JSON.stringify(r));
+
+  const rej = mk();
+  const rr = await run(() => loadPane(rej).opRevisionsMutate({ table_index: 2 }, "reject"));
+  check("scoped #79: reject only mutates the named table's revisions", rr.ok && rr.value.changed_count === 1 && rej.tables[0].revs.length === 2 && rej.paragraphs[1].revs.length === 1, JSON.stringify(rr));
+
+  const nocoll = mk();
+  nocoll.ooxmlUnreadable = true;
+  const rn = await run(() => loadPane(nocoll).opRevisionsMutate({ table_index: 1 }, "reject"));
+  check("scoped #79: a pane that cannot verify refuses before any write", !rn.ok && rn.code === "LIVE_CAPABILITY_MISSING" && trackedCalls(nocoll).length === 0, JSON.stringify(rn));
+
+  const both = mk();
+  const rb = await run(() => loadPane(both).opRevisionsMutate({ table_index: 1, revision_ids: ["x"] }, "reject"));
+  check("scoped #79: table_index with revision_ids is INVALID_INPUT", !rb.ok && rb.code === "INVALID_INPUT" && trackedCalls(both).length === 0, JSON.stringify(rb));
+
+  const locked = mk();
+  const rl = await run(() => loadPane(locked).opRevisionsMutate({ table_index: 1, forbiddenSections: ["intro"] }, "reject"));
+  check("scoped #79: refused while another client holds a section lock", !rl.ok && rl.code === "LOCKED_BY_OTHER_CLIENT" && trackedCalls(locked).length === 0, JSON.stringify(rl));
+
+  const missing = mk();
+  const rm = await run(() => loadPane(missing).opRevisionsMutate({ table_index: 9 }, "reject"));
+  check("scoped #79: unknown table is table_not_found", !rm.ok && rm.code === "table_not_found", JSON.stringify(rm));
+
+  const leaky = mk({});
+  leaky.scopedRejectTouchesOutside = true;
+  const rk = await run(() => loadPane(leaky).opRevisionsMutate({ table_index: 1 }, "reject"));
+  check("scoped #79: a change to revisions OUTSIDE the table is VERIFICATION_FAILED", !rk.ok && rk.code === "VERIFICATION_FAILED", JSON.stringify(rk));
+
+  const none = mk({ tables: [{ rows: [["T1"]], ooxml: EMPTY }] });
+  const rz = await run(() => loadPane(none).opRevisionsMutate({ table_index: 1 }, "accept"));
+  check("scoped #79: a table with no revisions is a verified no-op", rz.ok && rz.value.changed_count === 0, JSON.stringify(rz));
+}
+
+// 17. #79 item 4: tracked insert after a formatted anchor, then scoped reject, leaves the anchor alone
+{
+  const model = makeModel({
+    ooxmlMode: "revisions",
+    paragraphs: ["Intro", { text: "Purple italic anchor", watch: true, listed: false, revs: [] }, { text: "Tail", revs: [{ kind: "ins", author: "Colleague", text: "colleague edit" }] }],
+  });
+  const ops = loadPane(model);
+  const anchor = model.paragraphs[1];
+  anchor.font = { color: "#800080", italic: true };
+  const fontBefore = JSON.stringify(anchor.font);
+  const ins = await run(() => ops.opTableInsert({ rows: [[spec("a")]], anchor: { paragraph_text: "Purple italic anchor", position: "after" }, header_rows: 0, track_changes: true }));
+  check("anchor #79: tracked insert after the anchor succeeds", ins.ok && ins.value.table_index === 1 && model.tables[0].revs.some((r) => r.tableInsert), JSON.stringify(ins) + model.calls.join(" | "));
+  const rej = await run(() => ops.dispatchOp("revisions_reject", { table_index: ins.ok ? ins.value.table_index : 1 }));
+  check("anchor #79: scoped reject removes the tracked table", rej.ok && rej.value.table_removed === true && model.tables.length === 0, JSON.stringify(rej));
+  check("anchor #79: the colleague's tracked change survives", model.paragraphs[2].revs.length === 1, JSON.stringify(model.paragraphs));
+  check("anchor #79: no write ever touches the anchor paragraph", anchorWrites(model).length === 0, model.calls.join(" | "));
+  check("anchor #79: the anchor's text and formatting are unchanged", anchor.text === "Purple italic anchor" && JSON.stringify(anchor.font) === fontBefore, JSON.stringify(anchor));
+  check("anchor #79: tracking mode is back to what it was", model.mode === "Off", model.mode);
 }
 
 console.log(JSON.stringify({ results }));

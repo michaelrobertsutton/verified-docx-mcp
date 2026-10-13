@@ -73,6 +73,9 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         "delete_resolved_comments",
         # issue #82:
         "replace_text_batch",
+        # issue #79:
+        "clear_numbering",
+        "delete_table",
     }
 )
 

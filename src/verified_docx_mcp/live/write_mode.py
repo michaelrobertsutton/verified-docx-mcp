@@ -493,3 +493,20 @@ def audit_live_failure(
 def shape_counts(result: dict[str, Any]) -> dict[str, Any]:
     """Copy verified pane counts to public evidence and the audit entry."""
     return {key: result[key] for key in ("shapes_before", "shapes_after") if key in result}
+
+
+def require_live_only(path: str, requested: str, *, tool: str) -> None:
+    """Refuse a tool that has no file-mode implementation (issue #79).
+
+    ``write_mode="file"``, or ``"auto"`` with no connected pane for *path*,
+    raises ``LIVE_UNAVAILABLE``; ``"live"`` with no pane raises it too (inside
+    ``resolve_write_mode``). Returns only when a live session will serve the call.
+    """
+    if resolve_write_mode(path, requested) != "live":
+        raise _make_error(
+            ErrorCode.LIVE_UNAVAILABLE,
+            f"{tool} is live only: it edits the document open in Word through the Live pane and has no "
+            f"file-mode implementation (write_mode={requested!r} resolved to file). Connect the pane "
+            "(docs/live-mode.md) and use write_mode='live' or 'auto'.",
+            {"tool": tool, "write_mode": requested},
+        )
