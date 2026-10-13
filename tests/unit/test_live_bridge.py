@@ -289,3 +289,39 @@ class ServeOnlyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PortInUseTests(unittest.TestCase):
+    """#83: EADDRINUSE names the port and points at shared mode."""
+
+    def _hold(self):
+        import socket
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        self.addCleanup(sock.close)
+        return sock.getsockname()[1]
+
+    def _free(self):
+        import socket
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    def test_http_port_in_use_message(self):
+        held = self._hold()
+        with tempfile.TemporaryDirectory() as cert_dir, self.assertRaises(RuntimeError) as ctx:
+            bridge._start_local(port=held, ops_port=self._free(), cert_dir=Path(cert_dir))
+        self.assertIn(str(held), str(ctx.exception))
+        self.assertIn("VERIFIED_DOCX_SHARED_BRIDGE", str(ctx.exception))
+        self.assertIsNone(bridge._singleton)
+
+    def test_ops_port_in_use_message(self):
+        held = self._hold()
+        with tempfile.TemporaryDirectory() as cert_dir, self.assertRaises(RuntimeError) as ctx:
+            bridge._start_local(port=0, ops_port=held, cert_dir=Path(cert_dir), ready_timeout=5)
+        self.assertIn(str(held), str(ctx.exception))
+        self.assertIn("VERIFIED_DOCX_SHARED_BRIDGE", str(ctx.exception))
+        self.assertIsNone(bridge._singleton)

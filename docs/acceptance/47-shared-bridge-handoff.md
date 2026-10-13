@@ -34,7 +34,7 @@ Word acceptance is claimed by this draft.
 
 ## Implemented
 
-- Opt-in `VERIFIED_DOCX_SHARED_BRIDGE=1` on every participating MCP server.
+- Shared mode (originally opt-in `VERIFIED_DOCX_SHARED_BRIDGE=1`; since #83 the POSIX default, `=0` opts out).
   The first explicit `live_status`/`live_open_pane` starts the owner; subsequent
   processes attach. All clients, including the owner, use the broker proxy.
 - Unique process client IDs and pane activity labels. `live_status.shared`

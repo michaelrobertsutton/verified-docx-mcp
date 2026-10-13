@@ -27,3 +27,9 @@ def _isolate_desktop_word_query(monkeypatch, request):
     from verified_docx_mcp import desktop_word
     monkeypatch.setattr(desktop_word, 'status', lambda path:
                         {'supported': True, 'checked': True, 'open': False})
+
+
+@pytest.fixture(autouse=True)
+def _local_bridge_by_default(monkeypatch):
+    """Shared bridge is the production default; unit tests opt in explicitly."""
+    monkeypatch.setenv("VERIFIED_DOCX_SHARED_BRIDGE", "0")
