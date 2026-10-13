@@ -4,10 +4,11 @@ import { webcrypto } from "node:crypto";
 // Prints one JSON line of results; exit code 1 on a thrown error.
 import fs from "node:fs";
 import vm from "node:vm";
+import { DOMParser } from "./shape_dom.mjs";
 
 const src = fs.readFileSync(process.argv[2], "utf8");
 
-function makeDoc(n) {
+function makeDoc(n, ooxml) {
   const state = { syncs: 0, getRange: 0 };
   const comments = Array.from({ length: n }, (_, i) => {
     const c = {
@@ -30,7 +31,12 @@ function makeDoc(n) {
     return c;
   });
   const context = {
-    document: { body: { getComments: () => ({ items: comments, load() {} }) } },
+    document: {
+      body: {
+        getComments: () => ({ items: comments, load() {} }),
+        ...(ooxml === undefined ? {} : { getOoxml: () => ({ value: ooxml }) }),
+      },
+    },
     sync: async () => {
       state.syncs += 1;
     },
@@ -51,12 +57,13 @@ const sandbox = {
   TextEncoder,
   Office: { onReady() {}, HostType: { Word: "Word" }, context: {} },
   Word: { run: null },
+  DOMParser,
 };
 vm.createContext(sandbox);
 vm.runInContext(src + "\n;globalThis.__opCommentsList = opCommentsList; globalThis.__checkEpoch = checkCommentEpoch;", sandbox);
 
-async function run(n, payload) {
-  const { state, context } = makeDoc(n);
+async function run(n, payload, ooxml) {
+  const { state, context } = makeDoc(n, ooxml);
   sandbox.Word.run = (fn) => fn(context);
   const result = await sandbox.__opCommentsList(payload);
   return { result, syncs: state.syncs, getRange: state.getRange };
@@ -82,6 +89,28 @@ out.bigCounts = big.result.counts;
 out.filteredCounts = filtered.result.counts;
 out.scope = big.result.scope;
 out.hasObservedAt = typeof big.result.observed_at === "string" && big.result.observed_at.length > 0;
+
+// issue #39: OOXML cross-check. Three roots (one resolved by commentsExtended) plus one reply.
+const W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const W14 = "http://schemas.microsoft.com/office/word/2010/wordml";
+const W15 = "http://schemas.microsoft.com/office/word/2012/wordml";
+const PKG = "http://schemas.microsoft.com/office/2006/xmlPackage";
+const comment = (id, para) => `<w:comment w:id="${id}"><w:p w14:paraId="X${id}"/><w:p w14:paraId="${para}"><w:r><w:t>c${id}</w:t></w:r></w:p></w:comment>`;
+const pkg = (parts) => `<pkg:package xmlns:pkg="${PKG}" xmlns:w="${W}" xmlns:w14="${W14}" xmlns:w15="${W15}">${parts}</pkg:package>`;
+const part = (name, body) => `<pkg:part pkg:name="${name}"><pkg:xmlData>${body}</pkg:xmlData></pkg:part>`;
+const commentsPart = part("/word/comments.xml", `<w:comments>${comment(1, "A1")}${comment(2, "A2")}${comment(3, "A3")}${comment(4, "A4")}</w:comments>`);
+const extendedPart = part("/word/commentsExtended.xml",
+  `<w15:commentsEx><w15:commentEx w15:paraId="A1" w15:done="0"/><w15:commentEx w15:paraId="A2" w15:done="1"/>` +
+  `<w15:commentEx w15:paraId="A3" w15:done="false"/><w15:commentEx w15:paraId="A4" w15:paraIdParent="A1" w15:done="0"/></w15:commentsEx>`);
+const full = await run(1, undefined, pkg(commentsPart + extendedPart));
+out.ooxml = full.result.ooxml;
+out.ooxmlFiltered = (await run(1, { ids: ["c0"] }, pkg(commentsPart + extendedPart))).result.ooxml ?? null;
+out.ooxmlNoExtended = (await run(1, undefined, pkg(commentsPart))).result.ooxml;
+out.ooxmlNoComments = (await run(1, undefined, pkg(extendedPart))).result.ooxml;
+out.ooxmlGarbage = (await run(1, undefined, "<pkg:package")).result.ooxml;
+out.ooxmlNoReader = big.result.ooxml;
+out.ooxmlSyncs = full.syncs;
+out.capability = vm.runInContext("PANE_CAPABILITIES.includes('comments_ooxml_crosscheck')", sandbox);
 console.log(JSON.stringify(out));
 
 try { sandbox.__checkEpoch({session_epoch: "stale"}); throw new Error("stale epoch accepted"); } catch (e) { if (e.code !== "COMMENT_ID_STALE") throw e; }

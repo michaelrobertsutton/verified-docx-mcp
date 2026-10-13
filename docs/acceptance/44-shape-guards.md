@@ -28,6 +28,23 @@ Formatting, insertion and comment edits remain permitted with shape read-back.
 Revision acceptance/rejection is refused whenever body shapes exist because it
 can remove anchors and safe re-anchoring is unsupported.
 
+## Which ops refuse up front, which are verified afterwards
+
+- **Refuse before writing** (`ANCHORED_SHAPES`): `replace_text` / `replace_text_batch`
+  (any touched anchored paragraph), `replace_cell_markdown` (`cell_set`),
+  `replace_table_row` (`cells_set`), `delete_paragraph` (`paragraph_delete`), and
+  tracked-change accept/reject (`revisions_*`, whenever the body has shapes).
+  `delete_table` refuses a table anchoring a shape.
+- **Verified after the write** (shape identities and counts must be unchanged,
+  otherwise `VERIFICATION_FAILED`): `format_text`, `insert_table`, `insert_paragraphs`,
+  comment add/reply/resolve/delete, and `live_save`. Every guarded op also returns
+  `shapes_before`/`shapes_after`.
+
+Automated end-to-end coverage through the bridge (fake pane, not Word):
+`tests/unit/test_live_shape_e2e.py` (`list_shapes`, counts in evidence and the audit
+log, `ANCHORED_SHAPES` refusals with no write). The pane's JS is covered by
+`tests/unit/js/shapes_harness.mjs`.
+
 ## Word checks required before merge
 
 1. On a disposable document, create multiple floating textboxes and a geometric
@@ -48,3 +65,20 @@ can remove anchors and safe re-anchoring is unsupported.
    refuses mutation with LIVE_CAPABILITY_MISSING before sending the operation.
 7. Simulate missing shapes or a failed post-edit OOXML read: VERIFICATION_FAILED,
    no applied-success response, no claim that Word rolled back the edit.
+
+## Word results (2026-10-13)
+
+Word for Mac, branch `issue-44-39-shapes-comments`, pane `taskpane.js?v=58`, scratch copy of
+`tests/fixtures/textbox.docx` (one DrawingML text box anchored to the second paragraph).
+
+| Row | Result |
+|---|---|
+| 1. `list_shapes` reports the text box: id, name, `drawingml`, anchor paragraph 2 and text, size (2540000 x 1016000 EMU), horizontal/vertical position origins | PASS (single shape only; multiple shapes, table-cell shapes and VML not run) |
+| 2. `replace_text` on the anchored paragraph: `ANCHORED_SHAPES`, nothing changed. `replace_text` on the unanchored paragraph applies with `shapes_before 1`, `shapes_after 1`, shape still listed afterwards | PASS |
+| 3. Cell and row refusal with an anchored cell | NOT RUN |
+| 4. `delete_paragraph` on the anchored paragraph refused with nothing deleted (it hit `STRUCTURAL_BOUNDARY` first because it is the last paragraph); unanchored deletion with shifted indices not run | PARTIAL |
+| 5. Counts across `format_text`, `insert_table`, comment ops, `live_save`; audit entries | PARTIAL (counts verified on `replace_text`; audit counts covered by `test_live_shape_e2e.py`) |
+| 6. Tracked accept/reject refusal with shapes; old-pane refusal | NOT RUN in Word (unit tests cover both) |
+| 7. Simulated failed post-edit OOXML read | NOT RUN in Word (unit tests cover it) |
+
+#44 stays open until rows 3 to 7 and the multi-shape row 1 variants are run.

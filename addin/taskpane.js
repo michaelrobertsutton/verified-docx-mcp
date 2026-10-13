@@ -243,7 +243,8 @@ const OP_LOG_LIMIT = 20;
 // issue #77: "paragraph_insert" = the paragraph_insert op (styled, optionally tracked paragraphs).
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
-const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped"];
+// issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
+const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -1788,6 +1789,61 @@ async function opCellsSet(payload) {
 // those comment ids; `include_anchor: false` skips the per-comment
 // getRange() (used by reply/resolve verification, which never reads it).
 // `timing_ms` lets a caller see where a slow list went.
+const COMMENTS_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const COMMENTS_W14_NS = "http://schemas.microsoft.com/office/word/2010/wordml";
+const COMMENTS_W15_NS = "http://schemas.microsoft.com/office/word/2012/wordml";
+
+function commentsXmlAttr(el, ns, local, qname) {
+  const direct = el.getAttribute(qname);
+  if (direct !== null && direct !== undefined) return direct;
+  const viaNs = typeof el.getAttributeNS === "function" ? el.getAttributeNS(ns, local) : null;
+  return viaNs === "" ? null : viaNs;
+}
+
+// issue #39: count open comment THREADS from the comments parts of a flat OPC
+// package (body.getOoxml()), independently of body.getComments(). A thread
+// root is a w:comment whose last paragraph's w14:paraId has no paraIdParent in
+// commentsExtended.xml; replies carry a paraIdParent and are not threads. A root
+// is resolved when its commentEx done is "1"/"true". `available` is false when
+// either part is missing or the package does not parse, so the caller never
+// treats an absent cross-check as "complete". `ids` are w:id values (not
+// necessarily the Office.js comment ids).
+function crosscheckCommentsOoxml(xml) {
+  const unavailable = (reason) => ({ available: false, total_threads: null, open_threads: null, ids: [], reason });
+  try {
+    const doc = new DOMParser().parseFromString(xml, "application/xml");
+    if (doc.getElementsByTagName("parsererror").length) return unavailable("unparseable");
+    const partNames = [...doc.getElementsByTagNameNS(FLAT_OPC_NS, "part")]
+      .map((part) => part.getAttribute("pkg:name"));
+    if (!partNames.includes("/word/comments.xml")) return unavailable("comments part missing");
+    if (!partNames.includes("/word/commentsExtended.xml")) return unavailable("commentsExtended part missing");
+    const extended = new Map();
+    for (const ex of doc.getElementsByTagNameNS(COMMENTS_W15_NS, "commentEx")) {
+      const paraId = commentsXmlAttr(ex, COMMENTS_W15_NS, "paraId", "w15:paraId");
+      if (!paraId) continue;
+      const done = commentsXmlAttr(ex, COMMENTS_W15_NS, "done", "w15:done");
+      extended.set(paraId, {
+        parent: commentsXmlAttr(ex, COMMENTS_W15_NS, "paraIdParent", "w15:paraIdParent"),
+        done: done === "1" || done === "true",
+      });
+    }
+    let total = 0;
+    const ids = [];
+    for (const comment of doc.getElementsByTagNameNS(COMMENTS_W_NS, "comment")) {
+      const paragraphs = comment.getElementsByTagNameNS(COMMENTS_W_NS, "p");
+      const last = paragraphs.length ? paragraphs[paragraphs.length - 1] : null;
+      const paraId = last ? commentsXmlAttr(last, COMMENTS_W14_NS, "paraId", "w14:paraId") : null;
+      const ex = paraId ? extended.get(paraId) : undefined;
+      if (ex && ex.parent) continue; // a reply, not a thread
+      total += 1;
+      if (!(ex && ex.done)) ids.push(commentsXmlAttr(comment, COMMENTS_W_NS, "id", "w:id"));
+    }
+    return { available: true, total_threads: total, open_threads: ids.length, ids };
+  } catch (err) {
+    return unavailable(`parse error: ${err && err.message ? err.message : err}`);
+  }
+}
+
 async function opCommentsList(payload) {
   const p = payload || {};
   const started = Date.now();
@@ -1797,6 +1853,18 @@ async function opCommentsList(payload) {
       anchors: p.include_anchor !== false,
       replies: true,
     });
+    // issue #39: the unfiltered listing also reads the body's OOXML so a gap between
+    // getComments() and the comments parts is visible. A failure here must not fail the list.
+    let ooxml;
+    if (p.ids === undefined || p.ids === null) {
+      try {
+        const packaged = context.document.body.getOoxml();
+        await context.sync();
+        ooxml = crosscheckCommentsOoxml(packaged.value);
+      } catch (err) {
+        ooxml = { available: false, total_threads: null, open_threads: null, ids: [], reason: `read failed: ${err && err.message ? err.message : err}` };
+      }
+    }
     // issue #39: only the body collection is read (body.getComments()), so
     // comments anchored outside the main body (headers, footers, text boxes;
     // issue #35) are not covered. `scope` says so instead of implying more.
@@ -1808,6 +1876,7 @@ async function opCommentsList(payload) {
       scope: "body",
       observed_at: observedAt,
       session_epoch: paneEpoch,
+      ...(ooxml ? { ooxml } : {}),
       timing_ms: { total: Date.now() - started },
     };
   });
