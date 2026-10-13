@@ -63,6 +63,14 @@ from websockets.exceptions import ConnectionClosed
 from verified_docx_mcp.live.protocol import OP_ERROR_MATCH_COUNT_MISMATCH, OP_ERROR_ZERO_MATCH
 
 
+# Mirrors SHAPE_GUARDED_OPS in addin/taskpane.js.
+SHAPE_GUARDED_OPS = frozenset({
+    "replace", "format", "cell_set", "cells_set", "table_insert", "paragraph_delete", "paragraph_insert",
+    "revisions_accept", "revisions_reject", "comment_add", "comment_reply", "comment_resolve",
+    "comment_delete", "save", "table_delete", "paragraphs_unlist",
+})
+
+
 class OpRefused(Exception):
     """Raised by a `FakeDocument` op handler to make `FakePane` reply
     `ok=false` with this code/message, instead of a raised exception
@@ -226,9 +234,47 @@ class FakeDocument:
         self.drop_table_delete = False
         # 0-based indices of tables the fake reports as anchoring a shape.
         self.shape_tables: set[int] = set()
+        # Issue #44: the anchored-shape inventory `shapes_list` returns, entries shaped like the
+        # pane's `inventoryShapes` (id, name, kind, anchor_paragraph {index, text}, size_emu,
+        # horizontal_position/vertical_position {relative_to, value}, legacy_style). A paragraph
+        # or cell whose text equals an entry's anchor_paragraph.text is "anchored"; the guarded
+        # ops below refuse to touch it, like the real pane.
+        self.shapes: list[dict[str, Any]] = []
+        # Issue #39: the `ooxml` cross-check block comments_list returns ({available, total_threads,
+        # open_threads, ids}). None = a pane that predates the cross-check (no key). A list is
+        # consumed one block per unfiltered read (the last one sticks), for retry tests.
+        self.ooxml: dict[str, Any] | list[dict[str, Any]] | None = None
         # Tracked changes: {"kind", "author", "text", "table": 0-based index | None, "table_insert": bool}.
         # Not part of the body hash (Word's body.text excludes revision markup).
         self.revisions: list[dict[str, Any]] = []
+
+    def _anchored_texts(self) -> set[str]:
+        return {s["anchor_paragraph"]["text"] for s in self.shapes if s.get("anchor_paragraph")}
+
+    def guard_shape_text(self, *texts: str) -> None:
+        """Refuse (ANCHORED_SHAPES) when any of *texts* is an anchored paragraph/cell's text."""
+        hit = self._anchored_texts().intersection(texts)
+        if hit:
+            raise OpRefused("ANCHORED_SHAPES", "Edit touches a paragraph anchoring a shape; re-anchoring is unsupported")
+
+    def shapes_list(self) -> dict[str, Any]:
+        return {
+            "shapes": [dict(s) for s in self.shapes],
+            "coverage": "document_body",
+            "paragraph_indexing": "all body paragraphs including tables and textboxes; 1-based",
+        }
+
+    def paragraph_delete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        pre = self._check_fresh(payload)
+        lines = self.text.split("\n")
+        hits = [i for i, line in enumerate(lines) if line == payload["anchor_text"]]
+        if len(hits) != 1:
+            raise OpRefused("MATCH_COUNT_MISMATCH", f"Expected unique whole paragraph, found {len(hits)}")
+        if payload["anchor_text"] in self._anchored_texts():
+            raise OpRefused("ANCHORED_SHAPES", "Paragraph anchors a shape; re-anchoring is not supported")
+        del lines[hits[0]]
+        self.text = "\n".join(lines)
+        return {"applied": True, "pre": pre, "post": self.sha256()}
 
     def sha256(self) -> str:
         payload = self.text
@@ -263,6 +309,7 @@ class FakeDocument:
             self.before_cell_set()
         t, r, c = self._cell(payload)
         before = self.tables[t][r][c]
+        self.guard_shape_text(*before.split("\n"))
         if before != payload["expected_before_text"]:
             raise OpRefused(
                 "LIVE_OP_FAILED",
@@ -494,6 +541,8 @@ class FakeDocument:
         """Issue #79: accept/reject all revisions, or (table_index) only those inside one table.
         Rejecting a tracked table insertion removes the table, as Word does."""
         self._ensure_meta()
+        if self.shapes:
+            raise OpRefused("ANCHORED_SHAPES", "Revision changes with anchored shapes require manual review")
         pre = self._check_fresh(payload)
         scoped = payload.get("table_index") is not None
         t = int(payload["table_index"]) - 1 if scoped else None
@@ -557,6 +606,7 @@ class FakeDocument:
             self.before_cell_set()
         addresses = [self._cell(spec) for spec in payload["cells"]]
         before = [self.tables[t][r][c] for t, r, c in addresses]
+        self.guard_shape_text(*(line for text in before for line in text.split("\n")))
         for spec, text in zip(payload["cells"], before):
             if text != spec["expected_before_text"]:
                 raise OpRefused(
@@ -652,6 +702,14 @@ class FakeDocument:
                 "LIVE_OP_FAILED",
                 f"expected {expected_matches} match(es) for {find!r}, found {len(positions)}",
             )
+        if self.shapes:
+            touched: list[str] = []
+            offset = 0
+            for line in self.text.split("\n"):
+                if any(start < offset + len(line) + 1 and offset <= end for start, end in positions):
+                    touched.append(line)
+                offset += len(line) + 1
+            self.guard_shape_text(*touched)
         removed: list[dict[str, Any]] = []
         if allow_comment_loss_ids is not None:
             allowed = {e["comment_id"]: e["reply_count"] for e in allow_comment_loss_ids}
@@ -762,6 +820,9 @@ class FakeDocument:
             if not include_anchor:
                 d.pop("anchorText", None)
             out.append(d)
+        ooxml = self.ooxml
+        if isinstance(ooxml, list):
+            ooxml = ooxml.pop(0) if len(ooxml) > 1 else ooxml[0]
         # issue #39: counts describe the WHOLE collection, never the ids subset.
         return {
             "comments": out,
@@ -771,6 +832,7 @@ class FakeDocument:
             },
             "scope": "body",
             "observed_at": "2026-10-01T12:00:00.000Z",
+            **({"ooxml": ooxml} if ooxml is not None and ids is None else {}),
             **({"session_epoch": self.session_epoch} if self.session_epoch else {}),
         }
 
@@ -894,7 +956,7 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped"]
+            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"]
             if capabilities is None
             else list(capabilities)
         )
@@ -995,7 +1057,19 @@ class FakePane:
         return {"type": "reply", "request_id": request_id, "ok": True, "result": result}
 
     def _dispatch(self, op: str, payload: dict[str, Any]) -> dict[str, Any]:
+        result = self._dispatch_op(op, payload)
+        if op in SHAPE_GUARDED_OPS:
+            # The real pane's dispatchOp reads the shape inventory around every guarded op.
+            count = len(self.document.shapes)
+            result = {**result, "shapes_before": count, "shapes_after": count}
+        return result
+
+    def _dispatch_op(self, op: str, payload: dict[str, Any]) -> dict[str, Any]:
         doc = self.document
+        if op == "shapes_list":
+            return doc.shapes_list()
+        if op == "paragraph_delete":
+            return doc.paragraph_delete(payload)
         if op == "ping":
             return {}
         if op == "describe":

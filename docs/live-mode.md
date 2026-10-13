@@ -1081,6 +1081,31 @@ below), so the tool now makes a gap visible instead of guessing:
   `file_only_open_comments`; the file may simply be older than the live
   document, and a file-mode reply counts as its own comment, so replies whose
   text matches a live reply are skipped).
+- **OOXML cross-check: `complete`, `counts.ooxml_open`.** The pane's counter and
+  the list both read `body.getComments()`, so they cannot disagree with each
+  other. A pane advertising `comments_ooxml_crosscheck` therefore also reads
+  `body.getOoxml()` on an unfiltered `comments_list`, parses the comments part
+  (`w:comment`) and `commentsExtended.xml` (`w15:commentEx`: `paraId`,
+  `paraIdParent`, `done`), and returns `ooxml: {available, total_threads,
+  open_threads, ids}`. Thread roots are comments whose last paragraph's
+  `w14:paraId` has no `paraIdParent`; replies are not counted; a root is
+  resolved when `done` is `1`/`true`. The tool reports top-level
+  `complete: true | false | null`: `false` when `ooxml.open_threads` exceeds the
+  pane's open count, `null` (unknown, never "complete") for a pane without the
+  capability or when either comments part is missing or unparseable, `true`
+  otherwise. When `false`, `counts.ooxml_open` is set, the tool re-reads
+  `comments_list` once and uses the second read, and if the gap remains it adds
+  warning `pane_collection_incomplete` (both counts, `ooxml_open_ids`,
+  `missing_comment_ids`, `retried`). `missing_comment_ids` is the OOXML `w:id`
+  values not among the returned ids; because Office.js comment ids and `w:id`
+  are different id spaces on desktop Word, it is `null` when no OOXML id matches
+  any returned id (use `ooxml_open_ids` then). All of this is additive; old
+  panes yield `complete: null`.
+  **Limits:** the OOXML read comes from the body only, so comments anchored in
+  headers, footers or text boxes can still be invisible to both reads (only the
+  existing file-side warnings can hint at them), and it assumes Word includes
+  the comments parts in `body.getOoxml()` (check with
+  docs/acceptance/39-comments-complete.md).
 - **Malformed replies refuse.** A pane reply with no `comments` list, or
   `counts` that disagree with the comments returned, raises `LIVE_OP_FAILED`
   instead of reporting an empty result.

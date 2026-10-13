@@ -59,6 +59,28 @@ class OpCommentsListTests(unittest.TestCase):
         self.assertEqual(self.out["noAnchorGetRange"], 0)
         self.assertFalse(self.out["noAnchorHasAnchorText"])
 
+    def test_ooxml_crosscheck_counts_open_root_threads_only(self):
+        # 4 comments: roots 1 (open), 2 (done=1), 3 (done=false); 4 is a reply to 1.
+        self.assertEqual(
+            self.out["ooxml"],
+            {"available": True, "total_threads": 3, "open_threads": 2, "ids": ["1", "3"]},
+        )
+
+    def test_ooxml_crosscheck_unavailable_without_a_comments_part(self):
+        for key in ("ooxmlNoExtended", "ooxmlNoComments", "ooxmlGarbage"):
+            block = self.out[key]
+            self.assertFalse(block["available"], key)
+            self.assertIsNone(block["open_threads"], key)
+            self.assertEqual(block["ids"], [], key)
+
+    def test_ooxml_crosscheck_skipped_for_an_ids_filter_and_survives_a_missing_reader(self):
+        self.assertIsNone(self.out["ooxmlFiltered"])
+        self.assertFalse(self.out["ooxmlNoReader"]["available"])  # body.getOoxml absent -> caught, list still returned
+
+    def test_ooxml_crosscheck_adds_one_sync_and_a_capability(self):
+        self.assertEqual(self.out["ooxmlSyncs"], 3)
+        self.assertTrue(self.out["capability"])
+
 
 BODY_OOXML_HARNESS = Path(__file__).resolve().parent / "js" / "body_ooxml_harness.mjs"
 

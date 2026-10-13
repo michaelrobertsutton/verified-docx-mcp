@@ -551,6 +551,35 @@ def _validated_pane_comments(result: dict[str, Any]) -> list[dict[str, Any]]:
     return comments
 
 
+def _ooxml_block(result: dict[str, Any]) -> dict[str, Any] | None:
+    """The pane's ``ooxml`` cross-check block (issue #39) when it is usable: ``available`` true and
+    an integer ``open_threads``. None for an old pane (no block), an unavailable one, or a
+    malformed one -- every case where completeness is unknown."""
+    block = result.get("ooxml")
+    if not isinstance(block, dict) or block.get("available") is not True:
+        return None
+    open_threads = block.get("open_threads")
+    if isinstance(open_threads, bool) or not isinstance(open_threads, int):
+        return None
+    return block
+
+
+def _pane_open_count(result: dict[str, Any], comments: list[dict[str, Any]]) -> int:
+    counts = result.get("counts")
+    if isinstance(counts, dict) and isinstance(counts.get("open"), int):
+        return counts["open"]
+    return sum(1 for c in comments if not c.get("resolved", False))
+
+
+def _pane_complete(result: dict[str, Any], comments: list[dict[str, Any]]) -> bool | None:
+    """True/False when the OOXML open-thread count could be compared with the pane's own open
+    count, None (unknown) when it could not (issue #39)."""
+    block = _ooxml_block(result)
+    if block is None:
+        return None
+    return block["open_threads"] <= _pane_open_count(result, comments)
+
+
 def _live_state_full(path: str, session: LiveSession):
     """(raw_comments, correlation, pane_result, file_result): ``_live_state``
     plus the pane's whole reply (counts/scope/observed_at) and the ONE read
@@ -559,6 +588,12 @@ def _live_state_full(path: str, session: LiveSession):
     snapshots)."""
     result = _request(session, "comments_list")
     raw_comments = _validated_pane_comments(result)
+    if _pane_complete(result, raw_comments) is False:
+        # Issue #39: the OOXML read saw more open threads than getComments() returned. The
+        # collection can be momentarily stale, so read once more and trust the second read.
+        result = _request(session, "comments_list")
+        raw_comments = _validated_pane_comments(result)
+        result["_retried"] = True
     for comment in raw_comments:
         comment["session_epoch"] = result.get("session_epoch")
     file_result = _file_comments_and_suggestions(path)
@@ -680,8 +715,36 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
                 }
             )
 
+    # Issue #39: `complete` compares the pane's open count with the open threads counted from the
+    # body OOXML. null = unknown (old pane, or the pane could not read the comments parts).
+    # Office.js comment ids and OOXML w:id values are different id spaces on desktop Word, so
+    # missing_comment_ids is only a real diff when at least one OOXML id matches a returned id
+    # (or nothing was returned); otherwise it is null and ooxml_open_ids is the raw list.
+    ooxml = _ooxml_block(pane_result)
+    complete = _pane_complete(pane_result, raw_comments)
+    counts_out: dict[str, Any] = {"live_total": live_total, "live_open": live_open, "returned": len(open_raw)}
+    if ooxml is not None:
+        counts_out["ooxml_open"] = ooxml["open_threads"]
+    if complete is False and ooxml is not None:
+        ooxml_ids = [str(i) for i in (ooxml.get("ids") or []) if i is not None]
+        returned_ids = {str(c.get("id")) for c in raw_comments}
+        correlates = not raw_comments or any(i in returned_ids for i in ooxml_ids)
+        warnings.append(
+            {
+                "code": "pane_collection_incomplete",
+                "message": f"the pane's comment collection reported {live_open} open comment(s) but the "
+                f"document OOXML holds {ooxml['open_threads']} open thread(s); some comments may be missing "
+                "from this list",
+                "live_open": live_open,
+                "ooxml_open": ooxml["open_threads"],
+                "ooxml_open_ids": ooxml_ids,
+                "missing_comment_ids": [i for i in ooxml_ids if i not in returned_ids] if correlates else None,
+                "retried": bool(pane_result.get("_retried")),
+            }
+        )
+
     result: dict[str, Any] = {
-        "counts": {"live_total": live_total, "live_open": live_open, "returned": len(open_raw)},
+        "counts": counts_out,
         "scope": scope,
         "pane": {
             "instance_id": session.hello.instance_id,
@@ -702,6 +765,7 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
         "file_only_open_comments": file_only,
         "correlation": [entry for entry in correlation if entry["live_comment_id"] in open_ids],
     }
+    result["complete"] = complete
     if older_pane:
         result["pane_note"] = STALE_PANE_NOTE_COUNTS
     return result
