@@ -14,6 +14,7 @@ import os
 import socket
 import socketserver
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -69,7 +70,11 @@ def _lease_duration(request: dict) -> float:
 
 
 def enabled() -> bool:
-    return os.environ.get("VERIFIED_DOCX_SHARED_BRIDGE") == "1"
+    """Shared mode is the POSIX default; VERIFIED_DOCX_SHARED_BRIDGE=0 opts out."""
+    if sys.platform == "win32":
+        return False
+    value = os.environ.get("VERIFIED_DOCX_SHARED_BRIDGE", "").strip().lower()
+    return value not in {"0", "false", "off", "no"}
 
 
 def runtime_dir() -> Path:
@@ -153,6 +158,7 @@ class Broker:
                 return {}
             if action == "status":
                 return {
+                    "owner_pid": os.getpid(),
                     "clients": [
                         {"client_id": key, "idle_s": time.monotonic() - v["last_seen"]}
                         for key, v in self.clients.items()
@@ -534,6 +540,8 @@ class Client:
     def __init__(self, path: Path):
         self.path = path
         self.client_id = ""
+        # Set when the owner is unreachable; bridge.current_registry() then re-elects.
+        self.dead = False
         attached = self.rpc("attach")
         if attached["protocol"] != 1:
             raise RuntimeError("Incompatible shared bridge protocol; restart all MCP servers")
@@ -546,6 +554,7 @@ class Client:
             try:
                 self.rpc("status")
             except (LiveDisconnected, LiveOpFailed):
+                self.dead = True
                 return
 
     def close(self):
@@ -567,9 +576,10 @@ class Client:
                 with sock.makefile("rb") as stream:
                     response = _frame(stream)
         except (OSError, ValueError, TypeError) as exc:
+            self.dead = True
             raise LiveDisconnected(
                 "Shared bridge unavailable; result may be unknown. Do not replay writes. "
-                "Call live_status to reconnect."
+                "The next call re-attaches automatically (live_status forces it)."
             ) from exc
         if not response["ok"]:
             raise LiveOpFailed(response["code"], response["message"])
@@ -627,12 +637,22 @@ def connect(start_local, *, directory=None, ready_timeout=10):
             server.broker = Broker(registry)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
+            _write_owner_pid(directory)
             _owner = (server, thread, fd, socket_path)
             _client = Client(socket_path)
             return _client
         except Exception:
             os.close(fd)
             raise
+
+
+def _write_owner_pid(directory: Path) -> None:
+    """Atomically record the elected owner's PID (0600) beside owner.lock."""
+    tmp = directory / f"owner.pid.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(f"{os.getpid()}\n")
+    os.replace(tmp, directory / "owner.pid")
 
 
 def current():

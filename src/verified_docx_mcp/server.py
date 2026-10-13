@@ -702,8 +702,15 @@ def execute_live_status() -> dict[str, Any]:
             }
         )
 
+    shared_status = registry.status() if hasattr(registry, "status") else None
+    pid = os.getpid()
+    owner_pid = shared_status.get("owner_pid", pid) if shared_status is not None else pid
     return {
         "bridge_running": True,
+        "pid": pid,
+        "owner_pid": owner_pid,
+        "is_owner": owner_pid == pid,
+        "mode": "shared" if shared_status is not None else "local",
         "port": port,
         "ops_port": ops_port,
         "sessions": sessions,
@@ -715,7 +722,7 @@ def execute_live_status() -> dict[str, Any]:
         # such basename collision is recorded here so it is visible
         # rather than a silent misroute -- empty when none have happened.
         "session_collisions": registry.collisions(),
-        "shared": registry.status() if hasattr(registry, "status") else None,
+        "shared": shared_status,
     }
 
 
@@ -723,7 +730,7 @@ def execute_live_status() -> dict[str, Any]:
 def live_document_lock(path: str, release: bool = False, lease_s: float = 60) -> dict[str, Any]:
     """Acquire/renew or release this client's shared live DOCUMENT lock.
 
-    Requires VERIFIED_DOCX_SHARED_BRIDGE=1 and live_status in each MCP process.
+    Requires shared bridge mode (the POSIX default; VERIFIED_DOCX_SHARED_BRIDGE=0 disables it).
     Lease is 1-300 seconds; reads remain available to every client. This draft
     supports whole-document locks only, not independent heading/range locks.
     Other clients' writes fail LOCKED_BY_OTHER_CLIENT while the lease is held.
@@ -792,7 +799,7 @@ def live_section_lock(
     1-300 s and renew by locking again; renewing never re-baselines. Revision,
     text-box-scope and other document-wide operations are refused under section
     locks. ``release=true`` releases the named sections (all of yours if
-    ``section_keys`` is empty). Requires VERIFIED_DOCX_SHARED_BRIDGE=1.
+    ``section_keys`` is empty). Requires shared bridge mode (the POSIX default).
     ``include_subsections`` also locks the deeper-level sections that follow.
     """
     from .live import comments_live, write_mode
@@ -3817,6 +3824,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         sys.exit(doctor())
 
+    from .shutdown import install_shutdown_handlers
+
+    install_shutdown_handlers(live_bridge.stop)
     mcp.run()
 
 

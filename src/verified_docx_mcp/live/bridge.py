@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import errno
 import functools
 import http.server
 import json
@@ -326,17 +327,34 @@ _singleton_lock = threading.Lock()
 _singleton: _RunningBridge | None = None
 
 
+def _port_in_use_message(port: int) -> str:
+    holder = ""
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        ).stdout.split()
+        if out:
+            holder = f" (held by PID {', '.join(out)})"
+    except Exception:  # noqa: BLE001, S110 - best-effort diagnostics only
+        pass
+    return (
+        f"Live bridge port {port} is already in use{holder}. Leave "
+        "VERIFIED_DOCX_SHARED_BRIDGE unset (shared mode) so all MCP processes share one bridge."
+    )
+
+
 def start_in_background(**kwargs):
-    """Start/attach to the experimental shared owner when explicitly enabled.
+    """Start/attach to the shared owner (default on POSIX), else a local bridge.
 
-    Custom-port test/CLI bridges retain their existing isolated behavior.
+    Custom-port test/CLI bridges (any kwargs) retain their isolated local behavior.
     """
-    import os
+    from . import shared
 
-    if os.environ.get("VERIFIED_DOCX_SHARED_BRIDGE") == "1" and not kwargs:
-        if sys.platform == "win32":
-            raise RuntimeError("Shared bridge requires POSIX Unix sockets; Windows is unsupported")
-        from . import shared
+    if not kwargs and shared.enabled():
         return shared.connect(_start_local)
     return _start_local(**kwargs)
 
@@ -375,7 +393,14 @@ def _start_local(
         if not cert_path.exists() or not key_path.exists():
             cert_path, key_path = make_cert(cert_dir)
 
-        httpd = make_server(addin_dir, host=host, port=port, certfile=cert_path, keyfile=key_path, report_dir=report_dir)
+        try:
+            httpd = make_server(
+                addin_dir, host=host, port=port, certfile=cert_path, keyfile=key_path, report_dir=report_dir
+            )
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                raise RuntimeError(_port_in_use_message(port)) from exc
+            raise
         http_thread = threading.Thread(
             target=httpd.serve_forever, daemon=True, name="verified-docx-mcp-live-http"
         )
@@ -412,17 +437,22 @@ def _start_local(
 
             try:
                 loop.run_until_complete(_serve())
+            except OSError as exc:
+                state["error"] = exc
+                ready.set()
             finally:
                 loop.close()
 
         ops_thread = threading.Thread(target=_run_ops_loop, daemon=True, name="verified-docx-mcp-live-ops")
         ops_thread.start()
 
-        if not ready.wait(timeout=ready_timeout):
+        if not ready.wait(timeout=ready_timeout) or "error" in state:
             # Best-effort cleanup of the half-started bridge before raising --
             # a caller that catches this can retry cleanly.
             httpd.shutdown()
             httpd.server_close()
+            if isinstance(state.get("error"), OSError) and state["error"].errno == errno.EADDRINUSE:
+                raise RuntimeError(_port_in_use_message(resolved_ops_port)) from state["error"]
             raise RuntimeError(
                 f"WSS ops listener on {host}:{resolved_ops_port} did not start within {ready_timeout}s"
             )
@@ -478,8 +508,17 @@ def current_registry() -> SessionRegistry | None:
     to check bridge state without starting one."""
     if sys.platform != "win32":
         from . import shared
-        if shared.current() is not None:
-            return shared.current()
+        client = shared.current()
+        if client is not None and getattr(client, "dead", False) and shared.enabled():
+            # Owner went away: re-elect once; failures surface as the usual
+            # "no connected pane session" errors from the callers.
+            try:
+                shared.connect(_start_local)
+            except Exception:  # noqa: BLE001, S110 - callers report the disconnect
+                pass
+            client = shared.current()
+        if client is not None:
+            return client
     with _singleton_lock:
         return _singleton.registry if _singleton is not None else None
 

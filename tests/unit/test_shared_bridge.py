@@ -570,3 +570,150 @@ def test_basename_collision_refuses_every_request(setup_broker):
             call(a, op)
     with pytest.raises(LiveOpFailed, match="LIVE_SESSION_MISMATCH"):
         call(a, action="lock")
+
+
+# --- #83: default-on, ownership identity, re-election, shutdown -------------
+
+
+@pytest.mark.parametrize(
+    ("value", "platform", "expected"),
+    [
+        (None, "darwin", True),
+        (None, "linux", True),
+        ("1", "darwin", True),
+        ("0", "darwin", False),
+        ("false", "linux", False),
+        ("OFF", "linux", False),
+        ("no", "linux", False),
+        (None, "win32", False),
+        ("1", "win32", False),
+    ],
+)
+def test_enabled_matrix(monkeypatch, value, platform, expected):
+    if value is None:
+        monkeypatch.delenv("VERIFIED_DOCX_SHARED_BRIDGE", raising=False)
+    else:
+        monkeypatch.setenv("VERIFIED_DOCX_SHARED_BRIDGE", value)
+    monkeypatch.setattr(sys, "platform", platform)
+    assert shared.enabled() is expected
+
+
+def test_start_in_background_kwargs_stay_local(monkeypatch):
+    from verified_docx_mcp.live import bridge
+
+    monkeypatch.setenv("VERIFIED_DOCX_SHARED_BRIDGE", "1")
+    monkeypatch.setattr(shared, "connect", lambda *a, **k: pytest.fail("shared used"))
+    monkeypatch.setattr(bridge, "_start_local", lambda **kw: ("local", kw))
+    assert bridge.start_in_background(port=0) == ("local", {"port": 0})
+
+
+def test_owner_pid_file_and_broker_status(monkeypatch):
+    from pathlib import Path
+
+    from verified_docx_mcp.live import bridge
+
+    registry = SimpleNamespace(list=list, get=lambda name: None, collisions=list)
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="docx-pid-") as directory:
+        monkeypatch.setenv("VERIFIED_DOCX_SHARED_BRIDGE", "1")
+        monkeypatch.setattr(shared, "runtime_dir", lambda: Path(directory))
+        monkeypatch.setattr(bridge, "_start_local", lambda: registry)
+        try:
+            client = bridge.start_in_background()
+            pid_file = Path(directory) / "owner.pid"
+            assert pid_file.read_text().strip() == str(os.getpid())
+            assert pid_file.stat().st_mode & 0o777 == 0o600
+            assert client.status()["owner_pid"] == os.getpid()
+
+            from verified_docx_mcp import server
+
+            status = server.execute_live_status()
+            assert status["pid"] == status["owner_pid"] == os.getpid()
+            assert status["is_owner"] is True
+            assert status["mode"] == "shared"
+        finally:
+            bridge.stop()
+
+
+def test_dead_owner_triggers_reelection(monkeypatch):
+    from pathlib import Path
+
+    from verified_docx_mcp.live import bridge
+
+    script = """import os, sys
+from pathlib import Path
+from types import SimpleNamespace
+from verified_docx_mcp.live import shared
+def start():
+    return SimpleNamespace(list=list, get=lambda name:None, collisions=list)
+shared.connect(start, directory=Path(sys.argv[1]))
+print('ready', flush=True)
+sys.stdin.readline()
+os._exit(0)
+"""
+    registry = SimpleNamespace(list=list, get=lambda name: None, collisions=list)
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="docx-reelect-") as directory:
+        monkeypatch.setenv("VERIFIED_DOCX_SHARED_BRIDGE", "1")
+        monkeypatch.setattr(shared, "runtime_dir", lambda: Path(directory))
+        monkeypatch.setattr(bridge, "_start_local", lambda: registry)
+        owner = subprocess.Popen(
+            [sys.executable, "-c", script, directory],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert owner.stdout.readline().strip() == "ready"
+            client = bridge.start_in_background()
+            assert client.status()["owner_pid"] == owner.pid
+            assert bridge.current_registry() is client
+            owner.communicate("\n", timeout=15)
+            with pytest.raises(shared.LiveDisconnected, match="re-attaches automatically"):
+                client.status()
+            assert client.dead
+            fresh = bridge.current_registry()
+            assert fresh is not client and not fresh.dead
+            assert fresh.status()["owner_pid"] == os.getpid()
+        finally:
+            owner.kill()
+            bridge.stop()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_shutdown_handler_exits_with_signal_code(monkeypatch):
+    from verified_docx_mcp import shutdown
+
+    exits = []
+    stopped = threading.Event()
+    monkeypatch.setattr(shutdown.os, "_exit", exits.append)
+    shutdown.make_shutdown_handler(stopped.set)(15, None)
+    assert stopped.is_set() and exits == [143]
+
+    # A wedged teardown must not block the exit past the join timeout.
+    monkeypatch.setattr(shutdown, "JOIN_TIMEOUT_S", 0.1)
+    block = threading.Event()
+    shutdown.make_shutdown_handler(block.wait)(1, None)
+    assert exits == [143, 129]
+    block.set()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_sigterm_terminates_stdio_server():
+    import signal
+
+    env = {**os.environ, "VERIFIED_DOCX_SHARED_BRIDGE": "0"}
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "verified_docx_mcp"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        time.sleep(3)  # let the server install handlers and block on stdin
+        assert proc.poll() is None, proc.stderr.read()
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=5) == 128 + signal.SIGTERM
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate()

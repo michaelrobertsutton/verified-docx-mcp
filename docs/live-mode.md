@@ -1272,16 +1272,20 @@ not tried.
 
 ## Shared bridge: several agent sessions, one Word pane (#47)
 
-Opt-in and POSIX-only (macOS). Set `VERIFIED_DOCX_SHARED_BRIDGE=1` in **each** MCP
-server's environment and restart the servers. Call `live_status` in each process
-before using live tools. The first process owns the normal HTTPS/WSS ports; the
-others attach over a private same-user Unix socket. Reopen the pane so it loads the
-`shared_queue` and `section_locks` capabilities. With the variable unset nothing
-changes. Windows shared transport is unsupported.
+On by default on POSIX (macOS/Linux). Every MCP server process elects one owner for
+the normal HTTPS/WSS ports (53135/53136); the others attach over a private same-user
+Unix socket, so concurrent Claude sessions share one pane. Reopen the pane so it loads
+the `shared_queue` and `section_locks` capabilities. Set `VERIFIED_DOCX_SHARED_BRIDGE=0`
+(also `false`/`off`/`no`) to opt out; each process then binds the ports itself and a
+second process fails `LIVE_UNAVAILABLE` naming the port and, when `lsof` can find it,
+the holder PID. Windows always uses the local bridge (no shared transport).
 
 **Identity and visibility.** Every process gets a `client_id`; the pane's activity log
 labels each operation with its client. `live_status.shared` lists attached clients and
-every active lock. Any number of clients may read without a lock.
+every active lock. Any number of clients may read without a lock. `live_status` also
+reports `pid` (this process), `owner_pid` (the process holding the listeners; also
+written to `owner.pid` beside the election lock), `is_owner`, and `mode`
+(`"shared"` or `"local"`).
 
 **Optimistic concurrency.** A shared write needs a read baseline. Read the live body
 (`read_document source="live"`) before writing; only that explicit read acknowledges
@@ -1318,12 +1322,19 @@ writer from the whole document; it cannot coexist with another client's section 
 Use a lease or section locks across a multi-call read/edit/verify workflow, because
 operation serialization alone does not make a multi-call tool atomic.
 
-**Failure behaviour.** The first process owns the listeners; if it exits, the others get
-`LIVE_DISCONNECTED` and no write is replayed. Call `live_status` to elect a new owner,
-wait for the pane to reconnect, and re-read before deciding whether an earlier
-operation needs repeating. A timeout can mean an edit applied but its reply was lost;
+**Failure behaviour.** The owner process holds the listeners. If it exits, attached
+processes re-elect automatically: the next live tool call notices the dead owner and
+one of the survivors becomes the new owner (`live_status` forces it). The pane must
+reconnect to the new owner, so expect `LIVE_DISCONNECTED`/"no connected pane session"
+until it does. A call that was in flight when the owner died still raises
+`LIVE_DISCONNECTED` (outcome unknown) and no write is replayed: re-read before deciding
+whether it needs repeating. A timeout can mean an edit applied but its reply was lost;
 later operations never interleave with it because the pane runs one operation at a time.
+On SIGTERM/SIGHUP the server stops the bridge (waiting at most 2 s) and exits with
+128+signal, so a terminated session releases the ports promptly.
 
-**Limits.** Optimistic checks cover edits made by participating clients. A human or
+**Limits.** There is no detached daemon: the owner is one of the MCP processes, so the
+pane drops (and re-attaches to the successor) when it exits. There is no Windows
+transport. Optimistic checks cover edits made by participating clients. A human or
 co-author changing formatting or comments outside a lock is not detected by the text
 hash. See the [acceptance record](acceptance/47-shared-bridge-handoff.md).

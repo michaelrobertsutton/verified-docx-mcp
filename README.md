@@ -382,7 +382,7 @@ document back after a mutation. The MCP server starts the bridge lazily
 (idempotent) the first time a live-aware tool is called.
 
 `live_status` (read-only) reports bridge and connected-pane state:
-`{bridge_running, port, ops_port, sessions: [{document_name,
+`{bridge_running, pid, owner_pid, is_owner, mode, port, ops_port, sessions: [{document_name,
 document_url, connected_since, last_heartbeat_age_s, body_sha256,
 requirement_sets}], session_collisions}` — an empty `sessions` list is
 normal before the lead opens the pane in Word. `session_collisions`
@@ -390,6 +390,11 @@ normal before the lead opens the pane in Word. `session_collisions`
 a file name connecting at once — `SessionRegistry` keys purely on
 basename, so it can't tell them apart on its own; check this before
 trusting a live write's routing if that's possible.
+
+On POSIX several MCP processes share one bridge by default (one owner, the
+rest attach; automatic re-election if the owner exits). Set
+`VERIFIED_DOCX_SHARED_BRIDGE=0` to opt out. See
+[docs/live-mode.md](docs/live-mode.md#shared-bridge-several-agent-sessions-one-word-pane-47).
 
 `write_mode: "auto" | "file" | "live"` (default `"auto"`) is wired up on
 `replace_text`/`format_text` (WP-3) and on
