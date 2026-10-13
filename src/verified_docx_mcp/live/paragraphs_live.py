@@ -73,9 +73,6 @@ def insert_paragraphs(path: str, anchor: str, position: str, paragraphs: list[di
             "anchor": anchor, "expected_matches": expected_matches, "position": position,
             "paragraphs": wire, "track_changes": track_changes, "expectedBodySha256": pre})
     except VerifyError as exc:
-        if exc.envelope.diagnostics.get("pane_error_code") == "stale":
-            raise _make_error(ErrorCode.LIVE_STALE, exc.envelope.message,
-                              exc.envelope.diagnostics) from exc
         if exc.envelope.error_code == ErrorCode.VERIFICATION_FAILED:
             write_mode.audit_live_failure(
                 tool="insert_paragraphs", path=path, document_name=session.document_name,

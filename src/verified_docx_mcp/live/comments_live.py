@@ -102,6 +102,7 @@ from .session import (
     LiveOpFailed,
     LiveSession,
     LiveStale,
+    LiveStaleAfterWrite,
     LiveUnavailable,
 )
 
@@ -215,12 +216,19 @@ def _raise_from_live_error(exc: BaseException) -> None:
         raise _make_error(ErrorCode.LIVE_UNAVAILABLE, str(exc), {}) from exc
     if isinstance(exc, LiveDisconnected):
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc), {}) from exc
+    if isinstance(exc, LiveStaleAfterWrite):
+        raise _make_error(
+            ErrorCode.LIVE_STALE_AFTER_WRITE, str(exc), {"expected": exc.expected, "actual": exc.actual}
+        ) from exc
     if isinstance(exc, LiveStale):
         raise _make_error(
             ErrorCode.LIVE_STALE, str(exc), {"expected": exc.expected, "actual": exc.actual}
         ) from exc
     if isinstance(exc, LiveOpFailed):
         code = exc.code
+        if (code or "").strip().lower() in ("stale", "live_stale"):
+            # the pane refused before writing (body hash moved)
+            raise _make_error(ErrorCode.LIVE_STALE, exc.message, {"pane_error_code": code}) from exc
         if code in ErrorCode.__members__:
             raise _make_error(ErrorCode[code], exc.message, {"pane_error_code": code}) from exc
         if code == OP_ERROR_ZERO_MATCH:

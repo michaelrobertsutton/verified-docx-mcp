@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .protocol import VALID_OPS, HelloMessage
-from .session import LiveDisconnected, LiveOpFailed, LiveStale, resolve_timeout
+from .session import LiveDisconnected, LiveOpFailed, LiveStale, LiveStaleAfterWrite, resolve_timeout
 
 READ_OPS = frozenset(
     {
@@ -474,6 +474,15 @@ class Handler(socketserver.StreamRequestHandler):
         try:
             result = self.server.broker.dispatch(_frame(self.rfile))
             response = {"ok": True, "result": result}
+        except LiveStaleAfterWrite as exc:
+            # The write landed; the client must not see a plain (retryable-looking) LIVE_STALE.
+            response = {
+                "ok": False,
+                "code": "LIVE_STALE_AFTER_WRITE",
+                "message": str(exc),
+                "expected": exc.expected,
+                "actual": exc.actual,
+            }
         except LiveStale as exc:
             response = {"ok": False, "code": "LIVE_STALE", "message": str(exc)}
         except LiveOpFailed as exc:
@@ -582,6 +591,8 @@ class Client:
                 "The next call re-attaches automatically (live_status forces it)."
             ) from exc
         if not response["ok"]:
+            if response["code"] == "LIVE_STALE_AFTER_WRITE":
+                raise LiveStaleAfterWrite(response.get("expected", ""), response.get("actual", ""))
             raise LiveOpFailed(response["code"], response["message"])
         return response["result"]
 

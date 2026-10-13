@@ -129,6 +129,7 @@ class ErrorCode(Enum):
     WOULD_DELETE_COMMENTS = "WOULD_DELETE_COMMENTS"
     COMMENT_ID_STALE = "COMMENT_ID_STALE"
     LIVE_STALE = "LIVE_STALE"  # the pane's body hash before the op (result["pre"]) did not match a caller-supplied expected_body_sha256 (live/session.py LiveStale)
+    LIVE_STALE_AFTER_WRITE = "LIVE_STALE_AFTER_WRITE"  # the pane replied ok but its pre-op body hash differed from the caller's expected hash: the write ALREADY landed (live/session.py LiveStaleAfterWrite). Not retryable -- never repeat the op; re-read and verify instead. Contrast LIVE_STALE, where the pane refused and nothing was written
     LIVE_OP_FAILED = "LIVE_OP_FAILED"  # the pane replied ok=false (e.g. an expected_matches count mismatch it refused to act on) (live/session.py LiveOpFailed)
 
     # Issue #154: a Live pane is connected for the target document, so the
@@ -158,6 +159,20 @@ class ErrorCode(Enum):
 # §4 specifies exactly one wait (<=10s) performed by the tool itself before
 # raising, not a caller-side retry loop.
 _RETRYABLE_CODES: frozenset[ErrorCode] = frozenset({ErrorCode.HOST_SHAPE_READ_FAILED})
+
+
+def _make_retryable_error(
+    code: ErrorCode,
+    message: str,
+    diagnostics: dict[str, Any] | None = None,
+    *,
+    retryable: bool,
+) -> VerifyError:
+    """Like ``_make_error`` but with the retryable flag decided by the caller, for a
+    code (LIVE_UNAVAILABLE from live_open_pane) that is retryable only for some causes."""
+    return VerifyError(
+        ErrorEnvelope(error_code=code, message=message, diagnostics=diagnostics or {}, retryable=retryable)
+    )
 
 
 @dataclasses.dataclass(frozen=True)
