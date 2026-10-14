@@ -50,3 +50,17 @@ before merging. No whole-shape OOXML replacement is performed.
   for Mac, so that row is NOT SUPPORTED, not passed.
 - The revision guard works in shapes: a tracked insertion inside a text box
   refuses replace and format with `TRACKED_CHANGES_PRESENT`.
+
+### Re-check on Word for Mac 16.113.4, pane `taskpane.js?v=59` (2026-10-14)
+
+Fixture: `scripts/make_shapes_fixture.applescript`, opened in Word, pane attached.
+
+- **PASS** `list_textboxes` returned all seven shapes (RECT, TB1, TB2, TB3_EMPTY, TB4_COMMENT,
+  TB5_TRACKED, TB6_MIXED) with epoch handles and scope revisions, `coverage: body_shapes`, no warnings.
+- **PASS** `read_textbox` on TB1 returned both paragraphs; on TB3_EMPTY it returned `""` (verified
+  empty, not an error).
+- **NOT RUN** whole-paragraph `replace_text` / `format_text`, the substring refusal, the
+  tracked-change refusal and the stale-token refusal. The JennyStack live-write guard
+  (`live_doc_guard.py`) refused the first write ("no lead-approved permit") and the permit could not be
+  issued in this session. These rows stay pending until a permit is granted for the disposable fixture.
+  Whole-paragraph edits were already verified on 16.113.3 (above).
