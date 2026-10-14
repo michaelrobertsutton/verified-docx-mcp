@@ -678,6 +678,52 @@ os._exit(0)
             bridge.stop()
 
 
+def test_heartbeat_takes_over_from_dead_owner_without_a_tool_call(monkeypatch):
+    """#93: an idle client re-elects itself, so the pane ports come back."""
+    from pathlib import Path
+
+    from verified_docx_mcp.live import bridge
+
+    script = """import os, sys
+from pathlib import Path
+from types import SimpleNamespace
+from verified_docx_mcp.live import shared
+shared.connect(lambda: SimpleNamespace(list=list, get=lambda n: None, collisions=list),
+               directory=Path(sys.argv[1]))
+print('ready', flush=True)
+sys.stdin.readline()
+os._exit(0)
+"""
+    registry = SimpleNamespace(list=list, get=lambda name: None, collisions=list)
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="docx-takeover-") as directory:
+        monkeypatch.setenv("VERIFIED_DOCX_SHARED_BRIDGE", "1")
+        monkeypatch.setattr(shared, "runtime_dir", lambda: Path(directory))
+        monkeypatch.setattr(shared, "HEARTBEAT_S", 0.2)
+        started = []
+        monkeypatch.setattr(bridge, "_start_local", lambda: started.append(1) or registry)
+        owner = subprocess.Popen(
+            [sys.executable, "-c", script, directory],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert owner.stdout.readline().strip() == "ready"
+            client = bridge.start_in_background()
+            assert client.status()["owner_pid"] == owner.pid and not started
+            owner.communicate("\n", timeout=15)
+            deadline = time.monotonic() + 10
+            while shared.current() is client and time.monotonic() < deadline:
+                time.sleep(0.05)
+            fresh = shared.current()
+            assert fresh is not client and client.dead
+            assert started == [1]
+            assert fresh.status()["owner_pid"] == os.getpid()
+        finally:
+            owner.kill()
+            bridge.stop()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
 def test_shutdown_handler_exits_with_signal_code(monkeypatch):
     from verified_docx_mcp import shutdown
@@ -716,6 +762,58 @@ def test_sigterm_terminates_stdio_server():
     finally:
         if proc.poll() is None:
             proc.kill()
+        proc.communicate()
+
+
+def test_cancelled_tool_call_does_not_end_stdio_server(tmp_path):
+    """#93: the late result of a cancelled sync tool must not crash the server."""
+    script = tmp_path / "slow_server.py"
+    script.write_text(
+        "import sys, time\n"
+        "from verified_docx_mcp import server\n"
+        "from verified_docx_mcp.live import open_pane_live\n"
+        "open_pane_live.execute_open_pane = lambda path, timeout_s=60: time.sleep(2) or {}\n"
+        "sys.argv = ['verified-docx-mcp']\n"
+        "server.main()\n"
+    )
+    env = {**os.environ, "VERIFIED_DOCX_SHARED_BRIDGE": "0"}
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+
+    def send(message):
+        proc.stdin.write((json.dumps({"jsonrpc": "2.0", **message}) + "\n").encode())
+        proc.stdin.flush()
+
+    def reply(request_id):
+        while True:
+            line = proc.stdout.readline()
+            assert line, proc.stderr.read().decode()
+            message = json.loads(line)
+            if message.get("id") == request_id:
+                return message
+
+    try:
+        send({"id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "t", "version": "1"}}})
+        reply(1)
+        send({"method": "notifications/initialized"})
+        send({"id": 2, "method": "tools/call",
+              "params": {"name": "live_open_pane", "arguments": {"path": "/tmp/x.docx"}}})
+        time.sleep(0.5)
+        send({"method": "notifications/cancelled", "params": {"requestId": 2}})
+        assert reply(2)["error"]["message"] == "Request cancelled"
+        time.sleep(3)  # the worker thread finishes after the cancel
+        assert proc.poll() is None, proc.stderr.read().decode()
+        send({"id": 3, "method": "tools/list"})
+        assert "result" in reply(3)
+    finally:
+        proc.kill()
         proc.communicate()
 
 

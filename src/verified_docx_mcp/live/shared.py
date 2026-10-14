@@ -60,8 +60,11 @@ PRE_MUTATION_REFUSALS = frozenset(
 )
 MAX_FRAME = 72 * 2**20  # body_ooxml can return 48 MiB, with JSON escaping
 CLIENT_TTL = 300.0
+HEARTBEAT_S = 30.0
 _client = None
 _owner = None
+# connect()'s arguments, reused when a heartbeat takes over (#93).
+_reconnect_args = None
 _init_lock = threading.Lock()
 
 
@@ -576,11 +579,12 @@ class Client:
         threading.Thread(target=self._heartbeat, daemon=True).start()
 
     def _heartbeat(self):
-        while not self._closed.wait(30):
+        while not self._closed.wait(HEARTBEAT_S):
             try:
                 self.rpc("status")
             except (LiveDisconnected, LiveOpFailed):
                 self.dead = True
+                _take_over(self)
                 return
 
     def close(self):
@@ -630,8 +634,9 @@ def connect(start_local, *, directory=None, ready_timeout=10):
     """Elect owner or attach. Called only by explicit bridge startup."""
     import fcntl
 
-    global _client, _owner
+    global _client, _owner, _reconnect_args
     with _init_lock:
+        _reconnect_args = (start_local, directory)
         if _client is not None:
             try:
                 _client.status()
@@ -672,6 +677,18 @@ def connect(start_local, *, directory=None, ready_timeout=10):
         except Exception:
             os.close(fd)
             raise
+
+
+def _take_over(dead_client: Client) -> None:
+    """Re-elect from the heartbeat when the owner died (#93), so an idle MCP
+    process restores the pane listeners without waiting for its next tool call."""
+    if _client is not dead_client or _reconnect_args is None or not enabled():
+        return
+    start_local, directory = _reconnect_args
+    try:
+        connect(start_local, directory=directory)
+    except Exception:  # noqa: BLE001, S110 - the next tool call re-elects and reports
+        pass
 
 
 def _write_owner_pid(directory: Path) -> None:

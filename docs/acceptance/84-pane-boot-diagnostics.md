@@ -70,3 +70,20 @@ Side finding (not #84): cancelling a `live_open_pane` call from the client dropp
 connection (`STDIO connection dropped after 792s uptime`), which ended the shared-bridge owner
 process and left ports 53135/53136 unbound until `/mcp` reconnected. No other server process
 took the bridge over.
+
+### #92 re-check: local, unsynced Row01 copy (2026-10-14)
+
+Word for Mac 16.113.4, pane `taskpane.js?v=59`. `row01-local-copy.docx` in Word's container,
+opened with `live_open_pane` (`ribbon-button`, 5 s) after closing every document.
+
+- **Open 1:** one boot (`boot_seq` 14, `previous_events` empty, `load_error` null,
+  `report_build` 2981 ms, `ws_connect` 2149 ms). The same `instance_id` and steady heartbeats
+  over a 5 minute watch, no `pane_reload_loop` warning.
+- **Open 2 (close and reopen):** one boot (`boot_seq` 15), the same `instance_id` for the
+  2 minutes watched, no warning.
+
+The 2026-10-13 loop reloaded the pane about every 8 s. Neither the SharePoint-synced copy
+(above) nor the local copy shows it, so the sync-layer theory is untested, and #92 is
+closed as not reproducible. If it comes back, read `previous_events` in
+`~/.cache/verified-docx-mcp/live-report/latest.json` and the `pane_reload_loop` warning in
+`live_status` during the loop, and reopen #92.
