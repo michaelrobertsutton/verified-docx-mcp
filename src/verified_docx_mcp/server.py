@@ -4036,8 +4036,10 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         sys.exit(doctor())
 
+    from .cancellation import install_cancel_guard
     from .shutdown import install_shutdown_handlers
 
+    install_cancel_guard()
     install_shutdown_handlers(live_bridge.stop)
     mcp.run()
 
