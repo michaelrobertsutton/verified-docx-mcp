@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 — 2026-10-16
+
+- Add explicit approved font/link segments for mixed inline replacements, independent formatting and unchanged-text verification.
+
 ## 0.1.1 — 2026-10-16
 
 - Add digest-bound prepare/execute/resume for scoped live change sets, durable journals and explicit unknown-outcome reconciliation.

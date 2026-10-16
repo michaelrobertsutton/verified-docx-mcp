@@ -13,7 +13,10 @@ export class DOMParser {
         const parent=stack.at(-1),namespaces={...parent.namespaces};
         for(const [k,v] of Object.entries(attrs))if(k.startsWith('xmlns:'))namespaces[k.slice(6)]=v;
         const [prefix,localName]=match[1].split(':');
-        const node={children:[],parentNode:parent,namespaces,localName:localName||prefix,
+        const node={children:[],parentNode:parent,namespaces,nodeType:1,localName:localName||prefix,
+          get childNodes(){return this.children.map(c=>typeof c==='string'?{nodeType:3,nodeValue:c}:c);},
+          get attributes(){return Object.entries(attrs).map(([name,value])=>({name,value,localName:name.split(':').at(-1),namespaceURI:namespaces[name.split(':')[0]]}));},
+          getAttributeNS(ns,name){const key=Object.keys(attrs).find(k=>k.split(':').at(-1)===name&&namespaces[k.split(':')[0]]===ns);return key?attrs[key]:null;},
           namespaceURI:namespaces[prefix],getAttribute(k){return attrs[k]??null;},
           get textContent(){return this.children.map(c=>typeof c==='string'?c:c.textContent).join('');},
           getElementsByTagNameNS(ns,name){return descendants(this,ns,name);}};

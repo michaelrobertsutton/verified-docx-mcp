@@ -1588,10 +1588,17 @@ def replace_text(
     allow_concurrent_editor: bool = False,
     allow_comment_loss: bool = False,
     inherit_format: str = "replaced",
+    replacement_segments: list[dict[str, Any]] | None = None,
     scope: str = "body",
     allow_comment_loss_ids: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
+
+    Live-only replacement_segments specifies explicit text/format/hyperlink segments.
+    Text concatenates exactly to replace; each format includes bold, italic, underline
+    (None/Single/Double), strikeThrough, doubleStrikeThrough, subscript, superscript,
+    color (#RRGGBB), name, and size (points). Null hyperlink explicitly means no link.
+    Mixed spans require explicit segments; no neighbour-format inference is used.
 
     `write_mode` (issue #106 WP-3, "auto" | "file" | "live", default
     "auto"): whether this call edits the .docx file directly (today's
@@ -1761,6 +1768,7 @@ def replace_text(
             allow_comment_loss=allow_comment_loss,
             allow_comment_loss_ids=allow_comment_loss_ids,
             inherit_format=inherit_format,
+            replacement_segments=replacement_segments,
             allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:

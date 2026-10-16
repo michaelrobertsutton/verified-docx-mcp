@@ -35,7 +35,8 @@ OPS = {
 RETRY = {"LIVE_STALE", "LOCKED_BY_OTHER_CLIENT"}
 REFUSED = RETRY | {"MATCH_COUNT_MISMATCH", "ZERO_MATCH", "INVALID_INPUT", "CELL_TEXT_MISMATCH",
                    "LIVE_CAPABILITY_MISSING", "OUTSIDE_LOCKED_SECTION", "ANCHORED_SHAPES",
-                   "WOULD_DELETE_COMMENTS", "LOCK_SCOPE_UNRESOLVED", "MIXED_FORMATTING"}
+                   "WOULD_DELETE_COMMENTS", "LOCK_SCOPE_UNRESOLVED", "MIXED_FORMATTING",
+                   "STRUCTURAL_BOUNDARY", "TRACKED_CHANGES_PRESENT"}
 
 
 def invalid(message):
@@ -150,7 +151,7 @@ def project(sections, operation):
             if table.get("after_paragraph", -1) >= hits[0]:
                 table["after_paragraph"] -= 1
     else:
-        find = args["find"]
+        find = canonical(args["find"])
         locations = [(section["paragraphs"], i) for i, p in enumerate(section["paragraphs"]) if find in p]
         locations += [(row, i) for t in section["tables"] for row in t["rows"] for i, p in enumerate(row) if find in p]
         if len(locations) != 1 or locations[0][0][locations[0][1]].count(find) != 1:
@@ -158,7 +159,7 @@ def project(sections, operation):
         values, index = locations[0]
         if values is section["paragraphs"] and index == 0:
             raise invalid("Changing a protected heading requires a new plan")
-        values[index] = values[index].replace(find, args["replace"], 1)
+        values[index] = values[index].replace(find, canonical(args["replace"]), 1)
     return state
 
 
@@ -170,7 +171,7 @@ def target_keys(sections, operation):
         return [f"{slug}|t|{args['table_id']}|{args['row_index']}|{args['cell_index']}"]
     if op == "replace_table_row":
         return [f"{slug}|t|{args['table_id']}|{args['row_index']}|{c+1}" for c in range(len(args['cells']))]
-    needle = args.get("find", args.get("anchor_text"))
+    needle = canonical(args.get("find", args.get("anchor_text")))
     keys = [f"{slug}|p|{i}" for i,text in enumerate(section['paragraphs']) if needle in text]
     keys += [f"{slug}|t|{t['table_index']}|{r+1}|{c+1}" for t in section['tables'] for r,row in enumerate(t['rows']) for c,text in enumerate(row) if needle in text]
     return keys
@@ -214,11 +215,16 @@ def validate(operations):
         if not isinstance(item, dict) or set(item) != {"op", "section", "args"} or item.get("op") not in OPS:
             raise invalid(f"Operation {i} requires op, section and args from the supported operation set")
         op, args = item["op"], item["args"]
-        if not isinstance(args, dict) or set(args) != OPS[op]:
+        if not isinstance(args, dict) or set(args) - ({"replacement_segments"} if op == "replace_text" else set()) != OPS[op]:
             raise invalid(f"Operation {i} has unexpected or missing arguments")
         if op != "live_save" and (not isinstance(item["section"], str) or not item["section"]):
             raise invalid("Every text operation must name its protected section slug")
+        if op == "replace_text":
+            from ..formatted_text import validate_segments
+            validate_segments(args.get("replacement_segments"), args["replace"])
         for key, value in args.items():
+            if key == "replacement_segments":
+                continue
             if key in {"table_id", "row_index", "cell_index"}:
                 if type(value) is not int or value < 1:
                     raise invalid(f"{key} must be a positive integer")
@@ -247,6 +253,8 @@ def prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = F
     root = folder(path)
     with locked(root):
         ensure_settled(root, sections=slugs)
+        if any(o["args"].get("replacement_segments") is not None for o in operations):
+            wm.require_capability(session, "formatted_replacements_v1", feature_description="explicit formatted replacements")
         captured = snapshot(session, slugs, details=True)
         initial = captured["sections"]
         operations = copy.deepcopy(operations)
@@ -267,12 +275,14 @@ def prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = F
         run_id = uuid.uuid4().hex
         manifest = {"schema": 1, "run_id": run_id, "path": path, "document_url": session.document_url,
                     "sections": initial, "operations": operations, "comments": comments, "track_changes": track_changes, "targets": targets, "preconditions": preconditions}
+        if any(o["args"].get("replacement_segments") is not None for o in operations):
+            manifest["formatting_policy"] = "explicit-segments-v1"
         digest = sha(manifest)
         write(root / f"{run_id}.manifest.json", manifest)
         write(root / f"{run_id}.journal.json", {"digest": digest, "next": 0, "status": "prepared", "evidence": [], "verified_indices": [],
                                                      "working": initial, "deferred": {}, "attempts": {}, "blocked": []})
     return {"run_id": run_id, "manifest_sha256": digest, "operation_count": len(operations),
-            "sections": slugs, "status": "prepared", "preview": [{"op": o["op"], "section": o["section"]} for o in operations],
+            "sections": slugs, "status": "prepared", "preview": [{"op": o["op"], "section": o["section"], **({"replacement_segments": o["args"]["replacement_segments"]} if "replacement_segments" in o["args"] else {})} for o in operations],
             "manifest_path": str(root / f"{run_id}.manifest.json")}
 
 
@@ -322,9 +332,20 @@ def apply(path, operation, track_changes=False):
                 if [canonical(c["text"]) for c in got["rows"][args["row_index"]-1]] != [plain(c) for c in args["cells"]]:
                     raise RuntimeError("Row readback differs from the approved replacement")
         elif op == "replace_text":
+            if args.get("replacement_segments") is not None:
+                wm.require_capability(session, "formatted_replacements_v1", feature_description="explicit formatted replacements")
             before, after = args["find"], args["replace"]
             result = session.request_threadsafe("replace", {**args, **common, "allow_comment_loss": False,
                                                            "inherit_format": "replaced", "scope": "body"})
+            if args.get("replacement_segments") is not None:
+                from ..formatted_text import validate_segments
+                returned = result.get("matches", [{}])[0].get("segments")
+                try:
+                    verified_segments = validate_segments(returned, after) if returned is not None else None
+                except VerifyError as exc:
+                    raise RuntimeError("Malformed formatting readback after mutation") from exc
+                if verified_segments is None or verified_segments != validate_segments(args["replacement_segments"], after):
+                    raise RuntimeError("Independent formatting readback differs from approved segments")
             if len(result.get("matches", [])) != 1 or result["matches"][0]["after"] != after:
                 raise RuntimeError("Replacement did not independently verify")
         elif op == "delete_paragraph":
@@ -520,6 +541,8 @@ def reconcile(path,run_id,manifest_sha256,disposition,decision_ref,operation_ind
         before=manifest['sections']
         for prior in manifest['operations'][:operation_index]: before=project(before,prior)
         after=project(before,operation)
+        if operation["args"].get("replacement_segments") is not None:
+            raise invalid("Formatted outcomes require independent formatting evidence; text alone cannot reconcile them")
         if after==before and operation['op']!='live_save': raise invalid('Unchanged text cannot prove a formatting-only write; both dispositions require operation-specific evidence')
         session=wm.live_session_for(path)
         if session.document_url!=manifest['document_url']: raise invalid('Connected document identity differs')
