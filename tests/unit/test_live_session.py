@@ -447,3 +447,14 @@ class ResolveTimeoutTests(unittest.TestCase):
         for bad in ("abc", "0", "-5", ""):
             os.environ["VERIFIED_DOCX_LIVE_TIMEOUT_S"] = bad
             self.assertEqual(resolve_timeout("replace"), DEFAULT_REQUEST_TIMEOUT, bad)
+
+
+def test_protected_section_deadlines_keep_legacy_defaults_and_overrides(monkeypatch):
+    from verified_docx_mcp.live.session import resolve_timeout
+    monkeypatch.delenv('VERIFIED_DOCX_LIVE_TIMEOUT_S', raising=False)
+    monkeypatch.delenv('VERIFIED_DOCX_LIVE_TIMEOUT_CELL_SET_S', raising=False)
+    assert resolve_timeout('cell_set') == 15
+    assert resolve_timeout('cell_set', protected_sections=True) == 60
+    assert resolve_timeout('execution_snapshot') == 60
+    monkeypatch.setenv('VERIFIED_DOCX_LIVE_TIMEOUT_CELL_SET_S','80')
+    assert resolve_timeout('cell_set', protected_sections=True) == 80

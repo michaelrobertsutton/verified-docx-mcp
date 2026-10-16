@@ -39,7 +39,7 @@ function fakeContext(spec) {
   // The fake range model gives a paragraph's Start/End getRange the right collapsed points.
   items.forEach((p, i) => { p.getRange = where => where === 'Start' ? makeRange(10 * i, 10 * i) : where === 'End' ? makeRange(10 * i + 10, 10 * i + 10) : makeRange(10 * i, 10 * i + 10); });
   return {
-    document: {load() {}, saved:true, body: {getRange() { return {paragraphs: {items, load() {}}}; }, paragraphs: {items, load() {}}, text: spec.map(p => p[0]).join('\n'), load() {}}},
+    document: {load() {}, saved:true, body: {getRange(where) { return Object.assign(where === "End" ? makeRange(spec.length*10,spec.length*10) : makeRange(0,spec.length*10), {paragraphs: {items, load() {}}}); }, paragraphs: {items, load() {}}, text: spec.map(p => p[0]).join('\n'), load() {}}},
     sync: async () => {},
   };
 }
@@ -124,3 +124,16 @@ await expectCode(api.sectionGuard(globalThis.__ctx, {executionSections: initial.
 console.log('approved sections: unrelated edits pass; protected edits and wrong targets refuse');
 
 assert.equal(fullTextLoads,0);
+
+// Real Word body.paragraphs omits cell paragraphs: a table can occupy the gap
+// between two headings even when there is no intervening body paragraph.
+const gap = fakeContext([['Target',1],['Other',1]]);
+gap.document.body.paragraphs.items[0].getRange = where => where==='Start' ? makeRange(0,0) : where==='End' ? makeRange(2,2) : makeRange(0,2);
+const cells={items:[{body:{paragraphs:{items:[{text:'cell'}],load(){}}}}],load(){}};
+const table={nestingLevel:1,load(){},getRange(){return makeRange(3,8);},rows:{items:[{cells}],load(){}}};
+gap.document.body.tables={items:[table],load(){}};
+const gapSnapshot=await api.executionSnapshot(gap,['target']);
+assert.equal(gapSnapshot.sections[0].tables.length,1);
+assert.equal(gapSnapshot.sections[0].tables[0].rows[0][0],'cell');
+assert.equal(gapSnapshot.sections[0].tables[0].after_paragraph,0);
+console.log('approved sections: table between adjacent top-level headings remains protected');

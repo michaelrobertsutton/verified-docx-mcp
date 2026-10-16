@@ -915,6 +915,12 @@ async function loadSectionMap(context, headingsOnly = false) {
   });
   return { items, sections };
 }
+// Top-level body paragraphs omit table cells. End at the next heading's
+// start (or body end), so intervening tables remain inside the section.
+function sectionRange(context, items, section) {
+  const end = section.end < items.length ? items[section.end].getRange("Start") : context.document.body.getRange("End");
+  return items[section.start].getRange("Whole").expandTo(end);
+}
 function sectionSha(items, section) {
   return sha256Hex(items.slice(section.start, section.end).map(p => p.text || "").join("\n"));
 }
@@ -967,7 +973,7 @@ async function sectionGuard(context, payload) {
   };
   // Whole paragraphs, paragraph marks included: a paragraph's "End" point sits before its
   // mark, so a whole-paragraph target would not count as inside a section built from it.
-  const rangeOf = s => items[s.start].getRange("Whole").expandTo(items[s.end - 1].getRange("Whole"));
+  const rangeOf = s => sectionRange(context, items, s);
   const forbidden = forbiddenSlugs.map(slug => ({ slug, range: rangeOf(resolve(slug)) }));
   const mine = [];
   for (const o of [...own, ...execution]) {
@@ -1020,7 +1026,7 @@ async function executionSnapshot(context, slugs) {
   chosen.forEach(s => items.slice(s.start,s.end).filter(p => p.tableNestingLevel === 0).forEach(p => p.load("text")));
   await context.sync();
   const table_addresses = [];
-  const ranges = chosen.map(s => items[s.start].getRange("Whole").expandTo(items[s.end-1].getRange("Whole")));
+  const ranges = chosen.map(s => sectionRange(context, items, s));
   const tables = await loadTopLevelTables(context);
   const relations = tables.map(t => ranges.map(range => t.getRange().compareLocationWith(range)));
   await context.sync();
@@ -1053,7 +1059,7 @@ async function executionTargetRanges(context, payload, targets) {
   const found = sections.filter(s => s.slug === payload.executionTargetSection);
   if (found.length !== 1) throw refusalError("Target section is missing or ambiguous", "LOCK_SCOPE_UNRESOLVED");
   const s = found[0];
-  const range = items[s.start].getRange("Whole").expandTo(items[s.end-1].getRange("Whole"));
+  const range = sectionRange(context, items, s);
   const relations = targets.map(t => t.compareLocationWith(range));
   await context.sync();
   return targets.filter((_, i) => SECTION_WITHIN.has(relations[i].value));
@@ -1420,7 +1426,7 @@ async function targetSectionRange(context, payload) {
   const matches = sections.filter(s => s.slug === payload.executionTargetSection);
   if (matches.length !== 1) throw refusalError("Target section missing or ambiguous", "LOCK_SCOPE_UNRESOLVED");
   const s = matches[0];
-  return items[s.start].getRange("Whole").expandTo(items[s.end-1].getRange("Whole"));
+  return sectionRange(context, items, s);
 }
 
 async function targetTables(context, payload) {
@@ -1429,7 +1435,7 @@ async function targetTables(context, payload) {
   const matches = sections.filter(s => s.slug === payload.executionTargetSection);
   if (matches.length !== 1) throw refusalError("Target section missing or ambiguous", "LOCK_SCOPE_UNRESOLVED");
   const s = matches[0];
-  return loadTopLevelTables(context, items[s.start].getRange("Whole").expandTo(items[s.end-1].getRange("Whole")));
+  return loadTopLevelTables(context, sectionRange(context, items, s));
 }
 
 async function mutationHash(context, payload) {

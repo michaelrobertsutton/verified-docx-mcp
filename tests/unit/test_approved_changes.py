@@ -368,3 +368,13 @@ def test_resume_after_partial_result_saves_newly_applied_edits(setup):
     pane.request_threadsafe=original
     assert execute(path,p)['status']=='complete'
     assert pane.calls['save']==2
+
+
+def test_direct_scoped_readback_uses_same_deadline_as_write():
+    calls=[]
+    class Direct:
+        def request_threadsafe(self,op,payload=None,**kw): calls.append((op,kw['timeout']))
+    scoped=runs.ScopedSession(Direct(),[{'slug':'target'}])
+    scoped.request_threadsafe('cell_set',{})
+    scoped.request_threadsafe('cell_get',{'executionTargetSection':'target'})
+    assert calls==[('cell_set',60),('cell_get',60)]

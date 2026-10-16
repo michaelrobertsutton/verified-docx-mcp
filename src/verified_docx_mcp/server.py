@@ -4076,9 +4076,9 @@ def live_changes_execute(path: str, run_id: str, manifest_sha256: str, approved_
 
 @mcp.tool()
 def live_changes_resume(path: str, run_id: str, manifest_sha256: str) -> dict[str, Any]:
-    """Resume the remaining suffix of an already approved run. Verifies document,
-    digest and protected sections, skips verified operations, refuses uncertain
-    outcomes. Does not grant or broaden approval.
+    """Resume independent remaining operations of an already approved run. Verifies
+    document, digest and protected targets; skips verified operations and defers
+    uncertain targets without replaying them. Does not broaden approval.
     """
     from .live.approved_changes import execute
     try:

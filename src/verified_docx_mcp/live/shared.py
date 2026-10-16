@@ -222,7 +222,8 @@ class Broker:
         key = session.document_url
         with self.mutex:
             gate = self.doc_mutexes.setdefault(key, threading.Lock())
-        timeout = resolve_timeout(request.get("op", "describe"))
+        scope_payload = request.get("payload") or {}
+        timeout = resolve_timeout(request.get("op", "describe"), protected_sections=bool(scope_payload.get("executionSections") or scope_payload.get("executionTargetSection")))
         if not gate.acquire(timeout=timeout):
             raise LiveOpFailed("LIVE_OP_FAILED", "Document queue busy; no operation dispatched")
         try:
@@ -569,7 +570,7 @@ class RemoteSession:
             payload=payload,
             expected_body_sha256=expected_body_sha256,
             observe=self._observe,
-            rpc_timeout=(timeout or resolve_timeout(op)) * 2 + 10,
+            rpc_timeout=(timeout or resolve_timeout(op, protected_sections=bool((payload or {}).get("executionSections") or (payload or {}).get("executionTargetSection")))) * 2 + 10,
         )
 
     async def request(self, op, payload=None, **kwargs):

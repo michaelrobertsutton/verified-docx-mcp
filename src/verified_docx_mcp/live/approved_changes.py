@@ -85,6 +85,8 @@ class ScopedSession:
             data["executionSections"] = self.sections
             data["executionTargetSection"] = _TARGET.get()
             kwargs["expected_body_sha256"] = None
+        from .session import resolve_timeout
+        kwargs.setdefault("timeout", resolve_timeout(op, protected_sections=True))
         return self.session.request_threadsafe(op, data, **kwargs)
 
 
