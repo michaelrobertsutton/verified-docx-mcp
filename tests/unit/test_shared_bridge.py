@@ -859,3 +859,52 @@ def test_lone_client_may_write_without_a_prior_read():
     other = broker.dispatch({"action": "attach"})["client_id"]
     with pytest.raises(LiveOpFailed, match="LIVE_STALE"):
         broker.dispatch({**request, "client_id": other})
+
+
+def test_approved_run_keeps_owned_lock_membership_without_stale_hash_refresh(sections):
+    import dataclasses
+    pane,broker,a,_b,call=sections
+    pane.hello=dataclasses.replace(pane.hello,capabilities=pane.hello.capabilities | {'approved_changes_v1'})
+    call(a,action='section_lock',sections=['scope-1'])
+    before=len([1 for op,_ in pane.calls if op=='sections_list'])
+    for n in range(3):
+        call(a,'replace',payload={'executionSections':[{'slug':'scope','paragraphs':[str(n)],'tables':[]}]})
+        assert _last_write(pane)['ownSections']==[{'slug':'scope'}]
+        assert 'expectedBodySha256' not in _last_write(pane)
+    assert len([1 for op,_ in pane.calls if op=='sections_list'])==before
+    assert not broker.hashes
+
+
+def test_scoped_hash_never_becomes_legacy_body_baseline(sections):
+    import dataclasses
+    pane,broker,a,_b,call=sections
+    pane.hello=dataclasses.replace(pane.hello,capabilities=pane.hello.capabilities | {'approved_changes_v1'})
+    call(a)
+    call(a,'replace',payload={'executionSections':[{'slug':'scope','paragraphs':[],'tables':[]}]})
+    assert not broker.hashes
+    with pytest.raises(LiveOpFailed,match='LIVE_STALE'):
+        call(a,'replace')
+    call(a)  # an explicit body read restores the legacy baseline
+    call(a,'replace')
+
+
+def test_scoped_deadline_matches_broker_and_remote_rpc(sections):
+    import dataclasses
+    pane,_broker,a,_b,call=sections
+    pane.hello=dataclasses.replace(pane.hello,capabilities=pane.hello.capabilities | {'approved_changes_v1'})
+    original=pane.request_threadsafe
+    budgets=[]
+    def capture(op,payload=None,**kw):
+        budgets.append(kw['timeout'])
+        return original(op,payload,**kw)
+    pane.request_threadsafe=capture
+    payload={'executionSections':[{'slug':'scope','paragraphs':[],'tables':[]}]}
+    call(a,'replace',payload=payload)
+    assert budgets==[60]
+    remote=object.__new__(shared.RemoteSession)
+    remote.target=dict
+    remote._observe=True
+    requests=[]
+    remote.client=SimpleNamespace(rpc=lambda action,**kw: requests.append(kw))
+    remote.request_threadsafe('replace',payload)
+    assert requests[0]['rpc_timeout']==130

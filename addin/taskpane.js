@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
+const PANE_CAPABILITIES = ["approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -664,23 +664,26 @@ function enqueuePaneOperation(operation) {
 }
 const READ_ONLY_OPS = new Set(["ping", "describe", "body_ooxml", "search", "comments_list",
   "cell_get", "table_get", "shapes_list", "textboxes_list", "textboxes_read", "scope_describe",
-  "revisions_list", "autoopen_get", "sections_list"]);
+  "revisions_list", "autoopen_get", "sections_list", "execution_snapshot"]);
 
 async function dispatchOp(op, payload) {
-  const sectionScoped = !!(payload.ownSections && payload.ownSections.length);
+  if (op === "save" && payload.executionSections)
+    await Word.run(context => sectionGuard(context, payload));
+  const sectionScoped = !!((payload.ownSections && payload.ownSections.length) ||
+    (payload.executionSections && payload.executionSections.length));
   if (!READ_ONLY_OPS.has(op) && payload.clientId && !sectionScoped) {
     if (!payload.expectedBodySha256)
       throw refusalError("Shared write requires a body baseline", "LIVE_STALE");
     await Word.run(async context => requireFreshBody(context, payload.expectedBodySha256));
   }
   if (!SHAPE_GUARDED_OPS.has(op)) return dispatchOpUnchecked(op, payload);
-  const before = await opShapesList();
+  const before = await (payload.executionSections ? opExecutionShapes(payload) : opShapesList());
   // Accepting/rejecting tracked deletions can remove whole anchor paragraphs.
   if (op.startsWith("revisions_") && before.shapes.length)
     throw refusalError("Revision changes with anchored shapes require manual review", "ANCHORED_SHAPES");
   const result = await dispatchOpUnchecked(op, payload);
   let after;
-  try { after = await opShapesList(); }
+  try { after = await (payload.executionSections ? opExecutionShapes(payload) : opShapesList());}
   catch (err) {
     throw refusalError(`Shape read-back failed after ${op}; the edit may have applied; ` +
       `no rollback attempted; shapes_before=${before.shapes.length}; ${err.message || err}`, "VERIFICATION_FAILED");
@@ -696,6 +699,8 @@ async function dispatchOpUnchecked(op, payload) {
   switch (op) {
     case "shapes_list":
       return opShapesList();
+    case "execution_snapshot":
+      return Word.run(context => executionSnapshot(context, payload.section_slugs));
     case "sections_list":
       return opSectionsList();
     case "ping":
@@ -882,14 +887,18 @@ async function opBodyOoxml() {
 function sectionSlug(text) {
   return (text || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "section";
 }
-async function loadSectionMap(context) {
+async function loadSectionMap(context, headingsOnly = false) {
   // A separate collection from body.paragraphs: ops (paragraph_delete, table_insert)
   // keep paragraph objects from their own load, and reloading that collection here
   // would invalidate them.
   const paragraphs = context.document.body.getRange("Whole").paragraphs;
-  paragraphs.load("items/text,items/outlineLevel,items/tableNestingLevel");
+  paragraphs.load(headingsOnly ? "items/outlineLevel,items/tableNestingLevel" : "items/text,items/outlineLevel,items/tableNestingLevel");
   await context.sync();
   const items = paragraphs.items;
+  if (headingsOnly) {
+    items.filter(p => p.tableNestingLevel === 0 && p.outlineLevel >= 1 && p.outlineLevel <= 9).forEach(p => p.load("text"));
+    await context.sync();
+  }
   const heads = [];
   items.forEach((p, i) => {
     const level = p.outlineLevel;
@@ -905,6 +914,12 @@ async function loadSectionMap(context) {
     return { slug, section_key: `${slug}-${ordinal}`, heading_text: h.text, level: h.level, start: h.index, end };
   });
   return { items, sections };
+}
+// Top-level body paragraphs omit table cells. End at the next heading's
+// start (or body end), so intervening tables remain inside the section.
+function sectionRange(context, items, section) {
+  const end = section.end < items.length ? items[section.end].getRange("Start") : context.document.body.getRange("End");
+  return items[section.start].getRange("Whole").expandTo(end);
 }
 function sectionSha(items, section) {
   return sha256Hex(items.slice(section.start, section.end).map(p => p.text || "").join("\n"));
@@ -938,11 +953,17 @@ const SECTION_OUTSIDE = new Set(["Before", "AdjacentBefore", "After", "AdjacentA
 const SECTION_WITHIN = new Set(["Inside", "InsideStart", "InsideEnd", "Equal"]);
 async function sectionGuard(context, payload) {
   const forbiddenSlugs = payload.forbiddenSections || [];
+  const execution = payload.executionSections || [];
   const own = payload.ownSections || [];
-  if (!forbiddenSlugs.length && !own.length) return { active: false, async check() {} };
+  if (execution.length) {
+    const current = await executionSnapshot(context, execution.map(s => s.slug));
+    if (JSON.stringify(current.sections) !== JSON.stringify(execution))
+      throw refusalError("Protected section changed; nothing was written", "LIVE_STALE");
+  }
+  if (!forbiddenSlugs.length && !own.length && !execution.length) return { active: false, async check() {} };
   if (payload.scope && payload.scope !== "body")
     throw refusalError("Section locks do not cover text-box scopes; release the locks first", "OUTSIDE_LOCKED_SECTION");
-  const { items, sections } = await loadSectionMap(context);
+  const { items, sections } = await loadSectionMap(context, execution.length > 0);
   const resolve = (slug) => {
     const hits = sections.filter(s => s.slug === slug);
     if (hits.length !== 1)
@@ -952,11 +973,15 @@ async function sectionGuard(context, payload) {
   };
   // Whole paragraphs, paragraph marks included: a paragraph's "End" point sits before its
   // mark, so a whole-paragraph target would not count as inside a section built from it.
-  const rangeOf = s => items[s.start].getRange("Whole").expandTo(items[s.end - 1].getRange("Whole"));
+  const rangeOf = s => sectionRange(context, items, s);
   const forbidden = forbiddenSlugs.map(slug => ({ slug, range: rangeOf(resolve(slug)) }));
   const mine = [];
-  for (const o of own) {
+  for (const o of [...own, ...execution]) {
     const section = resolve(o.slug);
+    if (o.expectedSha256 && execution.length) {
+      items.slice(section.start,section.end).forEach(p => p.load("text"));
+      await context.sync();
+    }
     if (o.expectedSha256 && (await sectionSha(items, section)) !== o.expectedSha256)
       throw refusalError(`Section ${JSON.stringify(o.slug)} changed since it was read; nothing was written. Re-read and retry.`, "stale");
     mine.push({ slug: o.slug, range: rangeOf(section) });
@@ -984,6 +1009,60 @@ async function sectionGuard(context, payload) {
       });
     },
   };
+}
+
+
+// A structured, scoped snapshot. Cell identities are coordinates within an exact
+// table/section structure, never a global search for possibly repeated text.
+async function executionSnapshot(context, slugs) {
+  if (!Array.isArray(slugs) || !slugs.length || new Set(slugs).size !== slugs.length)
+    throw refusalError("Unique protected section slugs are required", "INVALID_INPUT");
+  const {items, sections} = await loadSectionMap(context, true);
+  const chosen = slugs.map(slug => {
+    const found = sections.filter(s => s.slug === slug);
+    if (found.length !== 1) throw refusalError("Missing or ambiguous protected section", "LOCK_SCOPE_UNRESOLVED");
+    return found[0];
+  });
+  chosen.forEach(s => items.slice(s.start,s.end).filter(p => p.tableNestingLevel === 0).forEach(p => p.load("text")));
+  await context.sync();
+  const table_addresses = [];
+  const ranges = chosen.map(s => sectionRange(context, items, s));
+  const tables = await loadTopLevelTables(context);
+  const relations = tables.map(t => ranges.map(range => t.getRange().compareLocationWith(range)));
+  await context.sync();
+  const result = chosen.map(s => ({slug:s.slug, paragraphs:items.slice(s.start,s.end)
+    .filter(p => p.tableNestingLevel === 0).map(p => p.text || ""), tables:[]}));
+  for (let i=0; i<tables.length; i++) {
+    const index = relations[i].findIndex(r => SECTION_WITHIN.has(r.value));
+    if (index < 0) continue;
+    const grid = await loadRowsAndCells(context, tables[i]);
+    grid.forEach(row => row.forEach(cell => cell.body.paragraphs.load("items/text")));
+    await context.sync();
+    const section = chosen[index];
+    const preceding = items.slice(section.start, section.end).filter(p => p.tableNestingLevel === 0)
+      .map(p => p.getRange("Whole").compareLocationWith(tables[i].getRange()));
+    await context.sync();
+    const after_paragraph = preceding.filter(r => r.value === "Before" || r.value === "AdjacentBefore").length - 1;
+    table_addresses.push({slug:chosen[index].slug, global_index:i+1, local_index:result[index].tables.length+1});
+    result[index].tables.push({table_index:result[index].tables.length+1, after_paragraph, rows:grid.map(row => row.map(cell => cell.body.paragraphs.items.map(p => canonicalCellText(p.text || "")).join("\n"))),
+      paragraph_counts:grid.map(row => row.map(cell => cell.body.paragraphs.items.length))});
+  }
+  context.document.load("saved");
+  await context.sync();
+  return {sections:result, table_addresses, saved:context.document.saved};
+}
+
+
+async function executionTargetRanges(context, payload, targets) {
+  if (!payload.executionTargetSection) return targets;
+  const {items, sections} = await loadSectionMap(context, true);
+  const found = sections.filter(s => s.slug === payload.executionTargetSection);
+  if (found.length !== 1) throw refusalError("Target section is missing or ambiguous", "LOCK_SCOPE_UNRESOLVED");
+  const s = found[0];
+  const range = sectionRange(context, items, s);
+  const relations = targets.map(t => t.compareLocationWith(range));
+  await context.sync();
+  return targets.filter((_, i) => SECTION_WITHIN.has(relations[i].value));
 }
 
 // -- search -------------------------------------------------------------
@@ -1107,10 +1186,11 @@ async function searchScoped(context, payload) {
     return merged;
   }
   if (payload.rowAnchor === null || payload.rowAnchor === undefined) {
-    const results = context.document.body.search(payload.find, { matchCase: true, matchWholeWord: false });
+    const source = payload.executionTargetSection ? await targetSectionRange(context, payload) : context.document.body;
+    const results = source.search(payload.find, { matchCase: true, matchWholeWord: false });
     results.load("text");
     await context.sync();
-    return results.items;
+    return executionTargetRanges(context, payload, results.items);
   }
   const rowCells = await resolveRowCells(context, payload.rowAnchor);
   const perCellResults = rowCells.map((cell) =>
@@ -1126,12 +1206,9 @@ async function searchScoped(context, payload) {
 async function opReplace(payload) {
   const expectedMatches = payload.expected_matches;
   return Word.run(async (context) => {
-    await requireFreshBody(context, payload.expectedBodySha256);
+    if (!payload.executionSections) await requireFreshBody(context, payload.expectedBodySha256);
     await requireFreshScope(context, payload);
-    const body = context.document.body;
-    body.load("text");
-    await context.sync();
-    const preHash = await sha256Hex(body.text || "");
+    const preHash = await mutationHash(context, payload);
 
     const guard = await sectionGuard(context, payload);
     const matchItems = await searchScoped(context, payload);
@@ -1162,11 +1239,16 @@ async function opReplace(payload) {
       context.document.load("changeTrackingMode");
       await context.sync();
       previousMode = context.document.changeTrackingMode;
-      context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
     }
 
+    await guard.check(matchItems); // Recheck protected content after asynchronous preflight.
+    matchItems.forEach(range => range.load("text"));
+    await context.sync();
+    if (matchItems.some(range => range.text !== payload.find))
+      throw refusalError("Replacement target changed during preflight", "LIVE_STALE");
     const matches = matchItems.map((range) => ({ before: range.text, after: payload.replace }));
     try {
+      if (previousMode !== null) context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
       inserted = matchItems.map((range, i) => {
         const target = range.insertText(payload.replace, Word.InsertLocation.replace);
         if (payload.replace && policy === "replaced") FONT_FIELDS.forEach(k => {target.font[k] = fonts[i][k];});
@@ -1191,11 +1273,10 @@ async function opReplace(payload) {
           FONT_FIELDS.some(k => matches[i].fontAfter[k] !== fonts[i][k])))
         throw refusalError(`Replacement read-back failed: ${JSON.stringify(matches)}`, "VERIFICATION_FAILED");
     });
-    const postBody = context.document.body;
-    postBody.load("text");
-    await context.sync();
-    const postHash = await sha256Hex(postBody.text || "");
+    const postHash = await mutationHash(context, {...payload, expectedBodySha256:undefined});
 
+    let commentsRemoved = [];
+    if (!payload.executionSections) {
     const remainingScope = await resolveScopes(context, payload.scope || "body", true);
     const remainingComments = [];
     for (const item of remainingScope.bodies) {
@@ -1209,8 +1290,9 @@ async function opReplace(payload) {
       remainingComments.push(...collection.items);
     }
     const remainingIds = new Set(remainingComments.map(c => c.id));
-    const commentsRemoved = commentsBefore.filter(c => !remainingIds.has(c.id));
-    const scopePost = await scopeHash(context, payload.scope || "body");
+    commentsRemoved = commentsBefore.filter(c => !remainingIds.has(c.id));
+    }
+    const scopePost = payload.executionSections ? postHash : await scopeHash(context, payload.scope || "body");
     return { scope_post: scopePost, comments_removed: commentsRemoved, applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
   });
 }
@@ -1301,7 +1383,7 @@ async function opFormat(payload) {
     await context.sync();
     const postHash = await sha256Hex(postBody.text || "");
 
-    const scopePost = await scopeHash(context, payload.scope || "body");
+    const scopePost = payload.executionSections ? postHash : await scopeHash(context, payload.scope || "body");
     return { scope_post: scopePost, applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
   });
 }
@@ -1325,8 +1407,8 @@ async function opFormat(payload) {
 // continuation cell is still a cell of its row). Manual sideload
 // verification against a real table (docs/live-mode.md) is still needed --
 // fake_pane.py's table model cannot exercise this object graph.
-async function loadTopLevelTables(context) {
-  const tables = context.document.body.tables;
+async function loadTopLevelTables(context, scope = null) {
+  const tables = (scope || context.document.body).tables;
   tables.load("items");
   await context.sync();
   tables.items.forEach((t) => t.load("nestingLevel"));
@@ -1339,8 +1421,33 @@ async function loadTopLevelTables(context) {
   return tables.items;
 }
 
+async function targetSectionRange(context, payload) {
+  const {items,sections} = await loadSectionMap(context, true);
+  const matches = sections.filter(s => s.slug === payload.executionTargetSection);
+  if (matches.length !== 1) throw refusalError("Target section missing or ambiguous", "LOCK_SCOPE_UNRESOLVED");
+  const s = matches[0];
+  return sectionRange(context, items, s);
+}
+
+async function targetTables(context, payload) {
+  if (!payload.executionTargetSection) return loadTopLevelTables(context);
+  const {items,sections} = await loadSectionMap(context, true);
+  const matches = sections.filter(s => s.slug === payload.executionTargetSection);
+  if (matches.length !== 1) throw refusalError("Target section missing or ambiguous", "LOCK_SCOPE_UNRESOLVED");
+  const s = matches[0];
+  return loadTopLevelTables(context, sectionRange(context, items, s));
+}
+
+async function mutationHash(context, payload) {
+  if (payload.executionSections) {
+    const state = await executionSnapshot(context, payload.executionSections.map(s=>s.slug));
+    return sha256Hex(JSON.stringify(state.sections));
+  }
+  return requireFreshBody(context, payload.expectedBodySha256);
+}
+
 async function resolveTableCell(context, payload) {
-  const tableItems = await loadTopLevelTables(context);
+  const tableItems = await targetTables(context, payload);
   const table = tableItems[payload.table_index - 1];
   if (!table) {
     throw refusalError(`no table ${payload.table_index} (the document has ${tableItems.length})`);
@@ -1427,6 +1534,7 @@ async function writeCellParagraphs(context, cell, paragraphs, strategy = CELL_WR
   });
 }
 
+const canonicalCellText = s => String(s).replace(/\r\n?|\v/g, "\n");
 const normCellText = (s) => String(s).replace(/\s+/g, " ").trim();
 
 // One string per intended paragraph; a hard break reads back as whitespace
@@ -1479,35 +1587,38 @@ async function opCellGet(payload) {
 
 async function opCellSet(payload) {
   return Word.run(async (context) => {
-    const body = context.document.body;
-    body.load("text");
-    await context.sync();
-    const preHash = await sha256Hex(body.text || "");
+    const preHash = await mutationHash(context, payload);
 
     const cell = await resolveTableCell(context, payload);
     cell.body.load("text");
     await context.sync();
-    const before = cell.body.text || "";
+    const before = payload.executionSections ? (await readCellParagraphs(context, cell)).map(canonicalCellText).join("\n") : (cell.body.text || "");
     // Compare-and-set: refuse if the cell changed since the server read it
     // (a co-author typing in this same cell), rather than overwrite them.
     if (before !== payload.expected_before_text) {
       throw refusalError(
-        "the cell's text changed since it was read (another editor may be working in it); nothing was written"
+        "the cell's text changed since it was read (another editor may be working in it); nothing was written", "CELL_TEXT_MISMATCH"
       );
     }
 
     await (await sectionGuard(context, payload)).check(() => [cell.body.getRange("Whole")]);
+    if (payload.executionSections) {
+      await guardComments(context, [cell.body.getRange("Whole")], false);
+      await guardRevisions(context, [cell.body.getRange("Whole")]);
+    }
     await guardAnchoredBodies(context, [cell.body]);
     let previousMode = null;
     if (payload.track_changes) {
       context.document.load("changeTrackingMode");
       await context.sync();
       previousMode = context.document.changeTrackingMode;
-      context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
     }
 
     // The cell's paragraphs before the write, for the restore below (issue #75).
     const beforeParagraphs = await readCellParagraphs(context, cell);
+    if (canonicalCellText(beforeParagraphs.join("\n")) !== canonicalCellText(payload.expected_before_text) ||
+        (payload.expected_before_paragraph_count != null && beforeParagraphs.length !== payload.expected_before_paragraph_count))
+      throw refusalError("Cell changed during preflight; nothing was written", "LIVE_STALE");
     const want = intendedCellParagraphs(payload.paragraphs);
 
     // Write, then self-check: the cell must hold exactly the intended
@@ -1518,6 +1629,7 @@ async function opCellSet(payload) {
     let usedStrategy = null;
     let got = [];
     try {
+      if (previousMode !== null) context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
       const strategies = payload.track_changes ? CELL_WRITE_STRATEGIES.slice(0, 1) : CELL_WRITE_STRATEGIES;
       for (const strategy of strategies) {
         await writeCellParagraphs(context, cell, payload.paragraphs || [], strategy);
@@ -1553,10 +1665,7 @@ async function opCellSet(payload) {
     }
 
     cell.body.load("text");
-    const postBody = context.document.body;
-    postBody.load("text");
-    await context.sync();
-    const postHash = await sha256Hex(postBody.text || "");
+    const postHash = await mutationHash(context, {...payload, expectedBodySha256:undefined});
 
     return { applied: true, before, after: cell.body.text || "", pre: preHash, post: postHash, strategy: usedStrategy };
   });
@@ -1651,7 +1760,7 @@ function documentPartXml(flatOpc) {
 
 async function opTableGet(payload) {
   return Word.run(async (context) => {
-    const tableItems = await loadTopLevelTables(context);
+    const tableItems = await targetTables(context, payload);
     const table = tableItems[payload.table_index - 1];
     if (!table) {
       throw refusalError(
@@ -1667,6 +1776,7 @@ async function opTableGet(payload) {
       cells.forEach((cell) => {
         cell.load(["shadingColor", "horizontalAlignment", "verticalAlignment", "columnWidth"]);
         cell.body.load("text");
+        if (payload.executionTargetSection) cell.body.paragraphs.load("items/text");
         cell.body.font.load(["bold", "color", "size"]);
       })
     );
@@ -1678,7 +1788,7 @@ async function opTableGet(payload) {
       merged: /<w:gridSpan[\s/>]/.test(part) || /<w:vMerge[\s/>]/.test(part),
       rows: grid.map((cells) =>
         cells.map((cell) => ({
-          text: cell.body.text || "",
+          text: payload.executionTargetSection ? cell.body.paragraphs.items.map(p => canonicalCellText(p.text || "")).join("\n") : (cell.body.text || ""),
           fill: cell.shadingColor || "",
           align: H_ALIGN_FROM_WORD[cell.horizontalAlignment] || String(cell.horizontalAlignment),
           valign: V_ALIGN_FROM_WORD[cell.verticalAlignment] || String(cell.verticalAlignment),
@@ -1867,8 +1977,8 @@ async function opTableInsert(payload) {
 
 async function opCellsSet(payload) {
   return Word.run(async (context) => {
-    const preHash = await requireFreshBody(context, payload.expectedBodySha256);
-    const tableItems = await loadTopLevelTables(context);
+    const preHash = await mutationHash(context, payload);
+    const tableItems = await targetTables(context, payload);
 
     const gridByTable = new Map();
     for (const spec of payload.cells) {
@@ -1896,10 +2006,21 @@ async function opCellsSet(payload) {
     // Word batches are not transactions. Narrow the window as far as the API
     // allows: compare every cell, then read them ALL again immediately before
     // queuing the writes, and refuse (writing nothing) on any difference.
+    let writingFinished = false;
     const readAll = async () => {
+      if (payload.executionSections) {
+        const texts = [];
+        for (let i=0;i<cells.length;i++) {
+          const paragraphs = await readCellParagraphs(context, cells[i]);
+          if (!writingFinished && payload.cells[i].expected_before_paragraph_count != null && paragraphs.length !== payload.cells[i].expected_before_paragraph_count)
+            throw refusalError("Row paragraph structure changed", "LIVE_STALE");
+          texts.push(paragraphs.map(canonicalCellText).join("\n"));
+        }
+        return texts;
+      }
       cells.forEach((cell) => cell.body.load("text"));
       await context.sync();
-      return cells.map((cell) => cell.body.text || "");
+      return cells.map((cell) => payload.executionSections ? canonicalCellText(cell.body.text || "") : (cell.body.text || ""));
     };
     const mismatch = (texts) => payload.cells.findIndex((spec, i) => texts[i] !== spec.expected_before_text);
     const before = await readAll();
@@ -1907,22 +2028,28 @@ async function opCellsSet(payload) {
     if (bad < 0) bad = mismatch(await readAll());
     if (bad >= 0) {
       throw refusalError(
-        `cell ${bad + 1} of ${payload.cells.length} changed since it was read (another editor may be working in it); nothing was written`
+        `cell ${bad + 1} of ${payload.cells.length} changed since it was read (another editor may be working in it); nothing was written`, "CELL_TEXT_MISMATCH"
       );
     }
 
     await (await sectionGuard(context, payload)).check(() => cells.map(c => c.body.getRange("Whole")));
+    if (payload.executionSections) {
+      await guardComments(context, cells.map(c => c.body.getRange("Whole")), false);
+      await guardRevisions(context, cells.map(c => c.body.getRange("Whole")));
+    }
     await guardAnchoredBodies(context, cells.map(c => c.body));
+    if (mismatch(await readAll()) >= 0)
+      throw refusalError("Row changed during preflight; nothing was written", "LIVE_STALE");
     await withTracking(context, payload.track_changes, async () => {
+      if (mismatch(await readAll()) >= 0)
+        throw refusalError("Row changed immediately before mutation", "LIVE_STALE");
       for (const [i, spec] of payload.cells.entries()) await writeCellParagraphs(context, cells[i], spec.paragraphs || []);
       await context.sync();
     });
 
+    writingFinished = true;
     const after = await readAll();
-    const postBody = context.document.body;
-    postBody.load("text");
-    await context.sync();
-    const postHash = await sha256Hex(postBody.text || "");
+    const postHash = await mutationHash(context, {...payload, expectedBodySha256:undefined});
     return { applied: true, before, after, pre: preHash, post: postHash };
   });
 }
@@ -2585,8 +2712,9 @@ function inspectDeleteParagraph(xml) {
 }
 async function opParagraphDelete(payload) {
   return Word.run(async context => {
-    const pre = await requireFreshBody(context,payload.expectedBodySha256);
-    const paragraphs = context.document.body.paragraphs;
+    const pre = await mutationHash(context, payload);
+    const source = payload.executionTargetSection ? await targetSectionRange(context, payload) : context.document.body;
+    const paragraphs = source.paragraphs;
     paragraphs.load('items/text,items/tableNestingLevel');
     await context.sync();
     const before = paragraphs.items.map(p => p.text);
@@ -2604,17 +2732,22 @@ async function opParagraphDelete(payload) {
     await guardComments(context,[range],false);
     await guardRevisions(context,[range]);
     await withTracking(context,payload.track_changes,async () => {
+      if (payload.executionSections) {
+        target.load('text');
+        await context.sync();
+        if (target.text !== payload.anchor_text) throw refusalError('Paragraph changed during preflight', 'LIVE_STALE');
+      }
       target.delete();
       await context.sync();
     });
-    const remaining = context.document.body.paragraphs;
+    const afterSource = payload.executionTargetSection ? await targetSectionRange(context, payload) : context.document.body;
+    const remaining = afterSource.paragraphs;
     remaining.load('items/text');
-    context.document.body.load('text');
     await context.sync();
     const after = remaining.items.map(p => p.text);
     const expected = before.filter((_,i) => i !== index);
     const result = {applied:true,before_count:before.length,after_count:after.length,
-      before_paragraphs:before,after_paragraphs:after,pre,post:await sha256Hex(context.document.body.text || '')};
+      before_paragraphs:before,after_paragraphs:after,pre,post:await mutationHash(context, {...payload, expectedBodySha256:undefined})};
     if (JSON.stringify(after) !== JSON.stringify(expected))
       throw refusalError(`Paragraph deletion read-back failed; observed effects: ${JSON.stringify(result)}`, 'VERIFICATION_FAILED');
     return result;
@@ -2699,7 +2832,14 @@ async function opTableDelete(payload) {
     await guardRevisions(context, [range]);
     const outside = async () => {
       const paragraphs = context.document.body.paragraphs;
-      paragraphs.load('items/text,items/tableNestingLevel');
+      paragraphs.load(payload.executionTargetSection ? 'items/tableNestingLevel' : 'items/text,items/tableNestingLevel');
+    if (payload.executionTargetSection) {
+      const scoped = await loadSectionMap(context, true);
+      const target = scoped.sections.find(s => s.slug === payload.executionTargetSection);
+      if (!target) throw refusalError('Missing target section', 'LOCK_SCOPE_UNRESOLVED');
+      await context.sync();
+      paragraphs.items.slice(target.start,target.end).forEach(p => p.load('text'));
+    }
       await context.sync();
       return paragraphs.items.filter(p => p.tableNestingLevel === 0).map(p => p.text);
     };
@@ -2907,6 +3047,18 @@ function inventoryShapes(xml) {
       size_emu:extent ? {width:extent.getAttribute('cx'),height:extent.getAttribute('cy')} : null,
       horizontal_position:position('positionH'),vertical_position:position('positionV'),
       legacy_style:node.namespaceURI === SHAPE_V ? node.getAttribute('style') : null};
+  });
+}
+async function opExecutionShapes(payload) {
+  return Word.run(async context => {
+    const shapes = [];
+    for (const s of payload.executionSections) {
+      const range = await targetSectionRange(context, {executionTargetSection:s.slug});
+      const xml = range.getOoxml();
+      await context.sync();
+      shapes.push(...inventoryShapes(xml.value));
+    }
+    return {shapes, coverage:'protected_sections'};
   });
 }
 async function opShapesList() {

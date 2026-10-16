@@ -4044,5 +4044,60 @@ def main() -> None:
     mcp.run()
 
 
+@mcp.tool()
+def live_changes_prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = False) -> dict[str, Any]:
+    """Prepare a scoped approved run without modifying Word. Operations are
+    {op, section, args}; section is a unique heading slug. Supports
+    replace_cell_markdown, replace_table_row, replace_text, delete_paragraph,
+    and a final live_save. Returns a compact preview, run_id and manifest_sha256.
+    Read the local manifest to review exact changes; approve that digest once.
+    Requires approved_changes_v1 in the connected Word pane.
+    """
+    from .live.approved_changes import prepare
+    try:
+        return prepare(path, operations, track_changes)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def live_changes_execute(path: str, run_id: str, manifest_sha256: str, approved_by: str) -> dict[str, Any]:
+    """Execute one immutable, lead-approved change set. Code handles all writes,
+    internal verification, bounded pre-write retries and the durable progress
+    journal. Unrelated section edits do not invalidate the run. Returns counts
+    and exceptions only; full evidence stays local. Unknown outcomes never retry.
+    """
+    from .live.approved_changes import execute
+    try:
+        return execute(path, run_id, manifest_sha256, approved_by)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def live_changes_resume(path: str, run_id: str, manifest_sha256: str) -> dict[str, Any]:
+    """Resume independent remaining operations of an already approved run. Verifies
+    document, digest and protected targets; skips verified operations and defers
+    uncertain targets without replaying them. Does not broaden approval.
+    """
+    from .live.approved_changes import execute
+    try:
+        return execute(path, run_id, manifest_sha256)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+@mcp.tool()
+def live_changes_reconcile(path: str, run_id: str, manifest_sha256: str,
+                           disposition: str, decision_ref: str, operation_index: int | None = None) -> dict[str, Any]:
+    """Record a lead's explicit applied/not-applied decision on an uncertain run.
+    Exact live section readback must support the decision. Does not write Word.
+    """
+    from .live.approved_changes import reconcile
+    try:
+        return reconcile(path, run_id, manifest_sha256, disposition, decision_ref, operation_index)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
 if __name__ == "__main__":
     main()

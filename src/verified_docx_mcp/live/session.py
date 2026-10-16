@@ -47,6 +47,7 @@ DEFAULT_REQUEST_TIMEOUT = 15.0
 # Issue #33: body_ooxml serializes the whole body.
 OP_TIMEOUTS: dict[str, float] = {
     "comments_list": 60.0,
+    "execution_snapshot": 60.0,
     "body_ooxml": 60.0,
     "table_get": 60.0,
     "table_insert": 90.0,
@@ -80,7 +81,7 @@ def _env_seconds(name: str) -> float | None:
     return value if value > 0 else None
 
 
-def resolve_timeout(op: str) -> float:
+def resolve_timeout(op: str, *, protected_sections: bool = False) -> float:
     """Seconds to wait for ``op``'s reply. Precedence: the per-op env var
     ``VERIFIED_DOCX_LIVE_TIMEOUT_<OP>_S`` (e.g. ``..._COMMENTS_LIST_S``),
     then the global ``VERIFIED_DOCX_LIVE_TIMEOUT_S``, then ``OP_TIMEOUTS``,
@@ -92,7 +93,10 @@ def resolve_timeout(op: str) -> float:
     global_value = _env_seconds(TIMEOUT_ENV)
     if global_value is not None:
         return global_value
-    return OP_TIMEOUTS.get(op, DEFAULT_REQUEST_TIMEOUT)
+    default = OP_TIMEOUTS.get(op, DEFAULT_REQUEST_TIMEOUT)
+    # Scoped mutations validate section structure, comments and shapes as well
+    # as the target. A 15-second legacy deadline can expire after a valid write.
+    return max(default, 60.0) if protected_sections else default
 
 
 class LiveError(Exception):

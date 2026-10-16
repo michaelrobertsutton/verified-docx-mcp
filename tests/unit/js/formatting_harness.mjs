@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import {fixture} from './edit_harness.mjs';
 const path=process.argv[2];
 const f=fixture(path,'Heading.plain sentence',false);
@@ -18,3 +19,9 @@ const fmt=fixture(path,'plain sentence',false);
 const formatted=await fmt.sandbox.api.opFormat({find:'sentence',expected_matches:1,bold:true,italic:true,underline:true});
 assert.equal(formatted.matches[0].boldAfter,true);assert.equal(formatted.matches[0].italicAfter,true);assert.equal(formatted.matches[0].underlineAfter,true);
 console.log('formatting behavior passed');
+
+const stale=fixture(path,'Heading.plain sentence',false);
+vm.runInContext(`let checks=0; sectionGuard=async()=>({check:async()=>{if(++checks===2) throw Object.assign(new Error('changed'),{code:'LIVE_STALE'});}});`,stale.sandbox);
+await assert.rejects(()=>stale.sandbox.api.opReplace({find:'plain sentence',replace:'new',expected_matches:1,track_changes:true}),e=>e.code==='LIVE_STALE');
+assert.equal(stale.context.document.changeTrackingMode,'Off');
+assert.equal(stale.state.text,'Heading.plain sentence');

@@ -284,7 +284,8 @@ def live_session_for(path: str) -> LiveSession:
     # explicit read (reads_live) advances its baseline, so a stale writer is
     # refused with LIVE_STALE instead of silently re-baselined.
     view = getattr(session, "status_view", None)
-    return view() if view is not None else session
+    from .approved_changes import scoped_session
+    return scoped_session(view() if view is not None else session)
 
 
 def require_capability(session: LiveSession, capability: str, *, feature_description: str) -> None:

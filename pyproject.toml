@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "verified-docx-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server for local .docx files with verified writes (Word render backend)"
 readme = "README.md"
 license = { file = "LICENSE" }
