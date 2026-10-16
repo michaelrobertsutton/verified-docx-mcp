@@ -40,6 +40,7 @@ READ_OPS = frozenset(
         "revisions_list",
         "autoopen_get",
         "sections_list",
+        "execution_snapshot",
     }
 )
 # Pane refusals raised before any mutation; they must not stale other clients.
@@ -270,6 +271,9 @@ class Broker:
             if op not in VALID_OPS:
                 raise ValueError("Unknown pane operation")
             write = op not in READ_OPS
+            scoped = bool((request.get("payload") or {}).get("executionSections"))
+            if scoped and "approved_changes_v1" not in session.hello.capabilities:
+                raise LiveOpFailed("LIVE_CAPABILITY_MISSING", "Reload the Word pane for approved_changes_v1")
             payload = dict(request.get("payload") or {})
             # Only the broker may scope a write; never trust caller-supplied scopes.
             payload.pop("forbiddenSections", None)
@@ -292,6 +296,7 @@ class Broker:
                     # a solo session must behave like local mode).
                     if (
                         not own
+                        and not scoped
                         and self.seen.get((client_id, key)) != version
                         and not (lone and (client_id, key) not in self.seen)
                     ):
@@ -312,8 +317,10 @@ class Broker:
                 if own:
                     payload.pop("expectedBodySha256", None)
                     payload["ownSections"] = [
-                        {"slug": s, "expectedSha256": v["sha"]} for s, v in own.items()
+                        ({"slug": s} if scoped else {"slug": s, "expectedSha256": v["sha"]}) for s, v in own.items()
                     ]
+                elif scoped:
+                    payload.pop("expectedBodySha256", None)
                 else:
                     expected = request.get("expected_body_sha256") or payload.get(
                         "expectedBodySha256"
@@ -338,7 +345,7 @@ class Broker:
                     op,
                     payload,
                     timeout=timeout,
-                    expected_body_sha256=None if own else request.get("expected_body_sha256"),
+                    expected_body_sha256=None if own or scoped else request.get("expected_body_sha256"),
                 )
             except LiveOpFailed as exc:
                 # Only a refusal the pane raises before touching the document is safe to
@@ -352,10 +359,14 @@ class Broker:
                     # even when the pane times out or reports verification failure.
                     with self.mutex:
                         self.versions[key] = version + 1
-                    if own:
+                    if own and not scoped:
                         self._refresh_baselines(session, key, client_id, timeout)
             with self.mutex:
-                if write or request.get("observe", True):
+                if write and scoped:
+                    # A protected-section digest is not a whole-body baseline.
+                    self.seen[(client_id,key)] = -1
+                    self.hashes.pop((client_id,key),None)
+                elif op != "execution_snapshot" and (write or request.get("observe", True)):
                     self.seen[(client_id, key)] = self.versions.get(key, 0)
                     body_hash = result.get("bodySha256") or result.get("post")
                     if body_hash:

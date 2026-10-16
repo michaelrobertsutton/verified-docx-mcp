@@ -105,6 +105,7 @@ function makeContext(model) {
   function node(label, readable, impl, setters = {}) {
     const loaded = new Set();
     impl.load = (spec) => {
+      (model.loads ||= []).push([label, String(spec)]);
       const names = (Array.isArray(spec) ? spec : String(spec).split(",")).map((s) => s.trim());
       ctx.queue.push(() => names.forEach((n) => loaded.add(n.split("/").pop())));
       return proxy;
@@ -145,6 +146,7 @@ function makeContext(model) {
   function collection(label, build, childSeed) {
     const impl = {};
     const loadFn = (spec) => {
+      (model.loads ||= []).push([label, String(spec)]);
       const names = String(spec).split(",").map((s) => s.trim());
       const children = names.filter((n) => n.startsWith("items/")).map((n) => n.slice(6));
       ctx.queue.push(() => {
@@ -274,6 +276,7 @@ function makeContext(model) {
     // against the paragraphs as of the last sync, so writes through it land in an earlier paragraph.
     paragraphs.getLast = () => makePara({ get i() { return quirk() ? Math.min(cell.paras.length, cell.__synced ?? cell.paras.length) - 1 : cell.paras.length - 1; } });
     const impl = {
+      getRange: () => ({}),
       get text() {
         const value = cellText(cell);
         // fires only for reads the PANE makes (the body-hash computation goes
@@ -489,6 +492,14 @@ function loadPane(model) {
       "\n;globalThis.__ops = { opTableInsert, opTableGet, opCellsSet, opCellSet, opCellGet, opParagraphsUnlist, opTableDelete, opRevisionsMutate, dispatchOp, PANE_CAPABILITIES };",
     sandbox
   );
+  sandbox.__ops.scopedTest = (onGuard) => {
+    sandbox.onGuard = onGuard;
+    vm.runInContext(`executionSnapshot = async () => ({sections:[{slug:'target'}]});
+      sectionGuard = async () => ({active:true, check:async()=>{}});
+      targetTables = async context => loadTopLevelTables(context);
+      guardComments = async () => { if (globalThis.onGuard) globalThis.onGuard(); };
+      guardRevisions = async () => {};`, sandbox);
+  };
   return sandbox.__ops;
 }
 
@@ -978,4 +989,22 @@ const trackedCalls = (model) => model.calls.filter((c) => /trackedChanges\.(acce
   check("anchor #79: tracking mode is back to what it was", model.mode === "Off", model.mode);
 }
 
+// Approved execution must not load body text; target CAS runs after async guards.
+{
+  const model = makeModel({tables:[{rows:[['old']]}]});
+  const ops = loadPane(model); ops.scopedTest();
+  const r = await run(() => ops.opCellSet({table_index:1,row_index:1,cell_index:1,
+    paragraphs:[para('new')], expected_before_text:'old', executionSections:[{slug:'target'}], executionTargetSection:'target'}));
+  check('approved cell: mutation verifies', r.ok, JSON.stringify(r));
+  check('approved cell: no full-body text load', !(model.loads || []).some(([label,spec]) => label === 'body' && spec.includes('text')), JSON.stringify(model.loads));
+}
+{
+  const model = makeModel({tables:[{rows:[['old']]}]});
+  const ops = loadPane(model); ops.scopedTest(() => { model.tables[0].rows[0][0].paras=['coauthor']; });
+  const r = await run(() => ops.opCellSet({table_index:1,row_index:1,cell_index:1,
+    paragraphs:[para('new')], expected_before_text:'old', track_changes:true, executionSections:[{slug:'target'}], executionTargetSection:'target'}));
+  check('approved cell: refusal preserves tracking mode', model.mode === 'Off', model.mode);
+  check('approved cell: edit during comment guard refuses', !r.ok && r.code === 'LIVE_STALE', JSON.stringify(r));
+  check('approved cell: coauthor text survives', cellText(model.tables[0].rows[0][0]) === 'coauthor', JSON.stringify(model.calls));
+}
 console.log(JSON.stringify({ results }));

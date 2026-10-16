@@ -1,0 +1,8 @@
+# Changelog
+
+## 0.1.1 — 2026-10-16
+
+- Add digest-bound prepare/execute/resume for scoped live change sets, durable journals and explicit unknown-outcome reconciliation.
+- Permit unrelated coauthor edits while preserving protected-section and target checks at the pane boundary.
+- Attempt independent edits before retrying pre-write refusals; quarantine uncertain targets, save after all mutations, and resume final verification without replay.
+- Keep full execution evidence local; return compact run reports.

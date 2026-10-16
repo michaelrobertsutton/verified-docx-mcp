@@ -486,3 +486,7 @@ verbatim rather than widening it. See `src/verified_docx_mcp/paths.py`.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Approved live changes
+
+Use `live_changes_prepare`, then one digest-bound `live_changes_execute` request for a live change set. Code handles sequencing, internal verification and durable resume without per-edit model calls. See [the execution contract and acceptance evidence](docs/acceptance/approved-changes.md). Requires the `approved_changes_v1` pane capability.

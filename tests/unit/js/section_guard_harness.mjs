@@ -9,7 +9,7 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + `
- globalThis.api = {sectionSlug, loadSectionMap, sectionGuard, refuseDocumentWide, dispatchOp, opSectionsList};
+ globalThis.api = {sectionSlug, loadSectionMap, sectionGuard, refuseDocumentWide, dispatchOp, opSectionsList, executionSnapshot};
 `, sandbox);
 const api = sandbox.api;
 const plain = v => JSON.parse(JSON.stringify(v));
@@ -33,13 +33,13 @@ const makeRange = (start, end) => ({
 });
 function fakeContext(spec) {
   const items = spec.map(([text, outlineLevel, tableNestingLevel], i) => ({
-    text, outlineLevel: outlineLevel ?? 10, tableNestingLevel: tableNestingLevel ?? 0,
+    load() {}, text, outlineLevel: outlineLevel ?? 10, tableNestingLevel: tableNestingLevel ?? 0,
     getRange(where) { return makeRange(10 * i + (where === 'End' ? 10 : 0), 10 * i + (where === 'Start' ? 0 : 10)); },
   }));
   // The fake range model gives a paragraph's Start/End getRange the right collapsed points.
   items.forEach((p, i) => { p.getRange = where => where === 'Start' ? makeRange(10 * i, 10 * i) : where === 'End' ? makeRange(10 * i + 10, 10 * i + 10) : makeRange(10 * i, 10 * i + 10); });
   return {
-    document: {body: {getRange() { return {paragraphs: {items, load() {}}}; }, paragraphs: {items, load() {}}, text: spec.map(p => p[0]).join('\n'), load() {}}},
+    document: {load() {}, saved:true, body: {getRange() { return {paragraphs: {items, load() {}}}; }, paragraphs: {items, load() {}}, text: spec.map(p => p[0]).join('\n'), load() {}}},
     sync: async () => {},
   };
 }
@@ -102,3 +102,25 @@ const listed = await api.opSectionsList();
 assert.equal(listed.sections.find(s => s.section_key === 'scope-detail-1').sectionSha256, scopeSha);
 assert.deepEqual(plain(listed.sections.filter(s => !s.slug_unique).map(s => s.section_key)), ['intro-1', 'intro-2']);
 console.log('section guard: resolution, fail-closed relations, own/forbidden scopes, document-wide refusal passed');
+
+// Approved runs use exact section content and structure, independent of body revisions.
+const body = globalThis.__ctx.document.body;
+body.tables = {items: [], load() {}};
+let fullTextLoads = 0;
+body.load = spec => { if (String(spec).includes('text')) { fullTextLoads++; throw Error('Full body text read'); } };
+const guardedCollection = {items:body.paragraphs.items, load(spec) { if (String(spec).includes('items/text')) { fullTextLoads++; throw Error('Full paragraph text read'); } }};
+body.getRange = () => ({paragraphs:guardedCollection});
+body.paragraphs.items.forEach((p,i) => { p.load = spec => {
+  if (String(spec).includes('text') && [0,2,4,5,9].includes(i)) throw Error('Unrelated prose text loaded');
+}; });
+const initial = await api.executionSnapshot(globalThis.__ctx, ['scope-detail']);
+assert.deepEqual(plain(initial.sections), [{slug:'scope-detail', paragraphs:['Scope detail','detail body'], tables:[]}]);
+body.paragraphs.items[4].text = 'coauthor elsewhere';
+const execution = await api.sectionGuard(globalThis.__ctx, {executionSections: initial.sections});
+await execution.check([para(7)]);
+await expectCode(execution.check([para(4)]), 'OUTSIDE_LOCKED_SECTION');
+body.paragraphs.items[7].text = 'coauthor in protected section';
+await expectCode(api.sectionGuard(globalThis.__ctx, {executionSections: initial.sections}), 'LIVE_STALE');
+console.log('approved sections: unrelated edits pass; protected edits and wrong targets refuse');
+
+assert.equal(fullTextLoads,0);

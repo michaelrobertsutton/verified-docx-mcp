@@ -346,6 +346,7 @@ VALID_OPS: frozenset[str] = frozenset(
         "autoopen_set",
         # issue #47: heading sections (key, level, hash) for section locks
         "sections_list",
+        "execution_snapshot",
     }
 )
 
