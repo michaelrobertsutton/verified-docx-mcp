@@ -1597,7 +1597,7 @@ async function opCellSet(payload) {
     // (a co-author typing in this same cell), rather than overwrite them.
     if (before !== payload.expected_before_text) {
       throw refusalError(
-        "the cell's text changed since it was read (another editor may be working in it); nothing was written"
+        "the cell's text changed since it was read (another editor may be working in it); nothing was written", "CELL_TEXT_MISMATCH"
       );
     }
 
@@ -2028,7 +2028,7 @@ async function opCellsSet(payload) {
     if (bad < 0) bad = mismatch(await readAll());
     if (bad >= 0) {
       throw refusalError(
-        `cell ${bad + 1} of ${payload.cells.length} changed since it was read (another editor may be working in it); nothing was written`
+        `cell ${bad + 1} of ${payload.cells.length} changed since it was read (another editor may be working in it); nothing was written`, "CELL_TEXT_MISMATCH"
       );
     }
 

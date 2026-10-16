@@ -57,8 +57,47 @@ scope checks, including unrelated edits, protected edits and wrong targets.
 
 ## Live Word acceptance
 
-PENDING until a disposable document has run the same 12x4 table scenario with
-v60 connected, outside-section edits and comment resolutions interleaved. Also
-confirm a same-section edit refuses the next operation without overwriting it.
-Record the run report, journal path, Word version and pane capabilities here.
-Do not substitute simulated results for this acceptance check.
+PASS — 2026-10-16, Word 16.114 (16.114.26101123), macOS, pane v60
+with `approved_changes_v1`.
+
+The disposable 12x4 fixture completed 36 cell edits plus save through **one MCP
+execution request**, with six actual unrelated section edits and an outside
+comment resolution interleaved by a second client. No model intervened between
+operations. The report was `complete`, 37/37 applied, no issues or remaining
+operations. Elapsed time was 342.33 seconds, including collaborator operations.
+
+| Main-client calls | Count |
+|---|---:|
+| MCP prepare / execute | 1 / 1 |
+| execution_snapshot (initial / final) | 2 total |
+| comments_list | 1 |
+| cell_set / independent cell_get | 36 / 36 |
+| save | 1 |
+| describe / body_ooxml | 0 / 0 |
+
+Clean run: `517306f16f1f4a1c9843b948abe1b48e`, manifest SHA-256
+`cf692eba841f575896529523f8a63abb88687ce2605468a1864fef21b27da6b8`.
+Its manifest, journal and full evidence remain in the local
+`verified-docx-mcp/approved-changes/<document-sha>/` state directory.
+
+A second live test changed an approved target cell before execution. The executor
+returned a focused `CELL_TEXT_MISMATCH` conflict, preserved the collaborator's
+content, applied the independent cell and saved. Its report was correctly
+`partial` (2/3 operations verified, only the conflicted cell remaining).
+Run: `8dc11bf8ed714e9094fe94ebea0bdbf1`.
+
+A preliminary run also exercised two late replies under the legacy 15-second
+deadline: all independent writes proceeded; exact target readback reconciled
+the late writes without repeating them. Scoped broker, socket and independent
+readback deadlines now agree at 60 seconds by default, with explicit timeout
+overrides retained.
+
+Reproduce with `tests/fixtures/approved-changes.docx`, copied to
+`/private/tmp/jennystack-word-acceptance.docx` and opened with the Live pane.
+Run `tests/live/approved_changes_probe.py` with
+`VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS=/private/tmp`. For the conflict probe, copy
+the fixture separately to `/private/tmp/jennystack-word-conflict-final.docx`,
+open its pane, then run `tests/live/approved_conflict_probe.py`.
+
+Native round-trip reduction, mixed-format text replacements, and safe edits in
+callout-anchored paragraphs are tracked separately in backend issues #96–#98.

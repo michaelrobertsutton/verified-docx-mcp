@@ -705,7 +705,7 @@ const writes = (model) => model.calls.filter((c) => /insertTable|insertText|clea
 
   const model2 = mk();
   const r2 = await run(() => loadPane(model2).opCellsSet({ cells: cells(["a", "WRONG"]), track_changes: false }));
-  check("cells_set: a changed cell refuses the WHOLE batch, nothing written", !r2.ok && /changed since it was read/.test(r2.message) && writes(model2).length === 0 && cellText(model2.tables[0].rows[0][0]) === "a", JSON.stringify(r2));
+  check("cells_set: a changed cell refuses the WHOLE batch, nothing written", !r2.ok && r2.code === "CELL_TEXT_MISMATCH" && /changed since it was read/.test(r2.message) && writes(model2).length === 0 && cellText(model2.tables[0].rows[0][0]) === "a", JSON.stringify(r2));
 
   const model3 = mk();
   const r3 = await run(() => loadPane(model3).opCellsSet({ cells: cells(), track_changes: false, expectedBodySha256: "f".repeat(64) }));
@@ -739,7 +739,7 @@ const writes = (model) => model.calls.filter((c) => /insertTable|insertText|clea
   const r2 = await run(() =>
     ops.opCellSet({ table_index: 1, row_index: 1, cell_index: 2, paragraphs: [para("x")], expected_before_text: "stale", track_changes: false })
   );
-  check("cell_set: compare-and-set still refuses a changed cell", !r2.ok && /changed since it was read/.test(r2.message) && cellText(model.tables[0].rows[0][1]) === "keep", JSON.stringify(r2));
+  check("cell_set: compare-and-set still refuses a changed cell", !r2.ok && r2.code === "CELL_TEXT_MISMATCH" && /changed since it was read/.test(r2.message) && cellText(model.tables[0].rows[0][1]) === "keep", JSON.stringify(r2));
 }
 
 // 11. wiring
