@@ -486,7 +486,7 @@ def execute(path: str, run_id: str, manifest_sha256: str, approved_by: str | Non
                         journal.update(status='read_unavailable',problem=f'Live read unavailable: {exc}',working=current,blocked=sorted(blocked))
                         write(jf,journal)
                         return report(manifest,journal)
-                    if operation['op']=='delete_paragraph': blocked.add(operation['section']+'|*')
+                    if operation['op']=='delete_paragraph' and problem['status']=='unknown': blocked.add(operation['section']+'|*')
                 else:
                     current=project(current,operation);verified.add(index);deferred.pop(key,None)
                     journal['evidence'].append(dict(index=index,**evidence))
