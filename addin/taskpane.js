@@ -236,7 +236,7 @@ async function collectComments(context, options) {
 }
 
 async function buildReport() {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const body = context.document.body;
     body.load("text");
     await context.sync();
@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
+const PANE_CAPABILITIES = ["approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -488,7 +488,7 @@ function logOp(op, ok, detail) {
 }
 
 async function currentBodyHash() {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const body = context.document.body;
     body.load("text");
     await context.sync();
@@ -577,7 +577,7 @@ function connectOpsSocket() {
     enqueuePaneOperation(async () => {
       if (socket.readyState !== WebSocket.OPEN) return;
       try {
-        const result = await dispatchOp(op, payload);
+        const result = await measuredDispatch(op, payload);
         logOp(payload.clientId ? `${op} [${payload.clientId.slice(0, 8)}]` : op, true, summarizeResult(op, result));
         socket.send(JSON.stringify({ type: "reply", request_id: requestId, ok: true, result }));
       } catch (err) {
@@ -650,7 +650,7 @@ function summarizeResult(op, result) {
   return "";
 }
 
-const SHAPE_GUARDED_OPS = new Set(["replace", "format", "cell_set", "cells_set",
+const SHAPE_GUARDED_OPS = new Set(["approved_cell_set", "replace", "format", "cell_set", "cells_set",
   "table_insert", "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
   "comment_add", "comment_reply", "comment_resolve", "comment_delete", "save", "table_delete", "paragraphs_unlist"]);
 
@@ -668,14 +668,15 @@ const READ_ONLY_OPS = new Set(["ping", "describe", "body_ooxml", "search", "comm
 
 async function dispatchOp(op, payload) {
   if (op === "save" && payload.executionSections)
-    await Word.run(context => sectionGuard(context, payload));
+    await measuredWordRun(context => sectionGuard(context, payload));
   const sectionScoped = !!((payload.ownSections && payload.ownSections.length) ||
     (payload.executionSections && payload.executionSections.length));
   if (!READ_ONLY_OPS.has(op) && payload.clientId && !sectionScoped) {
     if (!payload.expectedBodySha256)
       throw refusalError("Shared write requires a body baseline", "LIVE_STALE");
-    await Word.run(async context => requireFreshBody(context, payload.expectedBodySha256));
+    await measuredWordRun(async context => requireFreshBody(context, payload.expectedBodySha256));
   }
+  if (op === "approved_cell_set") return dispatchOpUnchecked(op, payload); // verifies scoped shapes inside its boundary snapshots
   if (!SHAPE_GUARDED_OPS.has(op)) return dispatchOpUnchecked(op, payload);
   const before = await (payload.executionSections ? opExecutionShapes(payload) : opShapesList());
   // Accepting/rejecting tracked deletions can remove whole anchor paragraphs.
@@ -700,7 +701,7 @@ async function dispatchOpUnchecked(op, payload) {
     case "shapes_list":
       return opShapesList();
     case "execution_snapshot":
-      return Word.run(context => executionSnapshot(context, payload.section_slugs));
+      return measuredWordRun(context => executionSnapshot(context, payload.section_slugs));
     case "sections_list":
       return opSectionsList();
     case "ping":
@@ -731,6 +732,8 @@ async function dispatchOpUnchecked(op, payload) {
       return opCommentDelete(payload);
     case "cell_get":
       return opCellGet(payload);
+    case "approved_cell_set":
+      return opApprovedCellSet(payload);
     case "cell_set":
       return opCellSet(payload);
     case "table_get":
@@ -771,7 +774,7 @@ async function dispatchOpUnchecked(op, payload) {
 async function opPing() {
   // Round-trips the JS engine through Word.run -- proves the pane is
   // alive, not just the socket (live/protocol.py's `ping` docstring).
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     context.document.body.load("text");
     await context.sync();
     return {};
@@ -810,7 +813,7 @@ async function opAutoopenSet(payload) {
 }
 
 async function opDescribe() {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const body = context.document.body;
     body.load("text");
     context.document.load(["changeTrackingMode", "saved"]);
@@ -851,7 +854,7 @@ function stripBinaryParts(ooxml) {
 }
 
 async function opBodyOoxml() {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const body = context.document.body;
     const ooxmlResult = body.getOoxml();
     body.load("text");
@@ -925,7 +928,7 @@ function sectionSha(items, section) {
   return sha256Hex(items.slice(section.start, section.end).map(p => p.text || "").join("\n"));
 }
 async function opSectionsList() {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const { items, sections } = await loadSectionMap(context);
     const bodySha256 = await requireFreshBody(context);
     const counts = new Map();
@@ -955,15 +958,18 @@ async function sectionGuard(context, payload) {
   const forbiddenSlugs = payload.forbiddenSections || [];
   const execution = payload.executionSections || [];
   const own = payload.ownSections || [];
+  let executionMap=null, scopeShapes=null;
   if (execution.length) {
-    const current = await executionSnapshot(context, execution.map(s => s.slug));
+    const current = await (payload.approvedCellStream ? executionXmlSnapshot : executionSnapshot)(context, execution.map(s => s.slug));
+    executionMap=current.section_map;
+    scopeShapes=current.shapes || null;
     if (JSON.stringify(current.sections) !== JSON.stringify(execution))
       throw refusalError("Protected section changed; nothing was written", "LIVE_STALE");
   }
   if (!forbiddenSlugs.length && !own.length && !execution.length) return { active: false, async check() {} };
   if (payload.scope && payload.scope !== "body")
     throw refusalError("Section locks do not cover text-box scopes; release the locks first", "OUTSIDE_LOCKED_SECTION");
-  const { items, sections } = await loadSectionMap(context, execution.length > 0);
+  const { items, sections } = executionMap || await loadSectionMap(context, execution.length > 0);
   const resolve = (slug) => {
     const hits = sections.filter(s => s.slug === slug);
     if (hits.length !== 1)
@@ -987,7 +993,7 @@ async function sectionGuard(context, payload) {
     mine.push({ slug: o.slug, range: rangeOf(section) });
   }
   return {
-    active: true,
+    active: true, scopeShapes,
     async check(targetsOrThunk) {
       const targets = typeof targetsOrThunk === "function" ? targetsOrThunk() : targetsOrThunk;
       const forbiddenRels = targets.map(t => forbidden.map(f => t.compareLocationWith(f.range)));
@@ -1026,6 +1032,7 @@ async function executionSnapshot(context, slugs) {
   chosen.forEach(s => items.slice(s.start,s.end).filter(p => p.tableNestingLevel === 0).forEach(p => p.load("text")));
   await context.sync();
   const table_addresses = [];
+  const cell_paragraphs = {};
   const ranges = chosen.map(s => sectionRange(context, items, s));
   const tables = await loadTopLevelTables(context);
   const relations = tables.map(t => ranges.map(range => t.getRange().compareLocationWith(range)));
@@ -1038,6 +1045,7 @@ async function executionSnapshot(context, slugs) {
     const grid = await loadRowsAndCells(context, tables[i]);
     grid.forEach(row => row.forEach(cell => cell.body.paragraphs.load("items/text")));
     await context.sync();
+    grid.forEach((row,r) => row.forEach((cell,c) => {cell_paragraphs[`${chosen[index].slug}|${result[index].tables.length+1}|${r+1}|${c+1}`]=cell.body.paragraphs.items.map(p=>canonicalCellText(p.text || ""));}));
     const section = chosen[index];
     const preceding = items.slice(section.start, section.end).filter(p => p.tableNestingLevel === 0)
       .map(p => p.getRange("Whole").compareLocationWith(tables[i].getRange()));
@@ -1049,7 +1057,10 @@ async function executionSnapshot(context, slugs) {
   }
   context.document.load("saved");
   await context.sync();
-  return {sections:result, table_addresses, saved:context.document.saved};
+  const captured={sections:result, table_addresses, saved:context.document.saved};
+  Object.defineProperty(captured,"section_map",{value:{items,sections}});
+  Object.defineProperty(captured,"cell_paragraphs",{value:cell_paragraphs});
+  return captured;
 }
 
 
@@ -1068,7 +1079,7 @@ async function executionTargetRanges(context, payload, targets) {
 // -- search -------------------------------------------------------------
 
 async function opSearch(payload) {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const results = context.document.body.search(payload.find, {
       matchCase: !!payload.matchCase,
       matchWholeWord: !!payload.matchWholeWord,
@@ -1337,7 +1348,7 @@ async function verifyAnchoredText(context, boundaries) {
 async function opReplace(payload) {
   const expectedMatches = payload.expected_matches;
   const segments = explicitSegments(payload);
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     if (!payload.executionSections) await requireFreshBody(context, payload.expectedBodySha256);
     await requireFreshScope(context, payload);
     const preHash = await mutationHash(context, payload);
@@ -1469,7 +1480,7 @@ async function opReplace(payload) {
 
 async function opFormat(payload) {
   const expectedMatches = payload.expected_matches;
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     await requireFreshBody(context, payload.expectedBodySha256);
     await requireFreshScope(context, payload);
     const body = context.document.body;
@@ -1746,7 +1757,7 @@ async function restoreCellText(context, cell, texts) {
 }
 
 async function opCellGet(payload) {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const cell = await resolveTableCell(context, payload);
     cell.body.load("text");
     cell.body.paragraphs.load("items/text");
@@ -1756,7 +1767,7 @@ async function opCellGet(payload) {
 }
 
 async function opCellSet(payload) {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const preHash = await mutationHash(context, payload);
 
     const cell = await resolveTableCell(context, payload);
@@ -1929,7 +1940,7 @@ function documentPartXml(flatOpc) {
 }
 
 async function opTableGet(payload) {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const tableItems = await targetTables(context, payload);
     const table = tableItems[payload.table_index - 1];
     if (!table) {
@@ -2052,7 +2063,7 @@ async function countListItems(context, getParagraphs) {
 async function opTableInsert(payload) {
   const rowCount = payload.rows.length;
   const colCount = payload.rows[0].length;
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const preHash = await requireFreshBody(context, payload.expectedBodySha256);
     const tableItems = await loadTopLevelTables(context);
     const styleChoice = await resolveInsertStyle(context, payload, tableItems);
@@ -2146,7 +2157,7 @@ async function opTableInsert(payload) {
 }
 
 async function opCellsSet(payload) {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const preHash = await mutationHash(context, payload);
     const tableItems = await targetTables(context, payload);
 
@@ -2288,7 +2299,7 @@ function crosscheckCommentsOoxml(xml) {
 async function opCommentsList(payload) {
   const p = payload || {};
   const started = Date.now();
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const { items, counts, observedAt } = await collectComments(context, {
       ids: p.ids,
       anchors: p.include_anchor !== false,
@@ -2325,7 +2336,7 @@ async function opCommentsList(payload) {
 
 async function opCommentAdd(payload) {
   const expectedMatches = payload.expected_matches;
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     const body = context.document.body;
     body.load("text");
     await context.sync();
@@ -2363,7 +2374,7 @@ async function opCommentAdd(payload) {
 }
 
 async function opCommentReply(payload) {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     checkCommentEpoch(payload);
     const comments = context.document.body.getComments();
     comments.load("items/id");
@@ -2380,7 +2391,7 @@ async function opCommentReply(payload) {
 }
 
 async function opCommentResolve(payload) {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     checkCommentEpoch(payload);
     const comments = context.document.body.getComments();
     comments.load("items/id");
@@ -2399,7 +2410,7 @@ async function opCommentResolve(payload) {
 // The pane only reports what it re-read afterwards; the server decides
 // whether `still_present` is a failure.
 async function opCommentDelete(payload) {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     checkCommentEpoch(payload);
     const comments = context.document.body.getComments();
     comments.load("items/id");
@@ -2429,7 +2440,7 @@ async function opCommentDelete(payload) {
 }
 
 async function opSave() {
-  return Word.run(async (context) => {
+  return measuredWordRun(async (context) => {
     context.document.save();
     await context.sync();
     return { saved: true };
@@ -2524,7 +2535,7 @@ async function desktopRevisionList(context) {
 }
 async function opRevisionsList() {
   if (!revisionsSupported()) return {revisions: null, coverage: "unavailable", reason: "WordApi 1.6 required"};
-  return Word.run(async context => {
+  return measuredWordRun(async context => {
     const changes = await revisionObjects(context, context.document.body);
     const entries = changes.items.map(change => {
       const id = `revision:${paneEpoch}:${crypto.randomUUID()}`;
@@ -2567,7 +2578,7 @@ async function guardRevisions(context, ranges) {
   await context.sync();
   const comparisons = [];
   nearby.forEach((changes, i) => changes.items.forEach(change => comparisons.push(scoped[i].compareLocationWith(change.getRange()))));
-  await context.sync();
+  if (comparisons.length) await context.sync();
   const apart = new Set(["Before", "After", "AdjacentBefore", "AdjacentAfter"]);
   if (comparisons.some(c => !apart.has(c.value))) throw refuse();
 }
@@ -2597,7 +2608,7 @@ function tableRevisionInventory(xml, tableIndex) {
   return {tableCount: tables.length, inside, outside: outside.sort()};
 }
 async function opRevisionsMutateScoped(payload, action) {
-  return Word.run(async context => {
+  return measuredWordRun(async context => {
     await requireFreshBody(context, payload.expectedBodySha256);
     const tableItems = await loadTopLevelTables(context);
     const table = tableItems[payload.table_index - 1];
@@ -2685,7 +2696,7 @@ async function opRevisionsMutate(payload, action) {
     await context.sync();
     return result;
   };
-  return retained.length ? Word.run(retained, execute) : Word.run(execute);
+  return retained.length ? measuredWordRun(retained, execute) : measuredWordRun(execute);
 }
 
 function checkCommentEpoch(payload) {
@@ -2770,7 +2781,7 @@ async function guardComments(context, ranges, allowLoss, shapeBodies, allowIds) 
       comment.replies.load("items/id,items/content,items/authorName");
       return {comment, anchor, relation: anchor.compareLocationWith(range)};
     });
-    await context.sync();
+    if (entries.length) await context.sync();
     const disjoint = new Set(["Before", "After", "AdjacentBefore", "AdjacentAfter"]);
     entries.filter(e => !disjoint.has(e.relation.value)).forEach(e => affected.set(e.comment.id, {
       id: e.comment.id, content: e.comment.content, authorName: e.comment.authorName,
@@ -2835,11 +2846,11 @@ async function requireFreshScope(context, payload) {
     throw refusalError('Scope changed since it was read; nothing written', 'LIVE_STALE');
 }
 async function opScopeDescribe(payload) {
-  return Word.run(async context => ({scopeSha256:await scopeHash(context,payload.scope || 'body'),
+  return measuredWordRun(async context => ({scopeSha256:await scopeHash(context,payload.scope || 'body'),
     bodySha256:await requireFreshBody(context),session_epoch:paneEpoch}));
 }
 async function opTextboxesList() {
-  return Word.run(async context => {
+  return measuredWordRun(async context => {
     const resolved = await resolveScopes(context,'all');
     const textboxes = [];
     for (const item of resolved.bodies.filter(b => b.shape)) {
@@ -2850,7 +2861,7 @@ async function opTextboxesList() {
   });
 }
 async function opTextboxesRead(payload) {
-  return Word.run(async context => {
+  return measuredWordRun(async context => {
     const resolved = await resolveScopes(context,payload.scope);
     const item = resolved.bodies[0];
     return {textbox_id:item.scope,text:item.body.text,shape:item.shape,session_epoch:paneEpoch,
@@ -2881,7 +2892,7 @@ function inspectDeleteParagraph(xml) {
     throw refusalError('Paragraph is a section boundary', 'STRUCTURAL_BOUNDARY');
 }
 async function opParagraphDelete(payload) {
-  return Word.run(async context => {
+  return measuredWordRun(async context => {
     const pre = await mutationHash(context, payload);
     const source = payload.executionTargetSection ? await targetSectionRange(context, payload) : context.document.body;
     const paragraphs = source.paragraphs;
@@ -2929,7 +2940,7 @@ async function opParagraphDelete(payload) {
 // Detaches every list-item paragraph in one table (table_index) or in the single paragraph
 // whose whole text equals paragraph_text. Detaching changes no text, so the body hash must not move.
 async function opParagraphsUnlist(payload) {
-  return Word.run(async context => {
+  return measuredWordRun(async context => {
     const pre = await requireFreshBody(context, payload.expectedBodySha256);
     const byTable = payload.table_index !== undefined && payload.table_index !== null;
     let range, loadScope;
@@ -2981,7 +2992,7 @@ function tableTextOf(grid) {
 }
 
 async function opTableDelete(payload) {
-  return Word.run(async context => {
+  return measuredWordRun(async context => {
     const pre = await requireFreshBody(context, payload.expectedBodySha256);
     const tableItems = await loadTopLevelTables(context);
     const table = tableItems[payload.table_index - 1];
@@ -3058,7 +3069,7 @@ async function resolveParagraphStyle(context, spec) {
 }
 
 async function opParagraphInsert(payload) {
-  return Word.run(async context => {
+  return measuredWordRun(async context => {
     const pre = await requireFreshBody(context, payload.expectedBodySha256);
     const specs = payload.paragraphs || [];
     if (!specs.length) throw refusalError("No paragraphs to insert", "INVALID_INPUT");
@@ -3221,7 +3232,7 @@ function inventoryShapes(xml) {
   });
 }
 async function opExecutionShapes(payload) {
-  return Word.run(async context => {
+  return measuredWordRun(async context => {
     const shapes = [];
     for (const s of payload.executionSections) {
       const range = await targetSectionRange(context, {executionTargetSection:s.slug});
@@ -3233,7 +3244,7 @@ async function opExecutionShapes(payload) {
   });
 }
 async function opShapesList() {
-  return Word.run(async context => {
+  return measuredWordRun(async context => {
     const xml = context.document.body.getOoxml();
     await context.sync();
     return {shapes:inventoryShapes(xml.value), coverage:'document_body',
@@ -3252,4 +3263,142 @@ async function guardAnchoredParagraphs(context, ranges) {
   await context.sync();
   // Conservative: any text replacement in an anchored paragraph is refused.
   await guardAnchoredBodies(context, collections.flatMap(p => p.items));
+}
+
+// A sequential execution stream with one durable server dispatch/ack per cell.
+// No section state survives a request; every mutation checks a fresh snapshot.
+async function opApprovedCellSet(payload) {
+  if (!payload.executionSections?.length || !payload.executionTargetSection)
+    throw refusalError('Approved cell stream requires protected section preconditions', 'INVALID_INPUT');
+  return measuredWordRun(async context => {
+    payload={...payload,approvedCellStream:true};
+    setExecutionPhase('preflight');
+    const cell=await resolveTableCell(context,payload);
+    const target=cell.body.getRange('Whole');
+    await guardComments(context,[target],false);
+    await guardRevisions(context,[target]);
+    await guardAnchoredBodies(context,[cell.body]);
+    let previousMode=null;
+    if (payload.track_changes) {
+      context.document.load('changeTrackingMode');await context.sync();
+      previousMode=context.document.changeTrackingMode;
+    }
+    // This fresh protected scope check is deliberately after asynchronous guards.
+    const boundary=await sectionGuard(context,payload);
+    await boundary.check([target]);
+    const shapesBefore=boundary.scopeShapes;
+    if (!Array.isArray(shapesBefore)) throw refusalError("Scoped shape baseline unavailable", "LIVE_CAPABILITY_MISSING");
+    const before=await readCellParagraphs(context,cell);
+    if (before.map(canonicalCellText).join('\n')!==payload.expected_before_text ||
+        (payload.expected_before_paragraph_count!=null && before.length!==payload.expected_before_paragraph_count))
+      throw refusalError('Cell changed at mutation boundary; nothing written', 'CELL_TEXT_MISMATCH');
+    setExecutionPhase('mutation');
+    try {
+      if (previousMode!==null) context.document.changeTrackingMode=Word.ChangeTrackingMode.trackAll;
+      // Exactly one write. An uncertain or failed write never switches strategies.
+      await writeCellParagraphs(context,cell,payload.paragraphs,'load-items');
+      await context.sync();
+    } finally {
+      if (previousMode!==null) {context.document.changeTrackingMode=previousMode;await context.sync();}
+    }
+    setExecutionPhase('verification');
+    // Freshly resolve the section/table/grid; no read from the mutated proxy.
+    try {
+    const post=await executionXmlSnapshot(context,payload.executionSections.map(s=>s.slug));
+    const shapeIdentity=shapes=>shapes.map(({anchor_paragraph,...shape})=>JSON.stringify(shape)).sort();
+    if (JSON.stringify(shapeIdentity(shapesBefore))!==JSON.stringify(shapeIdentity(post.shapes)))
+      throw refusalError('Scoped shapes changed after mutation','VERIFICATION_FAILED');
+    const section=post.sections.find(s=>s.slug===payload.executionTargetSection);
+    const table=section?.tables.find(t=>t.table_index===payload.table_index);
+    const text=table?.rows[payload.row_index-1]?.[payload.cell_index-1];
+    const count=table?.paragraph_counts[payload.row_index-1]?.[payload.cell_index-1];
+    const want=intendedCellParagraphs(payload.paragraphs).map(canonicalCellText);
+    if (text!==want.join('\n') || count!==want.length)
+      throw refusalError('Independent cell readback differs; reconcile the write', 'VERIFICATION_FAILED');
+    return {applied:true,shapes_before:shapesBefore.length,shapes_after:post.shapes.length,before:before.join('\n'),after:text,
+      readback:{text,paragraphs:post.cell_paragraphs[`${payload.executionTargetSection}|${payload.table_index}|${payload.row_index}|${payload.cell_index}`]},
+      pre:await sha256Hex(JSON.stringify(payload.executionSections)),post:await sha256Hex(JSON.stringify(post.sections)),strategy:'approved-single-write'};
+    } catch(error) {throw refusalError('Approved write may have applied; verification failed: '+(error.message || error),'VERIFICATION_FAILED');}
+  });
+}
+
+let executionMetrics=null;
+function setExecutionPhase(phase) {if(executionMetrics) executionMetrics.phase=phase;}
+async function measuredWordRun(...args) {
+  const callback=args.pop();
+  return Word.run(...args,async context => {
+    if (!executionMetrics) return callback(context);
+    const metrics=executionMetrics, originalSync=context.sync, native=originalSync.bind(context);
+    context.sync=async (...syncArgs) => {
+      const start=Date.now(), phase=metrics.phase || 'operation';
+      try {return await native(...syncArgs);}
+      finally {
+        metrics.sync_count++;
+        const item=metrics.phases[phase] ||= {sync_count:0,sync_ms:0};
+        item.sync_count++;item.sync_ms+=Date.now()-start;
+      }
+    };
+    try {return await callback(context);}
+    finally {context.sync=originalSync;}
+  });
+}
+async function measuredDispatch(op,payload) {
+  const start=Date.now();
+  executionMetrics={sync_count:0,phases:{},phase:'preflight'};
+  try {
+    const result=await dispatchOp(op,payload);
+    return {...result,metrics:{elapsed_ms:Date.now()-start,sync_count:executionMetrics.sync_count,phases:executionMetrics.phases}};
+  } finally {executionMetrics=null;}
+}
+
+function directWordChildren(node, name) {
+  return [...node.childNodes].filter(n=>n.namespaceURI===SHAPE_W && n.localName===name);
+}
+function visibleWordText(node) {
+  if (node.namespaceURI===SHAPE_W) {
+    if (['txbxContent','del','moveFrom','drawing','pict','object'].includes(node.localName)) return '';
+    if (node.localName==='t') return node.textContent;
+    if (node.localName==='tab') return '\t';
+    if (node.localName==='br' || node.localName==='cr') return '\n';
+  }
+  return [...(node.childNodes || [])].filter(n=>n.nodeType===1).map(visibleWordText).join('');
+}
+async function executionXmlSnapshot(context, slugs) {
+  const {items,sections}=await loadSectionMap(context,true);
+  const chosen=slugs.map(slug=>{
+    const found=sections.filter(s=>s.slug===slug);
+    if(found.length!==1) throw refusalError('Missing or ambiguous protected section','LOCK_SCOPE_UNRESOLVED');
+    return found[0];
+  });
+  const xml=chosen.map(s=>sectionRange(context,items,s).getOoxml());
+  chosen.forEach(s=>items.slice(s.start,s.end).filter(p=>p.tableNestingLevel===0).forEach(p=>p.load('text')));
+  await context.sync();
+  const cell_paragraphs={};
+  const shapes=[];
+  const result=chosen.map((s,index)=>{
+    const body=shapeXml(xml[index].value),tables=[];
+    shapes.push(...inventoryShapes(xml[index].value).map(shape=>({...shape,section:s.slug})));
+    let preceding=-1;
+    for (const node of body.childNodes) {
+      if (node.namespaceURI!==SHAPE_W) continue;
+      if (node.localName==='p') preceding++;
+      if (node.localName!=='tbl') continue;
+      if (node.getElementsByTagNameNS(SHAPE_W,'tbl').length)
+        throw refusalError('Nested tables are unsupported','LIVE_CAPABILITY_MISSING');
+      const grid=directWordChildren(node,'tr').map(row=>directWordChildren(row,'tc').map(cell=>{
+        if (cell.getElementsByTagNameNS(SHAPE_W,'vMerge').length || cell.getElementsByTagNameNS(SHAPE_W,'gridSpan').length)
+          throw refusalError('Merged tables use the conservative executor','LIVE_CAPABILITY_MISSING');
+        return directWordChildren(cell,'p').map(visibleWordText);
+      }));
+      const id=tables.length+1;
+      grid.forEach((row,r)=>row.forEach((paras,c)=>{cell_paragraphs[`${s.slug}|${id}|${r+1}|${c+1}`]=paras;}));
+      tables.push({table_index:id,after_paragraph:preceding,rows:grid.map(row=>row.map(paras=>paras.join('\n'))),paragraph_counts:grid.map(row=>row.map(paras=>paras.length))});
+    }
+    return {slug:s.slug,paragraphs:items.slice(s.start,s.end).filter(p=>p.tableNestingLevel===0).map(p=>p.text || ''),tables};
+  });
+  const captured={sections:result};
+  Object.defineProperty(captured,'shapes',{value:shapes});
+  Object.defineProperty(captured,'section_map',{value:{items,sections}});
+  Object.defineProperty(captured,'cell_paragraphs',{value:cell_paragraphs});
+  return captured;
 }

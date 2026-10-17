@@ -2,9 +2,10 @@
 
 ## 0.1.2 — 2026-10-16
 
-- Allow text-only edits beside callout anchors with complete shape-definition verification; retain independent targets after a proven prewrite deletion refusal.
-
 - Add explicit approved font/link segments for mixed inline replacements, independent formatting and unchanged-text verification.
+- Allow text-only edits beside callout anchors while preserving complete shape definitions and refusing structural edits. Keep independent targets eligible after a proven prewrite deletion refusal.
+- Add a capability-gated sequential cell stream with fresh scoped OOXML checks, one write attempt, independent per-target readback and durable per-operation acknowledgments.
+- Record native sync counts, phase timings and bridge request counts in local execution evidence. Older panes and unsupported stream structures retain the conservative path after proven prewrite capability refusal.
 
 ## 0.1.1 — 2026-10-16
 

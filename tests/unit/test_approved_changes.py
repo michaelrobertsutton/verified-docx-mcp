@@ -28,6 +28,10 @@ class Pane:
     def request_threadsafe(self, op, payload=None, **kwargs):
         self.calls[op] += 1
         payload = payload or {}
+        if op == "approved_cell_set":
+            result = self.request_threadsafe("cell_set", payload, **kwargs)
+            result["readback"] = self.request_threadsafe("cell_get", payload)
+            return result
         if op == "execution_snapshot":
             return {"sections": copy.deepcopy(self.sections)}
         if op == "comments_list":
@@ -64,11 +68,12 @@ class Pane:
         raise AssertionError(op)
 
 
-@pytest.fixture
-def setup(tmp_path, monkeypatch):
+@pytest.fixture(params=["legacy", "stream"])
+def setup(tmp_path, monkeypatch, request):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setenv("VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS", str(tmp_path))
     pane = Pane()
+    pane.hello = SimpleNamespace(capabilities=[*pane.hello.capabilities, *(["approved_cell_stream_v1"] if request.param == "stream" else [])])
     monkeypatch.setattr(wm, "live_session_for", lambda path: runs.scoped_session(pane))
     return str(tmp_path / pane.document_name), pane
 
@@ -386,7 +391,7 @@ def test_refused_anchored_delete_keeps_independent_cell_eligible(setup):
     def refused_delete(op,payload=None,**kw):
         if op=='paragraph_delete': raise LiveOpFailed('ANCHORED_SHAPES','Anchor paragraph cannot be removed')
         return native(op,payload,**kw)
-    pane.hello=SimpleNamespace(capabilities=[*pane.hello.capabilities,'delete_paragraph'])
+    pane.hello.capabilities.append('delete_paragraph')
     pane.request_threadsafe=refused_delete
     ops=[{'op':'delete_paragraph','section':'target','args':{'anchor_text':'Delete the whole paragraph.'}},cell(),{'op':'live_save','section':'','args':{}}]
     prepared=runs.prepare(path,ops)

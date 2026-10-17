@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -74,6 +75,7 @@ def locked(root):
 class ScopedSession:
     def __init__(self, session, sections):
         self.session, self.sections = session, sections
+        self.request_count = 0
 
     def __getattr__(self, name):
         return getattr(self.session, name)
@@ -88,6 +90,7 @@ class ScopedSession:
             kwargs["expected_body_sha256"] = None
         from .session import resolve_timeout
         kwargs.setdefault("timeout", resolve_timeout(op, protected_sections=True))
+        self.request_count += 1
         return self.session.request_threadsafe(op, data, **kwargs)
 
 
@@ -311,10 +314,20 @@ def apply(path, operation, track_changes=False):
                 paragraphs = tables.markdown_to_ooxml.parse_paragraph_runs(args["markdown"])
                 if len(paragraphs) > 1 or any(r.hard_break for p in paragraphs for r in p):
                     wm.require_capability(session, "cell_multiline", feature_description="multiline cell writes")
-                result = session.request_threadsafe("cell_set", {**address, "expected_before_text": before,
+                streamed = "approved_cell_stream_v1" in session.hello.capabilities and os.environ.get("VERIFIED_DOCX_DISABLE_APPROVED_CELL_STREAM") != "1"
+                cell_payload = {**address, "expected_before_text": before,
                     "paragraphs": tables._runs_to_wire(paragraphs),
-                    "expected_before_paragraph_count": table.get("paragraph_counts", [[None]*len(r) for r in table["rows"]])[args["row_index"]-1][args["cell_index"]-1]})
-                readback = session.request_threadsafe("cell_get", address)
+                    "expected_before_paragraph_count": table.get("paragraph_counts", [[None]*len(r) for r in table["rows"]])[args["row_index"]-1][args["cell_index"]-1]}
+                try:
+                    result = session.request_threadsafe("approved_cell_set" if streamed else "cell_set", cell_payload)
+                except LiveOpFailed as exc:
+                    # The stream converts every postwrite failure to VERIFICATION_FAILED.
+                    # Only its explicit prewrite capability refusal may use the old path.
+                    if not streamed or exc.code != "LIVE_CAPABILITY_MISSING":
+                        raise
+                    streamed = False
+                    result = session.request_threadsafe("cell_set", cell_payload)
+                readback = result["readback"] if streamed else session.request_threadsafe("cell_get", address)
                 if [canonical(p) for p in readback["paragraphs"]] != tables._intended_cell_paragraphs(paragraphs):
                     raise RuntimeError("Cell readback differs from the approved replacement")
             else:
@@ -369,13 +382,19 @@ def apply(path, operation, track_changes=False):
     evidence = {"applied": True, "before": before, "after": after,
                 "revision_scope": "protected-sections", "scope_before": scope_sha(current),
                 "scope_after": result.get("post"), "verified_via": "word-addin", "write_mode": "live"}
+    evidence["bridge_requests"] = getattr(session, "request_count", None)
+    if "metrics" in result:
+        evidence["metrics"] = result["metrics"]
     audit.append_audit(path=path, tool=op, evidence=evidence)
     return evidence
 
 
 def report(manifest, journal):
     verified=set(journal.get('verified_indices',range(journal['next'])))
-    return {"run_id":manifest['run_id'], "status":journal['status'], "applied":journal['status']=='complete',
+    performance = {"operation_elapsed_ms": round(sum(e.get("elapsed_ms", 0) for e in journal.get("evidence", [])), 2),
+                   "office_sync_count": sum(e.get("metrics", {}).get("sync_count", 0) for e in journal.get("evidence", [])),
+                   "bridge_requests": sum(e.get("bridge_requests") or 0 for e in journal.get("evidence", []))}
+    return {"performance": performance, "run_id":manifest['run_id'], "status":journal['status'], "applied":journal['status']=='complete',
             "applied_count":len(verified), "operation_count":len(manifest['operations']),
             "remaining":[i for i in range(len(manifest['operations'])) if i not in verified],
             "issues":[dict(index=int(i),**problem) for i,problem in journal.get('deferred',{}).items()],
@@ -462,7 +481,9 @@ def execute(path: str, run_id: str, manifest_sha256: str, approved_by: str | Non
                 token=_SCOPE.set(current);target_token=_TARGET.set(operation['section'])
                 problem=None
                 try:
+                    operation_started=time.monotonic()
                     evidence=apply(path,operation,manifest['track_changes'])
+                    evidence["elapsed_ms"]=round((time.monotonic()-operation_started)*1000,2)
                 except VerifyError as exc:
                     code=exc.envelope.error_code.value
                     problem={'status':'conflict' if code in REFUSED else 'unknown','code':code,'reason':exc.envelope.message}
