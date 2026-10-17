@@ -325,6 +325,7 @@ VALID_OPS: frozenset[str] = frozenset(
         "comment_delete",
         "cell_get",
         "cell_set",
+        "approved_cell_set",
         "table_get",
         "table_insert",
         "cells_set",
