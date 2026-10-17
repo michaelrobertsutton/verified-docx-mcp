@@ -95,11 +95,12 @@ These measured results do not promise a fixed speedup under different host load.
 | three pane(s), idle | 21 | 3 | 5.00s |
 | three pane(s), busy | 21 | 2 | 5.00s |
 
-Idle background sync reduction is **85.7%** for both pane counts. In busy windows,
+Idle background hash sync reduction is **85.7%** for both pane counts. In busy windows,
 the active pane sampled no hashes; only the two idle helpers sampled (one each).
-The tradeoff is diagnostic content samples up to 30 seconds old while idle,
-or older during long busy periods. Their age/state is explicit; writes and
-explicit reads never rely on this sampling schedule. Baseline maximum observed
+The tradeoff is diagnostic content samples typically 30–35 seconds old at the
+next idle refresh (30-second throttle plus the five-second timer granularity),
+plus native hash/queue latency, or older during long busy periods or host stalls.
+Their age/state is explicit; writes and explicit reads never rely on this sampling schedule. Baseline maximum observed
 heartbeat ages were 4.96–5.06 seconds; the candidate remained 4.92–5.00 seconds.
 
 An initial candidate timing run was discarded after a wall-clock jump produced
@@ -135,7 +136,7 @@ integration tests pass. An additional explicit metrics test confirmed extra
 performance evidence does not change authorization or verified completion. The
 existing unchanged-manifest resume and partial/unknown outcome tests pass.
 
-The complete backend suite passed **1,135 tests and 297 subtests**. Subsequent
+The complete backend suite passed **1,136 tests and 297 subtests**. Subsequent
 focused pane checks passed 43 tests/120 subtests, and the final stream/freshness
 checks (including the added old-broker case) passed 16 tests. Changed production
 Python and new probes pass Ruff; JavaScript parses; mypy retains the same 41
@@ -154,3 +155,24 @@ by this test. The probe resumes every stopped process in finally. Reproduction:
 
 Final backend protocol/session/broker checks passed **133 tests**, including
 stale baselines, negotiated/legacy peers, expiry, reconnect and ownership recovery.
+
+A separate real process takeover test stopped the bridge owner while an already
+attached follower waited in the background. Without a new tool call initiating
+an election, the follower acquired ownership and all three panes reconnected with
+fresh generations in **31.84 seconds**, consistent with the existing 30-second
+broker-owner heartbeat cadence. The observer reattached to the new broker rather
+than reusing an expired client ID. Evidence:
+`/private/tmp/word-101-takeover-evidence.json`. The elected follower runs the final
+server code from this checkout.
+
+`preflight_guard_probe.py` also passed on real Word. A deliberately mismatched
+expected table grid refused with LIVE_STALE, and missing section identity refused
+with LOCK_SCOPE_UNRESOLVED; independent cell reads confirmed no writes. A real
+second-client target-section lock refused that target while an eligible plain
+paragraph edit in the other section and final save completed (2/3; only the locked
+target remained). Run `84fd96bb15d24834bdda0ca6b4001f6f`; evidence:
+`/private/tmp/word-101-preflight-guards-evidence.json`. The plain paragraph was added
+as separate disposable-fixture setup using an explicit fresh body baseline: the
+original outside paragraph is comment-anchored, and headings are intentionally
+immutable in approved plans. Those safeguards were retained. This setup occurs
+after the timed 12×4 benchmark and does not change its read/request budget.
