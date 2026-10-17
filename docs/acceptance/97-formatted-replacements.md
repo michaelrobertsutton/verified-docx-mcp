@@ -51,3 +51,12 @@ Runs: `410aa74ece3c48ffb32878c67fca8280` (scoped repeat),
 `d44f7add9d084332a28aa2ca5118a9ac` (tracked formatted replacement),
 `fa27b534de8442319bf76371373a99cb` (revision refusal and independent completion).
 Full evidence: `/private/tmp/word-formatted-semantics-evidence.json`.
+
+
+An additional preservation probe edited the plain body next to the existing Link
+hyperlink. The scoped unchanged-character ledger verified the original destination
+and formatting stayed intact. Independent before/after comment and tracked-revision
+inventories also matched, including the OOXML revision count. Run
+`451da097aaf44dc6979730539e08c60d`, evidence
+`/private/tmp/word-format-preservation-evidence.json`. Reproduce with
+`tests/live/formatted_preservation_probe.py` after the semantics probe.
