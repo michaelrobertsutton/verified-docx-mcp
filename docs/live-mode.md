@@ -1519,3 +1519,19 @@ pane drops (and re-attaches to the successor) when it exits. There is no Windows
 transport. Optimistic checks cover edits made by participating clients. A human or
 co-author changing formatting or comments outside a lock is not detected by the text
 hash. See the [acceptance record](acceptance/47-shared-bridge-handoff.md).
+
+
+## Heartbeat liveness and digest samples (#102)
+
+Pane v64 negotiates `heartbeat_liveness_v1` with a `hello_ack`. It sends liveness
+without a Word request every five seconds and queues a coalesced body hash at most
+every 30 seconds while idle. Busy native operations defer samples. Legacy panes
+and old servers retain the previous hash heartbeat contract.
+
+`live_status.body_sha256` is diagnostic sampled content, never a fresh read stamp.
+Use the accompanying `body_hash_state` (`sampled`, `retained`, `unavailable`) and
+`body_hash_age_s` (null if unknown). Liveness alone does not refresh digest age or
+client revision baselines. All writes still perform their authoritative fresh
+content/structure checks. Expired negotiated panes close/reconnect; unknown writes
+are never replayed. See `acceptance/101-102-overhead.md` for measurements and
+JennyStack compatibility evidence.

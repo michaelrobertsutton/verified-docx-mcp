@@ -22,6 +22,10 @@ class Pane:
     document_url = "https://example.test/site/Proposal.docx"
     connected_since = 1.0
     last_body_sha256 = "initial"
+    body_hash_state = "sampled"
+    body_hash_sampled_monotonic = time.monotonic()
+    heartbeat_count = 0
+    hash_sample_count = 0
     hello = HelloMessage(
         document_url, "Word", "Mac", {}, "initial", frozenset({"shared_queue"}), "pane-1"
     )
@@ -908,3 +912,21 @@ def test_scoped_deadline_matches_broker_and_remote_rpc(sections):
     remote.client=SimpleNamespace(rpc=lambda action,**kw: requests.append(kw))
     remote.request_threadsafe('replace',payload)
     assert requests[0]['rpc_timeout']==130
+
+
+def test_heartbeat_sample_cannot_refresh_client_read_baseline(setup_broker):
+    pane, broker, a, b, call = setup_broker
+    call(a)
+    # A human edit observed by a background sample is not an explicit read.
+    pane.last_body_sha256 = 'human-edit'
+    pane.body_hash_state = 'sampled'
+    pane.hash_sample_count += 1
+    assert broker.snapshot(pane)['last_body_sha256'] == 'human-edit'
+    assert broker.hashes[(a, pane.document_url)] == 'initial'
+    def checked(op, payload=None, **kwargs):
+        assert payload['expectedBodySha256'] == 'initial'
+        raise LiveOpFailed('LIVE_STALE', 'Human content changed before mutation')
+    pane.request_threadsafe = checked
+    with pytest.raises(LiveOpFailed, match='Human content changed'):
+        call(a, op='replace')
+    assert broker.hashes[(a, pane.document_url)] == 'initial'

@@ -482,13 +482,26 @@ class HelloMessage:
 
 @dataclasses.dataclass(frozen=True)
 class HeartbeatMessage:
-    """Sent every 5s by a connected pane."""
+    """Legacy hash heartbeat or negotiated liveness with explicit sample state.
+
+    A sampled digest is diagnostic evidence of a past read, never a client
+    baseline. Liveness alone carries no digest and cannot refresh its age.
+    """
 
     document_url: str
-    body_sha256: str
+    body_sha256: str | None = None
+    digest_state: str | None = None
+    metrics: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {"type": "heartbeat", "documentUrl": self.document_url, "bodySha256": self.body_sha256}
+        result: dict[str, Any] = {"type": "heartbeat", "documentUrl": self.document_url}
+        if self.body_sha256 is not None:
+            result["bodySha256"] = self.body_sha256
+        if self.digest_state is not None:
+            result["digestState"] = self.digest_state
+        if self.metrics is not None:
+            result["metrics"] = self.metrics
+        return result
 
     @classmethod
     def from_json(cls, raw: str | bytes | dict[str, Any]) -> HeartbeatMessage:
@@ -496,9 +509,20 @@ class HeartbeatMessage:
         msg_type = _require(obj, "type", str)
         if msg_type != "heartbeat":
             raise ProtocolError(f"expected type 'heartbeat', got {msg_type!r}")
+        state = _optional(obj, "digestState", str, default=None)
+        if state not in (None, "sampled", "unavailable"):
+            raise ProtocolError("invalid heartbeat digestState")
+        digest = (_require(obj, "bodySha256", str) if state in (None, "sampled")
+                  else _optional(obj, "bodySha256", str, default=None))
+        if state == "unavailable" and digest is not None:
+            raise ProtocolError("unavailable heartbeat must omit bodySha256")
+        if state == "sampled" and not digest:
+            raise ProtocolError("sampled heartbeat requires a digest")
         return cls(
             document_url=_require(obj, "documentUrl", str),
-            body_sha256=_require(obj, "bodySha256", str),
+            body_sha256=digest,
+            digest_state=state,
+            metrics=_optional(obj, "metrics", dict, default=None),
         )
 
 

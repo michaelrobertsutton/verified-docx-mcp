@@ -1,0 +1,62 @@
+import fs from 'node:fs';
+import vm from 'node:vm';
+import assert from 'node:assert/strict';
+import {webcrypto} from 'node:crypto';
+import {DOMParser} from './shape_dom.mjs';
+const sandbox={TextEncoder,crypto:webcrypto,DOMParser,Office:{onReady(){},context:{document:{url:'/fixture.docx'},requirements:{isSetSupported:()=>true}}},document:{getElementById:()=>({addEventListener(){}})},WebSocket:{OPEN:1},Word:{}};
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[2],'utf8')+'\nglobalThis.api={heartbeatTick,enqueuePaneOperation,guardApprovedCell,resolveTableCell,measuredDispatch,currentBodyHash};',sandbox);
+const messages=[];const socket={readyState:1,send:m=>messages.push(JSON.parse(m))};
+sandbox.socket=socket;
+let hashes=0,release;let active=0,maxActive=0;
+sandbox.hash=async()=>{hashes++;assert.equal(active,0);return 'hash';};
+vm.runInContext('opsSocket=socket;heartbeatLiveness=true;currentBodyHash=hash;',sandbox);
+const blocked=sandbox.api.enqueuePaneOperation(async()=>{active++;maxActive=Math.max(maxActive,active);await new Promise(r=>release=r);active--;});
+await Promise.resolve();
+for(let i=0;i<5;i++)sandbox.api.heartbeatTick(socket);
+assert.equal(messages.length,5);assert.equal(hashes,0);assert(messages.every(m=>m.digestState==='unavailable'&&!m.bodySha256));
+release();await blocked;
+sandbox.api.heartbeatTick(socket);
+await sandbox.api.enqueuePaneOperation(async()=>{});await new Promise(r=>setImmediate(r));
+assert.equal(hashes,1);assert.equal(messages.at(-1).digestState,'sampled');
+for(let i=0;i<5;i++)sandbox.api.heartbeatTick(socket);
+assert.equal(hashes,1); // idle sampling is throttled, liveness isn't
+vm.runInContext('heartbeatLiveness=false;',sandbox);
+sandbox.api.heartbeatTick(socket);
+await sandbox.api.enqueuePaneOperation(async()=>{});await new Promise(r=>setImmediate(r));
+assert.equal(hashes,2);assert.equal(messages.at(-1).digestState,undefined); // legacy bridge
+const oldMessages=messages.length;
+sandbox.other={readyState:1,send(){throw Error('old socket used');}};
+sandbox.api.heartbeatTick(sandbox.other);assert.equal(messages.length,oldMessages);
+// Hash work never inherits an active operation's native sync metrics.
+sandbox.hashContext={document:{body:{text:'sample',load(){}}},sync:async()=>{}};
+sandbox.Word.run=fn=>fn(sandbox.hashContext);
+vm.runInContext('executionMetrics={sync_count:0,phases:{}};',sandbox);
+await sandbox.api.currentBodyHash();
+assert.equal(vm.runInContext('executionMetrics.sync_count',sandbox),0);
+vm.runInContext('executionMetrics=null;',sandbox);
+// Batched guard queues all first-pass loads before its only empty-target sync.
+let syncs=0,loads=[];let commentItems=[],revisionItems=[],nearbyItems=[];
+const collection=(name,items)=>({items,load(){loads.push(name);}});
+const nearby=()=>collection('nearby',nearbyItems);
+const range={getComments:()=>collection('comments',commentItems),getTrackedChanges:()=>collection('revisions',revisionItems),paragraphs:{getFirst:()=>({getRange:()=>({expandTo:()=>({getTrackedChanges:nearby})})}),getLast:()=>({getRange:()=>({})})},compareLocationWith:()=>({value:'Inside'})};
+const context={document:{load(){loads.push('tracking');},changeTrackingMode:'Off'},async sync(){syncs++;assert(loads.includes('comments'));assert(loads.includes('nearby'));}};
+const cell={body:{getRange:()=>range,getOoxml:()=>({value:'<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p/></w:body>'})}};
+assert.equal(await sandbox.api.guardApprovedCell(context,cell,true),'Off');assert.equal(syncs,1);
+revisionItems=[{}];await assert.rejects(()=>sandbox.api.guardApprovedCell(context,cell,false),e=>e.code==='TRACKED_CHANGES_PRESENT');
+revisionItems=[];nearbyItems=[{getRange:()=>({})}];await assert.rejects(()=>sandbox.api.guardApprovedCell(context,cell,false),e=>e.code==='TRACKED_CHANGES_PRESENT');
+nearbyItems=[];commentItems=[{}];sandbox.refuseComments=async()=>{throw Object.assign(Error('comment'),{code:'WOULD_DELETE_COMMENTS'});};vm.runInContext('guardComments=refuseComments;',sandbox);
+await assert.rejects(()=>sandbox.api.guardApprovedCell(context,cell,false),e=>e.code==='WOULD_DELETE_COMMENTS');
+commentItems=[];
+const shapeCell={body:{...cell.body,getOoxml:()=>({value:'<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><w:p><wp:anchor/></w:p></w:body>'})}};
+await assert.rejects(()=>sandbox.api.guardApprovedCell(context,shapeCell,false),e=>e.code==='ANCHORED_SHAPES');
+let coords;
+sandbox.tables=[{getCell:(r,c)=>{coords=[r,c];return cell;}}];vm.runInContext('targetTables=async()=>tables;',sandbox);
+assert.equal(await sandbox.api.resolveTableCell(context,{approvedCellStream:true,table_index:1,row_index:2,cell_index:3}),cell);assert.deepEqual(coords,[1,2]);
+await assert.rejects(()=>sandbox.api.resolveTableCell(context,{approvedCellStream:true,table_index:1,row_index:0,cell_index:3}),e=>e.code==='INVALID_INPUT');
+let steady=0;
+sandbox.performance={now:()=>++steady};
+vm.runInContext(`dispatchOp=async()=>({applied:true});`,sandbox);
+const timed=await sandbox.api.measuredDispatch('ping',{});
+assert.equal(timed.metrics.elapsed_ms,1); // performance clock, independent of wall time
+console.log('Heartbeat queue, legacy compatibility, batched protections and direct cell lookup passed');

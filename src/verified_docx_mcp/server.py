@@ -696,6 +696,11 @@ def execute_live_status() -> dict[str, Any]:
                 "connected_since": session.connected_since,
                 "last_heartbeat_age_s": session.heartbeat_age(),
                 "body_sha256": session.last_body_sha256,
+                "body_hash_state": session.body_hash_state,
+                "body_hash_age_s": (time.monotonic() - session.body_hash_sampled_monotonic
+                                    if session.body_hash_sampled_monotonic is not None else None),
+                "heartbeat_count": session.heartbeat_count,
+                "hash_sample_count": session.hash_sample_count,
                 "requirement_sets": session.hello.requirement_sets,
                 "instance_id": session.hello.instance_id,
                 "platform": session.hello.platform,
