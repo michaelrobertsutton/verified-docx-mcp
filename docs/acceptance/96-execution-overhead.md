@@ -82,3 +82,17 @@ prewrite conflict and postwrite uncertainty without strategy retries.
 Track native executor timing separately from collaborator/probe timing. The latter
 accounts for about 79 seconds of the optimized end-to-end fixture and cannot be
 removed by counting only the approved cells.
+
+## Live conflict preservation — PASS
+
+Run `316e988fdf8a493b8b98a9d7638e0bb6` changed an approved cell through a second
+client before execution. The optimized executor refused it with LIVE_STALE,
+preserved `Coauthor retained`, completed the independent cell and saved (2/3,
+with only the intended conflict remaining). Independent cell_get readback
+confirmed both cells. Evidence: `/private/tmp/word-stream-conflict-evidence.json`.
+Reproduce using `tests/live/approved_stream_conflict_probe.py` and its disposable
+fixture path. This is an expected partial outcome, not a failed clean-run result.
+
+Final combined backend suite: **1,123 tests and 297 subtests passed**. Focused
+stream/formatting/anchor parity: 67 tests passed. Changed production Python files
+pass Ruff. Mypy reports the same 41 existing errors as the pre-change baseline.

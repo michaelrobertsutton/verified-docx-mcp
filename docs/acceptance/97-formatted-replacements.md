@@ -35,3 +35,19 @@ and its Live pane, then run without --create.
 A preliminary failed link readback quarantined only its target while independent
 operations completed. The failure exposed adjacent-range hyperlink inheritance;
 links are now assigned after all text exists, then fonts are explicitly applied.
+
+
+## Repeated targets, comments and tracked changes — PASS
+
+`tests/live/formatted_semantics_probe.py` added an identical string in another
+section and verified that only the scoped target changed. A comment-overlapping
+replacement refused with WOULD_DELETE_COMMENTS while an independent formatted
+replacement and save completed. A tracked formatted replacement completed and
+preserved its pending revisions; a subsequent intersecting replacement refused
+with TRACKED_CHANGES_PRESENT while an independent target and save completed.
+
+Runs: `410aa74ece3c48ffb32878c67fca8280` (scoped repeat),
+`00fded273e3f4f308e353092d7404b93` (comment refusal),
+`d44f7add9d084332a28aa2ca5118a9ac` (tracked formatted replacement),
+`fa27b534de8442319bf76371373a99cb` (revision refusal and independent completion).
+Full evidence: `/private/tmp/word-formatted-semantics-evidence.json`.
