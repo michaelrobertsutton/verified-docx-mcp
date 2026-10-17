@@ -17,12 +17,15 @@ assert.equal(result.sections[0].tables[0].rows[0][0],'A\nB\nC');
 assert.equal(result.sections[0].tables[0].paragraph_counts[0][0],2);
 assert.equal(result.cell_paragraphs['target|1|1|1'].length,2);
 assert.equal(result.sections[0].tables[0].after_paragraph,0);
+const unmergedXml=xml;
 xml=xml.replace('<w:tc>','<w:tc><w:tcPr><w:vMerge/></w:tcPr>');
 await assert.rejects(()=>sandbox.api.executionXmlSnapshot(context,['target']),e=>e.code==='LIVE_CAPABILITY_MISSING');
+xml=unmergedXml.replace('</w:tc>', '<w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl></w:tc>');
+await assert.rejects(()=>sandbox.api.executionXmlSnapshot(context,['target']),e=>e.code==='LIVE_CAPABILITY_MISSING');
 let writes=0,checks=0;
-sandbox.cell={body:{getRange(){return {};}}};
+sandbox.cell={body:{getRange(){return {};}, paragraphs:{load(){},items:[{text:'old'}]}}};
 sandbox.guard=()=>{checks++;};sandbox.write=()=>{writes++;};
-vm.runInContext(`resolveTableCell=async()=>cell;guardComments=guardRevisions=guardAnchoredBodies=async()=>{};
+vm.runInContext(`resolveTableCell=async()=>cell;guardApprovedCell=async()=>null;
  sectionGuard=async()=>({scopeShapes:[],check:async()=>guard()});readCellParagraphs=async()=>['old'];
  writeCellParagraphs=async()=>write();
  executionXmlSnapshot=async()=>({shapes:[],sections:[{slug:'target',tables:[{table_index:1,rows:[['new']],paragraph_counts:[[1]]}]}],cell_paragraphs:{'target|1|1|1':['new']}});`,sandbox);
@@ -34,4 +37,7 @@ assert.equal(writes,1);
 vm.runInContext(`executionXmlSnapshot=async()=>{throw Object.assign(new Error('post read unavailable'),{code:'LIVE_CAPABILITY_MISSING'});}`,sandbox);
 await assert.rejects(()=>sandbox.api.opApprovedCellSet(payload),e=>e.code==='VERIFICATION_FAILED');
 assert.equal(writes,2); // exactly one additional write; no strategy retry
+vm.runInContext(`resolveTableCell=async()=>{throw Object.assign(new Error('cell removed'),{code:'InvalidArgument'});}`,sandbox);
+await assert.rejects(()=>sandbox.api.opApprovedCellSet(payload),e=>e.code==='LIVE_STALE');
+assert.equal(writes,2); // native preflight failure is proven to precede every write
 console.log('Approved stream snapshot, boundary checks and independent readback passed');

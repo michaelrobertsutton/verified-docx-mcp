@@ -2,6 +2,10 @@
 
 ## 0.1.2 — 2026-10-16
 
+- Batch approved cell preflight reads and use direct cell access, retaining fresh mutation-boundary checks and one-attempt independent verification.
+- Negotiate transport-only heartbeats, queue idle hash samples separately, expose sample age/state, and reconnect expired panes without replaying unknown writes.
+- Separate hash work from native operation sync metrics and use monotonic phase timers.
+
 - Add explicit approved font/link segments for mixed inline replacements, independent formatting and unchanged-text verification.
 - Allow text-only edits beside callout anchors while preserving complete shape definitions and refusing structural edits. Keep independent targets eligible after a proven prewrite deletion refusal.
 - Add a capability-gated sequential cell stream with fresh scoped OOXML checks, one write attempt, independent per-target readback and durable per-operation acknowledgments.

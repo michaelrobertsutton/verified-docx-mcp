@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
+const PANE_CAPABILITIES = ["heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -488,7 +488,7 @@ function logOp(op, ok, detail) {
 }
 
 async function currentBodyHash() {
-  return measuredWordRun(async (context) => {
+  return Word.run(async (context) => {
     const body = context.document.body;
     body.load("text");
     await context.sync();
@@ -510,6 +510,12 @@ function refusalError(message, code) {
   return err;
 }
 
+const paneNow = () => typeof performance !== "undefined" ? performance.now() : Date.now();
+let heartbeatLiveness = false;
+let lastIdleHashMs = -Infinity;
+let idleHashPending = false;
+const IDLE_HASH_INTERVAL_MS = 30000;
+
 function connectOpsSocket() {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
@@ -526,13 +532,21 @@ function connectOpsSocket() {
     return;
   }
   opsSocket = socket;
+  heartbeatLiveness = false;
+  lastIdleHashMs = -Infinity;
 
   socket.onopen = async () => {
     reconnectDelayMs = RECONNECT_MIN_MS;
     try {
-      paneEpoch = crypto.randomUUID();
-      revisionHandles.clear();
-      const hash = await currentBodyHash();
+      const hash = await enqueuePaneOperation(async () => {
+        const sampled = await currentBodyHash();
+        if (socket === opsSocket) {
+          paneEpoch = crypto.randomUUID();
+          revisionHandles.clear();
+        }
+        return sampled;
+      });
+      if (socket !== opsSocket || socket.readyState !== WebSocket.OPEN) return;
       socket.send(
         JSON.stringify({
           type: "hello",
@@ -570,6 +584,11 @@ function connectOpsSocket() {
     } catch (err) {
       return; // malformed message from the bridge; ignore rather than crash the pane
     }
+    if (socket !== opsSocket) return;
+    if (message.type === "hello_ack") {
+      heartbeatLiveness = (message.capabilities || []).includes("heartbeat_liveness_v1");
+      return;
+    }
     if (message.type !== "request") return;
     const requestId = message.request_id;
     const op = message.op;
@@ -592,6 +611,7 @@ function connectOpsSocket() {
   };
 
   socket.onclose = () => {
+    if (socket !== opsSocket) return;
     stopHeartbeat();
     setWsStatus(`disconnected — reconnecting in ${Math.round(reconnectDelayMs / 1000)}s`);
     scheduleReconnect();
@@ -612,21 +632,35 @@ function scheduleReconnect() {
   reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
 }
 
-function startHeartbeat() {
-  stopHeartbeat();
-  heartbeatTimer = setInterval(async () => {
-    if (!opsSocket || opsSocket.readyState !== WebSocket.OPEN) return;
+// Liveness never waits for Word. Hash work shares the operation queue and is
+// coalesced while busy; no hash is represented as a new document read.
+function heartbeatTick(socket) {
+  if (socket !== opsSocket || socket.readyState !== WebSocket.OPEN) return;
+  if (heartbeatLiveness) {
+    socket.send(JSON.stringify({type:"heartbeat", documentUrl:Office.context.document.url,
+      digestState:"unavailable"}));
+    if (paneQueueDepth || idleHashPending || paneNow()-lastIdleHashMs < IDLE_HASH_INTERVAL_MS) return;
+  } else if (idleHashPending) return;
+  idleHashPending = true;
+  enqueuePaneOperation(async () => {
+    if (socket !== opsSocket || socket.readyState !== WebSocket.OPEN) return;
+    const started = paneNow();
     try {
       const hash = await currentBodyHash();
-      opsSocket.send(
-        JSON.stringify({ type: "heartbeat", documentUrl: Office.context.document.url, bodySha256: hash })
-      );
+      if (socket !== opsSocket || socket.readyState !== WebSocket.OPEN) return;
+      lastIdleHashMs = paneNow();
+      socket.send(JSON.stringify({type:"heartbeat", documentUrl:Office.context.document.url,
+        bodySha256:hash, ...(heartbeatLiveness ? {digestState:"sampled",
+          metrics:{hash_requests:1, sync_count:1, elapsed_ms:paneNow()-started}} : {})}));
     } catch (err) {
-      // Best-effort: a single failed heartbeat just means the bridge's
-      // SessionRegistry evicts this session after missed_heartbeats and
-      // the reconnect loop (onclose -> scheduleReconnect) takes over.
+      // The independent liveness timer continues even if Word is blocked.
     }
-  }, HEARTBEAT_INTERVAL_MS);
+  }).catch(() => {}).finally(() => {idleHashPending = false;});
+}
+function startHeartbeat() {
+  stopHeartbeat();
+  const socket = opsSocket;
+  heartbeatTimer = setInterval(() => heartbeatTick(socket), HEARTBEAT_INTERVAL_MS);
 }
 
 function stopHeartbeat() {
@@ -657,8 +691,10 @@ const SHAPE_GUARDED_OPS = new Set(["approved_cell_set", "replace", "format", "ce
 // One queue across reconnects. A timed-out write can still be running in Word;
 // later commands must not overlap it, including commands on a new socket.
 let paneOperationQueue = Promise.resolve();
+let paneQueueDepth = 0;
 function enqueuePaneOperation(operation) {
-  const result = paneOperationQueue.then(operation);
+  paneQueueDepth++;
+  const result = paneOperationQueue.then(operation).finally(() => {paneQueueDepth--;});
   paneOperationQueue = result.catch(() => {});
   return result;
 }
@@ -1588,12 +1624,14 @@ async function opFormat(payload) {
 // continuation cell is still a cell of its row). Manual sideload
 // verification against a real table (docs/live-mode.md) is still needed --
 // fake_pane.py's table model cannot exercise this object graph.
-async function loadTopLevelTables(context, scope = null) {
+async function loadTopLevelTables(context, scope = null, batchNesting = false) {
   const tables = (scope || context.document.body).tables;
-  tables.load("items");
+  tables.load(batchNesting ? "items/nestingLevel" : "items");
   await context.sync();
-  tables.items.forEach((t) => t.load("nestingLevel"));
-  await context.sync();
+  if (!batchNesting && tables.items.length) {
+    tables.items.forEach((t) => t.load("nestingLevel"));
+    await context.sync();
+  }
   if (tables.items.some((t) => t.nestingLevel > 1)) {
     throw refusalError(
       "the document contains a nested table; table numbering cannot be mapped reliably, so live cell edits are refused"
@@ -1616,7 +1654,7 @@ async function targetTables(context, payload) {
   const matches = sections.filter(s => s.slug === payload.executionTargetSection);
   if (matches.length !== 1) throw refusalError("Target section missing or ambiguous", "LOCK_SCOPE_UNRESOLVED");
   const s = matches[0];
-  return loadTopLevelTables(context, sectionRange(context, items, s));
+  return loadTopLevelTables(context, sectionRange(context, items, s), !!payload.approvedCellStream);
 }
 
 async function mutationHash(context, payload) {
@@ -1631,7 +1669,14 @@ async function resolveTableCell(context, payload) {
   const tableItems = await targetTables(context, payload);
   const table = tableItems[payload.table_index - 1];
   if (!table) {
-    throw refusalError(`no table ${payload.table_index} (the document has ${tableItems.length})`);
+    throw refusalError(`no table ${payload.table_index} (the document has ${tableItems.length})`,
+      payload.approvedCellStream ? "LIVE_STALE" : undefined);
+  }
+  if (payload.approvedCellStream && Office.context.requirements.isSetSupported('WordApi', '1.3')) {
+    if (!Number.isInteger(payload.row_index) || payload.row_index < 1 ||
+        !Number.isInteger(payload.cell_index) || payload.cell_index < 1)
+      throw refusalError('Invalid approved cell coordinates', 'INVALID_INPUT');
+    return table.getCell(payload.row_index - 1, payload.cell_index - 1);
   }
   const rows = table.rows;
   rows.load("items");
@@ -2298,7 +2343,7 @@ function crosscheckCommentsOoxml(xml) {
 
 async function opCommentsList(payload) {
   const p = payload || {};
-  const started = Date.now();
+  const started = paneNow();
   return measuredWordRun(async (context) => {
     const { items, counts, observedAt } = await collectComments(context, {
       ids: p.ids,
@@ -2329,7 +2374,7 @@ async function opCommentsList(payload) {
       observed_at: observedAt,
       session_epoch: paneEpoch,
       ...(ooxml ? { ooxml } : {}),
-      timing_ms: { total: Date.now() - started },
+      timing_ms: { total: paneNow() - started },
     };
   });
 }
@@ -3265,6 +3310,31 @@ async function guardAnchoredParagraphs(context, ranges) {
   await guardAnchoredBodies(context, collections.flatMap(p => p.items));
 }
 
+// Compatible preflight reads are queued together, including paragraph-wide
+// revision coverage (Mac omits enclosing revisions from a smaller range).
+async function guardApprovedCell(context, cell, trackChanges) {
+  if (!revisionsSupported()) throw refusalError('Cannot inspect revisions: WordApi 1.6 required', 'LIVE_CAPABILITY_MISSING');
+  const target = cell.body.getRange('Whole');
+  const comments = target.getComments();
+  const changes = target.getTrackedChanges();
+  const nearby = target.paragraphs.getFirst().getRange('Start')
+    .expandTo(target.paragraphs.getLast().getRange('End')).getTrackedChanges();
+  comments.load('items'); changes.load('items'); nearby.load('items');
+  const xml = cell.body.getOoxml();
+  if (trackChanges) context.document.load('changeTrackingMode');
+  await context.sync();
+  if (comments.items.length) await guardComments(context, [target], false);
+  if (changes.items.length) throw refusalError('Accept or reject intersecting revisions before replacing text', 'TRACKED_CHANGES_PRESENT');
+  const comparisons = nearby.items.map(change => target.compareLocationWith(change.getRange()));
+  if (comparisons.length) await context.sync();
+  const apart = new Set(['Before','After','AdjacentBefore','AdjacentAfter']);
+  if (comparisons.some(c => !apart.has(c.value)))
+    throw refusalError('Accept or reject intersecting revisions before replacing text', 'TRACKED_CHANGES_PRESENT');
+  if (shapeNodes(shapeXml(xml.value)).length)
+    throw refusalError('Edit touches a paragraph anchoring a shape', 'ANCHORED_SHAPES');
+  return trackChanges ? context.document.changeTrackingMode : null;
+}
+
 // A sequential execution stream with one durable server dispatch/ack per cell.
 // No section state survives a request; every mutation checks a fresh snapshot.
 async function opApprovedCellSet(payload) {
@@ -3273,25 +3343,29 @@ async function opApprovedCellSet(payload) {
   return measuredWordRun(async context => {
     payload={...payload,approvedCellStream:true};
     setExecutionPhase('preflight');
-    const cell=await resolveTableCell(context,payload);
-    const target=cell.body.getRange('Whole');
-    await guardComments(context,[target],false);
-    await guardRevisions(context,[target]);
-    await guardAnchoredBodies(context,[cell.body]);
-    let previousMode=null;
-    if (payload.track_changes) {
-      context.document.load('changeTrackingMode');await context.sync();
-      previousMode=context.document.changeTrackingMode;
+    let cell, previousMode, shapesBefore, before;
+    try {
+      cell=await resolveTableCell(context,payload);
+      const target=cell.body.getRange('Whole');
+      previousMode = await guardApprovedCell(context, cell, payload.track_changes);
+      // This fresh protected scope check is deliberately after asynchronous guards.
+      const boundary=await sectionGuard(context,payload);
+      // Load exact target text in the same batch as the final location checks.
+      cell.body.paragraphs.load("items/text");
+      await boundary.check([target]);
+      shapesBefore=boundary.scopeShapes;
+      if (!Array.isArray(shapesBefore)) throw refusalError("Scoped shape baseline unavailable", "LIVE_CAPABILITY_MISSING");
+      before=cell.body.paragraphs.items.map(p => p.text || "");
+      if (before.map(canonicalCellText).join('\n')!==payload.expected_before_text ||
+          (payload.expected_before_paragraph_count!=null && before.length!==payload.expected_before_paragraph_count))
+        throw refusalError('Cell changed at mutation boundary; nothing written', 'CELL_TEXT_MISMATCH');
+    } catch (error) {
+      // A stale native proxy/coordinate can fail before the final scoped read.
+      // This catch covers reads only: it must never wrap any queued mutation.
+      if (['InvalidArgument','ItemNotFound','InvalidObjectPath'].includes(error.code))
+        throw refusalError('Approved target changed during preflight; nothing was written: '+error.message, 'LIVE_STALE');
+      throw error;
     }
-    // This fresh protected scope check is deliberately after asynchronous guards.
-    const boundary=await sectionGuard(context,payload);
-    await boundary.check([target]);
-    const shapesBefore=boundary.scopeShapes;
-    if (!Array.isArray(shapesBefore)) throw refusalError("Scoped shape baseline unavailable", "LIVE_CAPABILITY_MISSING");
-    const before=await readCellParagraphs(context,cell);
-    if (before.map(canonicalCellText).join('\n')!==payload.expected_before_text ||
-        (payload.expected_before_paragraph_count!=null && before.length!==payload.expected_before_paragraph_count))
-      throw refusalError('Cell changed at mutation boundary; nothing written', 'CELL_TEXT_MISMATCH');
     setExecutionPhase('mutation');
     try {
       if (previousMode!==null) context.document.changeTrackingMode=Word.ChangeTrackingMode.trackAll;
@@ -3330,12 +3404,12 @@ async function measuredWordRun(...args) {
     if (!executionMetrics) return callback(context);
     const metrics=executionMetrics, originalSync=context.sync, native=originalSync.bind(context);
     context.sync=async (...syncArgs) => {
-      const start=Date.now(), phase=metrics.phase || 'operation';
+      const start=paneNow(), phase=metrics.phase || 'operation';
       try {return await native(...syncArgs);}
       finally {
         metrics.sync_count++;
         const item=metrics.phases[phase] ||= {sync_count:0,sync_ms:0};
-        item.sync_count++;item.sync_ms+=Date.now()-start;
+        item.sync_count++;item.sync_ms+=paneNow()-start;
       }
     };
     try {return await callback(context);}
@@ -3343,11 +3417,11 @@ async function measuredWordRun(...args) {
   });
 }
 async function measuredDispatch(op,payload) {
-  const start=Date.now();
+  const start=paneNow();
   executionMetrics={sync_count:0,phases:{},phase:'preflight'};
   try {
     const result=await dispatchOp(op,payload);
-    return {...result,metrics:{elapsed_ms:Date.now()-start,sync_count:executionMetrics.sync_count,phases:executionMetrics.phases}};
+    return {...result,metrics:{elapsed_ms:paneNow()-start,sync_count:executionMetrics.sync_count,phases:executionMetrics.phases}};
   } finally {executionMetrics=null;}
 }
 

@@ -191,12 +191,18 @@ class LiveSession:
     connected_since: float = field(default_factory=time.time)
     last_heartbeat_monotonic: float = field(default_factory=time.monotonic)
     last_body_sha256: str = ""
+    body_hash_sampled_monotonic: float = field(default_factory=time.monotonic)
+    body_hash_state: str = "sampled"
+    heartbeat_count: int = 0
+    hash_sample_count: int = 0
     _pending: dict[str, asyncio.Future[OpReply]] = field(default_factory=dict, repr=False)
     _closed: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.last_body_sha256:
             self.last_body_sha256 = self.hello.body_sha256
+        if not self.last_body_sha256:
+            self.body_hash_state = "unavailable"
 
     # -- heartbeat / liveness -------------------------------------------------
 
@@ -204,6 +210,10 @@ class LiveSession:
         self.last_heartbeat_monotonic = time.monotonic()
         if body_sha256:
             self.last_body_sha256 = body_sha256
+            self.body_hash_sampled_monotonic = time.monotonic()
+            self.body_hash_state = "sampled"
+        else:
+            self.body_hash_state = "retained" if self.last_body_sha256 else "unavailable"
 
     def heartbeat_age(self) -> float:
         return time.monotonic() - self.last_heartbeat_monotonic
@@ -313,6 +323,8 @@ class LiveSession:
         if op in guarded and "shape_guard" not in self.hello.capabilities:
             raise LiveOpFailed("LIVE_CAPABILITY_MISSING",
                                "Reload the live pane: anchored-shape protection is required")
+        if op in guarded:
+            self.body_hash_state = "retained" if self.last_body_sha256 else "unavailable"
         if op not in VALID_OPS:
             raise ValueError(f"unknown op {op!r}; must be one of {sorted(VALID_OPS)}")
         if timeout is None:
@@ -340,6 +352,8 @@ class LiveSession:
             raise
         finally:
             self._pending.pop(rid, None)
+            if op in guarded:
+                self.body_hash_state = "retained" if self.last_body_sha256 else "unavailable"
 
         if not reply.ok:
             error = reply.error or OpError(code="LIVE_OP_FAILED", message="pane reported failure with no detail")
@@ -482,11 +496,10 @@ class SessionRegistry:
     def _evict_stale_locked(self) -> None:
         """Drop sessions that missed ``missed_heartbeats`` heartbeats at
         ``heartbeat_interval`` seconds each -- 3 x 5s = 15s by default.
-        This only forgets the bookkeeping entry; the bridge's own
-        receive-loop ``finally`` clause (on an actual socket close) is
-        what calls ``fail_pending`` for any request still in flight, so a
-        session evicted here for silence, not a socket error, simply
-        stops being visible to new lookups."""
+        Negotiated panes are also disconnected, so a suspended pane performs
+        a new hello on resume instead of remaining silently unregistered.
+        Pending writes become unknown; they must never be replayed. Legacy
+        panes retain their original bookkeeping-only eviction behavior."""
         now = time.monotonic()
         stale = [
             name
@@ -494,7 +507,12 @@ class SessionRegistry:
             if now - session.last_heartbeat_monotonic > self.stale_after
         ]
         for name in stale:
-            del self._sessions[name]
+            session = self._sessions.pop(name)
+            if "heartbeat_liveness_v1" in session.hello.capabilities:
+                async def expire(s=session):
+                    s.fail_pending(LiveDisconnected("Pane heartbeat expired; dispatched writes may be unknown"))
+                    await s.transport.close(code=1001, reason="heartbeat expired; reconnect")
+                asyncio.run_coroutine_threadsafe(expire(), session.loop)
 
     async def request(
         self,

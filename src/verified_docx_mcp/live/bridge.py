@@ -354,6 +354,8 @@ async def _handle_pane_connection(connection: ServerConnection, *, registry: Ses
     )
     registry.register(session)
     try:
+        if "heartbeat_liveness_v1" in hello.capabilities:
+            await connection.send(json.dumps({"type": "hello_ack", "capabilities": ["heartbeat_liveness_v1"]}))
         async for raw_msg in connection:
             try:
                 msg_type = peek_type(raw_msg)
@@ -364,7 +366,14 @@ async def _handle_pane_connection(connection: ServerConnection, *, registry: Ses
                     hb = HeartbeatMessage.from_json(raw_msg)
                 except ProtocolError:
                     continue
+                if hb.document_url != session.document_url:
+                    continue
+                if hb.digest_state is not None and "heartbeat_liveness_v1" not in hello.capabilities:
+                    continue
                 registry.touch_heartbeat(session, hb.body_sha256)
+                session.heartbeat_count += 1
+                if hb.body_sha256:
+                    session.hash_sample_count += 1
             elif msg_type == "reply":
                 try:
                     reply = OpReply.from_json(raw_msg)

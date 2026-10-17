@@ -17,6 +17,7 @@ instance (and must not each try to bind the real default ports 53135/
 from __future__ import annotations
 
 import asyncio
+import json
 import ssl
 import sys
 import tempfile
@@ -458,3 +459,42 @@ def test_protected_section_deadlines_keep_legacy_defaults_and_overrides(monkeypa
     assert resolve_timeout('execution_snapshot') == 60
     monkeypatch.setenv('VERIFIED_DOCX_LIVE_TIMEOUT_CELL_SET_S','80')
     assert resolve_timeout('cell_set', protected_sections=True) == 80
+
+class NegotiatedHeartbeatTests(LiveBridgeTestCase):
+    async def test_liveness_without_digest_and_reconnect(self):
+        pane = await self.connect_pane(capabilities=['heartbeat_liveness_v1'])
+        session = self.registry.list()[0]
+        sampled = session.body_hash_sampled_monotonic
+        before = session.last_heartbeat_monotonic
+        await pane._ws.send(json.dumps(dict(type='heartbeat', documentUrl=pane.document_url,
+                                           digestState='unavailable')))
+        await asyncio.sleep(0.05)
+        self.assertGreater(session.last_heartbeat_monotonic, before)
+        self.assertEqual(session.body_hash_sampled_monotonic, sampled)
+        self.assertEqual(session.body_hash_state, 'retained')
+        await pane.close()
+        replacement = await self.connect_pane(capabilities=['heartbeat_liveness_v1'])
+        self.assertIsNot(self.registry.list()[0], session)
+
+    async def test_old_pane_cannot_send_hashless_liveness(self):
+        pane = await self.connect_pane(capabilities=[])
+        session = self.registry.list()[0]
+        before = session.last_heartbeat_monotonic
+        await pane._ws.send(json.dumps(dict(type='heartbeat', documentUrl=pane.document_url,
+                                           digestState='unavailable')))
+        await asyncio.sleep(0.05)
+        self.assertEqual(session.last_heartbeat_monotonic, before)
+
+
+class NegotiatedHeartbeatEvictionTests(LiveBridgeTestCase):
+    heartbeat_interval = 0.05
+    missed_heartbeats = 3
+
+    async def test_delayed_liveness_cannot_revive_displaced_session(self):
+        pane = await self.connect_pane(capabilities=['heartbeat_liveness_v1'], heartbeat_interval=1000)
+        await asyncio.sleep(0.4)
+        self.assertEqual(self.registry.list(), [])
+        await asyncio.wait_for(pane._ws.wait_closed(), timeout=1)
+        self.assertEqual(self.registry.list(), [])
+        replacement = await self.connect_pane(capabilities=['heartbeat_liveness_v1'])
+        self.assertEqual(self.registry.list()[0].document_url, replacement.document_url)

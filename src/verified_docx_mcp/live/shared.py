@@ -495,6 +495,11 @@ class Broker:
             "connected_since": session.connected_since,
             "heartbeat_age": session.heartbeat_age(),
             "last_body_sha256": session.last_body_sha256,
+            "body_hash_state": getattr(session, "body_hash_state", "retained"),
+            "body_hash_age_s": (time.monotonic() - session.body_hash_sampled_monotonic
+                                if getattr(session, "body_hash_sampled_monotonic", None) is not None else None),
+            "heartbeat_count": getattr(session, "heartbeat_count", 0),
+            "hash_sample_count": getattr(session, "hash_sample_count", 0),
         }
 
 
@@ -540,6 +545,11 @@ class RemoteSession:
         self.document_url = self.hello.document_url
         self.connected_since = snapshot["connected_since"]
         self.last_body_sha256 = snapshot["last_body_sha256"]
+        self.body_hash_state = snapshot.get("body_hash_state", "retained" if self.last_body_sha256 else "unavailable")
+        hash_age = snapshot.get("body_hash_age_s")
+        self.body_hash_sampled_monotonic = time.monotonic() - hash_age if hash_age is not None else None
+        self.heartbeat_count = snapshot.get("heartbeat_count", 0)
+        self.hash_sample_count = snapshot.get("hash_sample_count", 0)
         self._age = snapshot["heartbeat_age"]
         self._at = time.monotonic()
 
