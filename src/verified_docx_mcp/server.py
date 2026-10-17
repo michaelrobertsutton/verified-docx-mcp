@@ -4059,7 +4059,10 @@ def live_changes_prepare(path: str, operations: list[dict[str, Any]], track_chan
     replace_cell_markdown, replace_table_row, replace_text, delete_paragraph,
     and a final live_save. Returns a compact preview, run_id and manifest_sha256.
     Read the local manifest to review exact changes; approve that digest once.
-    Requires approved_changes_v1 in the connected Word pane.
+    replace_text args may also include replacement_segments with the complete
+    explicit font/hyperlink schema documented on replace_text; concatenated segment
+    text must equal replace. The approval preview includes the exact segments.
+    Requires approved_changes_v1; explicit segments also require formatted_replacements_v1.
     """
     from .live.approved_changes import prepare
     try:
