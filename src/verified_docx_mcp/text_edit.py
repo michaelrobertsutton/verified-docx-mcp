@@ -820,6 +820,7 @@ def _live_replace_once(
     allow_comment_loss_ids: list[dict[str, Any]] | None = None,
     within_row_containing: str | None = None,
     inherit_format: str = "replaced",
+    replacement_segments: list[dict[str, Any]] | None = None,
     scope: str = "body",
     scope_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -840,6 +841,8 @@ def _live_replace_once(
         "allow_comment_loss": allow_comment_loss,
         "inherit_format": inherit_format,
     }
+    if replacement_segments is not None:
+        payload["replacement_segments"] = replacement_segments
     if allow_comment_loss_ids is not None:
         payload["allow_comment_loss_ids"] = allow_comment_loss_ids
     payload["scope"] = scope
@@ -872,7 +875,7 @@ def _live_replace_once(
     matches = result.get("matches") or []
     post_hash = result.get("post")
 
-    if not result.get("applied") or (result.get("scope_post") == scope_info["scopeSha256"] if scope_info else post_hash == pre_hash):
+    if not result.get("applied") or (replacement_segments is None and (result.get("scope_post") == scope_info["scopeSha256"] if scope_info else post_hash == pre_hash)):
         raise _make_error(
             ErrorCode.VERIFICATION_FAILED,
             "live replace did not verify: the pane's post-op body hash did not change from its "
@@ -918,6 +921,7 @@ def execute_replace_text_live(
     allow_comment_loss: bool = False,
     allow_comment_loss_ids: list[dict[str, Any]] | None = None,
     inherit_format: str = "replaced",
+    replacement_segments: list[dict[str, Any]] | None = None,
     scope: str = "body",
 ) -> dict[str, Any]:
     """Live-mode ``replace_text`` (issue #106 WP-3): sends a ``replace``
@@ -970,7 +974,11 @@ def execute_replace_text_live(
             ErrorCode.INVALID_INPUT, "allow_comment_loss and allow_comment_loss_ids are mutually exclusive"
         )
 
+    from .formatted_text import validate_segments
+    replacement_segments = validate_segments(replacement_segments, replace)
     session = live_write_mode.live_session_for(path)
+    if replacement_segments is not None:
+        live_write_mode.require_capability(session, "formatted_replacements_v1", feature_description="explicit formatted replacements")
     document_name = session.document_name
     _require_live_replace_capabilities(
         session, within_row_containing=within_row_containing, allow_comment_loss_ids=allow_comment_loss_ids
@@ -999,6 +1007,7 @@ def execute_replace_text_live(
             allow_comment_loss_ids=allow_comment_loss_ids,
             within_row_containing=within_row_containing,
             inherit_format=inherit_format,
+            replacement_segments=replacement_segments,
             scope=scope,
             scope_info=scope_info,
         )
@@ -1381,6 +1390,7 @@ def execute_replace_text(
     within_row_containing: str | None = None,
     allow_comment_loss: bool = False,
     inherit_format: str = "replaced",
+    replacement_segments: list[dict[str, Any]] | None = None,
     scope: str = "body",
     allow_comment_loss_ids: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -1389,7 +1399,11 @@ def execute_replace_text(
         raise _make_error(
             ErrorCode.INVALID_INPUT, "allow_comment_loss and allow_comment_loss_ids are mutually exclusive"
         )
+    from .formatted_text import validate_segments
+    replacement_segments = validate_segments(replacement_segments, replace)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
+    if replacement_segments is not None and mode != "live":
+        raise _make_error(ErrorCode.LIVE_UNAVAILABLE, "Explicit segments require live Word")
     if allow_comment_loss_ids is not None and mode != "live":
         raise _make_error(
             ErrorCode.INVALID_INPUT,
@@ -1409,6 +1423,7 @@ def execute_replace_text(
             allow_comment_loss=allow_comment_loss,
             allow_comment_loss_ids=allow_comment_loss_ids,
             inherit_format=inherit_format,
+            replacement_segments=replacement_segments,
         )
 
     if scope != "body":

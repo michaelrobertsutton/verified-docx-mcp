@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
+const PANE_CAPABILITIES = ["formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -1203,8 +1203,103 @@ async function searchScoped(context, payload) {
   return merged;
 }
 
+// Explicit segments never derive formatting from a neighbouring run.
+function explicitSegments(payload) {
+  if (payload.replacement_segments === undefined || payload.replacement_segments === null) return null;
+  const segments = payload.replacement_segments;
+  if (!Array.isArray(segments) || segments.length > 500 || segments.map(s => s.text).join('') !== payload.replace)
+    throw refusalError('Segments must concatenate exactly to replace', 'INVALID_INPUT');
+  for (const s of segments) {
+    if (!s || typeof s.text !== 'string' || !s.text || /[\x00-\x08\x0a\x0c-\x1f]/.test(s.text) ||
+        Object.keys(s).some(k => !['text','format','hyperlink'].includes(k)) ||
+        !s.format || Object.keys(s.format).sort().join(',') !== [...FONT_FIELDS].sort().join(',') ||
+        ['bold','italic','strikeThrough','doubleStrikeThrough','subscript','superscript'].some(k => typeof s.format[k] !== 'boolean') ||
+        (s.format.subscript && s.format.superscript) || !['None','Single','Double'].includes(s.format.underline) ||
+        !/^#[0-9a-f]{6}$/i.test(s.format.color) || typeof s.format.name !== 'string' || !s.format.name.trim() ||
+        typeof s.format.size !== 'number' || !Number.isFinite(s.format.size) || s.format.size < 1 || s.format.size > 1638 ||
+        s.format.size * 2 !== Math.floor(s.format.size * 2) ||
+        (s.hyperlink != null && (typeof s.hyperlink !== 'string' || !/^(https?:|mailto:)/.test(s.hyperlink) || /[\x00-\x1f]/.test(s.hyperlink))))
+      throw refusalError('Explicit segments require complete valid font properties and an optional URL', 'INVALID_INPUT');
+  }
+  return segments;
+}
+function xmlSignature(node) {
+  if (node.nodeType === 3) return node.nodeValue;
+  const attrs = [...(node.attributes || [])].filter(a => !a.name.startsWith('xmlns') && !a.localName.startsWith('rsid'))
+    .map(a => [a.namespaceURI || '',a.localName,a.value]).sort();
+  return [node.namespaceURI || '',node.localName,attrs,[...(node.childNodes || [])].map(xmlSignature)];
+}
+function inlineLedger(xml) {
+  const root = shapeXml(xml), W = SHAPE_W;
+  const packageRoot = new DOMParser().parseFromString(xml, 'application/xml');
+  const documentNode = root.getElementsByTagNameNS(W,'document')[0] || root;
+  let paragraphs = [...documentNode.getElementsByTagNameNS(W,'p')].filter(p => {
+    for (let n=p.parentNode;n && n!==documentNode;n=n.parentNode)
+      if (n.namespaceURI===W && n.localName==='txbxContent') return false;
+    return true;
+  });
+  // Word exports an extra empty final paragraph for some anchored ranges.
+  // The range's paragraph collection was independently checked to contain one.
+  if (paragraphs.length > 1) {
+    const substantive=paragraphs.filter(p => shapeNodes(p).length || [...p.getElementsByTagNameNS(W,'t')].some(t=>t.textContent.length));
+    paragraphs=substantive.length ? substantive : paragraphs.slice(0,1);
+  }
+  if (paragraphs.length !== 1) throw refusalError('Formatted edits require one paragraph: '+JSON.stringify(paragraphs.map(p=>p.textContent.slice(0,150))), 'STRUCTURAL_BOUNDARY');
+  const rels = new Map([...packageRoot.getElementsByTagNameNS('http://schemas.openxmlformats.org/package/2006/relationships','Relationship')]
+    .filter(r => /\/hyperlink$/.test(r.getAttribute('Type'))).map(r => [r.getAttribute('Id'),r.getAttribute('Target')]));
+  const chars = [];
+  for (const run of paragraphs[0].getElementsByTagNameNS(W,'r')) {
+    let link=null, inShape=false;
+    for (let n=run.parentNode;n && n!==paragraphs[0];n=n.parentNode) {
+      if (n.namespaceURI===W && n.localName==='txbxContent') inShape=true;
+      if (n.namespaceURI===W && n.localName==='hyperlink') {
+        const id=n.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships','id');
+        link=rels.get(id) || n.getAttributeNS(W,'anchor') || null;
+        if (id && !rels.has(id)) throw refusalError('Cannot resolve hyperlink formatting', 'LIVE_CAPABILITY_MISSING');
+      }
+    }
+    if (inShape) continue;
+    const props = [...run.childNodes].find(n => n.namespaceURI===W && n.localName==='rPr');
+    const format=JSON.stringify(props ? xmlSignature(props) : null);
+    for (const node of run.childNodes) {
+      if (node.namespaceURI!==W) continue;
+      const text=node.localName==='t' ? node.textContent : node.localName==='tab' ? '\t' : node.localName==='br' ? '\v' : '';
+      for (const ch of text) chars.push({ch,format,link});
+    }
+  }
+  return chars;
+}
+async function formattedBoundary(context, ranges, payload) {
+  const collections=ranges.map(r => r.paragraphs);
+  collections.forEach(p => p.load('items'));
+  await context.sync();
+  if (collections.some(p => p.items.length!==1)) throw refusalError('Text replacement crosses paragraphs', 'STRUCTURAL_BOUNDARY');
+  const paragraphs=collections.map(p => p.items[0]);
+  const xml=paragraphs.map(p => p.getOoxml());
+  await context.sync();
+  return xml.map((x,i) => {
+    const chars=inlineLedger(x.value), text=chars.map(c => c.ch).join('');
+    const start=text.indexOf(payload.find);
+    if (start<0 || text.indexOf(payload.find,start+1)>=0) throw refusalError('Paragraph target is not unique', 'MATCH_COUNT_MISMATCH');
+    const offset=Array.from(text.slice(0,start)).length;
+    return {paragraph:paragraphs[i], before:chars.slice(0,offset), after:chars.slice(offset+Array.from(payload.find).length)};
+  });
+}
+async function verifyFormattedBoundary(context, boundaries, payload) {
+  const xml=boundaries.map(b => b.paragraph.getOoxml());
+  await context.sync();
+  boundaries.forEach((b,i) => {
+    const chars=inlineLedger(xml[i].value), n=Array.from(payload.replace).length;
+    if (JSON.stringify(chars.slice(0,b.before.length))!==JSON.stringify(b.before) ||
+        JSON.stringify(chars.slice(b.before.length+n))!==JSON.stringify(b.after) ||
+        chars.slice(b.before.length,b.before.length+n).map(c => c.ch).join('')!==payload.replace)
+      throw refusalError('Text or formatting outside the replacement changed; reconcile before continuing', 'VERIFICATION_FAILED');
+  });
+}
+
 async function opReplace(payload) {
   const expectedMatches = payload.expected_matches;
+  const segments = explicitSegments(payload);
   return Word.run(async (context) => {
     if (!payload.executionSections) await requireFreshBody(context, payload.expectedBodySha256);
     await requireFreshScope(context, payload);
@@ -1231,8 +1326,10 @@ async function opReplace(payload) {
     matchItems.forEach(r => r.font.load(FONT_FIELDS));
     await context.sync();
     const fonts = matchItems.map(r => fontSnapshot(r.font));
-    if (policy === "replaced" && fonts.some(f => Object.values(f).some(v => v === null || v === undefined || v === "")))
+    if (segments === null && policy === "replaced" && fonts.some(f => Object.values(f).some(v => v === null || v === undefined || v === "")))
       throw refusalError("Mixed formatting; choose previous or none explicitly", "MIXED_FORMATTING");
+    const boundaries = segments !== null ? await formattedBoundary(context, matchItems, payload) : null;
+    let segmentRanges = [];
     let inserted = [];
     let previousMode = null;
     if (payload.track_changes) {
@@ -1241,7 +1338,7 @@ async function opReplace(payload) {
       previousMode = context.document.changeTrackingMode;
     }
 
-    await guard.check(matchItems); // Recheck protected content after asynchronous preflight.
+    await (await sectionGuard(context, payload)).check(matchItems); // Fresh protected content at mutation boundary.
     matchItems.forEach(range => range.load("text"));
     await context.sync();
     if (matchItems.some(range => range.text !== payload.find))
@@ -1250,12 +1347,34 @@ async function opReplace(payload) {
     try {
       if (previousMode !== null) context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
       inserted = matchItems.map((range, i) => {
+        if (segments !== null && segments.length) {
+          let first=null, last=null;
+          const entries=[];
+          for (const segment of segments) {
+            const target=last ? last.getRange('End').insertText(segment.text, 'After') : range.insertText(segment.text, 'Replace');
+            FONT_FIELDS.forEach(k => {target.font[k]=segment.format[k];});
+            if (!first) first=target;
+            last=target; entries.push({range:target,segment});
+          }
+          segmentRanges.push(entries);
+          return first.expandTo(last);
+        }
         const target = range.insertText(payload.replace, Word.InsertLocation.replace);
-        if (payload.replace && policy === "replaced") FONT_FIELDS.forEach(k => {target.font[k] = fonts[i][k];});
-        if (payload.replace && policy === "none") target.font.reset();
+        if (segments === null && payload.replace && policy === "replaced") FONT_FIELDS.forEach(k => {target.font[k] = fonts[i][k];});
+        if (segments === null && payload.replace && policy === "none") target.font.reset();
         return target;
       });
       await context.sync();
+      if (segments !== null && segmentRanges.flat().length) {
+        // Set links only after all text exists. Clearing a new adjacent range
+        // while it still inherits the preceding link can remove that whole link.
+        segmentRanges.flat().forEach(e => {e.range.hyperlink='';});
+        await context.sync();
+        segmentRanges.flat().filter(e => e.segment.hyperlink).forEach(e => {e.range.hyperlink=e.segment.hyperlink;});
+        await context.sync();
+        segmentRanges.flat().forEach(e => FONT_FIELDS.forEach(k => {e.range.font[k]=e.segment.format[k];}));
+        await context.sync();
+      }
     } finally {
       if (previousMode !== null) {
         context.document.changeTrackingMode = previousMode;
@@ -1263,16 +1382,26 @@ async function opReplace(payload) {
       }
     }
 
+    try {
+    segmentRanges.flat().forEach(e => {e.range.load("text,hyperlink");e.range.font.load(FONT_FIELDS);});
     inserted.forEach(r => {r.load("text"); if (payload.replace) r.font.load(FONT_FIELDS);});
     await context.sync();
     inserted.forEach((r, i) => {
       matches[i].after = r.text;
       matches[i].fontBefore = fonts[i];
       matches[i].fontAfter = payload.replace ? fontSnapshot(r.font) : null;
-      if (r.text !== payload.replace || (payload.replace && policy === "replaced" &&
+      if (r.text !== payload.replace || (segments === null && payload.replace && policy === "replaced" &&
           FONT_FIELDS.some(k => matches[i].fontAfter[k] !== fonts[i][k])))
         throw refusalError(`Replacement read-back failed: ${JSON.stringify(matches)}`, "VERIFICATION_FAILED");
     });
+    for (const entry of segmentRanges.flat()) {
+      const {range,segment}=entry;
+      if (range.text!==segment.text || (range.hyperlink || null)!==(segment.hyperlink || null) ||
+          FONT_FIELDS.some(k => String(range.font[k]).toLowerCase()!==String(segment.format[k]).toLowerCase()))
+        throw refusalError('Explicit segment readback failed: '+JSON.stringify({expected:segment,actual:{text:range.text,format:fontSnapshot(range.font),hyperlink:range.hyperlink || null}}), 'VERIFICATION_FAILED');
+    }
+    if (boundaries) await verifyFormattedBoundary(context, boundaries, payload);
+    if (segments !== null) matches.forEach((m,i) => {m.segments=segmentRanges[i]?.map(e => ({text:e.range.text,format:fontSnapshot(e.range.font),hyperlink:e.range.hyperlink || null})) || [];});
     const postHash = await mutationHash(context, {...payload, expectedBodySha256:undefined});
 
     let commentsRemoved = [];
@@ -1294,6 +1423,9 @@ async function opReplace(payload) {
     }
     const scopePost = payload.executionSections ? postHash : await scopeHash(context, payload.scope || "body");
     return { scope_post: scopePost, comments_removed: commentsRemoved, applied: true, match_count: matchItems.length, matches, pre: preHash, post: postHash };
+    } catch (error) {
+      throw refusalError('Replacement may have applied; independent verification failed: '+(error.message || error), 'VERIFICATION_FAILED');
+    }
   });
 }
 
