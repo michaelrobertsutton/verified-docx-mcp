@@ -2,6 +2,8 @@
 
 ## 0.1.2 — 2026-10-16
 
+- Allow text-only edits beside callout anchors with complete shape-definition verification; retain independent targets after a proven prewrite deletion refusal.
+
 - Add explicit approved font/link segments for mixed inline replacements, independent formatting and unchanged-text verification.
 
 ## 0.1.1 — 2026-10-16

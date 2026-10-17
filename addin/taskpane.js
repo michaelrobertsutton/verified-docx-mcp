@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
+const PANE_CAPABILITIES = ["anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -1297,6 +1297,43 @@ async function verifyFormattedBoundary(context, boundaries, payload) {
   });
 }
 
+// Text edits may touch an anchored paragraph only when the actual replacement
+// range excludes every drawing/anchor and the paragraph mark. Never rewrite OOXML.
+async function anchoredTextBoundary(context, ranges, payload) {
+  const collections=ranges.map(r => r.paragraphs);
+  collections.forEach(c => c.load('items'));
+  await context.sync();
+  if (collections.some(c => c.items.length!==1) || /[\r\n]/.test(payload.find + payload.replace))
+    throw refusalError('Anchored text edits cannot replace paragraph boundaries', 'ANCHORED_SHAPES');
+  const paragraphs=collections.map(c => c.items[0]);
+  const xml=paragraphs.map(p => p.getOoxml());
+  await context.sync();
+  const boundaries=[];
+  for (let i=0;i<xml.length;i++) {
+    const root=shapeXml(xml[i].value), nodes=shapeNodes(root);
+    if (!nodes.length) continue;
+    const targetXml=ranges[i].getOoxml();
+    await context.sync();
+    if (shapeNodes(shapeXml(targetXml.value)).length)
+      throw refusalError('Replacement includes a callout anchor; edit text before or after it', 'ANCHORED_SHAPES');
+    const ids=inventoryShapes(xml[i].value).map(s => s.id);
+    if (ids.some(id => !id) || new Set(ids).size!==ids.length)
+      throw refusalError('Cannot establish stable shape identity for this paragraph', 'ANCHORED_SHAPES');
+    boundaries.push({paragraph:paragraphs[i], signatures:nodes.map(n => JSON.stringify(xmlSignature(n))).sort(), ids});
+  }
+  return boundaries;
+}
+async function verifyAnchoredText(context, boundaries) {
+  if (!boundaries.length) return;
+  const xml=boundaries.map(b => b.paragraph.getOoxml());
+  await context.sync();
+  boundaries.forEach((b,i) => {
+    const signatures=shapeNodes(shapeXml(xml[i].value)).map(n => JSON.stringify(xmlSignature(n))).sort();
+    if (JSON.stringify(signatures)!==JSON.stringify(b.signatures))
+      throw refusalError('Callout shape, wrapping, position, content or anchor paragraph changed; reconcile the write', 'VERIFICATION_FAILED');
+  });
+}
+
 async function opReplace(payload) {
   const expectedMatches = payload.expected_matches;
   const segments = explicitSegments(payload);
@@ -1315,7 +1352,7 @@ async function opReplace(payload) {
     }
 
     await guard.check(matchItems);
-    await guardAnchoredParagraphs(context, matchItems);
+    const anchorBoundaries = await anchoredTextBoundary(context, matchItems, payload);
     await guardRevisions(context, matchItems);
     const shapeBodies = await scopeShapeBodies(context, payload.scope);
     const commentsBefore = await guardComments(context, matchItems, payload.allow_comment_loss, shapeBodies, payload.allow_comment_loss_ids);
@@ -1401,6 +1438,7 @@ async function opReplace(payload) {
         throw refusalError('Explicit segment readback failed: '+JSON.stringify({expected:segment,actual:{text:range.text,format:fontSnapshot(range.font),hyperlink:range.hyperlink || null}}), 'VERIFICATION_FAILED');
     }
     if (boundaries) await verifyFormattedBoundary(context, boundaries, payload);
+    await verifyAnchoredText(context, anchorBoundaries);
     if (segments !== null) matches.forEach((m,i) => {m.segments=segmentRanges[i]?.map(e => ({text:e.range.text,format:fontSnapshot(e.range.font),hyperlink:e.range.hyperlink || null})) || [];});
     const postHash = await mutationHash(context, {...payload, expectedBodySha256:undefined});
 
@@ -3178,7 +3216,8 @@ function inventoryShapes(xml) {
         }).map(t => t.textContent).join('') : null},
       size_emu:extent ? {width:extent.getAttribute('cx'),height:extent.getAttribute('cy')} : null,
       horizontal_position:position('positionH'),vertical_position:position('positionV'),
-      legacy_style:node.namespaceURI === SHAPE_V ? node.getAttribute('style') : null};
+      legacy_style:node.namespaceURI === SHAPE_V ? node.getAttribute('style') : null,
+      definition:JSON.stringify(xmlSignature(node))};
   });
 }
 async function opExecutionShapes(payload) {

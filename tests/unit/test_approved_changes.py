@@ -378,3 +378,20 @@ def test_direct_scoped_readback_uses_same_deadline_as_write():
     scoped.request_threadsafe('cell_set',{})
     scoped.request_threadsafe('cell_get',{'executionTargetSection':'target'})
     assert calls==[('cell_set',60),('cell_get',60)]
+
+
+def test_refused_anchored_delete_keeps_independent_cell_eligible(setup):
+    path,pane=setup
+    native=pane.request_threadsafe
+    def refused_delete(op,payload=None,**kw):
+        if op=='paragraph_delete': raise LiveOpFailed('ANCHORED_SHAPES','Anchor paragraph cannot be removed')
+        return native(op,payload,**kw)
+    pane.hello=SimpleNamespace(capabilities=[*pane.hello.capabilities,'delete_paragraph'])
+    pane.request_threadsafe=refused_delete
+    ops=[{'op':'delete_paragraph','section':'target','args':{'anchor_text':'Delete the whole paragraph.'}},cell(),{'op':'live_save','section':'','args':{}}]
+    prepared=runs.prepare(path,ops)
+    result=execute(path,prepared)
+    assert result['status']=='partial' and result['applied_count']==2,result
+    assert result['remaining']==[0]
+    assert result['issues'][0]['code']=='ANCHORED_SHAPES'
+    assert pane.sections[0]['tables'][0]['rows'][0][0]=='new'

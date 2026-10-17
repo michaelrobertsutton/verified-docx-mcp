@@ -11,7 +11,7 @@ export function fixture(path, initial='Heading. plain sentence', commented=true)
     const font={load() {},reset() {state.queue.push(()=>state.chars.slice(start,end).forEach(c=>Object.assign(c,{bold:false,italic:false,underline:"None"})));}};
     for(const key of ['bold','italic','underline','strikeThrough','color','name','size','doubleStrikeThrough','subscript','superscript'])
       Object.defineProperty(font,key,{get(){const vals=state.chars.slice(start,end).map(c=>c[key]);return vals.every(v=>v===vals[0])?vals[0]:null;},set(v){state.queue.push(()=>state.chars.slice(start,end).forEach(c=>c[key]=v));}});
-    const range={load(){},font,get text(){return state.text.slice(start,end);},
+    const range={load(){},font,getOoxml:()=>({value:state.paragraphXml}),get text(){return state.text.slice(start,end);},
       paragraphs:{items:[{text:state.text,getOoxml:()=>({value:state.paragraphXml})}],load(){}},getTrackedChanges:()=>({items:[],load(){}}),
       getComments:()=>({get items(){return state.comments;},load(){}}),
       compareLocationWith(other){return {value:end<=other.start?'Before':start>=other.end?'After':'Overlaps'};},
