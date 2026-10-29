@@ -29,6 +29,7 @@ READ_OPS = frozenset(
         "ping",
         "describe",
         "body_ooxml",
+        "body_hash",
         "search",
         "comments_list",
         "cell_get",
@@ -372,8 +373,10 @@ class Broker:
                     body_hash = result.get("bodySha256") or result.get("post")
                     if body_hash:
                         self.hashes[(client_id, key)] = body_hash
-            if not write and own and op == "body_ooxml" and request.get("observe", True):
+            if not write and own and op in ("body_ooxml", "body_hash") and request.get("observe", True):
                 # An explicit read of the body re-baselines the reader's own sections.
+                # observe=False (the status view) never does, so a lookup made while
+                # refusing a write cannot re-arm the client that was just refused.
                 self._refresh_baselines(session, key, client_id, timeout)
             return result
         finally:

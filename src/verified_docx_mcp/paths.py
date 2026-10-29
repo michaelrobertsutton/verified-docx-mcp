@@ -242,6 +242,77 @@ def resolve_allowed_docx_path(file_path: str, *, must_exist: bool = True) -> Pat
     return resolved
 
 
+def resolve_output_path(output_path: str, *, param: str = "output_path") -> Path:
+    """Validate an output file path (export_pdf, read_document(to_file=...)):
+    allowlisted, not denylisted, parent directory must already exist (no
+    implicit mkdir), and an existing target must be a regular file."""
+    if not output_path.strip():
+        raise _make_error(ErrorCode.INVALID_INPUT, f"{param} must not be empty")
+
+    resolved = resolve_allowed_docx_path(output_path, must_exist=False)
+
+    parent = resolved.parent
+    if not parent.is_dir():
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"Parent directory does not exist: {parent}",
+            {param: output_path, "resolved_path": str(resolved), "parent": str(parent)},
+        )
+
+    if resolved.exists() and not resolved.is_file():
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"Output path exists and is not a regular file: {output_path!r}",
+            {param: output_path, "resolved_path": str(resolved)},
+        )
+
+    return resolved
+
+
+_TEXT_OUTPUT_SUFFIXES = frozenset({".md", ".txt", ".json"})
+
+
+def resolve_text_output_path(output_path: str, *, param: str = "to_file", overwrite: bool = False) -> Path:
+    """Like ``resolve_output_path`` for a tool that writes document TEXT to a file the caller
+    names (``read_document(to_file=...)``): only ``.md``/``.txt``/``.json``, and never an
+    existing file unless ``overwrite`` is true. A read tool must not be able to replace a
+    .docx (including the one it is reading), a dotfile or a source file inside the allowed
+    roots just because the caller passed that path."""
+    resolved = resolve_output_path(output_path, param=param)
+    if resolved.suffix.lower() not in _TEXT_OUTPUT_SUFFIXES:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"{param} must end in .md, .txt or .json (got {resolved.suffix or 'no extension'!r}).",
+            {param: output_path},
+        )
+    if resolved.exists() and not overwrite:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"{param} already exists: {resolved.name!r}. Choose a new path or pass overwrite=true.",
+            {param: output_path},
+        )
+    return resolved
+
+
+def write_text_atomic(target: Path, text: str) -> bytes:
+    """Write *text* (UTF-8) to *target* via a temp file in the same directory
+    and ``os.replace``; returns the bytes written so the caller can hash
+    exactly what landed on disk."""
+    data = text.encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+    return data
+
+
 # ---------------------------------------------------------------------------
 # 3. Read-path package snapshot, with validated retry.
 # ---------------------------------------------------------------------------

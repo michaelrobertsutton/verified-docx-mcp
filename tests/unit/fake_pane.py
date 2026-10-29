@@ -933,6 +933,7 @@ class FakePane:
         instance_id: str = "pane-test",
         body_ooxml: str | None = None,
         body_ooxml_error: tuple[str, str] | None = None,
+        sections: list[dict[str, Any]] | None = None,
     ) -> None:
         self.instance_id = instance_id
         # issue #39: tests set this to rewrite/strip fields of the next
@@ -946,6 +947,14 @@ class FakePane:
         self.body_ooxml = body_ooxml
         self.body_ooxml_error = body_ooxml_error
         self.body_ooxml_requests = 0
+        # issue #110: the heading sections `sections_list` / `body_hash` answer
+        # with, as the pane reports them ({section_key, slug, heading_text,
+        # level, paragraph_count, slug_unique, sectionSha256}). Tests build
+        # them from a real .docx's find_sections; `body_hash` reports their
+        # first 12 hex.
+        self.sections = sections if sections is not None else []
+        self.body_hash_requests = 0
+        self.sections_list_requests = 0
         self.document_url = document_url
         self.host = host
         self.platform = platform
@@ -956,7 +965,7 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"]
+            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1"]
             if capabilities is None
             else list(capabilities)
         )
@@ -1086,6 +1095,15 @@ class FakePane:
                 "documentUrl": self.document_url,
                 "strippedParts": [],
             }
+        if op == "body_hash":
+            self.body_hash_requests += 1
+            return {
+                "bodySha256": doc.sha256(),
+                "sections": [[sec["section_key"], sec["sectionSha256"][:12]] for sec in self.sections],
+            }
+        if op == "sections_list":
+            self.sections_list_requests += 1
+            return {"sections": list(self.sections), "bodySha256": doc.sha256()}
         if op == "search":
             matches = doc.search(
                 payload["find"],

@@ -9,7 +9,7 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + `
- globalThis.api = {sectionSlug, loadSectionMap, sectionGuard, refuseDocumentWide, dispatchOp, opSectionsList, executionSnapshot};
+ globalThis.api = {sectionSlug, loadSectionMap, sectionGuard, refuseDocumentWide, dispatchOp, opSectionsList, opBodyHash, executionSnapshot};
 `, sandbox);
 const api = sandbox.api;
 const plain = v => JSON.parse(JSON.stringify(v));
@@ -101,6 +101,14 @@ assert.throws(() => api.refuseDocumentWide({ownSections: [{slug: 'x'}]}, 'Revisi
 const listed = await api.opSectionsList();
 assert.equal(listed.sections.find(s => s.section_key === 'scope-detail-1').sectionSha256, scopeSha);
 assert.deepEqual(plain(listed.sections.filter(s => !s.slug_unique).map(s => s.section_key)), ['intro-1', 'intro-2']);
+// body_hash (#110 live_revision): the fresh body hash plus sha12 per section, the first 12 hex of
+// the very sectionSha256 sections_list reports, so file and live digests agree.
+const hashed = await api.opBodyHash();
+const {createHash} = await import('node:crypto');
+assert.equal(hashed.bodySha256, createHash('sha256').update(globalThis.__ctx.document.body.text).digest('hex'));
+assert.deepEqual(plain(hashed.sections), plain(listed.sections.map(s => [s.section_key, s.sectionSha256.slice(0, 12)])));
+assert.ok(hashed.sections.every(([, sha]) => /^[0-9a-f]{12}$/.test(sha)));
+assert.equal(listed.bodySha256, hashed.bodySha256);
 console.log('section guard: resolution, fail-closed relations, own/forbidden scopes, document-wide refusal passed');
 
 // Approved runs use exact section content and structure, independent of body revisions.

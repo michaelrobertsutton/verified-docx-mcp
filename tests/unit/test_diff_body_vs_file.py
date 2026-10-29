@@ -65,14 +65,12 @@ class IdenticalTests(DiffBodyVsFileTestCase):
         result = server.execute_diff_body_vs_file(str(self.target), str(md_path))
 
         self.assertTrue(result["identical"])
-        self.assertEqual(result["hunks"], [{
-            "tag": "equal",
-            "body_lines": [FRAG_BODY_MARKDOWN],
-            "file_lines": [FRAG_BODY_MARKDOWN],
-            "body_range": [1, 1],
-            "file_range": [1, 1],
-        }])
-        self.assertEqual(result["unified_diff"], "")
+        self.assertTrue(result["identical_raw"])
+        self.assertTrue(result["normalized"])
+        # Identical: no hunks at all, never the document echoed back (#110).
+        self.assertEqual(result["hunks"], [])
+        self.assertNotIn("unified_diff", result)
+        self.assertFalse(result["truncated"])
         self.assertNotIn("lossy_elements", result)
         self.assertEqual(result["path"], str(self.target.resolve()))
         self.assertEqual(result["file_path"], str(md_path))
@@ -88,9 +86,134 @@ class DiffersTests(DiffBodyVsFileTestCase):
         self.assertFalse(result["identical"])
         tags = [h["tag"] for h in result["hunks"]]
         self.assertIn("replace", tags)
-        self.assertNotEqual(result["unified_diff"], "")
+        self.assertNotIn("unified_diff", result)
+
+    def test_unified_format_returns_only_the_unified_diff(self):
+        md_path = self._write_md("differ.md", "The quick **brown** fox leaps over the lazy dog.")
+        result = server.execute_diff_body_vs_file(str(self.target), str(md_path), format="unified")
+
+        self.assertNotIn("hunks", result)
         self.assertTrue(result["unified_diff"].startswith("--- docx:"))
         self.assertIn(f"+++ {md_path}", result["unified_diff"])
+
+    def test_bad_format_and_max_hunks_are_invalid_input(self):
+        md_path = self._write_md("x.md", "x")
+        for kwargs in ({"format": "both"}, {"max_hunks": 0}):
+            with self.assertRaises(VerifyError) as ctx:
+                server.execute_diff_body_vs_file(str(self.target), str(md_path), **kwargs)
+            self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+
+class NormalizedDiffTests(DiffBodyVsFileTestCase):
+    """#110: smart quotes, dashes, NBSP, NFC and trailing spaces are not edits."""
+
+    def _sections_docx(self) -> tuple[Path, str]:
+        from verified_docx_mcp import projection
+
+        docx = Path(self._tmp.name) / "sections.docx"
+        shutil.copyfile(FIXTURES / "sections.docx", docx)
+        body_md, _, _ = projection.read_document_markdown(docx)
+        return docx, body_md
+
+    def test_typographic_differences_are_identical_but_not_identical_raw(self):
+        variant = "The quick **brown** fox jumps over the lazy dog."
+        md_path = self._write_md("nbsp.md", variant + "  \n")
+        result = server.execute_diff_body_vs_file(str(self.target), str(md_path))
+        self.assertTrue(result["identical"])
+        self.assertFalse(result["identical_raw"])
+        self.assertEqual(result["hunks"], [])
+
+        raw = server.execute_diff_body_vs_file(str(self.target), str(md_path), normalize=False)
+        self.assertFalse(raw["identical"])
+        self.assertFalse(raw["normalized"])
+        self.assertTrue(raw["hunks"])
+
+    def test_normalize_for_compare_folds_quotes_dashes_softhyphen_nfc(self):
+        from verified_docx_mcp import locate
+
+        folded = locate.normalize_for_compare("“A” – it’s­ ok  \ncafé")
+        self.assertEqual(folded, '"A" - it\'s ok\ncafé')
+
+    def test_three_real_edits_give_exactly_three_non_equal_hunks(self):
+        docx, body_md = self._sections_docx()
+        edited = (
+            body_md.replace("Some overview text.", "Some NEW overview text.")
+            .replace("Background text.", "Background text, changed.")
+            .replace("Next steps text.", "Next steps text!")
+        )
+        result = server.execute_diff_body_vs_file(str(docx), str(self._write_md("edited.md", edited)))
+        changed = [h for h in result["hunks"] if h["tag"] != "equal"]
+        self.assertEqual(len(changed), 3)
+        self.assertNotIn("unified_diff", result)
+        equal = [h for h in result["hunks"] if h["tag"] == "equal"]
+        self.assertTrue(equal)
+        for hunk in equal:
+            self.assertEqual(set(hunk), {"tag", "body_lines_count", "file_lines_count", "body_range", "file_range"})
+        self.assertFalse(result["truncated"])
+
+    def test_max_hunks_truncates_and_reports_the_remainder(self):
+        docx, body_md = self._sections_docx()
+        edited = body_md.replace("text.", "text, edited.")
+        result = server.execute_diff_body_vs_file(str(docx), str(self._write_md("edited.md", edited)), max_hunks=1)
+        self.assertEqual(len([h for h in result["hunks"] if h["tag"] != "equal"]), 1)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["remaining_hunks"], 2)
+
+    def test_section_key_scopes_both_sides(self):
+        docx, body_md = self._sections_docx()
+        # Only Background differs; Overview and Next Steps are untouched.
+        md_path = self._write_md("edited.md", body_md.replace("Background text.", "Background text, changed."))
+
+        scoped = server.execute_diff_body_vs_file(str(docx), str(md_path), section_key="background-1")
+        self.assertFalse(scoped["identical"])
+        self.assertEqual(scoped["section_key"], "background-1")
+        self.assertEqual(len([h for h in scoped["hunks"] if h["tag"] != "equal"]), 1)
+        # The Background heading is file line 5 -> 0-based offset 4.
+        self.assertEqual(scoped["file_line_offset"], 4)
+
+        clean = server.execute_diff_body_vs_file(str(docx), str(md_path), section_key="overview-1")
+        self.assertTrue(clean["identical"])
+        self.assertEqual(clean["hunks"], [])
+
+    def test_appending_a_paragraph_does_not_make_the_unchanged_last_line_an_edit(self):
+        """Review finding: the last unchanged line used to come back as 'replace' because only the
+        file side kept its line ending; and the unified diff glued two lines together."""
+        docx, body_md = self._sections_docx()
+        md_path = self._write_md("longer.md", body_md + "\n\nExtra closing paragraph.\n")
+        result = server.execute_diff_body_vs_file(str(docx), str(md_path))
+        changed = [h for h in result["hunks"] if h["tag"] != "equal"]
+        self.assertEqual([h["tag"] for h in changed], ["insert"])
+        self.assertEqual(changed[0]["body_lines"], [])
+        self.assertIn("Extra closing paragraph.\n", changed[0]["file_lines"])
+
+        unified = server.execute_diff_body_vs_file(str(docx), str(md_path), format="unified")["unified_diff"]
+        for line in unified.splitlines():
+            self.assertFalse(line.startswith("-") and "+" in line[1:] and "Next steps" in line, line)
+        self.assertIn("+Extra closing paragraph.", unified.splitlines())
+
+        edited = self._write_md("edited.md", body_md.replace("Next steps text.", "Next steps text, CHANGED."))
+        text = server.execute_diff_body_vs_file(str(docx), str(edited), format="unified")["unified_diff"]
+        self.assertIn("-Next steps text.", text.splitlines())
+        self.assertIn("+Next steps text, CHANGED.", text.splitlines())
+
+    def test_file_section_slice_heading_levels_and_folded_headings(self):
+        # Outline levels 6-8 render as 7-9 '#'; a converted file may have lost a soft hyphen.
+        lines = ["# One\n", "text\n", "####### Deep\n", "deep text\n", "# inter­national\n", "more\n"]
+        chunk, start = server._file_section_slice(lines, "deep-1")
+        self.assertEqual((chunk, start), (["####### Deep\n", "deep text\n"], 2))
+        # The docx key was slugged from the raw text, soft hyphen included ("inter-national-1"); the
+        # file keeps it. Matching only the folded text used to refuse this.
+        self.assertEqual(server._file_section_slice(lines, "inter-national-1")[1], 4)
+
+    def test_section_key_unknown_in_body_or_file(self):
+        docx, _ = self._sections_docx()
+        md_path = self._write_md("nohead.md", "no headings here\n")
+        with self.assertRaises(VerifyError) as ctx:
+            server.execute_diff_body_vs_file(str(docx), str(md_path), section_key="nope-1")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.SECTION_NOT_FOUND)
+        with self.assertRaises(VerifyError) as ctx:
+            server.execute_diff_body_vs_file(str(docx), str(md_path), section_key="overview-1")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
 
 
 class MissingInputTests(DiffBodyVsFileTestCase):

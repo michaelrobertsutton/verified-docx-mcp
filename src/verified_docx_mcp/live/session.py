@@ -49,6 +49,8 @@ OP_TIMEOUTS: dict[str, float] = {
     "comments_list": 60.0,
     "execution_snapshot": 60.0,
     "body_ooxml": 60.0,
+    # #110: hashes the body and every section, but ships no body.
+    "body_hash": 30.0,
     "table_get": 60.0,
     "table_insert": 90.0,
     "cells_set": 60.0,

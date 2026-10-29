@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
+const PANE_CAPABILITIES = ["heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -698,7 +698,7 @@ function enqueuePaneOperation(operation) {
   paneOperationQueue = result.catch(() => {});
   return result;
 }
-const READ_ONLY_OPS = new Set(["ping", "describe", "body_ooxml", "search", "comments_list",
+const READ_ONLY_OPS = new Set(["ping", "describe", "body_ooxml", "body_hash", "search", "comments_list",
   "cell_get", "table_get", "shapes_list", "textboxes_list", "textboxes_read", "scope_describe",
   "revisions_list", "autoopen_get", "sections_list", "execution_snapshot"]);
 
@@ -750,6 +750,8 @@ async function dispatchOpUnchecked(op, payload) {
       return opAutoopenSet(payload);
     case "body_ooxml":
       return opBodyOoxml();
+    case "body_hash":
+      return opBodyHash();
     case "search":
       return opSearch(payload);
     case "replace":
@@ -978,6 +980,18 @@ async function opSectionsList() {
       });
     }
     return { sections: listed, bodySha256 };
+  });
+}
+// #110 live_revision: the fresh body hash and a 12-hex digest per heading
+// section in one pass, with no body transfer. sha12 is the first 12 hex of the
+// same sectionSha256 that sections_list reports, so file and live digests agree.
+async function opBodyHash() {
+  return measuredWordRun(async (context) => {
+    const { items, sections } = await loadSectionMap(context);
+    const bodySha256 = await requireFreshBody(context);
+    const digests = [];
+    for (const s of sections) digests.push([s.section_key, (await sectionSha(items, s)).slice(0, 12)]);
+    return { bodySha256, sections: digests };
   });
 }
 function refuseDocumentWide(payload, what) {

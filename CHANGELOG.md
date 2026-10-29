@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `diff_body_vs_file` is normalized (quotes, dashes, NBSP, soft hyphens, NFC, trailing whitespace), returns hunks or a unified diff but never both, drops the text of equal hunks, and can be scoped by `section_key` and capped by `max_hunks`. `identical_raw` keeps the byte comparison. On the ~20K-word fixture an identical-document diff falls from ~99K to ~100 tokens.
+- `read_document` gains inclusive `start_para_ref`/`end_para_ref` ranges (any format, file or live) and `to_file`, which writes the body to an allowed path and returns a summary with the file's sha256. `find_sections` entries carry `chars`; `find_sections(digests=true)` adds a per-section `sha12`.
+- New `live_revision` tool returns the live revision and per-section digests in one pane round trip (pane op `body_hash`, capability `body_hash_v1`; pane v65). Older panes fall back to `body_ooxml`. `live_list_sections(compact=true)` returns `[key, heading, sha12]` rows.
 - File-mode `list_open_items` now threads comment replies via `w15:paraIdParent`: replies are no longer listed as top-level comments, and each root reports a real `reply_count` and `replies` (`{id, author, date, text}`). The root comment's resolved state governs the thread. Shared threading walk lives in `projection.comment_thread_links`.
 
 ## 0.1.2 — 2026-10-16

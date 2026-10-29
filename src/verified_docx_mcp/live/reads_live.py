@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import datetime
 import tempfile
 import zipfile
 from collections.abc import Iterator
@@ -55,6 +56,7 @@ from .session import LiveDisconnected, LiveOpFailed, LiveSession, LiveStale, Liv
 
 VALID_SOURCES = ("auto", "file", "live")
 BODY_OOXML_CAPABILITY = "body_ooxml"
+BODY_HASH_CAPABILITY = "body_hash_v1"
 
 WARNING_LIVE_SESSION_IGNORED = "live_session_ignored"
 WARNING_LIVE_STYLES_MISSING = "live_styles_missing"
@@ -358,6 +360,81 @@ def read_source(path: str, source: str, part: str = DEFAULT_PART) -> Iterator[Re
     finally:
         if is_temp:
             local_path.unlink(missing_ok=True)
+
+
+def live_revision(path: str) -> dict[str, Any]:
+    """The live body's current revision token and per-section digests, without
+    reading the body into the response (issue #110).
+
+    One pane round trip (op ``body_hash``, capability ``body_hash_v1``). An
+    older pane falls back to ``body_ooxml``: the body is fetched, hashed and
+    section-digested server-side, then discarded -- correct but not cheap, so
+    the reply says ``via: "body_ooxml_fallback"``.
+
+    Like ``read_document(source="live")`` this goes through the registry
+    session (observe=True), so in shared-bridge mode it re-arms the caller's
+    write baseline. A non-observing view (``write_mode.live_session_for``)
+    never does, which is how an error path can look at the body without
+    re-arming the client it just refused.
+    """
+    from .. import projection
+    from .comments_live import _request
+
+    resolved = paths.resolve_allowed_docx_path(path, must_exist=False)
+    document_name = resolved.name
+    registry, session = _session_if_any(document_name)
+    if session is None:
+        raise _make_error(
+            ErrorCode.LIVE_UNAVAILABLE,
+            f"no connected pane session for document {document_name!r}. "
+            "Open the Live pane in Word (docs/live-mode.md) and retry, or call live_status.",
+            {"document_name": document_name},
+        )
+    if _collided(registry, document_name):
+        raise _make_error(
+            ErrorCode.LIVE_SESSION_MISMATCH,
+            f"another document connected under the file name {document_name!r}; confirm which one is "
+            "open in Word before reading its revision.",
+            {"document_name": document_name},
+        )
+    write_mode._check_session_identity(path, session)
+
+    if BODY_HASH_CAPABILITY in session.hello.capabilities:
+        reply = _request(session, "body_hash", {})
+        body_sha = reply.get("bodySha256")
+        sections = reply.get("sections")
+        try:
+            if not isinstance(body_sha, str):
+                raise TypeError("bodySha256")
+            digests = [[str(key), str(sha)] for key, sha in sections]
+        except (TypeError, ValueError):
+            raise _make_error(
+                ErrorCode.LIVE_OP_FAILED,
+                "the pane's body_hash reply is malformed (expected bodySha256 and [[section_key, sha12], ...])",
+                {"stage": "body_hash_reply"},
+            ) from None
+        via = "body_hash"
+    else:
+        write_mode.require_capability(session, BODY_OOXML_CAPABILITY, feature_description="live_revision")
+        reply = _fetch_body_ooxml(session)
+        body_sha = reply["bodySha256"]
+        with tempfile.TemporaryDirectory(prefix="verified-docx-live-rev-") as tmp:
+            temp_docx = Path(tmp) / document_name
+            flat_opc_to_docx(reply["ooxml"], temp_docx)
+            digests = [
+                [sec["section_key"], sec["sha12"]]
+                for sec in projection.find_sections_impl(temp_docx, digests=True, ignore_trailing_empty=True)
+                if sec["kind"] == "heading"
+            ]
+        via = "body_ooxml_fallback"
+
+    return {
+        "revision": f"{LIVE_REVISION_PREFIX}{body_sha}",
+        "body_sha12": body_sha[:12],
+        "sections": digests,
+        "observed_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        "via": via,
+    }
 
 
 def file_read_warnings(path: str) -> tuple[list[str], dict[str, Any] | None]:

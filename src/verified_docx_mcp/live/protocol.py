@@ -54,6 +54,13 @@ pane must honor.
                      Refuses with ``OP_ERROR_TOO_LARGE`` when the reply
                      would exceed the pane's size limit.
 
+  body_hash       -- no payload (issue #110; capability ``body_hash_v1``).
+                     Word calls: ``body.load("text")`` plus the section map's
+                     paragraph text. Reply result: ``{bodySha256, sections:
+                     [[section_key, sha12], ...]}`` -- the fresh
+                     body hash (computed exactly as ``describe``'s) and a
+                     12-hex digest per heading section, with no body transfer.
+
   search        -- ``SearchPayload`` (find, matchCase, matchWholeWord).
                      Word calls: ``body.search(find, {matchCase,
                      matchWholeWord})``, ``.load(["text"])`` on each
@@ -315,6 +322,7 @@ VALID_OPS: frozenset[str] = frozenset(
         "ping",
         "describe",
         "body_ooxml",
+        "body_hash",
         "search",
         "replace",
         "format",

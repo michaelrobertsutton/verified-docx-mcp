@@ -1363,7 +1363,148 @@ def _slugify(text: str) -> str:
     return slug or "section"
 
 
-def find_sections_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dict[str, Any]]:
+_PARA_REF_RE = re.compile(r"p(\d+)")
+
+
+def para_index(para_ref: str) -> int:
+    """The 0-based position of a positional ``pN`` paragraph ref."""
+    m = _PARA_REF_RE.fullmatch(para_ref)
+    if m is None:
+        raise ValueError(f"not a paragraph ref: {para_ref!r}")
+    return int(m.group(1))
+
+
+def paragraph_texts(proj: Projection) -> list[str]:
+    """Each paragraph's own text, aligned with ``proj.paragraphs`` (table
+    cell paragraphs included, in document order). The same string Word's
+    ``paragraph.text`` is compared against for section digests."""
+    by_ref: dict[str, list[str]] = {}
+    for event in proj.events:
+        if isinstance(event, RunEvent) and not event.run_ref.endswith("/break"):
+            # A soft line break (w:br) is "\n" in the projection but Word's paragraph.text
+            # reports it as "\v" (U+000B); digest what Word reports.
+            by_ref.setdefault(event.para_ref, []).append(event.text.replace("\n", "\u000b"))
+    return ["".join(by_ref.get(m.para_ref, [])) for m in proj.paragraphs]
+
+
+def section_digest(texts: list[str]) -> str:
+    """12-hex digest of one section's paragraph texts, defined exactly as the
+    pane's ``sectionSha`` (taskpane.js: sha256 of the paragraph texts joined
+    with ``\\n``), so a file read and a live read agree on unchanged text."""
+    return _sha256_hex("\n".join(texts).encode("utf-8"))[:12]
+
+
+def resolve_para_range(proj: Projection, start_ref: str, end_ref: str) -> tuple[int, int]:
+    """Validate an inclusive ``pN``..``pM`` range against *proj*; INVALID_INPUT
+    when malformed, out of range or inverted."""
+    count = len(proj.paragraphs)
+    bounds: list[int] = []
+    for name, ref in (("start_para_ref", start_ref), ("end_para_ref", end_ref)):
+        try:
+            idx = para_index(ref)
+        except ValueError:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"{name} must be a positional paragraph ref like 'p12'; got {ref!r}.",
+                {name: ref},
+            ) from None
+        if idx >= count:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"{name} {ref!r} is out of range: the part has {count} paragraphs (p0..p{max(count - 1, 0)}).",
+                {name: ref, "paragraph_count": count},
+            )
+        bounds.append(idx)
+    if bounds[0] > bounds[1]:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"start_para_ref {start_ref!r} comes after end_para_ref {end_ref!r}.",
+            {"start_para_ref": start_ref, "end_para_ref": end_ref},
+        )
+    return bounds[0], bounds[1]
+
+
+def slice_projection(proj: Projection, start_idx: int, end_idx: int) -> tuple[Projection, list[dict[str, Any]]]:
+    """A Projection restricted to paragraphs ``start_idx..end_idx``
+    (inclusive, 0-based), plus ``partial_table`` lossy records.
+
+    Every renderer (text / runs / markdown) then works on the slice unchanged.
+    A table with at least one paragraph in range is kept; when only some of
+    its rows hold in-range paragraphs, the table element is copied with just
+    those rows removed-around (so the markdown pipe table shows the slice, its
+    first kept row acting as the header) and ``{"kind": "partial_table",
+    "table_id": N}`` is reported. Ordered-list numbering restarts at the slice.
+    """
+    keep = {m.para_ref for m in proj.paragraphs[start_idx : end_idx + 1]}
+    kept_meta = [m for m in proj.paragraphs if m.para_ref in keep]
+    rows_by_table: dict[int, set[int]] = {}
+    for meta in kept_meta:
+        for link in meta.container_chain:
+            rows_by_table.setdefault(link["table_id"], set()).add(link["row"])
+
+    first_ref = kept_meta[0].para_ref if kept_meta else None
+    events: list[Event] = []
+    lossy: list[dict[str, Any]] = []
+    for event in proj.events:
+        if isinstance(event, TableBoundaryEvent):
+            if event.table_id not in rows_by_table:
+                continue
+            if event.kind == "table_start" and event.element is not None:
+                rows = [tr for tr in event.element if _ln(tr) == "tr"]
+                wanted = rows_by_table[event.table_id]
+                if len(wanted) < len(rows):
+                    import copy
+
+                    clone = copy.deepcopy(event.element)
+                    for idx, tr in enumerate([t for t in clone if _ln(t) == "tr"], start=1):
+                        if idx not in wanted:
+                            clone.remove(tr)
+                    lossy.append({"kind": "partial_table", "table_id": event.table_id})
+                    event = TableBoundaryEvent("table_start", event.table_id, element=clone)
+            events.append(event)
+            continue
+        if event.para_ref not in keep:
+            continue
+        if isinstance(event, RunEvent) and event.run_ref == f"{first_ref}/break":
+            continue  # the slice's first paragraph has no preceding paragraph
+        events.append(event)
+
+    text_parts: list[str] = []
+    offset_map: list[tuple[int, int, str, str]] = []
+    cursor = 0
+    for event in events:
+        if isinstance(event, RunEvent):
+            length = len(event.text)
+            if length:
+                offset_map.append((cursor, cursor + length, event.para_ref, event.run_ref))
+                cursor += length
+            text_parts.append(event.text)
+    sliced = Projection(
+        part=proj.part,
+        text="".join(text_parts),
+        offset_map=offset_map,
+        events=events,
+        paragraphs=kept_meta,
+        deleted_spans=[d for d in proj.deleted_spans if d.para_ref in keep],
+        warnings=proj.warnings,
+    )
+    return sliced, lossy
+
+
+def _section_ranges(proj: Projection, headings: list[tuple[int, str]]) -> list[tuple[int, int]]:
+    """(start_idx, end_idx_exclusive) per heading index, flat: each section
+    ends where the next heading starts."""
+    count = len(proj.paragraphs)
+    return [(h, headings[i + 1][0] if i + 1 < len(headings) else count) for i, (h, _) in enumerate(headings)]
+
+
+def find_sections_impl(
+    docx_path: Path,
+    part_name: str = DEFAULT_PART,
+    *,
+    digests: bool = False,
+    ignore_trailing_empty: bool = False,
+) -> list[dict[str, Any]]:
     """Heading ranges PLUS text-box sub-scopes, both keyed by
     ``section_key`` — this is the one discovery call a caller uses to find
     every ``section_key`` read_document(section_key=...) can then address,
@@ -1411,6 +1552,12 @@ def find_sections_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[d
     slug_counts: dict[str, int] = {}
     sections: list[dict[str, Any]] = []
     all_para_refs = [m.para_ref for m in projection.paragraphs]
+    texts = paragraph_texts(projection)
+    if ignore_trailing_empty and texts and texts[-1] == "":
+        # Word's Body.getOoxml() appends one empty paragraph that Body.paragraphs (what the
+        # pane digests) does not have. Real Word, #110: without this the last section's
+        # digest of a live body read would never match the pane's.
+        texts = texts[:-1]
 
     for idx, (meta, level, heading_text) in enumerate(heading_paras):
         base_slug = _slugify(heading_text)
@@ -1424,17 +1571,22 @@ def find_sections_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[d
         else:
             end_idx = len(all_para_refs)
 
-        sections.append(
-            {
-                "section_key": section_key,
-                "kind": "heading",
-                "heading_text": heading_text,
-                "outline_level": level,
-                "start_para_ref": meta.para_ref,
-                "end_para_ref": all_para_refs[end_idx - 1] if end_idx > start_idx else meta.para_ref,
-                "paragraph_count": max(end_idx - start_idx, 1),
-            }
-        )
+        section_texts = texts[start_idx : max(end_idx, start_idx + 1)]
+        entry = {
+            "section_key": section_key,
+            "kind": "heading",
+            "heading_text": heading_text,
+            "outline_level": level,
+            "start_para_ref": meta.para_ref,
+            "end_para_ref": all_para_refs[end_idx - 1] if end_idx > start_idx else meta.para_ref,
+            "paragraph_count": max(end_idx - start_idx, 1),
+            # Plain-text characters (paragraph texts joined with "\n"): the
+            # size of a text read of this range, so a caller can judge it.
+            "chars": len("\n".join(section_texts)),
+        }
+        if digests:
+            entry["sha12"] = section_digest(section_texts)
+        sections.append(entry)
 
     for textbox_scope in iter_textbox_scopes(docx_path, part_name):
         sections.append(
@@ -1446,6 +1598,7 @@ def find_sections_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[d
                 "start_para_ref": None,
                 "end_para_ref": None,
                 "paragraph_count": textbox_scope["paragraph_count"],
+                "chars": len(textbox_scope["text"]),
             }
         )
 
