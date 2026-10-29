@@ -175,6 +175,36 @@ class NormalizedDiffTests(DiffBodyVsFileTestCase):
         self.assertTrue(clean["identical"])
         self.assertEqual(clean["hunks"], [])
 
+    def test_appending_a_paragraph_does_not_make_the_unchanged_last_line_an_edit(self):
+        """Review finding: the last unchanged line used to come back as 'replace' because only the
+        file side kept its line ending; and the unified diff glued two lines together."""
+        docx, body_md = self._sections_docx()
+        md_path = self._write_md("longer.md", body_md + "\n\nExtra closing paragraph.\n")
+        result = server.execute_diff_body_vs_file(str(docx), str(md_path))
+        changed = [h for h in result["hunks"] if h["tag"] != "equal"]
+        self.assertEqual([h["tag"] for h in changed], ["insert"])
+        self.assertEqual(changed[0]["body_lines"], [])
+        self.assertIn("Extra closing paragraph.\n", changed[0]["file_lines"])
+
+        unified = server.execute_diff_body_vs_file(str(docx), str(md_path), format="unified")["unified_diff"]
+        for line in unified.splitlines():
+            self.assertFalse(line.startswith("-") and "+" in line[1:] and "Next steps" in line, line)
+        self.assertIn("+Extra closing paragraph.", unified.splitlines())
+
+        edited = self._write_md("edited.md", body_md.replace("Next steps text.", "Next steps text, CHANGED."))
+        text = server.execute_diff_body_vs_file(str(docx), str(edited), format="unified")["unified_diff"]
+        self.assertIn("-Next steps text.", text.splitlines())
+        self.assertIn("+Next steps text, CHANGED.", text.splitlines())
+
+    def test_file_section_slice_heading_levels_and_folded_headings(self):
+        # Outline levels 6-8 render as 7-9 '#'; a converted file may have lost a soft hyphen.
+        lines = ["# One\n", "text\n", "####### Deep\n", "deep text\n", "# inter­national\n", "more\n"]
+        chunk, start = server._file_section_slice(lines, "deep-1")
+        self.assertEqual((chunk, start), (["####### Deep\n", "deep text\n"], 2))
+        # The docx key was slugged from the raw text, soft hyphen included ("inter-national-1"); the
+        # file keeps it. Matching only the folded text used to refuse this.
+        self.assertEqual(server._file_section_slice(lines, "inter-national-1")[1], 4)
+
     def test_section_key_unknown_in_body_or_file(self):
         docx, _ = self._sections_docx()
         md_path = self._write_md("nohead.md", "no headings here\n")

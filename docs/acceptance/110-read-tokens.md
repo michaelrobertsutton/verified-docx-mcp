@@ -69,5 +69,31 @@ into the Word window (a heading became "Can you please Section 001") and the pro
 one heading; the other 148 sections agreed. The passing rerun started from a pristine copy of the
 fixture (the probe expects one and does not enforce it).
 
-Field results, tabs and tracked deletions, where file and live paragraph text can differ, are not in
-this fixture and remain untested.
+A follow-up run on a small document checked the cases the large fixture lacks. A soft line break
+(`w:br`) is U+000B in Word's `paragraph.text` but `\n` in the projection; the file side now digests
+it as U+000B and agrees with the pane. A real `<w:tab/>` agrees. A literal tab character typed
+inside a `w:t` (not how Word writes tabs) hashes differently and is not handled. Field results and
+tracked deletions remain untested.
+
+## Review
+
+An independent review of the diff (a fresh opus agent using the gstack checklist; a lean review, not
+the full `/review` pipeline) found one critical issue and six lesser ones. Fixed:
+
+- **Critical:** `read_document(to_file=...)` could overwrite any file under the allowed roots, including
+  the `.docx` being read (it destroyed `sections.docx` in the reviewer's reproduction). It now accepts
+  only `.md`/`.txt`/`.json`, refuses an existing file unless `overwrite=true`, and reads the sections
+  before writing.
+- The normalized diff reported an unchanged last line as a `replace` and the unified output glued two
+  lines together: both sides now end the same way.
+- `section_key` file matching missed heading levels 6-8 (7-9 `#`) and a heading that keeps a soft
+  hyphen.
+- `sha12` disagreed with Word for soft line breaks (above).
+- A malformed `body_hash` reply raised a bare `ValueError`/`TypeError`; it is now `LIVE_OP_FAILED`.
+
+Not changed, by decision: `identical` now defaults to the normalized comparison (the issue specifies
+`normalize=True`), so a caller that treated `identical: true` as byte-identical must read
+`identical_raw`; JennyStack's sync skill is such a caller and needs to switch. A table nested inside a
+partially read row is shown whole in markdown (documented). `opBodyHash` hashes the body and the
+sections in two Word syncs, as `sections_list` already does, so a keystroke between them can skew one
+reply; the next `live_revision` corrects it.

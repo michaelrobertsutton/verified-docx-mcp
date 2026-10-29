@@ -161,6 +161,27 @@ class ToFileTests(RangedReadTestCase):
                 self.read(self.sections, format="text", to_file=str(target))
             self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
 
+    def test_to_file_never_overwrites_an_existing_file_unless_asked(self):
+        out = Path(self._tmp.name) / "existing.md"
+        out.write_text("precious", encoding="utf-8")
+        with self.assertRaises(VerifyError) as ctx:
+            self.read(self.sections, format="text", to_file=str(out))
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        self.assertEqual(out.read_text(encoding="utf-8"), "precious")
+        result = self.read(self.sections, format="text", to_file=str(out), overwrite=True)
+        self.assertEqual(result["written_to"], str(out.resolve()))
+        self.assertNotEqual(out.read_text(encoding="utf-8"), "precious")
+
+    def test_to_file_cannot_replace_the_document_being_read_or_any_non_text_file(self):
+        """Review finding: to_file=<the .docx itself> used to destroy it."""
+        before = self.sections.read_bytes()
+        for target in (self.sections, Path(self._tmp.name) / ".zshrc", Path(self._tmp.name) / "notes"):
+            for overwrite in (False, True):
+                with self.assertRaises(VerifyError, msg=f"{target.name} overwrite={overwrite}") as ctx:
+                    self.read(self.sections, format="text", to_file=str(target), overwrite=overwrite)
+                self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        self.assertEqual(self.sections.read_bytes(), before)
+
     def test_to_file_leaves_no_temp_files_behind(self):
         out = Path(self._tmp.name) / "clean.txt"
         self.read(self.sections, format="text", to_file=str(out))
@@ -206,6 +227,20 @@ class FindSectionsSizeAndDigestTests(RangedReadTestCase):
         }
         self.assertNotEqual(raw["next-steps-1"], plain["next-steps-1"])  # the extra paragraph shows
         self.assertEqual(trimmed, plain)  # and is ignored when asked
+
+    def test_a_soft_line_break_is_digested_as_words_vertical_tab(self):
+        """Real Word (#110 review): paragraph.text reports a w:br as U+000B, and the digest
+        must hash what Word reports. Verified against real Word on 2026-10-29."""
+        doc = Path(self._tmp.name) / "br.docx"
+        shutil.copyfile(self.sections, doc)
+        from verified_docx_mcp import mutations
+
+        mutations._QUIESCE_INTERVAL_SECONDS = 0.02
+        mutations.execute_replace_body_markdown(str(doc), "# Alpha\n\nLine one  \nLine two\n", force=True)
+        texts = projection.paragraph_texts(projection.project_part(doc))
+        self.assertEqual(texts, ["Alpha", "Line one\u000bLine two"])
+        digest = projection.find_sections_impl(doc, digests=True)[0]["sha12"]
+        self.assertEqual(digest, hashlib.sha256("Alpha\nLine one\u000bLine two".encode()).hexdigest()[:12])
 
     def test_textbox_entries_carry_chars(self):
         box = Path(self._tmp.name) / "textbox.docx"

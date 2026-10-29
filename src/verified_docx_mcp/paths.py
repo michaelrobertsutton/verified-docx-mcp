@@ -269,6 +269,31 @@ def resolve_output_path(output_path: str, *, param: str = "output_path") -> Path
     return resolved
 
 
+_TEXT_OUTPUT_SUFFIXES = frozenset({".md", ".txt", ".json"})
+
+
+def resolve_text_output_path(output_path: str, *, param: str = "to_file", overwrite: bool = False) -> Path:
+    """Like ``resolve_output_path`` for a tool that writes document TEXT to a file the caller
+    names (``read_document(to_file=...)``): only ``.md``/``.txt``/``.json``, and never an
+    existing file unless ``overwrite`` is true. A read tool must not be able to replace a
+    .docx (including the one it is reading), a dotfile or a source file inside the allowed
+    roots just because the caller passed that path."""
+    resolved = resolve_output_path(output_path, param=param)
+    if resolved.suffix.lower() not in _TEXT_OUTPUT_SUFFIXES:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"{param} must end in .md, .txt or .json (got {resolved.suffix or 'no extension'!r}).",
+            {param: output_path},
+        )
+    if resolved.exists() and not overwrite:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"{param} already exists: {resolved.name!r}. Choose a new path or pass overwrite=true.",
+            {param: output_path},
+        )
+    return resolved
+
+
 def write_text_atomic(target: Path, text: str) -> bytes:
     """Write *text* (UTF-8) to *target* via a temp file in the same directory
     and ``os.replace``; returns the bytes written so the caller can hash

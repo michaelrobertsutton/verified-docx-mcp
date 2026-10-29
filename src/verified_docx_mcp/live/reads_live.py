@@ -403,14 +403,17 @@ def live_revision(path: str) -> dict[str, Any]:
         reply = _request(session, "body_hash", {})
         body_sha = reply.get("bodySha256")
         sections = reply.get("sections")
-        if not isinstance(body_sha, str) or not isinstance(sections, list):
+        try:
+            if not isinstance(body_sha, str):
+                raise TypeError("bodySha256")
+            digests = [[str(key), str(sha)] for key, sha in sections]
+        except (TypeError, ValueError):
             raise _make_error(
                 ErrorCode.LIVE_OP_FAILED,
-                "the pane's body_hash reply is missing bodySha256/sections",
+                "the pane's body_hash reply is malformed (expected bodySha256 and [[section_key, sha12], ...])",
                 {"stage": "body_hash_reply"},
-            )
+            ) from None
         via = "body_hash"
-        digests = [[str(key), str(sha)] for key, sha in sections]
     else:
         write_mode.require_capability(session, BODY_OOXML_CAPABILITY, feature_description="live_revision")
         reply = _fetch_body_ooxml(session)

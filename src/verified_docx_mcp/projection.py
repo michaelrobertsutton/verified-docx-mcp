@@ -1353,7 +1353,9 @@ def paragraph_texts(proj: Projection) -> list[str]:
     by_ref: dict[str, list[str]] = {}
     for event in proj.events:
         if isinstance(event, RunEvent) and not event.run_ref.endswith("/break"):
-            by_ref.setdefault(event.para_ref, []).append(event.text)
+            # A soft line break (w:br) is "\n" in the projection but Word's paragraph.text
+            # reports it as "\v" (U+000B); digest what Word reports.
+            by_ref.setdefault(event.para_ref, []).append(event.text.replace("\n", "\u000b"))
     return ["".join(by_ref.get(m.para_ref, [])) for m in proj.paragraphs]
 
 

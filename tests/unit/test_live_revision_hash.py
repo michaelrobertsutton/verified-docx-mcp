@@ -105,6 +105,19 @@ class LiveRevisionTests(LiveRevisionTestCase):
             await self.revision()
         self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.LIVE_CAPABILITY_MISSING)
 
+    async def test_a_malformed_pane_reply_is_live_op_failed_not_a_crash(self) -> None:
+        from unittest import mock
+
+        from verified_docx_mcp.live import comments_live
+
+        await self.connect_live()
+        for bad in ({"bodySha256": 7, "sections": []}, {"bodySha256": "a" * 64, "sections": "nope"},
+                    {"bodySha256": "a" * 64, "sections": [["only-one"]]}):
+            with mock.patch.object(comments_live, "_request", return_value=bad):
+                with self.assertRaises(VerifyError, msg=str(bad)) as ctx:
+                    await self.revision()
+            self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.LIVE_OP_FAILED)
+
     async def test_no_session_is_live_unavailable(self) -> None:
         with self.assertRaises(VerifyError) as ctx:
             await self.revision()

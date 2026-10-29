@@ -843,7 +843,8 @@ def live_revision(path: str) -> dict[str, Any]:
     discards it (``via: "body_ooxml_fallback"``): correct, not cheap. Reload the
     pane to get the fast path.
 
-    Errors: LIVE_UNAVAILABLE (no pane), LIVE_SESSION_MISMATCH, LIVE_OP_FAILED.
+    Errors: LIVE_UNAVAILABLE (no pane), LIVE_SESSION_MISMATCH, LIVE_OP_FAILED,
+    LIVE_CAPABILITY_MISSING (the pane offers neither body_hash_v1 nor body_ooxml).
     """
     from .live import comments_live, reads_live
     from .live.session import LiveError
@@ -1023,6 +1024,7 @@ def execute_read_document(
     start_para_ref: str | None = None,
     end_para_ref: str | None = None,
     to_file: str | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     if format not in _VALID_READ_FORMATS:
         raise _make_error(
@@ -1044,7 +1046,9 @@ def execute_read_document(
         )
     # Resolve the destination BEFORE the read so a bad path costs nothing and
     # a live read is never half-performed for nothing.
-    target = paths.resolve_output_path(to_file, param="to_file") if to_file is not None else None
+    target = (
+        paths.resolve_text_output_path(to_file, param="to_file", overwrite=overwrite) if to_file is not None else None
+    )
     with reads_live.read_source(path, source, part) as rs:
         result, paragraph_count = _read_document_from(
             rs.local_path, rs.resolved, format, part, section_key, start_para_ref, end_para_ref
@@ -1064,8 +1068,9 @@ def _written_read_summary(
     summary (no body), plus the heading sections with their sizes."""
     rendered = result.pop(format)
     text = rendered if isinstance(rendered, str) else json.dumps(rendered, ensure_ascii=False)
-    data = paths.write_text_atomic(target, text)
+    # Read the sections BEFORE writing: nothing may fail after the file is on disk.
     headings = [sec for sec in projection.find_sections_impl(local_path, part) if sec["kind"] == "heading"]
+    data = paths.write_text_atomic(target, text)
     # Compact rows, capped: a 150-section document would otherwise make the
     # "no body" summary itself thousands of tokens. find_sections has the rest.
     sections = [
@@ -1167,6 +1172,7 @@ def read_document(
     start_para_ref: str | None = None,
     end_para_ref: str | None = None,
     to_file: str | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Read a .docx part's content as markdown, flat text, or a run-level
     structural list.
@@ -1235,12 +1241,15 @@ def read_document(
     range, in any format, file or live. A malformed, out-of-range or
     inverted range is INVALID_INPUT. A table cut by the range keeps only
     the rows that hold in-range paragraphs and is reported in
-    lossy_elements as {"kind": "partial_table", "table_id"}; an ordered
+    lossy_elements as {"kind": "partial_table", "table_id"} (a table nested
+    inside a kept row is shown whole in markdown); an ordered
     list's numbering restarts at the slice. Cannot be combined with
     section_key.
 
     to_file writes the rendered text/markdown/runs (runs as JSON) to that
-    path (allowed roots only; the parent directory must exist) and returns
+    path (allowed roots only; the parent directory must exist; the name must
+    end in .md, .txt or .json; an existing file is refused unless
+    overwrite=true, so a read can never replace a .docx or source file) and returns
     NO body: {path, part, format, revision, written_to, sha256 (of the
     written file), chars, paragraph_count, sections: [[section_key,
     start_para_ref, end_para_ref, chars], ...] (the first 25 heading
@@ -1266,7 +1275,7 @@ def read_document(
     """
     try:
         return execute_read_document(
-            path, format, part, section_key, source, start_para_ref, end_para_ref, to_file
+            path, format, part, section_key, source, start_para_ref, end_para_ref, to_file, overwrite
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1326,9 +1335,11 @@ def find_sections(
     can judge whether reading it is affordable. With digests=true each
     heading entry also carries sha12, the first 12 hex of the sha256 of the
     section's paragraph texts joined with "\\n" (table-cell paragraphs
-    included, no normalization) -- defined to agree with the live pane's
-    section digests (live_list_sections compact=true, live_revision) for
-    unchanged text.
+    included, no normalization; a soft line break counts as Word's U+000B) --
+    defined to agree with the live pane's section digests (live_list_sections
+    compact=true, live_revision) for unchanged text. Checked against real Word for
+    plain text, soft line breaks and <w:tab/> tabs; field results, tracked deletions
+    and a literal tab character typed inside a w:t are NOT verified and may differ.
 
     Not gated by DOCX_LOCKED — see list_parts' docstring.
 
@@ -3629,7 +3640,8 @@ def read_header_footer(path: str) -> dict[str, Any]:
 
 
 _VALID_DIFF_FORMATS = frozenset({"hunks", "unified"})
-_MD_HEADING_RE = re.compile(r"^ {0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$")
+# Outline levels 6-8 render as 7-9 "#" characters (level + 1), so accept up to nine.
+_MD_HEADING_RE = re.compile(r"^ {0,3}#{1,9}[ \t]+(.+?)[ \t]*#*[ \t]*$")
 
 
 def _file_section_slice(lines: list[str], section_key: str) -> tuple[list[str], int]:
@@ -3652,12 +3664,13 @@ def _file_section_slice(lines: list[str], section_key: str) -> tuple[list[str], 
         m = _MD_HEADING_RE.match(line.rstrip("\r\n"))
         if m:
             headings.append(idx)
-    matching = [
-        idx
-        for idx in headings
-        if projection._slugify(locate.normalize_for_compare(_MD_HEADING_RE.match(lines[idx].rstrip("\r\n")).group(1)))
-        == base
-    ]
+    def slug_matches(idx: int) -> bool:
+        text = _MD_HEADING_RE.match(lines[idx].rstrip("\r\n")).group(1)
+        # find_sections slugged the docx's raw heading text; a converted file may have folded it
+        # (soft hyphens, NFC), so accept either spelling.
+        return base in (projection._slugify(text), projection._slugify(locate.normalize_for_compare(text)))
+
+    matching = [idx for idx in headings if slug_matches(idx)]
     if ordinal < 1 or ordinal > len(matching):
         raise _make_error(
             ErrorCode.INVALID_INPUT,
@@ -3749,6 +3762,11 @@ def execute_diff_body_vs_file(
         if normalize:
             body_cmp = locate.normalize_for_compare(body_markdown).rstrip("\n")
             file_cmp = locate.normalize_for_compare(file_content).rstrip("\n")
+            # Give both sides the same final newline, so the last line of an otherwise
+            # unchanged file never differs only by its line ending (and a unified diff
+            # never glues two lines together).
+            body_cmp += "\n" if body_cmp else ""
+            file_cmp += "\n" if file_cmp else ""
         else:
             body_cmp, file_cmp = body_markdown, file_content
         identical = body_cmp == file_cmp
@@ -3911,7 +3929,8 @@ def diff_body_vs_file(
         edits. The response says normalized. identical is then judged on the
         folded text (a trailing newline difference does not count);
         identical_raw is always the byte-for-byte comparison, i.e. the old
-        meaning of identical. normalize=false compares exactly.
+        meaning of identical: a caller that needs "nothing differs, not even
+        dashes or quotes" must read identical_raw (or pass normalize=false).
       - format="hunks" (default) returns hunks only; "unified" returns
         unified_diff only. Never both. An equal hunk carries no text, just
         {tag:"equal", body_lines_count, file_lines_count, body_range,

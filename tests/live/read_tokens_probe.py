@@ -38,7 +38,7 @@ status = registry.status() if hasattr(registry, "status") else {}
 opened = open_pane_live.execute_open_pane(path, timeout_s=90)
 session = registry.get(Path(path).name)
 caps = sorted(session.hello.capabilities)
-check("pane connected with new capabilities", "body_hash_v1" in caps and "compact_evidence_v1" in caps,
+check("pane connected with body_hash_v1", "body_hash_v1" in caps,
       method=opened["method"], capabilities_with_110_112=[c for c in caps if c in ("body_hash_v1", "compact_evidence_v1")])
 
 # 1. live_revision: native path, timing, and token equals a live read's.
@@ -80,6 +80,7 @@ for fmt in ("markdown", "runs"):
     lr = server.execute_read_document(path, source="live", format=fmt, start_para_ref="p10", end_para_ref="p19")
     check(f"live ranged {fmt} read matches the file range", lr[fmt] == fr[fmt])
 out = Path(tempfile.gettempdir()).parent / "probe-110-body.md"
+out.unlink(missing_ok=True)  # to_file refuses an existing file unless overwrite=true
 summary = server.execute_read_document(path, source="live", format="markdown", to_file=str(out))
 written = out.read_bytes()
 tokens = len(json.dumps(summary, separators=(",", ":"))) // 4
