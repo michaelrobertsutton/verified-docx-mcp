@@ -26,7 +26,7 @@ for(const flag of ['table','anchored','section','malformed','comments','revision
 await assert.rejects(()=>sandbox.op({anchor_text:''}),e=>e.code==='STRUCTURAL_BOUNDARY');
 texts=['same','same',''];await assert.rejects(()=>sandbox.op({anchor_text:'same'}));
 texts=['previous','target','next',''];broken=true;
-await assert.rejects(()=>sandbox.op({anchor_text:'target',track_changes:true}),e=>e.code==='VERIFICATION_FAILED');assert.equal(mode,'Off');broken=false;
+await assert.rejects(()=>sandbox.op({anchor_text:'target',track_changes:true}),e=>e.code==='VERIFICATION_FAILED'&&/before_paragraphs/.test(e.message)&&/after_paragraphs/.test(e.message));assert.equal(mode,'Off');broken=false;
 const r=await sandbox.op({anchor_text:'target',track_changes:true});assert.equal(r.after_count,3);assert.deepEqual(texts,['previous','next','']);assert.equal(mode,'Off');
 // compact_evidence_v1 (#112): counts and the two neighbours, never every paragraph twice.
 assert.equal(r.before_count,4);assert.deepEqual(JSON.parse(JSON.stringify(r.neighbours)),{previous:'previous',next:'next'});

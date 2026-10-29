@@ -734,7 +734,8 @@ def _run_accept_or_reject(
     logged, _ = audit.append_audit(path=str(resolved), tool=tool_name, evidence=evidence, evidence_ref=ref)
     evidence["audit_logged"] = logged
     # #112: the whole-document text stays in the audit log; the caller gets bounded evidence.
-    evidence_module.compact_whole_document(evidence, evidence_ref=ref if logged else None, sep="\n")
+    if logged:  # see mutations.py: never drop the only copy of the text
+        evidence_module.compact_whole_document(evidence, evidence_ref=ref, sep="\n")
     return evidence
 
 

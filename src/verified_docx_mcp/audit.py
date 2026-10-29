@@ -24,7 +24,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-_AUDIT_REDACTED_KEYS = frozenset({"before", "after", "runs_before", "runs_after"})
+# before_paragraphs / after_paragraphs: an older pane's live delete_paragraph reply, which
+# live_evidence routes into the audit record (#112); redaction must cover them too.
+_AUDIT_REDACTED_KEYS = frozenset(
+    {"before", "after", "runs_before", "runs_after", "before_paragraphs", "after_paragraphs"}
+)
 
 # Operator control surface for audit-excerpt redaction. No tool exposes the
 # toggle, so this environment variable is the only way to reach the

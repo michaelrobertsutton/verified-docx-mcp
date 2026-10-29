@@ -1496,7 +1496,10 @@ def execute_replace_body_markdown(
     logged, _ = audit.append_audit(path=str(resolved), tool="replace_body_markdown", evidence=evidence, evidence_ref=ref)
     evidence["audit_logged"] = logged
     # #112: the full before/after stays in the audit log; the caller gets bounded evidence.
-    evidence_module.compact_whole_document(evidence, evidence_ref=ref if logged else None)
+    # Only when the full text really is in the audit log: if that write failed, the response
+    # is the caller's only copy of the pre-write text, so it keeps it.
+    if logged:
+        evidence_module.compact_whole_document(evidence, evidence_ref=ref)
     return evidence
 
 
@@ -1657,7 +1660,10 @@ def execute_replace_range_markdown(
     logged, _ = audit.append_audit(path=str(resolved), tool="replace_range_markdown", evidence=evidence, evidence_ref=ref)
     evidence["audit_logged"] = logged
     # #112: the full before/after stays in the audit log; the caller gets bounded evidence.
-    evidence_module.compact_whole_document(evidence, evidence_ref=ref if logged else None)
+    # Only when the full text really is in the audit log: if that write failed, the response
+    # is the caller's only copy of the pre-write text, so it keeps it.
+    if logged:
+        evidence_module.compact_whole_document(evidence, evidence_ref=ref)
     return evidence
 
 
@@ -1764,5 +1770,8 @@ def execute_append_markdown(
     logged, _ = audit.append_audit(path=str(resolved), tool="append_markdown", evidence=evidence, evidence_ref=ref)
     evidence["audit_logged"] = logged
     # #112: the full before/after stays in the audit log; the caller gets bounded evidence.
-    evidence_module.compact_whole_document(evidence, evidence_ref=ref if logged else None)
+    # Only when the full text really is in the audit log: if that write failed, the response
+    # is the caller's only copy of the pre-write text, so it keeps it.
+    if logged:
+        evidence_module.compact_whole_document(evidence, evidence_ref=ref)
     return evidence

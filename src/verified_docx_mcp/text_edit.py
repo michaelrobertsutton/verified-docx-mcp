@@ -1198,7 +1198,9 @@ def execute_replace_text_batch_live(
         if evidence is not None:
             entry["evidence"] = evidence
         results.append(entry)
-        audit_entry = {k: v for k, v in entry.items() if k != "evidence"}
+        # No document text: an error message can embed the pane's observed text, so only the
+        # code is audited (the message goes to the caller).
+        audit_entry = {k: v for k, v in entry.items() if k not in ("evidence", "message")}
         if evidence is not None:
             audit_entry["evidence"] = {k: v for k, v in evidence.items() if k not in ("before", "after")}
         audit_results.append(audit_entry)

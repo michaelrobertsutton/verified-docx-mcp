@@ -73,6 +73,25 @@ class LiveDeleteEvidenceTests(LiveWriteBridgeTestCase):
         self.assertEqual(len(record["before_paragraphs"]), 302)
         self.assertEqual(len(record["after_paragraphs"]), 301)
 
+    async def test_older_pane_lists_are_redacted_when_the_operator_disables_excerpts(self) -> None:
+        """Review finding: the lists routed into the audit record bypassed VERIFIED_DOCX_MCP_AUDIT_EXCERPTS=0."""
+        import os
+        from unittest import mock
+
+        doc = FakeDocument(text="Secret one\nSecret target\nSecret three\nTail")
+        doc.legacy_delete_lists = True
+        await self.connect_pane(doc, capabilities=CAPS)
+        with mock.patch.dict(os.environ, {audit._AUDIT_EXCERPTS_ENV: "0"}):
+            await asyncio.to_thread(
+                paragraphs_live.delete_paragraph, str(self.target), "Secret target", f"live:sha256:{doc.sha256()}"
+            )
+        raw = (audit._state_dir() / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn("Secret one", raw)
+        self.assertNotIn("Secret three", raw)
+        record = _records("delete_paragraph")[-1]["evidence"]
+        self.assertTrue(record["before_paragraphs"].startswith("[redacted;"))
+        self.assertTrue(record["after_paragraphs"].startswith("[redacted;"))
+
     async def test_long_neighbours_are_clipped(self) -> None:
         doc = FakeDocument(text="x" * 900 + "\nTarget paragraph\n" + "y" * 900 + "\nTail")
         result = await self.delete(doc)

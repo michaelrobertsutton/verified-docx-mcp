@@ -520,6 +520,18 @@ class CompactBatchReportTests(_BatchCase):
         self.assertEqual(result["results"][2], {"index": 2, "status": "not_attempted"})
         self.assertEqual(result["revision_after"], result["results"][0]["evidence"]["revision_after"])
 
+    async def test_error_messages_reach_the_caller_but_never_the_audit_log(self) -> None:
+        """Review finding: a pane's error text can embed document text; the audit entry keeps the code only."""
+        doc = FakeDocument(text=TEXT)
+        await self.connect_pane(doc)
+        before = len(_audit_records("replace_text_batch"))
+        result = await self.batch([_edit("alpha", "A"), _edit("nowhere", "X")], _rev(doc))
+        self.assertTrue(result["results"][1]["message"])
+        record = _audit_records("replace_text_batch")[before]
+        audited = record["evidence"]["results"]
+        self.assertEqual(audited[1]["code"], "ZERO_MATCH")
+        self.assertTrue(all("message" not in entry for entry in audited))
+
     async def test_stale_start_is_reported_with_its_message(self) -> None:
         doc = FakeDocument(text=TEXT)
         await self.connect_pane(doc)

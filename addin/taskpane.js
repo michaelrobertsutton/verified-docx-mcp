@@ -2987,13 +2987,14 @@ async function opParagraphDelete(payload) {
     const after = remaining.items.map(p => p.text);
     const expected = before.filter((_,i) => i !== index);
     // compact_evidence_v1 (#112): counts and the two neighbouring paragraphs, not every
-    // paragraph of the section twice. The read-back above still compares the full lists here.
+    // paragraph of the section twice. The read-back below still compares the full lists here.
     const clip = text => text == null ? null : (text.length <= 200 ? text : text.slice(0, 200) + "…");
     const result = {applied:true,before_count:before.length,after_count:after.length,
       neighbours:{previous:clip(index > 0 ? before[index-1] : null), next:clip(index+1 < before.length ? before[index+1] : null)},
       pre,post:await mutationHash(context, {...payload, expectedBodySha256:undefined})};
     if (JSON.stringify(after) !== JSON.stringify(expected))
-      throw refusalError(`Paragraph deletion read-back failed; observed effects: ${JSON.stringify(result)}`, 'VERIFICATION_FAILED');
+      // The uncertain-outcome path needs the full lists to reconcile, so they stay in this message only.
+      throw refusalError(`Paragraph deletion read-back failed; observed effects: ${JSON.stringify({...result, before_paragraphs:before, after_paragraphs:after})}`, 'VERIFICATION_FAILED');
     return result;
   });
 }

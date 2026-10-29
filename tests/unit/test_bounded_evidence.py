@@ -116,7 +116,11 @@ class WholeDocumentToolsTests(unittest.TestCase):
             result = mutations.execute_append_markdown(str(self.target), "Another paragraph.")
         self.assertFalse(result["audit_logged"])
         self.assertNotIn("evidence_ref", result)
-        self.assertIn("after_sha256", result)
+        # Review finding: if the audit write failed, the response is the caller's ONLY copy of the
+        # pre-write text, so it must not be compacted away.
+        self.assertIn("before", result)
+        self.assertTrue(result["after"].endswith("Another paragraph."))
+        self.assertNotIn("after_sha256", result)
 
     def test_redacted_audit_still_returns_bounded_evidence(self):
         with mock.patch.dict(os.environ, {audit._AUDIT_EXCERPTS_ENV: "0"}):

@@ -2023,8 +2023,9 @@ def format_text(
     matched text span, without touching its content.
 
     The text never changes, so the result carries ``text_unchanged: true`` and one
-    ``excerpt`` instead of a before and an after, plus ``format_delta`` (only the
-    attributes that moved). ``verbose=true`` also returns ``runs_before`` /
+    ``excerpt`` instead of a before and an after, plus ``format_delta`` (only the direct
+    character formatting that moved; a named style may change none of it, so ``style_id``
+    is what shows it applied). ``verbose=true`` also returns ``runs_before`` /
     ``runs_after`` (issue #112).
 
     `write_mode` (issue #106 WP-3, "auto" | "file" | "live", default
@@ -3534,8 +3535,9 @@ def apply_style(
     the named-style counterpart to format_text's four boolean toggles.
 
     The text never changes, so the result carries ``text_unchanged: true`` and one
-    ``excerpt`` instead of a before and an after, plus ``format_delta`` (only the
-    attributes that moved). ``verbose=true`` also returns ``runs_before`` /
+    ``excerpt`` instead of a before and an after, plus ``format_delta`` (only the direct
+    character formatting that moved; a named style may change none of it, so ``style_id``
+    is what shows it applied). ``verbose=true`` also returns ``runs_before`` /
     ``runs_after`` (issue #112).
 
     This tool has no `write_mode` parameter -- it always writes the
