@@ -3010,6 +3010,7 @@ def replace_cell_markdown(
     allow_concurrent_editor: bool = False,
     write_mode: str = "auto",
     expected_before: str | None = None,
+    inherit_format: str = "first_run",
 ) -> dict[str, Any]:
     """Replace one table cell's content with rendered markdown, leaving
     its own w:tcPr byte-identical -- the only write path safe on a merged
@@ -3087,7 +3088,7 @@ def replace_cell_markdown(
             path, table_id, row_index, cell_index, markdown,
             revision_before=revision_before, force=force, track_changes=track_changes,
             allow_concurrent_editor=allow_concurrent_editor, write_mode=write_mode,
-            expected_before=expected_before,
+            expected_before=expected_before, inherit_format=inherit_format,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -3967,7 +3968,7 @@ def delete_table(
 @mcp.tool()
 def insert_paragraphs(
     path: str,
-    anchor: str,
+    anchor: str | dict[str, Any],
     paragraphs: list[dict[str, Any]],
     expected_matches: int,
     position: str = "after",
@@ -4155,6 +4156,26 @@ def delete_table_row(path: str, table_id: int, row_index: int, expected_text: st
             expected_text=expected_text, revision_before=revision_before,
             track_changes=track_changes, write_mode=write_mode,
             allow_concurrent_editor=allow_concurrent_editor)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def merge_paragraph_with_next(path: str, table_id: int, row_index: int, cell_index: int,
+    paragraph_index: int, expected_text: list[str] | None = None, separator: str = "",
+    revision_before: str | None = None, track_changes: bool = False,
+    write_mode: str = "auto", allow_concurrent_editor: bool = False) -> dict[str, Any]:
+    """Merge two adjacent paragraphs in one cell, preserving inline formatting and the first pPr.
+
+    Indices are 1-based. expected_text optionally guards both paragraph texts.
+    separator defaults to empty. Refuses comments, shapes and unsafe structure;
+    tracked merges require live Word. Verified and audited.
+    """
+    from .paragraph_merge import execute
+    try:
+        return execute(path, table_id, row_index, cell_index, paragraph_index,
+            expected_text, separator, revision_before, track_changes, write_mode,
+            allow_concurrent_editor)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

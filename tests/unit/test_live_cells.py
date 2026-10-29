@@ -147,7 +147,7 @@ class ReplaceCellLiveTests(LiveWriteBridgeTestCase):
 
     async def test_multiline_needs_the_cell_multiline_capability_and_sends_nothing(self) -> None:
         doc = _two_by_two()
-        await self.connect_pane(doc, capabilities=["cell_edit", "shape_guard"])
+        await self.connect_pane(doc, capabilities=["cell_edit", "cell_font_inheritance_v1", "shape_guard"])
         for markdown in ("one\n\ntwo", "one  \ntwo"):
             with self.subTest(markdown=markdown):
                 envelope = await self.assertRefusedWith(ErrorCode.LIVE_CAPABILITY_MISSING, markdown)

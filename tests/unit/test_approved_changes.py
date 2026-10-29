@@ -15,7 +15,7 @@ from verified_docx_mcp.live.session import LiveOpFailed
 class Pane:
     document_name = "collaborative.docx"
     document_url = "https://example.test/collaborative.docx"
-    hello = SimpleNamespace(capabilities=["approved_changes_v1", "cell_edit", "cell_multiline", "table_edit"])
+    hello = SimpleNamespace(capabilities=["cell_font_inheritance_v1", "approved_changes_v1", "cell_edit", "cell_multiline", "table_edit"])
 
     def __init__(self):
         self.sections = [{"slug": "target", "paragraphs": ["Target", "Proof is current.", "Delete the whole paragraph."],

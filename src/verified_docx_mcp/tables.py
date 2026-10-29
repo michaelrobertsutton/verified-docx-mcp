@@ -533,7 +533,10 @@ def execute_replace_cell_markdown(
     track_changes: bool = False,
     write_mode: str = "auto",
     expected_before: str | None = None,
+    inherit_format: str = "first_run",
 ) -> dict[str, Any]:
+    if inherit_format not in {"first_run", "none"}:
+        raise _make_error(ErrorCode.INVALID_INPUT, "inherit_format must be first_run or none")
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
         return execute_replace_cell_markdown_live(
@@ -545,6 +548,7 @@ def execute_replace_cell_markdown(
             revision_before=revision_before,
             track_changes=track_changes,
             expected_before=expected_before,
+            inherit_format=inherit_format,
         )
 
     own_author = resolve_author_name()
@@ -584,6 +588,20 @@ def execute_replace_cell_markdown(
     # tree across levels via increasing w:ilvl (issue #28 WP-16a; see
     # StyleContext.allocate_list_root/ensure_list_level).
     new_elements = _render_cell_markdown(markdown, ctx)
+    if inherit_format == "first_run":
+        import copy
+        first_run = next(tc.iter(_w("r")), None)
+        original = first_run.find(_w("rPr")) if first_run is not None else None
+        if original is not None:
+            inherited = [n for n in original if projection._ln(n) in {"rFonts", "sz", "szCs", "color"}]
+            for block in new_elements:
+                for run in block.iter(_w("r")):
+                    props = run.find(_w("rPr"))
+                    if props is None:
+                        props = ET.Element(_w("rPr")); run.insert(0, props)
+                    for prop in inherited:
+                        if props.find(prop.tag) is None:
+                            props.append(copy.deepcopy(prop))
 
     # tcPr snapshot, purely for the byte-identity acceptance check this
     # tool exists to satisfy -- never read from again, never mutated.
@@ -750,6 +768,7 @@ def execute_replace_cell_markdown_live(
     revision_before: str | None = None,
     track_changes: bool = False,
     expected_before: str | None = None,
+    inherit_format: str = "first_run",
 ) -> dict[str, Any]:
     """Live-mode ``replace_cell_markdown`` (issue #27, #75).
 
@@ -785,6 +804,9 @@ def execute_replace_cell_markdown_live(
         live_write_mode.require_capability(
             session, _CELL_MULTILINE_CAPABILITY, feature_description="live multi-paragraph / line-break cell edits"
         )
+    if inherit_format == "first_run":
+        live_write_mode.require_capability(session, "cell_font_inheritance_v1",
+            feature_description="cell first-run font inheritance")
     document_name = session.document_name
     address = {"table_index": table_id, "row_index": row_index, "cell_index": cell_index}
 
@@ -805,6 +827,7 @@ def execute_replace_cell_markdown_live(
             {
                 **address,
                 "paragraphs": _runs_to_wire(paragraphs),
+                "inherit_format": inherit_format,
                 "expected_before_text": before_text,
                 "track_changes": track_changes,
             },

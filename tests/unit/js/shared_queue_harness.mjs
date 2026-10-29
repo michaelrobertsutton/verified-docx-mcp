@@ -29,10 +29,12 @@ assert.deepEqual(events, ['start']);
 release();
 await Promise.all([first, handled, third]);
 assert.deepEqual(events, ['start', 'end', 'second', 'third']);
-for (const op of ['replace', 'format', 'comment_reply', 'comment_resolve', 'autoopen_set', 'save']) {
+for (const op of ['replace', 'format', 'comment_reply', 'comment_resolve', 'autoopen_set']) {
   await assert.rejects(sandbox.dispatch(op, {clientId:'a', expectedBodySha256:'old'}), {code:'LIVE_STALE'});
 }
 assert.equal(sandbox.mutations, 0);
 await sandbox.dispatch('comment_reply', {clientId:'a', expectedBodySha256:'current'});
 assert.equal(sandbox.mutations, 1);
+await sandbox.dispatch('save', {clientId:'a', expectedBodySha256:'old'});
+assert.equal(sandbox.mutations, 2);
 console.log('queue order, rejection recovery, and all-family stale preflight passed');

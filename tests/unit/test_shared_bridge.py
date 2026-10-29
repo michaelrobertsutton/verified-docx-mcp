@@ -930,3 +930,17 @@ def test_heartbeat_sample_cannot_refresh_client_read_baseline(setup_broker):
     with pytest.raises(LiveOpFailed, match='Human content changed'):
         call(a, op='replace')
     assert broker.hashes[(a, pane.document_url)] == 'initial'
+
+
+def test_save_neither_requires_nor_refreshes_content_baseline(setup_broker):
+    _pane, broker, a, b, call = setup_broker
+    call(a)
+    call(b)
+    call(b, "replace")
+    version = broker.versions[next(iter(broker.versions))]
+    seen = dict(broker.seen)
+    call(a, "save")
+    assert broker.versions[next(iter(broker.versions))] == version
+    assert broker.seen == seen
+    with pytest.raises(LiveOpFailed, match="Read the live document"):
+        call(a, "replace")

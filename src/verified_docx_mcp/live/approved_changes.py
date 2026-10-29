@@ -83,7 +83,7 @@ class ScopedSession:
     def request_threadsafe(self, op, payload=None, **kwargs):
         from .shared import READ_OPS
         data = dict(payload or {})
-        if op not in READ_OPS:
+        if op not in READ_OPS or op == "save":
             data.pop("expectedBodySha256", None)
             data["executionSections"] = self.sections
             data["executionTargetSection"] = _TARGET.get()
@@ -308,6 +308,7 @@ def apply(path, operation, track_changes=False):
             address = {"table_index": args["table_id"], "row_index": args["row_index"], **common}
             if op == "replace_cell_markdown":
                 wm.require_capability(session, "cell_edit", feature_description="scoped cell writes")
+                wm.require_capability(session, "cell_font_inheritance_v1", feature_description="cell font preservation")
                 before = row[args["cell_index"]-1]
                 after = plain(args["markdown"])
                 address["cell_index"] = args["cell_index"]
@@ -315,7 +316,7 @@ def apply(path, operation, track_changes=False):
                 if len(paragraphs) > 1 or any(r.hard_break for p in paragraphs for r in p):
                     wm.require_capability(session, "cell_multiline", feature_description="multiline cell writes")
                 streamed = "approved_cell_stream_v1" in session.hello.capabilities and os.environ.get("VERIFIED_DOCX_DISABLE_APPROVED_CELL_STREAM") != "1"
-                cell_payload = {**address, "expected_before_text": before,
+                cell_payload = {**address, "expected_before_text": before, "inherit_format": "first_run",
                     "paragraphs": tables._runs_to_wire(paragraphs),
                     "expected_before_paragraph_count": table.get("paragraph_counts", [[None]*len(r) for r in table["rows"]])[args["row_index"]-1][args["cell_index"]-1]}
                 try:

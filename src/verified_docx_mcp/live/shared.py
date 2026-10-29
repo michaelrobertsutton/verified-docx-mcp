@@ -41,6 +41,7 @@ READ_OPS = frozenset(
         "autoopen_get",
         "sections_list",
         "execution_snapshot",
+        "save",  # Persistence does not mutate content or establish a read baseline.
     }
 )
 # Pane refusals raised before any mutation; they must not stale other clients.
@@ -367,7 +368,7 @@ class Broker:
                     # A protected-section digest is not a whole-body baseline.
                     self.seen[(client_id,key)] = -1
                     self.hashes.pop((client_id,key),None)
-                elif op != "execution_snapshot" and (write or request.get("observe", True)):
+                elif op not in {"execution_snapshot", "save"} and (write or request.get("observe", True)):
                     self.seen[(client_id, key)] = self.versions.get(key, 0)
                     body_hash = result.get("bodySha256") or result.get("post")
                     if body_hash:

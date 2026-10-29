@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["table_rows_v1", "table_copy_v1", "heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
+const PANE_CAPABILITIES = ["cell_paragraph_merge_v1", "paragraph_positions_v1", "cell_paragraphs_v1", "cell_font_inheritance_v1", "table_rows_v1", "table_copy_v1", "heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -685,8 +685,8 @@ function summarizeResult(op, result) {
 }
 
 const SHAPE_GUARDED_OPS = new Set(["approved_cell_set", "replace", "format", "cell_set", "cells_set",
-  "table_insert", "table_row_edit", "table_copy", "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
-  "comment_add", "comment_reply", "comment_resolve", "comment_delete", "save", "table_delete", "paragraphs_unlist"]);
+  "table_insert", "table_row_edit", "table_copy", "cell_paragraph_merge", "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
+  "comment_add", "comment_reply", "comment_resolve", "comment_delete", "table_delete", "paragraphs_unlist"]);
 
 // One queue across reconnects. A timed-out write can still be running in Word;
 // later commands must not overlap it, including commands on a new socket.
@@ -700,7 +700,7 @@ function enqueuePaneOperation(operation) {
 }
 const READ_ONLY_OPS = new Set(["ping", "describe", "body_ooxml", "search", "comments_list",
   "cell_get", "table_get", "shapes_list", "textboxes_list", "textboxes_read", "scope_describe",
-  "revisions_list", "autoopen_get", "sections_list", "execution_snapshot"]);
+  "revisions_list", "autoopen_get", "sections_list", "execution_snapshot", "save"]);
 
 async function dispatchOp(op, payload) {
   if (op === "save" && payload.executionSections)
@@ -782,6 +782,8 @@ async function dispatchOpUnchecked(op, payload) {
       return opTableInsert(payload);
     case "cells_set":
       return opCellsSet(payload);
+    case "cell_paragraph_merge":
+      return opCellParagraphMerge(payload);
     case "paragraph_delete":
       return opParagraphDelete(payload);
     case "paragraph_insert":
@@ -1849,6 +1851,13 @@ async function opCellSet(payload) {
     if (canonicalCellText(beforeParagraphs.join("\n")) !== canonicalCellText(payload.expected_before_text) ||
         (payload.expected_before_paragraph_count != null && beforeParagraphs.length !== payload.expected_before_paragraph_count))
       throw refusalError("Cell changed during preflight; nothing was written", "LIVE_STALE");
+    let inheritedFont = null;
+    if (payload.inherit_format === "first_run") {
+      const first = cell.body.paragraphs.getFirst().getRange("Start").font;
+      first.load("name,size,color");
+      await context.sync();
+      inheritedFont = {name:first.name,size:first.size,color:first.color};
+    }
     const want = intendedCellParagraphs(payload.paragraphs);
 
     // Write, then self-check: the cell must hold exactly the intended
@@ -1863,6 +1872,11 @@ async function opCellSet(payload) {
       const strategies = payload.track_changes ? CELL_WRITE_STRATEGIES.slice(0, 1) : CELL_WRITE_STRATEGIES;
       for (const strategy of strategies) {
         await writeCellParagraphs(context, cell, payload.paragraphs || [], strategy);
+        if (inheritedFont) {
+          for (const [key,value] of Object.entries(inheritedFont)) {
+            if (value !== null && value !== undefined && value !== "") cell.body.font[key] = value;
+          }
+        }
         await context.sync();
         got = await readCellParagraphs(context, cell);
         if (sameParagraphs(want, got)) {
@@ -1874,6 +1888,13 @@ async function opCellSet(payload) {
       if (previousMode !== null) {
         context.document.changeTrackingMode = previousMode;
         await context.sync();
+      }
+    }
+    if (usedStrategy !== null && inheritedFont) {
+      cell.body.font.load("name,size,color"); await context.sync();
+      for (const [key,value] of Object.entries(inheritedFont)) {
+        if (value !== null && value !== undefined && value !== "" && cell.body.font[key] !== value)
+          throw refusalError(`Inherited cell font ${key} failed readback`, "VERIFICATION_FAILED");
       }
     }
     if (usedStrategy === null) {
@@ -2952,8 +2973,14 @@ async function opParagraphDelete(payload) {
     if (indexes.length !== 1) throw refusalError(`Expected unique whole paragraph, found ${indexes.length}`, 'MATCH_COUNT_MISMATCH');
     const index = indexes[0];
     const target = paragraphs.items[index];
-    if (index === before.length-1 || target.tableNestingLevel !== 0)
-      throw refusalError('Cannot delete final or table-cell paragraph', 'STRUCTURAL_BOUNDARY');
+    if (target.tableNestingLevel !== 0) {
+      const cellParagraphs = target.parentTableCell.body.paragraphs;
+      cellParagraphs.load('items'); await context.sync();
+      if (cellParagraphs.items.length <= 1)
+        throw refusalError('Cannot delete the last paragraph in a cell', 'STRUCTURAL_BOUNDARY');
+    } else if (index === before.length-1) {
+      throw refusalError('Cannot delete the final body paragraph', 'STRUCTURAL_BOUNDARY');
+    }
     const range = target.getRange(Word.RangeLocation.whole);
     await (await sectionGuard(context, payload)).check(() => [range]);
     const xml = target.getOoxml();
@@ -3118,6 +3145,7 @@ async function resolveParagraphStyle(context, spec) {
 }
 
 async function opParagraphInsert(payload) {
+  if (payload.anchor && typeof payload.anchor === "object") return opParagraphInsertPositional(payload);
   return measuredWordRun(async context => {
     const pre = await requireFreshBody(context, payload.expectedBodySha256);
     const specs = payload.paragraphs || [];
@@ -3347,10 +3375,15 @@ async function opApprovedCellSet(payload) {
   return measuredWordRun(async context => {
     payload={...payload,approvedCellStream:true};
     setExecutionPhase('preflight');
-    let cell, previousMode, shapesBefore, before;
+    let cell, previousMode, shapesBefore, before, inheritedFont;
     try {
       cell=await resolveTableCell(context,payload);
       const target=cell.body.getRange('Whole');
+      if (payload.inherit_format === 'first_run') {
+        const font=cell.body.paragraphs.getFirst().getRange('Start').font;
+        font.load('name,size,color'); await context.sync();
+        inheritedFont={name:font.name,size:font.size,color:font.color};
+      }
       previousMode = await guardApprovedCell(context, cell, payload.track_changes);
       // This fresh protected scope check is deliberately after asynchronous guards.
       const boundary=await sectionGuard(context,payload);
@@ -3375,6 +3408,9 @@ async function opApprovedCellSet(payload) {
       if (previousMode!==null) context.document.changeTrackingMode=Word.ChangeTrackingMode.trackAll;
       // Exactly one write. An uncertain or failed write never switches strategies.
       await writeCellParagraphs(context,cell,payload.paragraphs,'load-items');
+      if (inheritedFont) for(const [key,value] of Object.entries(inheritedFont)) {
+        if(value !== null && value !== undefined && value !== '') cell.body.font[key]=value;
+      }
       await context.sync();
     } finally {
       if (previousMode!==null) {context.document.changeTrackingMode=previousMode;await context.sync();}
@@ -3382,6 +3418,13 @@ async function opApprovedCellSet(payload) {
     setExecutionPhase('verification');
     // Freshly resolve the section/table/grid; no read from the mutated proxy.
     try {
+    if (inheritedFont) {
+      cell.body.font.load('name,size,color');await context.sync();
+      for(const [key,value] of Object.entries(inheritedFont)) {
+        if(value !== null && value !== undefined && value !== '' && cell.body.font[key] !== value)
+          throw refusalError('Inherited cell font differs','VERIFICATION_FAILED');
+      }
+    }
     const post=await executionXmlSnapshot(context,payload.executionSections.map(s=>s.slug));
     const shapeIdentity=shapes=>shapes.map(({anchor_paragraph,...shape})=>JSON.stringify(shape)).sort();
     if (JSON.stringify(shapeIdentity(shapesBefore))!==JSON.stringify(shapeIdentity(post.shapes)))
@@ -3605,5 +3648,100 @@ async function opTableCopy(payload) {
     const index=relations.findIndex(r=>r.value === "Equal");
     if(index < 0) throw refusalError("Copied table missing","VERIFICATION_FAILED");
     return {applied:true,table_index:index+1,pre,post:await mutationHash(context,{...payload,expectedBodySha256:undefined})};
+  });
+}
+
+// Positional anchors address structural gaps without searching for empty text.
+async function opParagraphInsertPositional(payload) {
+  return measuredWordRun(async context => {
+    const pre=await mutationHash(context,payload);
+    const tables=await loadTopLevelTables(context);
+    const fill=payload.anchor.empty_paragraph_after_table_id !== undefined;
+    const index=fill ? payload.anchor.empty_paragraph_after_table_id : payload.anchor.after_table_id;
+    const table=tables[index-1];
+    if (!table) throw refusalError('Anchor table not found','table_not_found');
+    const specs=payload.paragraphs;
+    const styles=[];
+    for(const spec of specs) styles.push(await resolveParagraphStyle(context,spec));
+    let empty=null;
+    if(fill) {
+      const xml=context.document.body.getOoxml(); await context.sync();
+      const doc=new DOMParser().parseFromString(xml.value,'application/xml');
+      const ns='http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+      const body=doc.getElementsByTagNameNS(ns,'body')[0];
+      const children=[...body.children];
+      const xmlTable=children.filter(n=>n.localName === 'tbl')[index-1];
+      const next=children[children.indexOf(xmlTable)+1];
+      if(!next || next.localName !== 'p' || visibleWordText(next) || shapeNodes(next).length ||
+          next.getElementsByTagNameNS(ns,'sectPr').length)
+        throw refusalError('No immediately following empty paragraph','STRUCTURAL_BOUNDARY');
+      empty=table.getRange('After').paragraphs.getFirst();
+      empty.load('text,tableNestingLevel'); await context.sync();
+      if(empty.text || empty.tableNestingLevel)
+        throw refusalError('Positional paragraph is not empty','STRUCTURAL_BOUNDARY');
+      await guardComments(context,[empty.getRange()],false);
+      await guardRevisions(context,[empty.getRange()]);
+    }
+    await (await sectionGuard(context,payload)).check(()=>[table.getRange('End')]);
+    await requireFreshBody(context,pre);
+    const inserted=[];
+    await withTracking(context,payload.track_changes,async()=>{
+      let previous=null;
+      specs.forEach((spec,i)=>{
+        let p;
+        if(i===0 && empty) {p=empty;p.insertText(spec.text,'Replace');}
+        else p=(previous || table).insertParagraph(spec.text,'After');
+        if(styles[i].kind === 'name') p.style=styles[i].value;
+        else p.styleBuiltIn=styles[i].value;
+        if(spec.color) p.font.color=withHash(spec.color);
+        inserted.push(p);previous=p;
+      });
+      await context.sync();
+    });
+    inserted.forEach(p=>{p.load('text,style,styleBuiltIn');p.font.load('color');});
+    await context.sync();
+    const observed=inserted.map((p,i)=>({text:p.text,style:p.style,style_builtin:p.styleBuiltIn,
+      color:p.font.color,requested_style:styles[i]}));
+    if(observed.some((p,i)=>p.text !== specs[i].text))
+      throw refusalError('Positional paragraph insertion readback failed','VERIFICATION_FAILED');
+    return {applied:true,inserted:observed,pre,post:await mutationHash(context,{...payload,expectedBodySha256:undefined})};
+  });
+}
+
+function canonicalMergeNode(node) {
+  if (node.nodeType === 3) return node.nodeValue;
+  if (node.nodeType !== 1) return null;
+  const attrs=[...node.attributes].filter(a=>a.namespaceURI !== 'http://www.w3.org/2000/xmlns/')
+    .map(a=>[a.namespaceURI,a.localName,a.value]).sort();
+  return [node.namespaceURI,node.localName,attrs,[...node.childNodes].map(canonicalMergeNode).filter(n=>n!==null)];
+}
+async function opCellParagraphMerge(payload) {
+  return measuredWordRun(async context=>{
+    const pre=await mutationHash(context,payload);
+    const cell=await resolveTableCell(context,payload);
+    const paragraphs=cell.body.paragraphs;paragraphs.load('items/text');await context.sync();
+    const i=payload.paragraph_index-1;
+    if(!Number.isInteger(i) || i<0 || i+1>=paragraphs.items.length)
+      throw refusalError('No next paragraph in this cell','STRUCTURAL_BOUNDARY');
+    const before=paragraphs.items.map(p=>p.text);
+    const pair=paragraphs.items.slice(i,i+2);
+    const xml=pair.map(p=>p.getOoxml());await context.sync();
+    const parse=xml=>new DOMParser().parseFromString(xml,'application/xml');
+    const ns='http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+    pair.forEach((p,j)=>{
+      const actual=parse(xml[j].value).getElementsByTagNameNS(ns,'p')[0];
+      const expected=parse(payload.before_xml[j]).documentElement;
+      if(JSON.stringify(canonicalMergeNode(actual)) !== JSON.stringify(canonicalMergeNode(expected)))
+        throw refusalError('Paragraph changed during preparation','LIVE_STALE');
+    });
+    const range=pair[0].getRange('Content').getRange('Start').expandTo(pair[1].getRange('Content').getRange('End'));
+    await (await sectionGuard(context,payload)).check(()=>[range]);
+    await guardComments(context,[range],false);await guardRevisions(context,[range]);
+    await guardAnchoredParagraphs(context,[range]);await requireFreshBody(context,pre);
+    await withTracking(context,payload.track_changes,async()=>{range.insertOoxml(payload.ooxml,'Replace');await context.sync();});
+    const after=await readCellParagraphs(context,cell);
+    if(after.length !== before.length-1)
+      throw refusalError('Paragraph merge count differs','VERIFICATION_FAILED');
+    return {applied:true,pre,post:await mutationHash(context,{...payload,expectedBodySha256:undefined})};
   });
 }

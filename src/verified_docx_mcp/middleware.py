@@ -48,6 +48,7 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         # issue #28 WP-06:
         "replace_text",
         "delete_paragraph",
+        "merge_paragraph_with_next",
         "format_text",
         # issue #28 WP-07 (list_open_items is read-only, not listed here):
         "accept_tracked_changes",

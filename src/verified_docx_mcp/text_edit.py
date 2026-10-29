@@ -1100,7 +1100,7 @@ def _validate_batch_edits(edits: Any) -> list[dict[str, Any]]:
                 ErrorCode.INVALID_INPUT,
                 f"edits[{i}]: allow_comment_loss is not accepted in a batch; use allow_comment_loss_ids",
             )
-        unknown = set(edit) - {"find", "replace", "expected_matches", "allow_comment_loss_ids"}
+        unknown = set(edit) - {"find", "replace", "expected_matches", "allow_comment_loss_ids", "within_row_containing"}
         if unknown:
             raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}]: unknown key(s) {sorted(unknown)}")
         find, replace, expected = edit.get("find"), edit.get("replace"), edit.get("expected_matches")
@@ -1116,7 +1116,11 @@ def _validate_batch_edits(edits: Any) -> list[dict[str, Any]]:
             raise _make_error(
                 ErrorCode.INVALID_INPUT, f"edits[{i}]: {exc.envelope.message}", exc.envelope.diagnostics
             ) from exc
-        out.append({"find": find, "replace": replace, "expected_matches": expected, "allow_comment_loss_ids": ids})
+        row_scope = edit.get("within_row_containing")
+        if row_scope is not None and (not isinstance(row_scope, str) or not row_scope.strip()):
+            raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}].within_row_containing must be nonempty text")
+        out.append({"find": find, "replace": replace, "expected_matches": expected,
+                    "allow_comment_loss_ids": ids, "within_row_containing": row_scope})
     return out
 
 
@@ -1155,7 +1159,7 @@ def execute_replace_text_batch_live(
     document_name = session.document_name
     _require_live_replace_capabilities(
         session,
-        within_row_containing=None,
+        within_row_containing=next((e["within_row_containing"] for e in checked if e["within_row_containing"]), None),
         allow_comment_loss_ids=[] if any(e["allow_comment_loss_ids"] is not None for e in checked) else None,
     )
 
@@ -1206,6 +1210,7 @@ def execute_replace_text_batch_live(
                 pre_hash=current,
                 track_changes=track_changes,
                 allow_comment_loss_ids=edit["allow_comment_loss_ids"],
+                within_row_containing=edit["within_row_containing"],
                 inherit_format=inherit_format,
             )
         except VerifyError as exc:

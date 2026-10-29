@@ -143,7 +143,7 @@ def _spec_problems(specs: list[dict[str, Any]], inserted: list[dict[str, Any]]) 
     return problems
 
 
-def insert_paragraphs(path: str, anchor: str, position: str, paragraphs: list[dict[str, Any]],
+def insert_paragraphs(path: str, anchor: str | dict[str, Any], position: str, paragraphs: list[dict[str, Any]],
                       expected_matches: int, revision_before: str | None = None,
                       track_changes: bool = False) -> dict[str, Any]:
     """Live ``insert_paragraphs`` (issue #77): ``paragraph_insert`` over the ops channel.
@@ -155,6 +155,8 @@ def insert_paragraphs(path: str, anchor: str, position: str, paragraphs: list[di
     """
     session = wm.live_session_for(path)
     wm.require_capability(session, "paragraph_insert", feature_description="paragraph insertion")
+    if isinstance(anchor, dict):
+        wm.require_capability(session, "paragraph_positions_v1", feature_description="positional paragraph anchors")
     pre = comments_live._request(session, "describe")["bodySha256"]
     wm.check_not_stale(revision_before, pre)
     wire = [{key: spec[key] for key in ("text", "style", "color") if spec.get(key) is not None}

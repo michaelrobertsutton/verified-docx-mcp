@@ -3,8 +3,10 @@ import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
 let texts=['previous','target','next',''];
+let cellParagraphCount=1;
 let trailer=null; let mode='Off', table=false, anchored=false, section=false, malformed=false, comments=false, revisions=false, broken=false;
 const collection={load(){},get items(){return texts.map((text,i)=>({text,tableNestingLevel:table&&i===1?1:0,
+  parentTableCell:{body:{paragraphs:{load(){},get items(){return Array.from({length:cellParagraphCount},()=>({}));}}}},
   getOoxml:()=>({value:'xml'}),getRange:()=>({getComments:()=>({items:comments?[comment]:[],load(){}}),
     getTrackedChanges:()=>({items:revisions?[{}]:[],load(){}})}),delete(){if(!broken)texts.splice(i,1);}}));}};
 const comment={id:'c',content:'question',authorName:'A',resolved:false,
@@ -36,4 +38,8 @@ trailer={textContent:'',getElementsByTagNameNS:(ns,tag)=>tag==='drawing'?[{}]:[]
 await assert.rejects(()=>sandbox.op({anchor_text:'next'}),e=>e.code==='STRUCTURAL_BOUNDARY');
 trailer=empty;texts=['previous','target','next',''];
 const withTrailer=await sandbox.op({anchor_text:'target'});assert.equal(withTrailer.after_count,3);trailer=null;
+texts=['previous','target','next',''];table=true;cellParagraphCount=2;
+const cellDeleted=await sandbox.op({anchor_text:'target'});
+assert.equal(cellDeleted.applied,true);assert.deepEqual(texts,['previous','next','']);
+table=false;cellParagraphCount=1;
 console.log('paragraph deletion passed');

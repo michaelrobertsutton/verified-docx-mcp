@@ -32,15 +32,22 @@ def _invalid(message: str, **diagnostics: Any) -> Exception:
 
 
 def validate_insert_request(
-    anchor: str, position: str, paragraphs: list[dict[str, Any]], expected_matches: int
+    anchor: str | dict[str, Any], position: str, paragraphs: list[dict[str, Any]], expected_matches: int
 ) -> list[dict[str, Any]]:
     """Return normalized paragraph specs (``text``, ``style``, ``color``: uppercase
     6-hex without ``#``, or ``None``); raise ``INVALID_INPUT`` otherwise."""
-    if not isinstance(anchor, str) or not anchor:
+    positional = isinstance(anchor, dict)
+    if positional:
+        keys = {"after_table_id", "empty_paragraph_after_table_id"}
+        if len(anchor) != 1 or not set(anchor) <= keys or type(next(iter(anchor.values()))) is not int or next(iter(anchor.values())) < 1:
+            raise _invalid("anchor must contain one positive after_table_id or empty_paragraph_after_table_id")
+        if position != "after":
+            raise _invalid("Positional table anchors use position=after")
+    if not positional and (not isinstance(anchor, str) or not anchor):
         raise _invalid("anchor must be a non-empty string")
-    if any(ch in anchor for ch in _FORBIDDEN_TEXT_CHARS):
+    if not positional and any(ch in anchor for ch in _FORBIDDEN_TEXT_CHARS):
         raise _invalid("anchor must be one line of text (no newline, vertical tab or tab characters)")
-    if len(anchor) > _MAX_ANCHOR_LEN:
+    if not positional and len(anchor) > _MAX_ANCHOR_LEN:
         raise _invalid(f"anchor is {len(anchor)} characters; Word searches at most {_MAX_ANCHOR_LEN}")
     if position not in ("after", "before"):
         raise _invalid(f"position must be 'after' or 'before', got {position!r}")
@@ -76,7 +83,7 @@ def validate_insert_request(
 
 def execute_insert_paragraphs(
     path: str,
-    anchor: str,
+    anchor: str | dict[str, Any],
     paragraphs: list[dict[str, Any]],
     expected_matches: int,
     *,
@@ -152,7 +159,7 @@ def _paragraph_style_id(p_elem: Any) -> str | None:
 
 def _insert_paragraphs_file(
     path: str,
-    anchor: str,
+    anchor: str | dict[str, Any],
     specs: list[dict[str, Any]],
     expected_matches: int,
     *,
@@ -168,18 +175,32 @@ def _insert_paragraphs_file(
 
     document_root, raw_xml = mutations._load_document(resolved)
     proj = projection.project_document_root(document_root)
-    locate_result = locate(anchor, proj, expected_matches)
-    start, end = locate_result.spans[0]
-    atoms = text_edit._atoms_for_span(proj, start, end)
     parent_map = text_edit._build_parent_map(document_root)
-    p_elem = text_edit._enclosing_paragraph(parent_map, atoms[0][2].r_elem) if atoms else None
     body = mutations._find_body(document_root)
-    if p_elem is None or parent_map.get(id(p_elem)) is not body:
-        raise _make_error(
-            ErrorCode.STRUCTURAL_BOUNDARY,
-            "the anchor is not in a top-level body paragraph (a table cell or other container); "
-            "anchor on text in a body paragraph.",
-            {"anchor": anchor})
+    fill_empty = isinstance(anchor, dict) and "empty_paragraph_after_table_id" in anchor
+    if isinstance(anchor, dict):
+        from . import tables
+        p_elem = tables._find_table_element(document_root, next(iter(anchor.values())))
+        if parent_map.get(id(p_elem)) is not body:
+            raise _make_error(ErrorCode.STRUCTURAL_BOUNDARY, "Anchor must be a top-level table")
+        if fill_empty:
+            index = list(body).index(p_elem) + 1
+            if index >= len(body) or body[index].tag != text_edit._w("p") or any((n.tag == text_edit._w("t") and bool(n.text)) or projection._ln(n) in
+                {"drawing", "pict", "object", "sectPr", "tab", "br", "cr", "bookmarkStart", "bookmarkEnd", "fldChar", "instrText", "footnoteReference", "endnoteReference"}
+                for n in body[index].iter()):
+                raise _make_error(ErrorCode.STRUCTURAL_BOUNDARY, "No immediately following empty paragraph")
+            p_elem = body[index]
+            mutations._check_hazards_or_raise(mutations._scan_range_hazards([p_elem]), False, resolve_author_name())
+        start, end = 0, 0
+        from types import SimpleNamespace
+        locate_result = SimpleNamespace(rung=1, warnings=[])
+    else:
+        locate_result = locate(anchor, proj, expected_matches)
+        start, end = locate_result.spans[0]
+        atoms = text_edit._atoms_for_span(proj, start, end)
+        p_elem = text_edit._enclosing_paragraph(parent_map, atoms[0][2].r_elem) if atoms else None
+        if p_elem is None or parent_map.get(id(p_elem)) is not body:
+            raise _make_error(ErrorCode.STRUCTURAL_BOUNDARY, "Anchor must be a top-level body paragraph")
 
     new_ps = [_build_paragraph(spec, style_id) for spec, style_id in zip(specs, style_ids, strict=True)]
     track = None
@@ -188,7 +209,9 @@ def _insert_paragraphs_file(
         tracked_changes.wrap_all_runs(
             new_ps,
             lambda r: tracked_changes.wrap_insertion(r, rid=track.next_id(), author=track.author, date=track.date))
-    at = list(body).index(p_elem) + (1 if position == "after" else 0)
+    at = list(body).index(p_elem) + (0 if fill_empty else (1 if position == "after" else 0))
+    if fill_empty:
+        body.remove(p_elem)
     for offset, new_p in enumerate(new_ps):
         body.insert(at + offset, new_p)
 
