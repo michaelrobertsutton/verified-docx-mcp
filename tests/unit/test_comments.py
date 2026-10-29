@@ -727,7 +727,7 @@ class MultiParagraphCommentIdentityTests(_TempFixtureCase):
 class GoldenFixtureListOpenItemsRegressionTests(unittest.TestCase):
     """Spec test 7: the identity fix must not change list_open_items'
     output for the golden fixture -- it carries only single-paragraph
-    comments, so a first-vs-last-paragraph identity change is a no-op for
+    comments (its reply is now threaded under the root, not top level), so a first-vs-last-paragraph identity change is a no-op for
     it. Pinned as an exact snapshot rather than a relative comparison
     (there is no "before this change" binary to diff against here); a
     single-paragraph comment has only one paraId, so this snapshot is
@@ -758,22 +758,15 @@ class GoldenFixtureListOpenItemsRegressionTests(unittest.TestCase):
                 "w_id": "0",
                 "content": "comment.",
                 "resolved": False,
-                "reply_count": 0,
-                "replies": [],
-                "quoted_text": "role in making cities healthier and more livable. Parks, gardens, and "
-                "tree-lined streets help soften the hard edges ",
-                "author": "Michael Sutton",
-                "created_time": "2026-09-10T21:33:00Z",
-                "modified_time": "",
-                "scope": "document",
-            },
-            {
-                "comment_id": "7E7E1D27",
-                "w_id": "1",
-                "content": "reply.",
-                "resolved": False,
-                "reply_count": 0,
-                "replies": [],
+                "reply_count": 1,
+                "replies": [
+                    {
+                        "id": "7E7E1D27",
+                        "author": "Michael Sutton",
+                        "date": "2026-09-10T21:33:00Z",
+                        "text": "reply.",
+                    }
+                ],
                 "quoted_text": "role in making cities healthier and more livable. Parks, gardens, and "
                 "tree-lined streets help soften the hard edges ",
                 "author": "Michael Sutton",

@@ -794,21 +794,7 @@ def execute_get_comment_thread(path: str, comment_id: str) -> dict[str, Any]:
                     },
                 )
 
-        done_by_para: dict[str, str | None] = {}
-        parent_by_para: dict[str, str | None] = {}
-        children_by_parent: dict[str, list[str]] = {}
-        if ext_root is not None:
-            for child in ext_root:
-                if projection._ln(child) != "commentEx":
-                    continue
-                pid = projection._attr(child, "paraId")
-                if not pid:
-                    continue
-                done_by_para[pid] = projection._attr(child, "done")
-                parent_pid = projection._attr(child, "paraIdParent")
-                parent_by_para[pid] = parent_pid
-                if parent_pid:
-                    children_by_parent.setdefault(parent_pid, []).append(pid)
+        done_by_para, _parent_by_para, children_by_parent = projection.comment_thread_links(ext_root)
 
         w_id_by_para = {v: k for k, v in para_id_by_w_id.items()}
 

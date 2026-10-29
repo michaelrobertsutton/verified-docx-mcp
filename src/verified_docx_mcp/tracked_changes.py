@@ -21,11 +21,18 @@ commentsExtended.xml's resolved flag, anchor text taken from the live
 projection's own comment_ids tracking -- see projection.RunEvent) and
 `pending_suggestions` (every w:ins/w:del in word/document.xml, with author/
 date/text, in Google's {suggestion_id, kind, text, anchor_context} shape).
-Scope limit, documented rather than silently mishandled: comment REPLY
-threading (commentsExtended's parent/child linking) is not resolved here --
-every comment reports reply_count=0/replies=[]; WP-08 owns the fixture
-(tests/fixtures/comments/golden-comment.docx) built specifically to test
-threading, and this WP does not touch it.
+Comment threading: a reply is a w:comment whose commentsExtended.xml
+w15:commentEx carries w15:paraIdParent = its parent's identity paraId (the
+parent comment's LAST paragraph w14:paraId, projection.identity_para_id;
+parsed by the shared projection.comment_thread_links, the same walk
+comments.get_comment_thread uses). `comments` lists ROOT comments only; each
+root reports reply_count == len(replies) and replies = [{id, author, date,
+text}] in comments.xml order (id is the reply's durableId, falling back to
+its w:id). A reply never appears at top level. The root comment's
+resolved/done state governs the whole thread: a resolved root hides its
+replies with it, and a reply's own done flag is ignored. A reply whose
+parent paraId matches no comment is treated as a root rather than dropped.
+Replies to replies are flattened onto the thread's root.
 
 accept_tracked_changes/reject_tracked_changes both take an optional
 `revision_ids` (a w:ins/w:del `w:id` list) -- omitted or None means every
@@ -116,24 +123,10 @@ def _parse_comments(local_path: Path, proj: projection.Projection) -> list[dict[
         if "word/comments.xml" not in names:
             return []
         comments_root = ET.fromstring(zf.read("word/comments.xml"))
-        ext_by_paraid: dict[str, dict[str, Any]] = {}
-        # ext_root/ids_root stay in scope (possibly None) past these two
-        # `if` blocks -- issue #108's identity_para_id needs the parsed
-        # roots themselves, not just the paraId->value dicts built below,
-        # to resolve a multi-paragraph comment's identity paraId.
         ext_root: Any | None = None
         ids_root: Any | None = None
         if "word/commentsExtended.xml" in names:
             ext_root = ET.fromstring(zf.read("word/commentsExtended.xml"))
-            for child in ext_root:
-                if projection._ln(child) != "commentEx":
-                    continue
-                pid = projection._attr(child, "paraId")
-                if pid:
-                    ext_by_paraid[pid] = {
-                        "done": projection._attr(child, "done"),
-                        "parent": projection._attr(child, "parent"),
-                    }
         # New for the WP-08 interop fix: durableId per paraId, from
         # word/commentsIds.xml -- comments.py's add_anchored_comment/
         # get_comment_thread already key everything on durableId (the plan
@@ -165,7 +158,9 @@ def _parse_comments(local_path: Path, proj: projection.Projection) -> list[dict[
             for cid in event.comment_ids:
                 anchor_by_id.setdefault(cid, []).append(event.text)
 
+    done_by_para, parent_by_para, _children = projection.comment_thread_links(ext_root)
     comments: list[dict[str, Any]] = []
+    para_by_index: list[str | None] = []
     for c in comments_root:
         if projection._ln(c) != "comment":
             continue
@@ -182,7 +177,6 @@ def _parse_comments(local_path: Path, proj: projection.Projection) -> list[dict[
         # above still joins EVERY paragraph's text; only the identity
         # lookup key changes.
         own_para_id = projection.identity_para_id(c, ids_root=ids_root, ext_root=ext_root)
-        ext = ext_by_paraid.get(own_para_id or "", {})
         # durableId is the durable, opaque identifier (Google's own shape:
         # a comment id independent of the document's own w:id numbering,
         # which is only ever max-existing-plus-1 and therefore not
@@ -196,8 +190,8 @@ def _parse_comments(local_path: Path, proj: projection.Projection) -> list[dict[
                 "comment_id": durable_id,
                 "w_id": w_id,
                 "content": "".join(content_parts),
-                "resolved": ext.get("done") == "1",
-                "reply_count": 0,  # see module docstring: threading is WP-08 scope
+                "resolved": done_by_para.get(own_para_id or "") == "1",
+                "reply_count": 0,
                 "replies": [],
                 "quoted_text": "".join(anchor_by_id.get(w_id, [])),
                 "author": author,
@@ -206,7 +200,40 @@ def _parse_comments(local_path: Path, proj: projection.Projection) -> list[dict[
                 "scope": "document",
             }
         )
-    return comments
+        para_by_index.append(own_para_id)
+
+    # Thread: attach replies to their root, drop them from the top level.
+    index_by_para = {pid: i for i, pid in enumerate(para_by_index) if pid}
+
+    def _root_index(i: int) -> int:
+        seen = {i}
+        pid = para_by_index[i]
+        while pid and parent_by_para.get(pid):
+            j = index_by_para.get(parent_by_para[pid] or "")
+            if j is None or j in seen:
+                break
+            seen.add(j)
+            i, pid = j, para_by_index[j]
+        return i
+
+    roots: list[dict[str, Any]] = []
+    root_of: dict[int, int] = {i: _root_index(i) for i in range(len(comments))}
+    for i, comment in enumerate(comments):
+        if root_of[i] == i:
+            roots.append(comment)
+            continue
+        root = comments[root_of[i]]
+        root["replies"].append(
+            {
+                "id": comment["comment_id"],
+                "author": comment["author"],
+                "date": comment["created_time"],
+                "text": comment["content"],
+            }
+        )
+    for root in roots:
+        root["reply_count"] = len(root["replies"])
+    return roots
 
 
 def execute_list_open_items(path: str) -> dict[str, Any]:
