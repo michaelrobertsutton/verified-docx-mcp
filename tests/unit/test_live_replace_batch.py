@@ -465,3 +465,74 @@ def test_unlisted_codes_are_not_globally_retryable():
     from verified_docx_mcp.errors import _make_error
 
     assert _make_error(ErrorCode.LIVE_UNAVAILABLE, "x").envelope.retryable is False
+
+
+class CompactBatchReportTests(_BatchCase):
+    """Issue #112: the report names what callers read and nothing else."""
+
+    async def test_fifty_edit_success_is_compact_and_keeps_the_hook_fields(self) -> None:
+        words = [f"w{n:02d}" for n in range(50)]
+        doc = FakeDocument(text=" ".join(words))
+        await self.connect_pane(doc)
+        before = _rev(doc)
+        result = await self.batch([_edit(w, w.upper()) for w in words], before)
+
+        # JennyStack's hook validates exactly these (live_doc_stamp.record_batch_result).
+        self.assertEqual(
+            set(result),
+            {"applied", "batch_status", "applied_count", "edit_count", "revision_before", "revision_after", "results"},
+        )
+        self.assertIs(result["applied"], True)
+        self.assertEqual((result["batch_status"], result["applied_count"], result["edit_count"]), ("complete", 50, 50))
+        self.assertEqual(result["revision_before"], before)
+        self.assertEqual(result["revision_after"], _rev(doc))
+        self.assertEqual([r["index"] for r in result["results"]], list(range(50)))
+        for r in result["results"]:
+            self.assertEqual(set(r), {"index", "status", "evidence"})
+            self.assertEqual(r["status"], "applied")
+            self.assertEqual(r["evidence"]["match_count"], 1)
+            self.assertRegex(r["evidence"]["revision_after"], r"^live:sha256:[0-9a-f]{64}$")
+        self.assertEqual(result["results"][-1]["evidence"]["revision_after"], result["revision_after"])
+        for gone in ("before", "after", "rung", "match_count", "write_mode", "verified_via", "document_name"):
+            self.assertNotIn(gone, result)
+        # Recorded in docs/acceptance/112-write-tokens.md (chars / 4). The per-edit full
+        # revision_after is what JennyStack's hook chains, so it is the floor: ~157 chars per edit.
+        compact_tokens = len(json.dumps(result, separators=(",", ":"))) // 4
+        legacy = await self.batch([_edit(w.upper(), w) for w in words], _rev(doc), verbose=True)
+        legacy_tokens = len(json.dumps(legacy, separators=(",", ":"))) // 4
+        print(f"\n50-edit batch: compact {compact_tokens} tokens, verbose (previous shape) {legacy_tokens} tokens")
+        self.assertLess(compact_tokens, legacy_tokens)
+        self.assertLess(compact_tokens, 2200)
+
+    async def test_mid_batch_refusal_names_the_failing_index_code_and_message(self) -> None:
+        doc = FakeDocument(text=TEXT)
+        await self.connect_pane(doc)
+        result = await self.batch(
+            [_edit("alpha", "A"), _edit("nowhere", "X"), _edit("gamma", "G")], _rev(doc)
+        )
+        self.assertEqual(result["batch_status"], "partial")
+        self.assertEqual(result["results"][0]["status"], "applied")
+        failed = result["results"][1]
+        self.assertEqual((failed["index"], failed["status"], failed["code"]), (1, "refused_before_write", "ZERO_MATCH"))
+        self.assertTrue(failed["message"])
+        self.assertLessEqual(len(failed["message"]), 240)
+        self.assertEqual(result["results"][2], {"index": 2, "status": "not_attempted"})
+        self.assertEqual(result["revision_after"], result["results"][0]["evidence"]["revision_after"])
+
+    async def test_stale_start_is_reported_with_its_message(self) -> None:
+        doc = FakeDocument(text=TEXT)
+        await self.connect_pane(doc)
+        result = await self.batch([_edit("alpha", "A")], "live:sha256:" + "0" * 64)
+        self.assertEqual(result["batch_status"], "none_applied")
+        self.assertEqual(result["results"][0]["code"], ErrorCode.LIVE_STALE.value)
+        self.assertTrue(result["results"][0]["message"])
+        self.assertEqual(result["revision_before"], "live:sha256:" + "0" * 64)
+
+    async def test_verbose_restores_per_edit_before_and_after(self) -> None:
+        doc = FakeDocument(text=TEXT)
+        await self.connect_pane(doc)
+        result = await self.batch([_edit("alpha", "A")], _rev(doc), verbose=True)
+        evidence = result["results"][0]["evidence"]
+        self.assertEqual((evidence["before"], evidence["after"]), ("alpha", "A"))
+        self.assertIn("comments_removed", evidence)
+        self.assertIn("write_mode", result)  # the full live envelope, as before

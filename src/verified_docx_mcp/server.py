@@ -1930,6 +1930,7 @@ def replace_text_batch(
     write_mode: str = "live",
     track_changes: bool = False,
     inherit_format: str = "replaced",
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Apply 1..50 replace_text edits to the LIVE Word document in order, in one call (issue #82).
 
@@ -1959,8 +1960,11 @@ def replace_text_batch(
     unchanged), or "unknown" (a failure after dispatch whose outcome cannot
     be proven: disconnect, timeout, LIVE_OP_FAILED, VERIFICATION_FAILED,
     LIVE_STALE_AFTER_WRITE -- re-read the document before doing anything).
-    `results` has one entry per edit: {index, status, evidence?, code?} with
-    status "applied" | "refused_before_write" | "unknown" | "not_attempted".
+    `results` has one entry per edit: {index, status, evidence?, code?, message?} with
+    status "applied" | "refused_before_write" | "unknown" | "not_attempted". The report is
+    compact (issue #112): an applied edit's `evidence` is just {match_count,
+    revision_after} (plus comments_removed when a comment was lost); a failed edit has its
+    `code` and `message`. `verbose=true` returns each edit's before/after text and shape counts.
     Only an explicit allowlist of codes counts as refused_before_write
     (LIVE_STALE from the pane, MATCH_COUNT_MISMATCH/ZERO_MATCH,
     ANCHORED_SHAPES, WOULD_DELETE_COMMENTS, capability and section-lock
@@ -1981,6 +1985,7 @@ def replace_text_batch(
             write_mode=write_mode,
             track_changes=track_changes,
             inherit_format=inherit_format,
+            verbose=verbose,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -4460,8 +4465,12 @@ def live_changes_prepare(path: str, operations: list[dict[str, Any]], track_chan
     """Prepare a scoped approved run without modifying Word. Operations are
     {op, section, args}; section is a unique heading slug. Supports
     replace_cell_markdown, replace_table_row, replace_text, delete_paragraph,
-    and a final live_save. Returns a compact preview, run_id and manifest_sha256.
-    Read the local manifest to review exact changes; approve that digest once.
+    and a final live_save. Returns a preview, run_id and manifest_sha256. The preview
+    shows each operation's find/replace/markdown/cells/anchor_text (cut to 200
+    characters with an ellipsis), its table address and expected_matches, so the
+    lead can approve from the response. It is DERIVED from the manifest: the
+    manifest file and its digest remain the authority, and approving that digest
+    binds the exact operations, not the clipped preview.
     replace_text args may also include replacement_segments with the complete
     explicit font/hyperlink schema documented on replace_text; concatenated segment
     text must equal replace. The approval preview includes the exact segments.
@@ -4475,40 +4484,47 @@ def live_changes_prepare(path: str, operations: list[dict[str, Any]], track_chan
 
 
 @mcp.tool()
-def live_changes_execute(path: str, run_id: str, manifest_sha256: str, approved_by: str) -> dict[str, Any]:
+def live_changes_execute(
+    path: str, run_id: str, manifest_sha256: str, approved_by: str, verbose: bool = False
+) -> dict[str, Any]:
     """Execute one immutable, lead-approved change set. Code handles all writes,
     internal verification, bounded pre-write retries and the durable progress
     journal. Unrelated section edits do not invalidate the run. Returns counts
     and exceptions only; full evidence stays local. Unknown outcomes never retry.
+    The report does not echo your run_id or manifest_sha256; `remaining` lists
+    operation indices and `remaining_ranges` is the same as a string ("7-36");
+    an issue's `section_diff` is cut to 600 characters (`journal_path` has the
+    rest). `verbose=true` adds `performance`.
     """
     from .live.approved_changes import execute
     try:
-        return execute(path, run_id, manifest_sha256, approved_by)
+        return execute(path, run_id, manifest_sha256, approved_by, verbose)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
 @mcp.tool()
-def live_changes_resume(path: str, run_id: str, manifest_sha256: str) -> dict[str, Any]:
+def live_changes_resume(path: str, run_id: str, manifest_sha256: str, verbose: bool = False) -> dict[str, Any]:
     """Resume independent remaining operations of an already approved run. Verifies
     document, digest and protected targets; skips verified operations and defers
     uncertain targets without replaying them. Does not broaden approval.
     """
     from .live.approved_changes import execute
     try:
-        return execute(path, run_id, manifest_sha256)
+        return execute(path, run_id, manifest_sha256, None, verbose)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 @mcp.tool()
 def live_changes_reconcile(path: str, run_id: str, manifest_sha256: str,
-                           disposition: str, decision_ref: str, operation_index: int | None = None) -> dict[str, Any]:
+                           disposition: str, decision_ref: str, operation_index: int | None = None,
+                           verbose: bool = False) -> dict[str, Any]:
     """Record a lead's explicit applied/not-applied decision on an uncertain run.
     Exact live section readback must support the decision. Does not write Word.
     """
     from .live.approved_changes import reconcile
     try:
-        return reconcile(path, run_id, manifest_sha256, disposition, decision_ref, operation_index)
+        return reconcile(path, run_id, manifest_sha256, disposition, decision_ref, operation_index, verbose)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

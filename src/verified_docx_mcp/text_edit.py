@@ -1129,8 +1129,16 @@ def execute_replace_text_batch_live(
     write_mode: str = "live",
     track_changes: bool = False,
     inherit_format: str = "replaced",
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Live-only ``replace_text_batch`` (issue #82); see the block comment above.
+
+    The report is compact (issue #112): top-level ``applied``, ``batch_status``,
+    ``applied_count``, ``edit_count``, ``revision_before``, ``revision_after`` and one
+    result per edit. An applied edit carries ``evidence: {match_count, revision_after}``
+    (full tokens: callers chain them); a failed one carries ``code`` and ``message``.
+    ``verbose=true`` restores each edit's before/after text, comments removed and shape
+    counts.
 
     Returns ``{batch_status, results, revision_before, revision_after, applied, ...}``.
     ``batch_status`` is ``complete`` / ``partial`` / ``none_applied`` / ``unknown``;
@@ -1171,10 +1179,19 @@ def execute_replace_text_batch_live(
     applied_count = 0
     unknown = False
 
-    def _record(i: int, status: str, *, code: str | None = None, evidence: dict[str, Any] | None = None) -> None:
+    def _record(
+        i: int,
+        status: str,
+        *,
+        code: str | None = None,
+        message: str | None = None,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
         entry: dict[str, Any] = {"index": i, "status": status}
         if code is not None:
             entry["code"] = code
+        if message:
+            entry["message"] = message[:_BATCH_MESSAGE_CHARS]
         if evidence is not None:
             entry["evidence"] = evidence
         results.append(entry)
@@ -1186,12 +1203,12 @@ def execute_replace_text_batch_live(
     try:
         live_write_mode.check_not_stale(revision_before, pre_hash)
     except VerifyError as exc:
-        _record(0, "refused_before_write", code=exc.envelope.error_code.value)
+        _record(0, "refused_before_write", code=exc.envelope.error_code.value, message=exc.envelope.message)
         for i in range(1, len(checked)):
             _record(i, "not_attempted")
         return _finish_batch(
             path, document_name, results, audit_results, pre_hash, pre_hash, 0,
-            unknown=False, total=len(checked), revision_before=revision_before,
+            unknown=False, total=len(checked), revision_before=revision_before, verbose=verbose,
         )
 
     for i, edit in enumerate(checked):
@@ -1212,14 +1229,14 @@ def execute_replace_text_batch_live(
         except VerifyError as exc:
             code = exc.envelope.error_code.value
             if _batch_refused_before_write(exc):
-                _record(i, "refused_before_write", code=code)
+                _record(i, "refused_before_write", code=code, message=exc.envelope.message)
             else:
                 unknown = True
-                _record(i, "unknown", code=code)
+                _record(i, "unknown", code=code, message=exc.envelope.message)
             continue
-        except Exception:  # noqa: BLE001 - after dispatch, any other failure leaves the outcome unknown
+        except Exception as exc:  # noqa: BLE001 - after dispatch, any other failure leaves the outcome unknown
             unknown = True
-            _record(i, "unknown", code=ErrorCode.LIVE_OP_FAILED.value)
+            _record(i, "unknown", code=ErrorCode.LIVE_OP_FAILED.value, message=str(exc))
             continue
         matches = result.get("matches") or []
         applied_count += 1
@@ -1236,8 +1253,27 @@ def execute_replace_text_batch_live(
 
     return _finish_batch(
         path, document_name, results, audit_results, pre_hash, current, applied_count,
-        unknown=unknown, total=len(checked), revision_before=revision_before,
+        unknown=unknown, total=len(checked), revision_before=revision_before, verbose=verbose,
     )
+
+
+_BATCH_MESSAGE_CHARS = 240
+
+
+def _compact_batch_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One line per edit. An applied edit keeps ``evidence: {match_count, revision_after}``
+    (the pieces callers read and chain from) and, only when non-empty, ``comments_removed``:
+    losing a comment must never be silent."""
+    compact: list[dict[str, Any]] = []
+    for entry in results:
+        row = {k: v for k, v in entry.items() if k != "evidence"}
+        ev = entry.get("evidence")
+        if ev is not None:
+            row["evidence"] = {"match_count": ev["match_count"], "revision_after": ev["revision_after"]}
+            if ev.get("comments_removed"):
+                row["evidence"]["comments_removed"] = ev["comments_removed"]
+        compact.append(row)
+    return compact
 
 
 def _finish_batch(
@@ -1252,6 +1288,7 @@ def _finish_batch(
     unknown: bool,
     total: int,
     revision_before: str,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     if unknown:
         batch_status = "unknown"
@@ -1279,13 +1316,31 @@ def _finish_batch(
             "results": audit_results,
         },
     )
-    evidence["batch_status"] = batch_status
-    evidence["applied_count"] = applied_count
-    evidence["edit_count"] = total
-    evidence["results"] = results
-    # Echo the caller's own token (it may name an older body than the pane's describe on a stale start).
-    evidence["revision_before"] = revision_before
-    return evidence
+    if verbose:
+        evidence["batch_status"] = batch_status
+        evidence["applied_count"] = applied_count
+        evidence["edit_count"] = total
+        evidence["results"] = results
+        # Echo the caller's own token (it may name an older body than the pane's describe on a stale start).
+        evidence["revision_before"] = revision_before
+        return evidence
+    # Compact report (issue #112): none of the placeholder before/after/rung/match_count and
+    # none of the constant live envelope. revision_before is the caller's own token (it may
+    # name an older body than the pane's describe on a stale start) and is always present.
+    report: dict[str, Any] = {
+        "applied": evidence["applied"],
+        "batch_status": batch_status,
+        "applied_count": applied_count,
+        "edit_count": total,
+        "revision_before": revision_before,
+        "revision_after": evidence["revision_after"],
+        "results": _compact_batch_results(results),
+    }
+    if not evidence.get("audit_logged"):
+        report["audit_logged"] = False
+    if evidence.get("evidence_ref"):
+        report["evidence_ref"] = evidence["evidence_ref"]
+    return report
 
 
 # ---------------------------------------------------------------------------

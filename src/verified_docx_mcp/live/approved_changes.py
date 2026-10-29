@@ -285,8 +285,39 @@ def prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = F
         write(root / f"{run_id}.journal.json", {"digest": digest, "next": 0, "status": "prepared", "evidence": [], "verified_indices": [],
                                                      "working": initial, "deferred": {}, "attempts": {}, "blocked": []})
     return {"run_id": run_id, "manifest_sha256": digest, "operation_count": len(operations),
-            "sections": slugs, "status": "prepared", "preview": [{"op": o["op"], "section": o["section"], **({"replacement_segments": o["args"]["replacement_segments"]} if "replacement_segments" in o["args"] else {})} for o in operations],
+            "sections": slugs, "status": "prepared", "preview": [preview_entry(o) for o in operations],
             "manifest_path": str(root / f"{run_id}.manifest.json")}
+
+
+_PREVIEW_CHARS = 200
+_PREVIEW_ADDRESS = ("table_id", "row_index", "cell_index")
+
+
+def _clip(value: str) -> str:
+    return value if len(value) <= _PREVIEW_CHARS else value[:_PREVIEW_CHARS] + "\u2026"
+
+
+def preview_entry(operation: dict[str, Any]) -> dict[str, Any]:
+    """What one operation will change, enough for a lead to approve from the response:
+    the text-bearing arguments (each cut to 200 characters with an ellipsis), the table
+    address, and the match count a replace_text must find. DERIVED from the manifest: the
+    manifest file and its digest stay the authority, so a clipped preview never approves
+    anything the digest does not bind."""
+    args = operation["args"]
+    entry: dict[str, Any] = {"op": operation["op"], "section": operation["section"]}
+    for key in _PREVIEW_ADDRESS:
+        if key in args:
+            entry[key] = args[key]
+    for key in ("find", "replace", "markdown", "anchor_text"):
+        if isinstance(args.get(key), str):
+            entry[key] = _clip(args[key])
+    if isinstance(args.get("cells"), list):
+        entry["cells"] = [_clip(c) for c in args["cells"]]
+    if operation["op"] == "replace_text":
+        entry["expected_matches"] = args.get("expected_matches", 1)
+    if "replacement_segments" in args:
+        entry["replacement_segments"] = args["replacement_segments"]
+    return entry
 
 
 def scope_sha(sections):
@@ -389,19 +420,59 @@ def apply(path, operation, track_changes=False):
     return evidence
 
 
-def report(manifest, journal):
+_SECTION_DIFF_CHARS = 600
+
+
+def _ranges(indices: list[int]) -> str:
+    """[7, 8, 9, 12] -> "7-9,12"."""
+    out: list[str] = []
+    start = prev = None
+    for i in indices:
+        if start is None:
+            start = prev = i
+        elif i == prev + 1:
+            prev = i
+        else:
+            out.append(str(start) if start == prev else f"{start}-{prev}")
+            start = prev = i
+    if start is not None:
+        out.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(out)
+
+
+def report(manifest, journal, jf=None, verbose=False):
+    """The compact run report (issue #112). No echo of the caller's own run_id and
+    manifest_sha256; ``performance`` only with verbose; ``remaining`` stays a list of
+    operation indices with ``remaining_ranges`` beside it as a compact string; each
+    issue's ``section_diff`` is cut to 600 characters (the journal keeps the full diff
+    and ``journal_path`` says where)."""
     verified=set(journal.get('verified_indices',range(journal['next'])))
-    performance = {"operation_elapsed_ms": round(sum(e.get("elapsed_ms", 0) for e in journal.get("evidence", [])), 2),
-                   "office_sync_count": sum(e.get("metrics", {}).get("sync_count", 0) for e in journal.get("evidence", [])),
-                   "bridge_requests": sum(e.get("bridge_requests") or 0 for e in journal.get("evidence", []))}
-    return {"performance": performance, "run_id":manifest['run_id'], "status":journal['status'], "applied":journal['status']=='complete',
-            "applied_count":len(verified), "operation_count":len(manifest['operations']),
-            "remaining":[i for i in range(len(manifest['operations'])) if i not in verified],
-            "issues":[dict(index=int(i),**problem) for i,problem in journal.get('deferred',{}).items()],
-            "external_changes":journal.get('blocked',[]), "problem":journal.get('problem'), "manifest_sha256":journal['digest']}
+    remaining=[i for i in range(len(manifest['operations'])) if i not in verified]
+    issues=[]
+    truncated=False
+    for i,problem in journal.get('deferred',{}).items():
+        issue=dict(index=int(i),**problem)
+        diff=issue.get('section_diff')
+        if isinstance(diff,str) and len(diff)>_SECTION_DIFF_CHARS:
+            issue['section_diff']=diff[:_SECTION_DIFF_CHARS]
+            issue['section_diff_truncated']=True
+            truncated=True
+        issues.append(issue)
+    out={"status":journal['status'], "applied":journal['status']=='complete',
+         "applied_count":len(verified), "operation_count":len(manifest['operations']),
+         "remaining":remaining, "remaining_ranges":_ranges(remaining),
+         "issues":issues,
+         "external_changes":journal.get('blocked',[]), "problem":journal.get('problem')}
+    if truncated and jf is not None:
+        out["journal_path"]=str(jf)
+    if verbose:
+        out["performance"]={"operation_elapsed_ms": round(sum(e.get("elapsed_ms", 0) for e in journal.get("evidence", [])), 2),
+                            "office_sync_count": sum(e.get("metrics", {}).get("sync_count", 0) for e in journal.get("evidence", [])),
+                            "bridge_requests": sum(e.get("bridge_requests") or 0 for e in journal.get("evidence", []))}
+    return out
 
 
-def execute(path: str, run_id: str, manifest_sha256: str, approved_by: str | None = None) -> dict:
+def execute(path: str, run_id: str, manifest_sha256: str, approved_by: str | None = None, verbose: bool = False) -> dict:
     path=str(paths.resolve_allowed_docx_path(path,must_exist=False))
     if not re.fullmatch(r'[0-9a-f]{32}',run_id): raise invalid('Invalid run_id')
     root=folder(path)
@@ -412,7 +483,7 @@ def execute(path: str, run_id: str, manifest_sha256: str, approved_by: str | Non
         if manifest['path']!=path or sha(manifest)!=manifest_sha256 or journal['digest']!=manifest_sha256:
             raise invalid('Manifest changed, digest differs, or document identity differs')
         ensure_settled(root,run_id,sections=[s['slug'] for s in manifest['sections']])
-        if journal['status']=='complete': return report(manifest,journal)
+        if journal['status']=='complete': return report(manifest,journal,jf,verbose)
         if not journal.get('approved_by'):
             if not isinstance(approved_by,str) or not approved_by.strip(): raise invalid('Lead approval is required for this manifest digest')
             journal['approved_by']=approved_by.strip()
@@ -506,7 +577,7 @@ def execute(path: str, run_id: str, manifest_sha256: str, approved_by: str | Non
                     except Exception as exc:  # noqa: BLE001 - unavailable transport cannot establish independent safe targets
                         journal.update(status='read_unavailable',problem=f'Live read unavailable: {exc}',working=current,blocked=sorted(blocked))
                         write(jf,journal)
-                        return report(manifest,journal)
+                        return report(manifest,journal,jf,verbose)
                     if operation['op']=='delete_paragraph' and problem['status']=='unknown': blocked.add(operation['section']+'|*')
                 else:
                     current=project(current,operation);verified.add(index);deferred.pop(key,None)
@@ -517,7 +588,7 @@ def execute(path: str, run_id: str, manifest_sha256: str, approved_by: str | Non
         try: final=snapshot(session,slugs)
         except Exception as exc:  # noqa: BLE001 - report final verification unavailable without replay
             journal.update(status='verification_pending',problem=f'Final verification unavailable: {exc}')
-            write(jf,journal);return report(manifest,journal)
+            write(jf,journal);return report(manifest,journal,jf,verbose)
         if final!=current:
             journal.update(status='partial',problem='Protected section changed during final verification')
         elif deferred or blocked:
@@ -525,7 +596,7 @@ def execute(path: str, run_id: str, manifest_sha256: str, approved_by: str | Non
         else: journal.update(status='complete',problem=None)
         journal.update(next=len(verified),verified_indices=sorted(verified),working=current,blocked=sorted(blocked))
         write(jf,journal)
-        return report(manifest,journal)
+        return report(manifest,journal,jf,verbose)
 
 
 def ensure_settled(root, own_run=None, sections=None):
@@ -542,7 +613,7 @@ def ensure_settled(root, own_run=None, sections=None):
             raise invalid("Another run has an uncertain outcome in an overlapping or unknown section; reconcile it before changing that section")
 
 
-def reconcile(path,run_id,manifest_sha256,disposition,decision_ref,operation_index=None):
+def reconcile(path,run_id,manifest_sha256,disposition,decision_ref,operation_index=None,verbose=False):
     path=str(paths.resolve_allowed_docx_path(path,must_exist=False))
     if not re.fullmatch(r'[0-9a-f]{32}',run_id) or disposition not in {'applied','not-applied'} or not decision_ref.strip():
         raise invalid('Reconciliation requires run_id, applied/not-applied disposition and decision_ref')
@@ -583,4 +654,4 @@ def reconcile(path,run_id,manifest_sha256,disposition,decision_ref,operation_ind
         blocked=set(journal.get('blocked',[]));blocked.difference_update(manifest['targets'][operation_index])
         journal.setdefault('decisions',[]).append({'index':operation_index,'disposition':disposition,'decision_ref':decision_ref})
         journal.update(status='partial',problem=None,working=captured['sections'],verified_indices=sorted(verified),next=len(verified),blocked=sorted(blocked))
-        write(jf,journal);return report(manifest,journal)
+        write(jf,journal);return report(manifest,journal,jf,verbose)
