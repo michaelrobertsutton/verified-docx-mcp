@@ -210,19 +210,25 @@ def _raise_from_live_error(exc: BaseException) -> None:
     """Map a live/session.py exception onto the matching errors.py
     ErrorCode and raise it (never returns) -- server.py's live tool
     wrappers let this propagate as the VerifyError it already is."""
-    from ..errors import ErrorCode
+    from ..errors import ErrorCode, short_hash
 
     if isinstance(exc, LiveUnavailable):
-        raise _make_error(ErrorCode.LIVE_UNAVAILABLE, str(exc), {}) from exc
+        raise _make_error(ErrorCode.LIVE_UNAVAILABLE, "No Word pane is connected; open the Live pane and retry.", {}) from exc
     if isinstance(exc, LiveDisconnected):
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc), {}) from exc
     if isinstance(exc, LiveStaleAfterWrite):
         raise _make_error(
-            ErrorCode.LIVE_STALE_AFTER_WRITE, str(exc), {"expected": exc.expected, "actual": exc.actual}
+            ErrorCode.LIVE_STALE_AFTER_WRITE,
+            "The pane applied the write, but the document had moved since it was read. The write "
+            "ALREADY LANDED: do not retry; re-read and verify.",
+            {"expected": short_hash(exc.expected), "actual": short_hash(exc.actual)},
         ) from exc
     if isinstance(exc, LiveStale):
         raise _make_error(
-            ErrorCode.LIVE_STALE, str(exc), {"expected": exc.expected, "actual": exc.actual}
+            ErrorCode.LIVE_STALE,
+            "The live document changed since it was read; nothing was written. Call live_revision or "
+            "re-read, then retry.",
+            {"expected": short_hash(exc.expected), "actual": short_hash(exc.actual)},
         ) from exc
     if isinstance(exc, LiveOpFailed):
         code = exc.code
@@ -687,7 +693,7 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
     # A second pane on this same document displaced another (or this one
     # displaced it): the two can disagree about the document.
     registry = _registry()
-    for collision in getattr(registry, "collisions", lambda: [])():
+    for collision in getattr(registry, "collisions", list)():
         if (
             collision.get("kind") == "same_document_duplicate"
             and collision.get("document_name") == session.document_name
@@ -1195,7 +1201,7 @@ def _delete_targets_live(
                 drift.append(cid)
 
     still_present = [h for h in remaining if h in ok_replies]
-    live_ids = lambda handles: [f"{_LIVE_HANDLE_PREFIX}{h}" for h in handles]  # noqa: E731
+    live_ids = lambda handles: [f"{_LIVE_HANDLE_PREFIX}{h}" for h in handles]
 
     if failure is not None or still_present or drift or post_comments is None:
         evidence: dict[str, Any] = {

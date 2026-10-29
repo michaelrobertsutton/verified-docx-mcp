@@ -72,6 +72,7 @@ over the same span before any accept/reject in between.
 from __future__ import annotations
 
 import copy
+import functools
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -80,7 +81,7 @@ from xml.etree import ElementTree as ET
 
 from . import audit, mutations, paths, projection, tables, tracked_changes
 from .author import resolve_author_name
-from .errors import ErrorCode, VerifyError, _make_error
+from .errors import ErrorCode, VerifyError, _make_error, short_hash
 from .live import write_mode as live_write_mode
 from .live.session import LiveDisconnected, LiveOpFailed, LiveStale, LiveStaleAfterWrite
 from .locate import LocateResult, locate
@@ -859,11 +860,14 @@ def _live_replace_once(
             "the pane applied the replace, but its body hash before the op differed from the one "
             "this call expected: the document moved between the read and the write. The write "
             "ALREADY LANDED -- do not retry; re-read the live document and verify it.",
-            {"expected": exc.expected, "actual": exc.actual},
+            {"expected": short_hash(exc.expected), "actual": short_hash(exc.actual)},
         ) from exc
     except LiveStale as exc:
         raise _make_error(
-            ErrorCode.LIVE_STALE, str(exc), {"expected": exc.expected, "actual": exc.actual}
+            ErrorCode.LIVE_STALE,
+            "The live document changed since it was read; nothing was written. Call live_revision or "
+            "re-read, then retry.",
+            {"expected": short_hash(exc.expected), "actual": short_hash(exc.actual)},
         ) from exc
     except LiveOpFailed as exc:
         raise _make_error(
@@ -1128,8 +1132,16 @@ def execute_replace_text_batch_live(
     write_mode: str = "live",
     track_changes: bool = False,
     inherit_format: str = "replaced",
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Live-only ``replace_text_batch`` (issue #82); see the block comment above.
+
+    The report is compact (issue #112): top-level ``applied``, ``batch_status``,
+    ``applied_count``, ``edit_count``, ``revision_before``, ``revision_after`` and one
+    result per edit. An applied edit carries ``evidence: {match_count, revision_after}``
+    (full tokens: callers chain them); a failed one carries ``code`` and ``message``.
+    ``verbose=true`` restores each edit's before/after text, comments removed and shape
+    counts.
 
     Returns ``{batch_status, results, revision_before, revision_after, applied, ...}``.
     ``batch_status`` is ``complete`` / ``partial`` / ``none_applied`` / ``unknown``;
@@ -1170,14 +1182,25 @@ def execute_replace_text_batch_live(
     applied_count = 0
     unknown = False
 
-    def _record(i: int, status: str, *, code: str | None = None, evidence: dict[str, Any] | None = None) -> None:
+    def _record(
+        i: int,
+        status: str,
+        *,
+        code: str | None = None,
+        message: str | None = None,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
         entry: dict[str, Any] = {"index": i, "status": status}
         if code is not None:
             entry["code"] = code
+        if message:
+            entry["message"] = message[:_BATCH_MESSAGE_CHARS]
         if evidence is not None:
             entry["evidence"] = evidence
         results.append(entry)
-        audit_entry = {k: v for k, v in entry.items() if k != "evidence"}
+        # No document text: an error message can embed the pane's observed text, so only the
+        # code is audited (the message goes to the caller).
+        audit_entry = {k: v for k, v in entry.items() if k not in ("evidence", "message")}
         if evidence is not None:
             audit_entry["evidence"] = {k: v for k, v in evidence.items() if k not in ("before", "after")}
         audit_results.append(audit_entry)
@@ -1185,12 +1208,12 @@ def execute_replace_text_batch_live(
     try:
         live_write_mode.check_not_stale(revision_before, pre_hash)
     except VerifyError as exc:
-        _record(0, "refused_before_write", code=exc.envelope.error_code.value)
+        _record(0, "refused_before_write", code=exc.envelope.error_code.value, message=exc.envelope.message)
         for i in range(1, len(checked)):
             _record(i, "not_attempted")
         return _finish_batch(
             path, document_name, results, audit_results, pre_hash, pre_hash, 0,
-            unknown=False, total=len(checked), revision_before=revision_before,
+            unknown=False, total=len(checked), revision_before=revision_before, verbose=verbose,
         )
 
     for i, edit in enumerate(checked):
@@ -1211,14 +1234,14 @@ def execute_replace_text_batch_live(
         except VerifyError as exc:
             code = exc.envelope.error_code.value
             if _batch_refused_before_write(exc):
-                _record(i, "refused_before_write", code=code)
+                _record(i, "refused_before_write", code=code, message=exc.envelope.message)
             else:
                 unknown = True
-                _record(i, "unknown", code=code)
+                _record(i, "unknown", code=code, message=exc.envelope.message)
             continue
-        except Exception:  # noqa: BLE001 - after dispatch, any other failure leaves the outcome unknown
+        except Exception as exc:  # noqa: BLE001 - after dispatch, any other failure leaves the outcome unknown
             unknown = True
-            _record(i, "unknown", code=ErrorCode.LIVE_OP_FAILED.value)
+            _record(i, "unknown", code=ErrorCode.LIVE_OP_FAILED.value, message=str(exc))
             continue
         matches = result.get("matches") or []
         applied_count += 1
@@ -1235,8 +1258,27 @@ def execute_replace_text_batch_live(
 
     return _finish_batch(
         path, document_name, results, audit_results, pre_hash, current, applied_count,
-        unknown=unknown, total=len(checked), revision_before=revision_before,
+        unknown=unknown, total=len(checked), revision_before=revision_before, verbose=verbose,
     )
+
+
+_BATCH_MESSAGE_CHARS = 240
+
+
+def _compact_batch_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One line per edit. An applied edit keeps ``evidence: {match_count, revision_after}``
+    (the pieces callers read and chain from) and, only when non-empty, ``comments_removed``:
+    losing a comment must never be silent."""
+    compact: list[dict[str, Any]] = []
+    for entry in results:
+        row = {k: v for k, v in entry.items() if k != "evidence"}
+        ev = entry.get("evidence")
+        if ev is not None:
+            row["evidence"] = {"match_count": ev["match_count"], "revision_after": ev["revision_after"]}
+            if ev.get("comments_removed"):
+                row["evidence"]["comments_removed"] = ev["comments_removed"]
+        compact.append(row)
+    return compact
 
 
 def _finish_batch(
@@ -1251,6 +1293,7 @@ def _finish_batch(
     unknown: bool,
     total: int,
     revision_before: str,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     if unknown:
         batch_status = "unknown"
@@ -1278,13 +1321,31 @@ def _finish_batch(
             "results": audit_results,
         },
     )
-    evidence["batch_status"] = batch_status
-    evidence["applied_count"] = applied_count
-    evidence["edit_count"] = total
-    evidence["results"] = results
-    # Echo the caller's own token (it may name an older body than the pane's describe on a stale start).
-    evidence["revision_before"] = revision_before
-    return evidence
+    if verbose:
+        evidence["batch_status"] = batch_status
+        evidence["applied_count"] = applied_count
+        evidence["edit_count"] = total
+        evidence["results"] = results
+        # Echo the caller's own token (it may name an older body than the pane's describe on a stale start).
+        evidence["revision_before"] = revision_before
+        return evidence
+    # Compact report (issue #112): none of the placeholder before/after/rung/match_count and
+    # none of the constant live envelope. revision_before is the caller's own token (it may
+    # name an older body than the pane's describe on a stale start) and is always present.
+    report: dict[str, Any] = {
+        "applied": evidence["applied"],
+        "batch_status": batch_status,
+        "applied_count": applied_count,
+        "edit_count": total,
+        "revision_before": revision_before,
+        "revision_after": evidence["revision_after"],
+        "results": _compact_batch_results(results),
+    }
+    if not evidence.get("audit_logged"):
+        report["audit_logged"] = False
+    if evidence.get("evidence_ref"):
+        report["evidence_ref"] = evidence["evidence_ref"]
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -1683,7 +1744,7 @@ def execute_format_text_live(
     return evidence
 
 
-def execute_format_text(
+def _execute_format_text(
     path: str,
     find: str,
     style: dict[str, bool | str],
@@ -1994,7 +2055,7 @@ def _apply_paragraph_style(p_elem: Any, style_id: str, *, track: _TrackContext |
     return True
 
 
-def execute_apply_style(
+def _execute_apply_style(
     path: str,
     find: str,
     style_id: str,
@@ -2185,6 +2246,52 @@ def execute_apply_style(
     logged, _ = audit.append_audit(path=str(resolved), tool="apply_style", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
+
+
+_FORMAT_DELTA_ATTRS = ("bold", "italic", "underline", "strike", "color")
+
+
+def _compact_format_evidence(evidence: dict[str, Any], *, verbose: bool) -> dict[str, Any]:
+    """Shape a formatting-only result (issue #112).
+
+    format_text and apply_style never change text, so echoing a before and an after
+    excerpt (and every run, both times) says nothing the caller needs. When the two
+    excerpts are equal the result says ``text_unchanged: true`` with one ``excerpt``,
+    and ``format_delta`` lists only the attributes that moved. ``runs_before`` /
+    ``runs_after`` come back only with ``verbose=true``.
+    """
+    runs_before, runs_after = evidence.get("runs_before"), evidence.get("runs_after")
+    if runs_before is not None and runs_after is not None:
+        delta: dict[str, Any] = {}
+        for attr in _FORMAT_DELTA_ATTRS:
+            old = sorted({str(r.get(attr)) for span in runs_before for r in span})
+            new = sorted({str(r.get(attr)) for span in runs_after for r in span})
+            if old != new:
+                delta[attr] = {"before": old, "after": new}
+        if delta:
+            evidence["format_delta"] = delta
+    if not verbose:
+        evidence.pop("runs_before", None)
+        evidence.pop("runs_after", None)
+    if "before" in evidence and evidence.get("before") == evidence.get("after"):
+        evidence["text_unchanged"] = True
+        evidence["excerpt"] = evidence.pop("before")
+        evidence.pop("after", None)
+    return evidence
+
+
+@functools.wraps(_execute_format_text)
+def execute_format_text(*args: Any, verbose: bool = False, **kwargs: Any) -> dict[str, Any]:
+    """format_text: the parameters are ``_execute_format_text``'s, plus ``verbose``. The
+    result is shaped by ``_compact_format_evidence``."""
+    return _compact_format_evidence(_execute_format_text(*args, **kwargs), verbose=verbose)
+
+
+@functools.wraps(_execute_apply_style)
+def execute_apply_style(*args: Any, verbose: bool = False, **kwargs: Any) -> dict[str, Any]:
+    """apply_style: the parameters are ``_execute_apply_style``'s, plus ``verbose``. The
+    result is shaped by ``_compact_format_evidence``."""
+    return _compact_format_evidence(_execute_apply_style(*args, **kwargs), verbose=verbose)
 
 
 # ---------------------------------------------------------------------------

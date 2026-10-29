@@ -403,6 +403,17 @@ a file name connecting at once — `SessionRegistry` keys purely on
 basename, so it can't tell them apart on its own; check this before
 trusting a live write's routing if that's possible.
 
+Write responses are bounded (issue #112). A write that rewrites a whole body, section or
+revision set returns hashes, sizes and a short excerpt instead of the whole before/after, plus an
+`evidence_ref`; **`read_audit_evidence(evidence_ref, field?, to_file?)`** fetches the full record
+from the audit log (`$XDG_STATE_HOME/verified-docx-mcp/audit.jsonl`, append-only and never
+rotated by the server; with `VERIFIED_DOCX_MCP_AUDIT_EXCERPTS=0` the text is not stored).
+`verbose=true` (on `replace_text_batch`, `format_text`, `apply_style`, `replace_text` errors and
+the approved-run tools) restores only the named extras (per-edit batch text, `runs_before`/
+`runs_after`, `ladder_report`, `performance`), never whole-document text. Constant envelope
+fields (`verified_via`, `document_name`, `audit_logged: true`, ...) are omitted. See
+`docs/acceptance/112-write-tokens.md`.
+
 `live_revision(path)` (issue #110) returns the live body's current
 `revision` token plus a `sha12` digest per heading section in one pane round
 trip, with no body in the response. It re-arms your write baseline exactly

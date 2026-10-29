@@ -477,8 +477,11 @@ class FormatTextLiveTests(LiveWriteBridgeTestCase):
         self.assertTrue(evidence["applied"])
         self.assertEqual(evidence["match_count"], 1)
         self.assertEqual(evidence["rung"], 1)
-        self.assertEqual(evidence["before"], "beta")
-        self.assertEqual(evidence["after"], "beta")  # format never changes content
+        # #112: format never changes content, so one excerpt instead of before and after.
+        self.assertTrue(evidence["text_unchanged"])
+        self.assertEqual(evidence["excerpt"], "beta")
+        self.assertNotIn("before", evidence)
+        self.assertNotIn("after", evidence)
         self.assertEqual(evidence["write_mode"], "live")
         self.assertEqual(evidence["verified_via"], "word-addin")
         self.assertEqual(evidence["document_name"], self.target.name)

@@ -36,7 +36,7 @@ from xml.etree import ElementTree as ET
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 
-from verified_docx_mcp import mutations, paths, projection
+from verified_docx_mcp import audit, mutations, paths, projection
 from verified_docx_mcp.errors import ErrorCode, VerifyError
 from verified_docx_mcp.middleware import MUTATING_TOOLS
 
@@ -543,8 +543,14 @@ class ReplaceBodyMarkdownRoundTripTests(_TempFixtureCase):
         section_md = (FIXTURES / "markdown" / "section.md").read_text(encoding="utf-8")
         evidence = mutations.execute_replace_body_markdown(str(self.target), section_md)
 
-        for key in ("applied", "match_count", "rung", "before", "after", "revision_before", "revision_after", "audit_logged"):
+        for key in ("applied", "match_count", "rung", "revision_before", "revision_after", "audit_logged"):
             self.assertIn(key, evidence, f"missing evidence key: {key}")
+        # #112: the whole-document text is not echoed; bounded evidence and a ref are.
+        self.assertNotIn("before", evidence)
+        self.assertNotIn("after", evidence)
+        for key in ("before_sha256", "after_sha256", "before_chars", "after_chars", "paragraphs_before",
+                    "paragraphs_after", "before_excerpt", "after_excerpt", "evidence_ref"):
+            self.assertIn(key, evidence, f"missing bounded evidence key: {key}")
         self.assertTrue(evidence["applied"])
         self.assertEqual(evidence["match_count"], 1)
         self.assertEqual(evidence["rung"], 4)
@@ -554,8 +560,12 @@ class ReplaceBodyMarkdownRoundTripTests(_TempFixtureCase):
         markdown_after, _, _ = projection.read_document_markdown(self.target)
         normalize = lambda s: " ".join(s.split())
         self.assertEqual(normalize(markdown_after), normalize(section_md))
-        # The evidence's own "after" must match what a fresh read reports.
-        self.assertEqual(normalize(evidence["after"]), normalize(markdown_after))
+        # The full "after" lives in the audit log under evidence_ref, and must match
+        # what a fresh read reports.
+        record = audit.find_audit_record(evidence["evidence_ref"])
+        self.assertIsNotNone(record)
+        self.assertEqual(normalize(record["evidence"]["after"]), normalize(markdown_after))
+        self.assertEqual(evidence["after_chars"], len(record["evidence"]["after"]))
 
     # STYLE_NOT_FOUND itself is exercised directly against StyleContext in
     # test_markdown_to_ooxml.py — CommonMark ATX headings cap at level 6,
@@ -583,8 +593,10 @@ class ReplaceRangeMarkdownTests(_TempFixtureCase):
         evidence = mutations.execute_replace_range_markdown(str(self.target), "background-1", new_md)
         self.assertTrue(evidence["applied"])
         self.assertEqual(evidence["rung"], 3)
-        self.assertIn("Background text.", evidence["before"])
-        self.assertIn("Updated background content", evidence["after"])
+        record = audit.find_audit_record(evidence["evidence_ref"])
+        self.assertIn("Background text.", record["evidence"]["before"])
+        self.assertIn("Updated background content", record["evidence"]["after"])
+        self.assertNotIn("before", evidence)
 
         sections_after = projection.find_sections_impl(self.target)
         keys_after = {s["section_key"] for s in sections_after}

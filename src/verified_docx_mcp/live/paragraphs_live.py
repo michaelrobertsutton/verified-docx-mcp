@@ -23,13 +23,54 @@ def delete_paragraph(path: str, anchor_text: str, revision_before: str,
             audit.append_audit(path=path, tool="delete_paragraph", evidence={
                 "applied": None, "write_mode": "live", "error": exc.envelope.to_dict()})
         raise
+    # A pane predating compact_evidence_v1 replies with every paragraph before and
+    # after. Those go to the audit log (live_evidence's `extra` is merged before the
+    # audit write); the caller only ever gets the compact form below.
+    audited = {k: result[k] for k in ("before_paragraphs", "after_paragraphs") if k in result}
     evidence = wm.live_evidence(
         shape_result=result,
         applied=True, match_count=1, rung=1, before=anchor_text, after="",
         pre_body_sha256=pre, post_body_sha256=result["post"],
-        document_name=session.document_name, tool="delete_paragraph", path=path)
-    evidence.update(result)
+        document_name=session.document_name, tool="delete_paragraph", path=path, extra=audited)
+    for key in audited:
+        evidence.pop(key, None)
+    evidence.update(_compact_delete_result(result, anchor_text))
     return evidence
+
+
+_EXCERPT_CHARS = 200
+
+
+def _clip(text: str | None) -> str | None:
+    if text is None:
+        return None
+    return text if len(text) <= _EXCERPT_CHARS else text[:_EXCERPT_CHARS] + "…"
+
+
+def _compact_delete_result(result: dict[str, Any], anchor_text: str) -> dict[str, Any]:
+    """Counts and the two neighbouring paragraphs, never the whole section.
+
+    A current pane (``compact_evidence_v1``) already sends ``neighbours``; for an older
+    pane that sent every paragraph, derive the same thing from its lists.
+    """
+    before = result.get("before_paragraphs")
+    after = result.get("after_paragraphs")
+    if isinstance(before, list) and isinstance(after, list):
+        index = before.index(anchor_text) if anchor_text in before else 0
+        neighbours = {
+            "previous": before[index - 1] if index > 0 else None,
+            "next": before[index + 1] if index + 1 < len(before) else None,
+        }
+        counts = (len(before), len(after))
+    else:
+        neighbours = result.get("neighbours") or {"previous": None, "next": None}
+        counts = (result.get("before_count"), result.get("after_count"))
+    return {
+        "paragraphs_before": counts[0],
+        "paragraphs_after": counts[1],
+        "before_excerpt": _clip(anchor_text),
+        "neighbours": {"previous": _clip(neighbours.get("previous")), "next": _clip(neighbours.get("next"))},
+    }
 
 
 def clear_numbering(path: str, table_id: int | None = None, paragraph_text: str | None = None,

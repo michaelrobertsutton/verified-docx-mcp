@@ -52,6 +52,7 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from . import audit, mutations, paths, projection
+from . import evidence as evidence_module
 from .errors import ErrorCode, _make_error
 from .projection import W_NS
 
@@ -729,8 +730,12 @@ def _run_accept_or_reject(
         "revision_ids": processed_ids,
     }
     mutations._merge_conflict_sweep(evidence, conflict_sweep)  # issue #28 WP-10
-    logged, _ = audit.append_audit(path=str(resolved), tool=tool_name, evidence=evidence)
+    ref = audit.new_evidence_ref()
+    logged, _ = audit.append_audit(path=str(resolved), tool=tool_name, evidence=evidence, evidence_ref=ref)
     evidence["audit_logged"] = logged
+    # #112: the whole-document text stays in the audit log; the caller gets bounded evidence.
+    if logged:  # see mutations.py: never drop the only copy of the text
+        evidence_module.compact_whole_document(evidence, evidence_ref=ref, sep="\n")
     return evidence
 
 

@@ -54,6 +54,7 @@ from typing import Any, NoReturn
 from fastmcp import FastMCP
 
 from . import (
+    audit,
     comments,
     geometry,
     images,
@@ -69,6 +70,7 @@ from . import (
 )
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
+from .lean_envelope import LeanEnvelopeMiddleware
 from .live import bridge as live_bridge
 from .live import comments_live, reads_live
 from .middleware import EvidenceEnforcementMiddleware
@@ -89,16 +91,22 @@ mcp = FastMCP(
 )
 
 mcp.add_middleware(EvidenceEnforcementMiddleware())
+mcp.add_middleware(LeanEnvelopeMiddleware())
 
 
-def _raise_tool_error(exc: VerifyError) -> NoReturn:
+def _raise_tool_error(exc: VerifyError, verbose: bool = False) -> NoReturn:
     """Raise a FastMCP ToolError carrying a JSON error envelope.
 
-    Mirrors verified-googledocs-mcp's server.py helper of the same name.
+    Mirrors verified-googledocs-mcp's server.py helper of the same name. A ZERO_MATCH's
+    ``ladder_report`` (a count of zero per normalization rung) is dropped unless
+    ``verbose``: ``near_miss`` is the useful part (issue #112).
     """
     from fastmcp.exceptions import ToolError
 
-    raise ToolError(json.dumps(exc.envelope.to_dict(), ensure_ascii=False)) from exc
+    payload = exc.envelope.to_dict()
+    if not verbose and payload.get("error_code") == ErrorCode.ZERO_MATCH.value:
+        payload["diagnostics"] = {k: v for k, v in payload["diagnostics"].items() if k != "ladder_report"}
+    raise ToolError(json.dumps(payload, ensure_ascii=False)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1737,8 +1745,14 @@ def replace_text(
     replacement_segments: list[dict[str, Any]] | None = None,
     scope: str = "body",
     allow_comment_loss_ids: list[dict[str, Any]] | None = None,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
+
+    `verbose=true` keeps a ZERO_MATCH error's `ladder_report` (a match count of zero per
+    normalization rung); without it the error carries `near_miss` only, which is the useful
+    part. MATCH_COUNT_MISMATCH and STRUCTURAL_BOUNDARY errors list at most five matches as
+    {start, end, context} plus `total_matches`.
 
     Live-only replacement_segments specifies explicit text/format/hyperlink segments.
     Text concatenates exactly to replace; each format includes bold, italic, underline
@@ -1918,7 +1932,7 @@ def replace_text(
             allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
-        _raise_tool_error(exc)
+        _raise_tool_error(exc, verbose)
 
 
 @mcp.tool()
@@ -1929,6 +1943,7 @@ def replace_text_batch(
     write_mode: str = "live",
     track_changes: bool = False,
     inherit_format: str = "replaced",
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Apply 1..50 replace_text edits to the LIVE Word document in order, in one call (issue #82).
 
@@ -1958,8 +1973,11 @@ def replace_text_batch(
     unchanged), or "unknown" (a failure after dispatch whose outcome cannot
     be proven: disconnect, timeout, LIVE_OP_FAILED, VERIFICATION_FAILED,
     LIVE_STALE_AFTER_WRITE -- re-read the document before doing anything).
-    `results` has one entry per edit: {index, status, evidence?, code?} with
-    status "applied" | "refused_before_write" | "unknown" | "not_attempted".
+    `results` has one entry per edit: {index, status, evidence?, code?, message?} with
+    status "applied" | "refused_before_write" | "unknown" | "not_attempted". The report is
+    compact (issue #112): an applied edit's `evidence` is just {match_count,
+    revision_after} (plus comments_removed when a comment was lost); a failed edit has its
+    `code` and `message`. `verbose=true` returns each edit's before/after text and shape counts.
     Only an explicit allowlist of codes counts as refused_before_write
     (LIVE_STALE from the pane, MATCH_COUNT_MISMATCH/ZERO_MATCH,
     ANCHORED_SHAPES, WOULD_DELETE_COMMENTS, capability and section-lock
@@ -1980,6 +1998,7 @@ def replace_text_batch(
             write_mode=write_mode,
             track_changes=track_changes,
             inherit_format=inherit_format,
+            verbose=verbose,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -1998,9 +2017,16 @@ def format_text(
     within_row_containing: str | None = None,
     allow_concurrent_editor: bool = False,
     scope: str = "body",
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Apply character styling (bold/italic/underline/strike/color) to a
     matched text span, without touching its content.
+
+    The text never changes, so the result carries ``text_unchanged: true`` and one
+    ``excerpt`` instead of a before and an after, plus ``format_delta`` (only the direct
+    character formatting that moved; a named style may change none of it, so ``style_id``
+    is what shows it applied). ``verbose=true`` also returns ``runs_before`` /
+    ``runs_after`` (issue #112).
 
     `write_mode` (issue #106 WP-3, "auto" | "file" | "live", default
     "auto"): identical rule and evidence differences to `replace_text`'s
@@ -2074,9 +2100,10 @@ def format_text(
             within_row_containing=within_row_containing,
             scope=scope,
             allow_concurrent_editor=allow_concurrent_editor,
+            verbose=verbose,
         )
     except VerifyError as exc:
-        _raise_tool_error(exc)
+        _raise_tool_error(exc, verbose)
 
 
 # ---------------------------------------------------------------------------
@@ -3502,9 +3529,16 @@ def apply_style(
     force: bool = False,
     track_changes: bool = False,
     allow_concurrent_editor: bool = False,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Apply a NAMED style (from list_styles) to text located via find --
     the named-style counterpart to format_text's four boolean toggles.
+
+    The text never changes, so the result carries ``text_unchanged: true`` and one
+    ``excerpt`` instead of a before and an after, plus ``format_delta`` (only the direct
+    character formatting that moved; a named style may change none of it, so ``style_id``
+    is what shows it applied). ``verbose=true`` also returns ``runs_before`` /
+    ``runs_after`` (issue #112).
 
     This tool has no `write_mode` parameter -- it always writes the
     .docx file directly. Issue #154: that means it now refuses with
@@ -3576,10 +3610,82 @@ def apply_style(
         return text_edit.execute_apply_style(
             path, find, style_id, expected_matches,
             revision_before=revision_before, force=force, track_changes=track_changes,
-            allow_concurrent_editor=allow_concurrent_editor,
+            allow_concurrent_editor=allow_concurrent_editor, verbose=verbose,
         )
     except VerifyError as exc:
+        _raise_tool_error(exc, verbose)
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def read_audit_evidence(
+    evidence_ref: str, field: str | None = None, to_file: str | None = None, overwrite: bool = False
+) -> dict[str, Any]:
+    """Fetch the full audit record behind an ``evidence_ref`` a write returned.
+
+    Writes that rewrite a whole body, section or revision set return hashes, sizes and
+    a short excerpt instead of the whole before/after text; the text itself is in the
+    audit log (``$XDG_STATE_HOME/verified-docx-mcp/audit.jsonl``, default
+    ``~/.local/state/verified-docx-mcp/``). The log is append-only and never rotated by
+    the server, so a ref stays valid until the operator removes the file. If the
+    operator set ``VERIFIED_DOCX_MCP_AUDIT_EXCERPTS=0`` the text was never stored and
+    ``before``/``after`` read ``[redacted; N chars]``.
+
+    ``field`` (e.g. ``"before"``, ``"after"``) returns just that evidence field.
+    ``to_file`` writes the result (JSON, or the raw text of one string ``field``) to an
+    allowed path (.md, .txt or .json; an existing file is refused unless ``overwrite=true``)
+    and returns only {written_to, sha256, chars}.
+
+    Errors: INVALID_INPUT - unknown ``evidence_ref`` or ``field``, or a bad ``to_file``.
+    """
+    try:
+        return execute_read_audit_evidence(evidence_ref, field, to_file, overwrite)
+    except VerifyError as exc:
         _raise_tool_error(exc)
+
+
+def execute_read_audit_evidence(
+    evidence_ref: str, field: str | None = None, to_file: str | None = None, overwrite: bool = False
+) -> dict[str, Any]:
+    target = (
+        paths.resolve_text_output_path(to_file, param="to_file", overwrite=overwrite) if to_file is not None else None
+    )
+    record = audit.find_audit_record(evidence_ref)
+    if record is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"No audit record with evidence_ref {evidence_ref!r}. The ref is only valid on the machine "
+            "and state directory that wrote it, and only while its audit log still holds the record.",
+            {"evidence_ref": evidence_ref},
+        )
+    evidence = record.get("evidence", {})
+    if field is not None and field not in evidence:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"The audit record has no evidence field {field!r}.",
+            {"evidence_ref": evidence_ref, "available_fields": sorted(evidence)},
+        )
+    result: dict[str, Any] = {
+        "evidence_ref": evidence_ref,
+        "tool": record.get("tool"),
+        "path": record.get("path"),
+        "timestamp": record.get("timestamp"),
+    }
+    payload: Any = evidence if field is None else evidence[field]
+    if field is None:
+        result["evidence"] = payload
+    else:
+        result["field"] = field
+        result["value"] = payload
+    if target is None:
+        return result
+    text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    data = paths.write_text_atomic(target, text)
+    return {
+        **{k: result[k] for k in ("evidence_ref", "tool", "path", "timestamp")},
+        "written_to": str(target),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "chars": len(text),
+    }
 
 
 _HEADER_FOOTER_KINDS = frozenset({"header", "footer"})
@@ -4377,8 +4483,12 @@ def live_changes_prepare(path: str, operations: list[dict[str, Any]], track_chan
     """Prepare a scoped approved run without modifying Word. Operations are
     {op, section, args}; section is a unique heading slug. Supports
     replace_cell_markdown, replace_table_row, replace_text, delete_paragraph,
-    and a final live_save. Returns a compact preview, run_id and manifest_sha256.
-    Read the local manifest to review exact changes; approve that digest once.
+    and a final live_save. Returns a preview, run_id and manifest_sha256. The preview
+    shows each operation's find/replace/markdown/cells/anchor_text (cut to 200
+    characters with an ellipsis), its table address and expected_matches, so the
+    lead can approve from the response. It is DERIVED from the manifest: the
+    manifest file and its digest remain the authority, and approving that digest
+    binds the exact operations, not the clipped preview.
     replace_text args may also include replacement_segments with the complete
     explicit font/hyperlink schema documented on replace_text; concatenated segment
     text must equal replace. The approval preview includes the exact segments.
@@ -4392,40 +4502,47 @@ def live_changes_prepare(path: str, operations: list[dict[str, Any]], track_chan
 
 
 @mcp.tool()
-def live_changes_execute(path: str, run_id: str, manifest_sha256: str, approved_by: str) -> dict[str, Any]:
+def live_changes_execute(
+    path: str, run_id: str, manifest_sha256: str, approved_by: str, verbose: bool = False
+) -> dict[str, Any]:
     """Execute one immutable, lead-approved change set. Code handles all writes,
     internal verification, bounded pre-write retries and the durable progress
     journal. Unrelated section edits do not invalidate the run. Returns counts
     and exceptions only; full evidence stays local. Unknown outcomes never retry.
+    The report does not echo your run_id or manifest_sha256; `remaining` lists
+    operation indices and `remaining_ranges` is the same as a string ("7-36");
+    an issue's `section_diff` is cut to 600 characters (`journal_path` has the
+    rest). `verbose=true` adds `performance`.
     """
     from .live.approved_changes import execute
     try:
-        return execute(path, run_id, manifest_sha256, approved_by)
+        return execute(path, run_id, manifest_sha256, approved_by, verbose)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
 @mcp.tool()
-def live_changes_resume(path: str, run_id: str, manifest_sha256: str) -> dict[str, Any]:
+def live_changes_resume(path: str, run_id: str, manifest_sha256: str, verbose: bool = False) -> dict[str, Any]:
     """Resume independent remaining operations of an already approved run. Verifies
     document, digest and protected targets; skips verified operations and defers
     uncertain targets without replaying them. Does not broaden approval.
     """
     from .live.approved_changes import execute
     try:
-        return execute(path, run_id, manifest_sha256)
+        return execute(path, run_id, manifest_sha256, None, verbose)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 @mcp.tool()
 def live_changes_reconcile(path: str, run_id: str, manifest_sha256: str,
-                           disposition: str, decision_ref: str, operation_index: int | None = None) -> dict[str, Any]:
+                           disposition: str, decision_ref: str, operation_index: int | None = None,
+                           verbose: bool = False) -> dict[str, Any]:
     """Record a lead's explicit applied/not-applied decision on an uncertain run.
     Exact live section readback must support the decision. Does not write Word.
     """
     from .live.approved_changes import reconcile
     try:
-        return reconcile(path, run_id, manifest_sha256, disposition, decision_ref, operation_index)
+        return reconcile(path, run_id, manifest_sha256, disposition, decision_ref, operation_index, verbose)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

@@ -69,7 +69,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .. import audit, paths
-from ..errors import ErrorCode, _make_error
+from ..errors import ErrorCode, _make_error, short_hash
 from . import bridge as live_bridge
 from .session import LiveOpFailed, LiveSession
 
@@ -202,10 +202,8 @@ def resolve_write_mode(path: str, requested: str) -> str:
         if session is None:
             raise _make_error(
                 ErrorCode.LIVE_UNAVAILABLE,
-                f"write_mode='live' requested but no connected pane session for document "
-                f"{document_name!r}. Open the Live pane in Word (docs/live-mode.md) and retry, "
-                "or call live_status to confirm the bridge is running.",
-                {"document_name": document_name, "path": path},
+                f"No Word pane connected for {document_name!r}; open the Live pane and retry.",
+                {"document_name": document_name},
             )
         _check_session_identity(path, session)
         return "live"
@@ -273,10 +271,8 @@ def live_session_for(path: str) -> LiveSession:
     if session is None:
         raise _make_error(
             ErrorCode.LIVE_UNAVAILABLE,
-            f"no connected pane session for document {document_name!r}. Open the Live pane in "
-            "Word (docs/live-mode.md) and retry, or call live_status to confirm the bridge is "
-            "running.",
-            {"document_name": document_name, "path": path},
+            f"No Word pane connected for {document_name!r}; open the Live pane and retry.",
+            {"document_name": document_name},
         )
     _check_session_identity(path, session)
     # Shared bridge: tool-internal reads (a write tool fetching the body before
@@ -329,10 +325,9 @@ def check_not_stale(revision_before: str | None, current_body_sha256: str) -> No
     if expected != current_body_sha256:
         raise _make_error(
             ErrorCode.LIVE_STALE,
-            f"revision_before {revision_before!r} no longer matches the live document's current "
-            f"body hash ({_LIVE_REVISION_PREFIX}{current_body_sha256}) -- someone (the lead, "
-            "typing) changed the document since that revision was read. Re-read and retry.",
-            {"revision_before": revision_before, "current_body_sha256": current_body_sha256},
+            "The live document changed since revision_before was read (someone typed, or another "
+            "client wrote). Call live_revision or re-read, then retry.",
+            {"expected": short_hash(expected), "actual": short_hash(current_body_sha256)},
         )
 
 
@@ -454,8 +449,11 @@ def live_evidence(
     }
     evidence.update(shape_counts(shape_result or {}))
     evidence.update(extra or {})
-    logged, _ = audit.append_audit(path=path, tool=tool, evidence=evidence)
+    ref = audit.new_evidence_ref()
+    logged, _ = audit.append_audit(path=path, tool=tool, evidence=evidence, evidence_ref=ref)
     evidence["audit_logged"] = logged
+    if logged:
+        evidence["evidence_ref"] = ref  # issue #112: the full record, fetchable with read_audit_evidence
     return evidence
 
 

@@ -19,11 +19,16 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-_AUDIT_REDACTED_KEYS = frozenset({"before", "after", "runs_before", "runs_after"})
+# before_paragraphs / after_paragraphs: an older pane's live delete_paragraph reply, which
+# live_evidence routes into the audit record (#112); redaction must cover them too.
+_AUDIT_REDACTED_KEYS = frozenset(
+    {"before", "after", "runs_before", "runs_after", "before_paragraphs", "after_paragraphs"}
+)
 
 # Operator control surface for audit-excerpt redaction. No tool exposes the
 # toggle, so this environment variable is the only way to reach the
@@ -56,12 +61,20 @@ def _state_dir() -> Path:
     return base / "verified-docx-mcp"
 
 
+def new_evidence_ref() -> str:
+    """A fresh audit record id. A caller that wants to hand the model a handle to
+    the full before/after generates one, passes it to ``append_audit`` and returns
+    it as ``evidence_ref`` only if the record was written."""
+    return uuid.uuid4().hex
+
+
 def append_audit(
     *,
     path: str,
     tool: str,
     evidence: dict[str, Any],
     audit_excerpts: bool = True,
+    evidence_ref: str | None = None,
 ) -> tuple[bool, str]:
     """Append a mutation record to the audit log.
 
@@ -89,6 +102,7 @@ def append_audit(
                     payload[key] = f"[redacted; {len(str(payload[key]))} chars]"
 
         record = {
+            "id": evidence_ref or new_evidence_ref(),
             "timestamp": datetime.now(UTC).isoformat(),
             "path": path,
             "tool": tool,
@@ -106,3 +120,30 @@ def append_audit(
 
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
+
+
+def find_audit_record(evidence_ref: str) -> dict[str, Any] | None:
+    """The audit record whose ``id`` is *evidence_ref*, or None.
+
+    The log is append-only and the server never rotates or prunes it, so a ref
+    stays valid until the operator removes the file. Scans line by line and
+    parses only lines containing the id, so a large log is not loaded whole.
+    """
+    audit_path = _state_dir() / "audit.jsonl"
+    if not evidence_ref or not audit_path.is_file():
+        return None
+    needle = f'"id": "{evidence_ref}"'
+    try:
+        with audit_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if needle not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if record.get("id") == evidence_ref:
+                    return record
+    except OSError:
+        return None
+    return None

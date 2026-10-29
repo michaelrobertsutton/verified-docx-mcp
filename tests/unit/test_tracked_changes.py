@@ -259,6 +259,19 @@ class AcceptTests(_TempFixtureCase):
         self.assertIn("conflict_copy_detected", evidence)
         self.assertFalse(evidence["conflict_copy_detected"])
 
+    def test_accept_returns_bounded_evidence_and_keeps_the_full_text_in_the_audit_log(self):
+        from verified_docx_mcp import audit
+
+        evidence = tracked_changes.execute_accept_tracked_changes(str(self.target))
+        self.assertNotIn("before", evidence)
+        self.assertNotIn("after", evidence)
+        for key in ("before_sha256", "after_sha256", "before_chars", "after_chars", "before_excerpt", "evidence_ref"):
+            self.assertIn(key, evidence)
+        record = audit.find_audit_record(evidence["evidence_ref"])
+        self.assertEqual(record["tool"], "accept_tracked_changes")
+        self.assertEqual(len(record["evidence"]["after"]), evidence["after_chars"])
+        self.assertEqual(record["evidence"]["after"], projection.read_document_text(self.target))
+
     def test_accept_by_id_leaves_the_other_pending(self):
         evidence = tracked_changes.execute_accept_tracked_changes(str(self.target), revision_ids=["0"])
         self.assertEqual(evidence["rung"], "by_id")

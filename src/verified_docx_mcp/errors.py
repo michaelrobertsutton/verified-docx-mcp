@@ -185,12 +185,26 @@ class ErrorEnvelope:
     retryable: bool
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "error_code": self.error_code.value,
             "message": self.message,
             "diagnostics": self.diagnostics,
-            "retryable": self.retryable,
         }
+        # Issue #112: omitted when false (nearly every error), present only when a retry can help.
+        if self.retryable:
+            out["retryable"] = True
+        return out
+
+
+def short_hash(value: str | None, length: int = 12) -> str | None:
+    """The first *length* hex characters of a body hash or ``live:sha256:<hex>`` token.
+
+    A stale-revision error used to carry two full 76-character tokens as ``expected`` /
+    ``actual``; twelve hex characters are enough to tell two revisions apart (issue #112).
+    """
+    if not value:
+        return None
+    return value.removeprefix("live:sha256:")[:length]
 
 
 class VerifyError(Exception):
