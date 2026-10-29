@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add guarded file/live `insert_table_row` and `delete_table_row` with 1-based positions, template formatting and expected-text deletion checks. Add `insert_table(like_table_id=...)` for direct-formatting copies with explicit overrides (pane v67). Live after-table copies insert a separator paragraph to preserve distinct tables. See `docs/acceptance/106-table-structure.md` for native acceptance and bounded template support.
+
 - Bounded write evidence (#112): `append_markdown`, `replace_body_markdown`, `replace_range_markdown` and file-mode accept/reject return hashes, sizes and a 200-character excerpt instead of the whole before/after (`append_markdown` of one paragraph to a 20K-word document: ~98K to ~175 tokens). The full text stays in the audit log under `evidence_ref`; new `read_audit_evidence` fetches it. `verbose` never restores it.
 - Live `delete_paragraph` returns counts and the two neighbouring paragraphs (pane v66, `compact_evidence_v1`). `format_text`/`apply_style` report `text_unchanged`, one excerpt and a `format_delta`; `runs_before`/`runs_after` need `verbose=true`.
 - Compact `replace_text_batch` and approved-run reports (no echo of `run_id`/`manifest_sha256`, `performance` behind `verbose`, `section_diff` cut to 600 characters, `remaining_ranges` beside `remaining`); `live_changes_prepare` previews each operation's text. A lean envelope drops constants (`verified_via`, `document_name`, `audit_logged: true`, ...). Errors list at most five match contexts with `total_matches`, drop `ladder_report` unless `verbose`, use 12-hex stale hashes and omit `retryable` when false.

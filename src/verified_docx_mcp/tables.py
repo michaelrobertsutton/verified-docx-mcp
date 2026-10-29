@@ -1854,9 +1854,19 @@ def execute_insert_table(
     style_from_table_id: int | None = None,
     style_builtin: str | None = None,
     font_size_pt: float | None = None,
+    like_table_id: int | None = None,
 ) -> dict[str, Any]:
+    from . import table_structure
+    if like_table_id is not None:
+        table_structure.positive(like_table_id, "like_table_id")
     _check_style_sources(style_id, style_from_table_id, style_builtin)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
+    if mode == "live" and like_table_id is not None:
+        return table_structure.execute_copy_live(path, rows, like_table_id=like_table_id,
+            anchor=anchor, revision_before=revision_before, track_changes=track_changes,
+            header_rows=header_rows, grid_dxa=grid_dxa, cant_split=cant_split,
+            font_size_pt=font_size_pt, style_id=style_id, style_builtin=style_builtin,
+            style_from_table_id=style_from_table_id)
     if mode == "live":
         return execute_insert_table_live(
             path,
@@ -1879,7 +1889,7 @@ def execute_insert_table(
             "table style); give style_id (an OOXML table style id) or style_from_table_id.",
             {"style_builtin": style_builtin},
         )
-    if style_id is None and style_from_table_id is None:
+    if style_id is None and style_from_table_id is None and like_table_id is None:
         raise _make_error(
             ErrorCode.INVALID_INPUT,
             "give style_id (an existing table style id, see list_styles) or style_from_table_id.",
@@ -1906,7 +1916,7 @@ def execute_insert_table(
 
     styles = projection.list_styles_impl(resolved)
     table_style_ids = {s["style_id"] for s in styles if s.get("type") == "table" and s.get("style_id")}
-    if style_id not in table_style_ids:
+    if style_id is not None and style_id not in table_style_ids:
         raise _make_error(
             ErrorCode.STYLE_NOT_FOUND,
             f"style_id {style_id!r} is not a table style (w:type=\"table\") in this document's styles.xml.",
@@ -1966,6 +1976,18 @@ def execute_insert_table(
         ctx, style_id, norm_rows, col_count, grid_cols_dxa, explicit_grid, header_rows, cant_split,
         font_size_half_points,
     )
+
+    if like_table_id is not None:
+        source_table = table_structure.simple_table(document_root, like_table_id)
+        table_structure.apply_table_template(source_table, tbl, grid_explicit=bool(grid_dxa),
+            header_rows=header_rows, cant_split=cant_split, font_size=font_size_half_points,
+            norm_rows=norm_rows)
+        if style_id is not None:
+            props = tbl.find(_w("tblPr"))
+            old_style = props.find(_w("tblStyle"))
+            if old_style is not None:
+                props.remove(old_style)
+            props.insert(0, ET.Element(_w("tblStyle"), {_w("val"): style_id}))
 
     track = tracked_changes.TrackContext(document_root, author=own_author) if track_changes else None
     if track:
