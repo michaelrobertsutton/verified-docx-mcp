@@ -88,10 +88,30 @@ The 50-edit batch misses the issue's 1.5K target. Each applied edit must keep a 
 and chains it; the agreed fix is on the JennyStack side. `replace_text` still returns its text
 before/after and `runs_before`/`runs_after`: those belong to #108's `verbose` work.
 
-## Not run yet
+## Real Word
 
-`LIVE_STALE` also reporting `changed_sections` waits on the section digests behaving on real Word
-documents (#110's acceptance), and the live-pane items need real Word: live `delete_paragraph` on a
-304-paragraph document with pane v66, and `compact_evidence_v1` against an older pane. The pane
-could not be loaded because another agent's process holds the fixed bridge ports; see
-`110-read-tokens.md`.
+PASS, 13 of 13 checks, Word for Mac on 2026-10-29, `tests/live/write_tokens_probe.py` against a
+pristine disposable copy of the large fixture (300 paragraphs), pane v66.
+
+| Check | Result |
+|---|---|
+| live `delete_paragraph` of a heading in the 300-paragraph body | 264 tokens: `paragraphs_before/after` 300/299, both neighbouring paragraphs, `evidence_ref` resolves to the audit record, paragraph gone |
+| 50-edit `replace_text_batch` | all 50 applied, every hook field intact (`applied`, `batch_status`, `applied_count`, `edit_count`, `revision_before`, full `revision_after`, each edit's `evidence`), 2,043 tokens, **134 s** (about 2.7 s per edit in Word) |
+| a write chained from the batch's `revision_after` | accepted |
+| mid-batch refusal | `partial`; failing index 1, `ZERO_MATCH`, its message; the next edit `not_attempted` |
+| `LIVE_STALE` through the MCP layer | `expected`/`actual` 12-hex, no `retryable` |
+| `MATCH_COUNT_MISMATCH` from the live pane | 35 tokens, diagnostics `pane_code` only |
+| `ZERO_MATCH` | no `ladder_report` |
+| a live `replace_text` result | none of `verified_via`, `track_changes_author`, `document_name`, `audit_logged`, `write_mode`, `orphaned_comment_ids`; 185 tokens |
+| live `format_text` | `text_unchanged: true`, one `excerpt`, 104 tokens |
+
+Two limits the run showed. A match-count error raised by the live pane carries only `pane_code`:
+the pane reports counts, not offsets, so the five-context list applies to file-mode and `locate`
+errors. And `compact_evidence_v1` was exercised against the current pane only; the older-pane path
+(server trims the full lists) is covered by the unit test, not by real Word.
+
+## Not done
+
+`LIVE_STALE` also reporting `changed_sections`: #110's digests now behave on real Word, but the
+error path would need a second pane round trip on every stale refusal, and nothing yet reads it.
+Left out rather than shipped speculative.
