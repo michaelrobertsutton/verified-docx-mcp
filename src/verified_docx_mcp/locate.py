@@ -99,6 +99,7 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import re
+import unicodedata
 from collections.abc import Callable
 from typing import Any
 
@@ -186,6 +187,39 @@ def _norm_softhyphen(s: str) -> tuple[str, list[int]]:
         orig_pos.append(i)
     orig_pos.append(len(s))  # sentinel
     return "".join(parts), orig_pos
+
+
+_DASH_MAP = str.maketrans(
+    {
+        "‐": "-",  # HYPHEN
+        "‑": "-",  # NON-BREAKING HYPHEN
+        "‒": "-",  # FIGURE DASH
+        "–": "-",  # EN DASH
+        "—": "-",  # EM DASH
+        "―": "-",  # HORIZONTAL BAR
+        "−": "-",  # MINUS SIGN
+        "﹘": "-",  # SMALL EM DASH
+        "﹣": "-",  # SMALL HYPHEN-MINUS
+        "－": "-",  # FULLWIDTH HYPHEN-MINUS
+    }
+)
+
+
+def normalize_for_compare(text: str) -> str:
+    """Fold *text* with the same equivalences ``locate`` uses to find text
+    (curly->straight quotes, NBSP-class spaces, soft-hyphen strip) plus dash
+    variants and NFC, for comparing two renderings of one document
+    (``diff_body_vs_file``) and for matching headings across them.
+
+    Whitespace runs are NOT collapsed -- callers diff line by line -- but each
+    line is right-stripped, because trailing spaces (and a CR before the LF)
+    are the commonest phantom difference between pandoc, markitdown and
+    Word projections. Newlines are kept, so line numbers stay valid.
+    """
+    s = unicodedata.normalize("NFC", text)
+    s = s.translate(_QUOTE_MAP).translate(_DASH_MAP)
+    s = _NBSP_RE.sub(" ", s).replace(_SOFTHYPHEN, "")
+    return "\n".join(line.rstrip() for line in s.split("\n"))
 
 
 def _compose_orig_pos(inner: list[int], outer: list[int]) -> list[int]:

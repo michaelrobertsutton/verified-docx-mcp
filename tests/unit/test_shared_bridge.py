@@ -554,6 +554,47 @@ def test_holder_baseline_refreshes_on_own_write_and_explicit_read(sections):
     assert _last_write(pane)["ownSections"][0]["expectedSha256"] == "human-edit"
 
 
+def test_body_hash_read_rearms_a_stale_client_like_any_observed_read(setup_broker):
+    """#110 live_revision: an observed body_hash is an explicit read."""
+    pane, _, a, b, call = setup_broker
+    call(a)
+    call(b)
+    call(a, "replace")
+    with pytest.raises(LiveOpFailed, match="LIVE_STALE"):
+        call(b, "replace")
+    call(b, "body_hash")
+    call(b, "replace")
+    assert pane.calls[-1][0] == "replace"
+
+
+def test_non_observing_body_hash_never_rearms_a_refused_client(setup_broker):
+    """A lookup made while refusing a write (observe=False, the status view) must not
+    re-arm the client that was just refused: the retry has to stay refused."""
+    pane, _, a, b, call = setup_broker
+    call(a)
+    call(b)
+    call(a, "replace")
+    with pytest.raises(LiveOpFailed, match="LIVE_STALE"):
+        call(b, "replace")
+    call(b, "body_hash", observe=False)
+    with pytest.raises(LiveOpFailed, match="LIVE_STALE"):
+        call(b, "replace")
+    assert sum(op == "replace" for op, _ in pane.calls) == 1
+
+
+def test_section_holder_baseline_refreshes_on_observed_body_hash_only(sections):
+    pane, _, a, _, call = sections
+    call(a, action="section_lock", sections=["scope-1"])
+    pane.sha["scope"] = "seen-by-live-revision"
+    call(a, "body_hash", observe=False)  # error-path lookup: baseline stays
+    call(a, "replace")
+    assert _last_write(pane)["ownSections"][0]["expectedSha256"] == "s-scope"
+    pane.sha["scope"] = "seen-by-live-revision-2"
+    call(a, "body_hash")  # live_revision: an explicit read re-baselines
+    call(a, "replace")
+    assert _last_write(pane)["ownSections"][0]["expectedSha256"] == "seen-by-live-revision-2"
+
+
 def test_renewing_a_lock_does_not_rebaseline(sections):
     pane, _, a, _, call = sections
     call(a, action="section_lock", sections=["scope-1"])

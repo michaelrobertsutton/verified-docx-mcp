@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import difflib
 import glob
+import hashlib
 import itertools
 import json
 import os
@@ -56,6 +57,7 @@ from . import (
     comments,
     geometry,
     images,
+    locate,
     mutations,
     paragraph_insert,
     paths,
@@ -105,31 +107,9 @@ def _raise_tool_error(exc: VerifyError) -> NoReturn:
 
 
 def _resolve_export_output_path(output_path: str) -> Path:
-    """Validate *output_path* for export_pdf: allowlisted, not denylisted,
-    parent directory must already exist (no implicit mkdir — mirrors
-    verified-googledocs-mcp's export_pdf validation), and an existing
-    target must be a regular file."""
-    if not output_path.strip():
-        raise _make_error(ErrorCode.INVALID_INPUT, "output_path must not be empty")
-
-    resolved = paths.resolve_allowed_docx_path(output_path, must_exist=False)
-
-    parent = resolved.parent
-    if not parent.is_dir():
-        raise _make_error(
-            ErrorCode.INVALID_INPUT,
-            f"Parent directory does not exist: {parent}",
-            {"output_path": output_path, "resolved_path": str(resolved), "parent": str(parent)},
-        )
-
-    if resolved.exists() and not resolved.is_file():
-        raise _make_error(
-            ErrorCode.INVALID_INPUT,
-            f"Output path exists and is not a regular file: {output_path!r}",
-            {"output_path": output_path, "resolved_path": str(resolved)},
-        )
-
-    return resolved
+    """Validate *output_path* for export_pdf (see paths.resolve_output_path;
+    mirrors verified-googledocs-mcp's export_pdf validation)."""
+    return paths.resolve_output_path(output_path)
 
 
 def _section_keys_error(missing: list[str]) -> Any:
@@ -806,7 +786,7 @@ def live_document_lock(path: str, release: bool = False, lease_s: float = 60) ->
 
 
 @mcp.tool()
-def live_list_sections(path: str) -> dict[str, Any]:
+def live_list_sections(path: str, compact: bool = False) -> dict[str, Any]:
     """List the live document's heading sections as the Word pane sees them.
 
     Each entry has ``section_key`` (the find_sections convention: heading slug plus
@@ -814,6 +794,11 @@ def live_list_sections(path: str) -> dict[str, Any]:
     ``sectionSha256``. Only sections with ``slug_unique`` true can be locked with
     live_section_lock. Needs a pane that reports ``section_locks``; works with or
     without the shared bridge.
+
+    ``compact=true`` returns ``{sections: [[section_key, heading_text, sha12], ...],
+    body_sha12}`` instead (no 64-hex hashes, slugs or counts, so much smaller): sha12 is
+    the first 12 hex of ``sectionSha256``, which find_sections(digests=true) also
+    reports for unchanged text. Section locks still key on the full hash internally.
     """
     from .live import comments_live, write_mode
     from .live.session import LiveError
@@ -821,7 +806,50 @@ def live_list_sections(path: str) -> dict[str, Any]:
     try:
         session = write_mode.live_session_for(path)
         write_mode.require_capability(session, "section_locks", feature_description="live_list_sections")
-        return comments_live._request(session, "sections_list", {})
+        reply = comments_live._request(session, "sections_list", {})
+        if not compact:
+            return reply
+        return {
+            "sections": [
+                [sec["section_key"], sec["heading_text"], sec["sectionSha256"][:12]]
+                for sec in reply.get("sections", [])
+            ],
+            "body_sha12": str(reply.get("bodySha256", ""))[:12],
+        }
+    except LiveError as exc:
+        try:
+            comments_live._raise_from_live_error(exc)
+        except VerifyError as error:
+            _raise_tool_error(error)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def live_revision(path: str) -> dict[str, Any]:
+    """The live document's current revision and per-section digests, without
+    reading the body.
+
+    Returns ``{revision: "live:sha256:<64 hex>", body_sha12, sections:
+    [[section_key, sha12], ...], observed_at, via}``. ``revision`` is exactly the
+    token read_document(source="live") reports and live writes accept as
+    ``revision_before``. Calling this re-arms your write baseline the same way a
+    live read_document does (shared-bridge mode), so use it to resume after
+    LIVE_STALE when you have no reason to re-read the text -- and read the text
+    instead if ``sections`` shows a section you care about changed.
+
+    One pane round trip (``via: "body_hash"``, pane capability ``body_hash_v1``).
+    An older pane still works but transfers the whole body to this server and
+    discards it (``via: "body_ooxml_fallback"``): correct, not cheap. Reload the
+    pane to get the fast path.
+
+    Errors: LIVE_UNAVAILABLE (no pane), LIVE_SESSION_MISMATCH, LIVE_OP_FAILED.
+    """
+    from .live import comments_live, reads_live
+    from .live.session import LiveError
+
+    try:
+        return reads_live.live_revision(path)
     except LiveError as exc:
         try:
             comments_live._raise_from_live_error(exc)
@@ -992,6 +1020,9 @@ def execute_read_document(
     part: str = projection.DEFAULT_PART,
     section_key: str | None = None,
     source: str = "auto",
+    start_para_ref: str | None = None,
+    end_para_ref: str | None = None,
+    to_file: str | None = None,
 ) -> dict[str, Any]:
     if format not in _VALID_READ_FORMATS:
         raise _make_error(
@@ -999,13 +1030,81 @@ def execute_read_document(
             f"format must be one of {sorted(_VALID_READ_FORMATS)}, got {format!r}",
             {"format": format},
         )
+    if (start_para_ref is None) != (end_para_ref is None):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "start_para_ref and end_para_ref must be given together (an inclusive pN..pM range).",
+            {"start_para_ref": start_para_ref, "end_para_ref": end_para_ref},
+        )
+    if start_para_ref is not None and section_key is not None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "A paragraph range cannot be combined with section_key (a text-box scope has its own paragraphs).",
+            {"section_key": section_key, "start_para_ref": start_para_ref},
+        )
+    # Resolve the destination BEFORE the read so a bad path costs nothing and
+    # a live read is never half-performed for nothing.
+    target = paths.resolve_output_path(to_file, param="to_file") if to_file is not None else None
     with reads_live.read_source(path, source, part) as rs:
-        return rs.annotate(_read_document_from(rs.local_path, rs.resolved, format, part, section_key))
+        result, paragraph_count = _read_document_from(
+            rs.local_path, rs.resolved, format, part, section_key, start_para_ref, end_para_ref
+        )
+        if target is not None:
+            result = _written_read_summary(rs.local_path, result, paragraph_count, format, part, target)
+        return rs.annotate(result)
+
+
+_TO_FILE_MAX_SECTIONS = 25
+
+
+def _written_read_summary(
+    local_path: Path, result: dict[str, Any], paragraph_count: int, format: str, part: str, target: Path
+) -> dict[str, Any]:
+    """Write the rendered body of a read to *target* and return only the
+    summary (no body), plus the heading sections with their sizes."""
+    rendered = result.pop(format)
+    text = rendered if isinstance(rendered, str) else json.dumps(rendered, ensure_ascii=False)
+    data = paths.write_text_atomic(target, text)
+    headings = [sec for sec in projection.find_sections_impl(local_path, part) if sec["kind"] == "heading"]
+    # Compact rows, capped: a 150-section document would otherwise make the
+    # "no body" summary itself thousands of tokens. find_sections has the rest.
+    sections = [
+        [sec["section_key"], sec["start_para_ref"], sec["end_para_ref"], sec["chars"]]
+        for sec in headings[:_TO_FILE_MAX_SECTIONS]
+    ]
+    summary: dict[str, Any] = {
+        "path": result["path"],
+        "part": part,
+        "format": format,
+        "section_key": result["section_key"],
+        "revision": result["revision"],
+        "revision_detail": result["revision_detail"],
+        "written_to": str(target),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "chars": len(text),
+        "paragraph_count": paragraph_count,
+        "sections": sections,
+        "section_count": len(headings),
+        "warnings": result["warnings"],
+    }
+    if len(headings) > len(sections):
+        summary["sections_truncated"] = True
+    for key in ("lossy_elements", "start_para_ref", "end_para_ref"):
+        if key in result:
+            summary[key] = result[key]
+    return summary
 
 
 def _read_document_from(
-    local_path: Path, resolved: Path, format: str, part: str, section_key: str | None
-) -> dict[str, Any]:
+    local_path: Path,
+    resolved: Path,
+    format: str,
+    part: str,
+    section_key: str | None,
+    start_para_ref: str | None = None,
+    end_para_ref: str | None = None,
+) -> tuple[dict[str, Any], int]:
+    """The read body plus the number of paragraphs it covers."""
     revision = projection.compute_revision(local_path)
     result: dict[str, Any] = {
         "path": str(resolved),
@@ -1015,6 +1114,20 @@ def _read_document_from(
         "revision": revision["token"],
         "revision_detail": revision["detail"],
     }
+
+    def render(proj: projection.Projection, extra_lossy: list[dict[str, Any]]) -> tuple[dict[str, Any], int]:
+        if format == "text":
+            result["text"] = proj.text
+        elif format == "runs":
+            result["runs"] = projection.runs_from_projection(proj)
+        else:  # markdown
+            markdown, _, lossy_elements = projection.markdown_from_projection(local_path, proj)
+            result["markdown"] = markdown
+            lossy_elements = lossy_elements + extra_lossy
+            if lossy_elements:
+                result["lossy_elements"] = lossy_elements
+        result["warnings"] = proj.warnings
+        return result, len(proj.paragraphs)
 
     if section_key is not None:
         # Only a textbox-<n> sub-scope resolves here (WP-03 scope —
@@ -1031,34 +1144,17 @@ def _read_document_from(
                 f"section_key {section_key!r} does not name a text box in part {part!r}.",
                 {"section_key": section_key, "part": part, "available_textbox_keys": available},
             )
-        if format == "text":
-            result["text"] = scoped.text
-        elif format == "runs":
-            result["runs"] = projection.runs_from_projection(scoped)
-        else:  # markdown
-            markdown, _, lossy_elements = projection.markdown_from_projection(local_path, scoped)
-            result["markdown"] = markdown
-            if lossy_elements:
-                result["lossy_elements"] = lossy_elements
-        result["warnings"] = scoped.warnings
-        return result
+        return render(scoped, [])
 
-    if format == "text":
-        result["text"] = projection.read_document_text(local_path, part)
-        result["warnings"] = projection.project_part(local_path, part).warnings
-    elif format == "runs":
-        result["runs"] = projection.read_document_runs(local_path, part)
-        result["warnings"] = projection.project_part(local_path, part).warnings
-    else:  # markdown
-        markdown, warnings, lossy_elements = projection.read_document_markdown(local_path, part)
-        result["markdown"] = markdown
-        result["warnings"] = warnings
-        # Same response shape as GoogleDocs-MCP's read_document (issue
-        # #28 WP-03b-a): a lossy_elements key, present only when the
-        # rendering actually lost something (a merged/nested table).
-        if lossy_elements:
-            result["lossy_elements"] = lossy_elements
-    return result
+    whole = projection.project_part(local_path, part)
+    if start_para_ref is not None and end_para_ref is not None:
+        first, last = projection.resolve_para_range(whole, start_para_ref, end_para_ref)
+        sliced, partial = projection.slice_projection(whole, first, last)
+        result["start_para_ref"] = start_para_ref
+        result["end_para_ref"] = end_para_ref
+        return render(sliced, partial)
+
+    return render(whole, [])
 
 
 @mcp.tool()
@@ -1068,6 +1164,9 @@ def read_document(
     part: str = projection.DEFAULT_PART,
     section_key: str | None = None,
     source: str = "auto",
+    start_para_ref: str | None = None,
+    end_para_ref: str | None = None,
+    to_file: str | None = None,
 ) -> dict[str, Any]:
     """Read a .docx part's content as markdown, flat text, or a run-level
     structural list.
@@ -1131,6 +1230,26 @@ def read_document(
     ordinary rendered text, never duplicated by a "[field:...]" token
     (that placeholder appears only when a field carries NO result at all).
 
+    start_para_ref / end_para_ref (together, inclusive, positional "pN"
+    exactly as find_sections reports them) return only that paragraph
+    range, in any format, file or live. A malformed, out-of-range or
+    inverted range is INVALID_INPUT. A table cut by the range keeps only
+    the rows that hold in-range paragraphs and is reported in
+    lossy_elements as {"kind": "partial_table", "table_id"}; an ordered
+    list's numbering restarts at the slice. Cannot be combined with
+    section_key.
+
+    to_file writes the rendered text/markdown/runs (runs as JSON) to that
+    path (allowed roots only; the parent directory must exist) and returns
+    NO body: {path, part, format, revision, written_to, sha256 (of the
+    written file), chars, paragraph_count, sections: [[section_key,
+    start_para_ref, end_para_ref, chars], ...] (the first 25 heading
+    sections only), section_count, sections_truncated (present when more
+    exist: call find_sections for the rest), warnings}. Use it for a large
+    document you only need to grep, hash or hand to another tool. A live
+    to_file or ranged read still counts as this client's baseline read
+    (the server saw the whole body).
+
     Returns path, part, format, section_key (echoed back, None unless
     passed), revision (the "<doc8>:<cmt8>" token), revision_detail (the
     full {document_sha256, comments_sha256, size, mtime_ns} tuple),
@@ -1146,27 +1265,29 @@ def read_document(
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
-        return execute_read_document(path, format, part, section_key, source)
+        return execute_read_document(
+            path, format, part, section_key, source, start_para_ref, end_para_ref, to_file
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
 def execute_find_sections(
-    path: str, part: str = projection.DEFAULT_PART, source: str = "auto"
+    path: str, part: str = projection.DEFAULT_PART, source: str = "auto", digests: bool = False
 ) -> dict[str, Any]:
     with reads_live.read_source(path, source, part) as rs:
         return rs.annotate(
             {
                 "path": str(rs.resolved),
                 "part": part,
-                "sections": projection.find_sections_impl(rs.local_path, part),
+                "sections": projection.find_sections_impl(rs.local_path, part, digests=digests),
             }
         )
 
 
 @mcp.tool()
 def find_sections(
-    path: str, part: str = projection.DEFAULT_PART, source: str = "auto"
+    path: str, part: str = projection.DEFAULT_PART, source: str = "auto", digests: bool = False
 ) -> dict[str, Any]:
     """List heading-delimited section ranges AND text-box sub-scopes in a
     .docx part — this is the one call that discovers every section_key
@@ -1198,7 +1319,14 @@ def find_sections(
 
     Returns path, part, sections (list of {section_key, kind
     ("heading"|"textbox"), heading_text, outline_level, start_para_ref,
-    end_para_ref, paragraph_count}).
+    end_para_ref, paragraph_count, chars}). chars is the section's size in
+    plain-text characters (paragraph texts joined with "\\n"), so a caller
+    can judge whether reading it is affordable. With digests=true each
+    heading entry also carries sha12, the first 12 hex of the sha256 of the
+    section's paragraph texts joined with "\\n" (table-cell paragraphs
+    included, no normalization) -- defined to agree with the live pane's
+    section digests (live_list_sections compact=true, live_revision) for
+    unchanged text.
 
     Not gated by DOCX_LOCKED — see list_parts' docstring.
 
@@ -1208,7 +1336,7 @@ def find_sections(
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
-        return execute_find_sections(path, part, source)
+        return execute_find_sections(path, part, source, digests)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -3498,16 +3626,73 @@ def read_header_footer(path: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def execute_diff_body_vs_file(path: str, file_path: str) -> dict[str, Any]:
+_VALID_DIFF_FORMATS = frozenset({"hunks", "unified"})
+_MD_HEADING_RE = re.compile(r"^ {0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$")
+
+
+def _file_section_slice(lines: list[str], section_key: str) -> tuple[list[str], int]:
+    """The lines of the markdown file's section matching *section_key* (a
+    find_sections heading key: slug-ordinal) and the 0-based index of its
+    first line. Headings match by folded text (slug), the same ordinal
+    rule find_sections uses for duplicates; the section runs to the next
+    heading of any level. INVALID_INPUT when the file has no such heading."""
+    base, _, ordinal_text = section_key.rpartition("-")
+    ordinal = int(ordinal_text) if ordinal_text.isdigit() else 1
+    base = base or section_key
+    headings: list[int] = []
+    in_fence = False
+    for idx, line in enumerate(lines):
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _MD_HEADING_RE.match(line.rstrip("\r\n"))
+        if m:
+            headings.append(idx)
+    matching = [
+        idx
+        for idx in headings
+        if projection._slugify(locate.normalize_for_compare(_MD_HEADING_RE.match(lines[idx].rstrip("\r\n")).group(1)))
+        == base
+    ]
+    if ordinal < 1 or ordinal > len(matching):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"The markdown file has no heading matching section_key {section_key!r}.",
+            {"section_key": section_key},
+        )
+    start = matching[ordinal - 1]
+    later = [h for h in headings if h > start]
+    return lines[start : later[0] if later else len(lines)], start
+
+
+def execute_diff_body_vs_file(
+    path: str,
+    file_path: str,
+    normalize: bool = True,
+    format: str = "hunks",
+    section_key: str | None = None,
+    max_hunks: int = 50,
+) -> dict[str, Any]:
     """Diff the docx body's markdown projection against a local markdown
     file -- issue #28 WP-11a, same ``difflib`` mechanism as
     GoogleDocs-MCP's ``diff_tab_vs_file`` (markdown_mutations.py
-    ``execute_diff_tab_vs_file``).
+    ``execute_diff_tab_vs_file``), reshaped by issue #110 so the response
+    is O(diff) rather than O(document).
 
     This is a READ tool -- no mutation, no audit, no evidence envelope
     required (mirrors Google's own "no changes to the document or file"
     framing for that tool).
     """
+    if format not in _VALID_DIFF_FORMATS:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"format must be one of {sorted(_VALID_DIFF_FORMATS)}, got {format!r}",
+            {"format": format},
+        )
+    if max_hunks < 1:
+        raise _make_error(ErrorCode.INVALID_INPUT, "max_hunks must be at least 1", {"max_hunks": max_hunks})
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
 
     # Reuses the same allowlist/denylist paths.resolve_allowed_docx_path
@@ -3528,45 +3713,123 @@ def execute_diff_body_vs_file(path: str, file_path: str) -> dict[str, Any]:
     local_path, is_temp = _read_local_copy(resolved)
     try:
         revision = projection.compute_revision(local_path)
-        body_markdown, warnings, lossy_elements = projection.read_document_markdown(
-            local_path, projection.DEFAULT_PART
-        )
+        whole = projection.project_part(local_path, projection.DEFAULT_PART)
         file_content = file_resolved.read_text(encoding="utf-8")
+        file_line_offset = 0
+        extra_lossy: list[dict[str, Any]] = []
 
-        body_lines = body_markdown.splitlines(keepends=True)
-        file_lines = file_content.splitlines(keepends=True)
+        if section_key is None:
+            body_markdown, warnings, lossy_elements = projection.markdown_from_projection(local_path, whole)
+        else:
+            entry = next(
+                (
+                    sec
+                    for sec in projection.find_sections_impl(local_path)
+                    if sec["kind"] == "heading" and sec["section_key"] == section_key
+                ),
+                None,
+            )
+            if entry is None:
+                raise _make_error(
+                    ErrorCode.SECTION_NOT_FOUND,
+                    f"section_key {section_key!r} does not name a heading section (call find_sections).",
+                    {"section_key": section_key},
+                )
+            sliced, extra_lossy = projection.slice_projection(
+                whole, projection.para_index(entry["start_para_ref"]), projection.para_index(entry["end_para_ref"])
+            )
+            body_markdown, warnings, lossy_elements = projection.markdown_from_projection(local_path, sliced)
+            section_lines, file_line_offset = _file_section_slice(file_content.splitlines(keepends=True), section_key)
+            file_content = "".join(section_lines)
+        lossy_elements = lossy_elements + extra_lossy
 
+        identical_raw = body_markdown == file_content
+        if normalize:
+            body_cmp = locate.normalize_for_compare(body_markdown).rstrip("\n")
+            file_cmp = locate.normalize_for_compare(file_content).rstrip("\n")
+        else:
+            body_cmp, file_cmp = body_markdown, file_content
+        identical = body_cmp == file_cmp
+
+        body_lines = body_cmp.splitlines(keepends=True)
+        file_lines = file_cmp.splitlines(keepends=True)
         matcher = difflib.SequenceMatcher(None, body_lines, file_lines)
-        hunks: list[dict[str, Any]] = []
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            hunks.append(
-                {
-                    "tag": tag,
-                    "body_lines": body_lines[i1:i2],
-                    "file_lines": file_lines[j1:j2],
-                    "body_range": [i1 + 1, i2],
-                    "file_range": [j1 + 1, j2],
-                }
-            )
-
-        unified = list(
-            difflib.unified_diff(
-                body_lines,
-                file_lines,
-                fromfile=f"docx:{path}#body",
-                tofile=file_path,
-            )
-        )
 
         result: dict[str, Any] = {
             "path": str(resolved),
             "file_path": file_path,
             "revision": revision["token"],
-            "identical": body_markdown == file_content,
-            "hunks": hunks,
-            "unified_diff": "".join(unified),
+            "identical": identical,
+            "identical_raw": identical_raw,
+            "normalized": normalize,
             "warnings": warnings,
         }
+        if section_key is not None:
+            result["section_key"] = section_key
+            result["file_line_offset"] = file_line_offset
+
+        if format == "hunks":
+            opcodes = matcher.get_opcodes()
+            changed = [op for op in opcodes if op[0] != "equal"]
+            hunks: list[dict[str, Any]] = []
+            if changed:
+                emitted = 0
+                for tag, i1, i2, j1, j2 in opcodes:
+                    if tag == "equal":
+                        hunks.append(
+                            {
+                                "tag": "equal",
+                                "body_lines_count": i2 - i1,
+                                "file_lines_count": j2 - j1,
+                                "body_range": [i1 + 1, i2],
+                                "file_range": [j1 + 1, j2],
+                            }
+                        )
+                        continue
+                    if emitted >= max_hunks:
+                        break
+                    emitted += 1
+                    hunks.append(
+                        {
+                            "tag": tag,
+                            "body_lines": body_lines[i1:i2],
+                            "file_lines": file_lines[j1:j2],
+                            "body_range": [i1 + 1, i2],
+                            "file_range": [j1 + 1, j2],
+                        }
+                    )
+                # A trailing run of equal hunks after the cap adds nothing.
+                while hunks and hunks[-1]["tag"] == "equal" and emitted >= max_hunks and emitted < len(changed):
+                    hunks.pop()
+                result["truncated"] = len(changed) > max_hunks
+                if result["truncated"]:
+                    result["remaining_hunks"] = len(changed) - max_hunks
+            else:
+                result["truncated"] = False
+            result["hunks"] = hunks
+        else:
+            unified = list(
+                difflib.unified_diff(
+                    body_lines,
+                    file_lines,
+                    fromfile=f"docx:{path}#body",
+                    tofile=file_path,
+                )
+            )
+            groups: list[list[str]] = []
+            header: list[str] = []
+            for line in unified:
+                if line.startswith("@@"):
+                    groups.append([line])
+                elif groups:
+                    groups[-1].append(line)
+                else:
+                    header.append(line)
+            kept = groups[:max_hunks]
+            result["unified_diff"] = "".join(header) + "".join("".join(g) for g in kept)
+            result["truncated"] = len(groups) > max_hunks
+            if result["truncated"]:
+                result["remaining_hunks"] = len(groups) - max_hunks
         # Same convention as read_document: present only when the body's
         # own markdown rendering actually lost something (a merged/nested
         # table). A non-empty lossy_elements here is a direct reason an
@@ -3581,7 +3844,14 @@ def execute_diff_body_vs_file(path: str, file_path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def diff_body_vs_file(path: str, file_path: str) -> dict[str, Any]:
+def diff_body_vs_file(
+    path: str,
+    file_path: str,
+    normalize: bool = True,
+    format: str = "hunks",
+    section_key: str | None = None,
+    max_hunks: int = 50,
+) -> dict[str, Any]:
     """Export the docx body as markdown and diff against a local file.
 
     Use this tool when you need to compare a .docx's body against a local
@@ -3632,18 +3902,40 @@ def diff_body_vs_file(path: str, file_path: str) -> dict[str, Any]:
     as "no difference found by this projection," not as a guarantee the
     two are in sync.
 
+    Response size is O(diff), not O(document):
+      - normalize=true (default) folds both sides first -- curly->straight
+        quotes, dash variants, NBSP-class spaces, soft hyphens, NFC, and
+        trailing whitespace per line -- so those never surface as phantom
+        edits. The response says normalized. identical is then judged on the
+        folded text (a trailing newline difference does not count);
+        identical_raw is always the byte-for-byte comparison, i.e. the old
+        meaning of identical. normalize=false compares exactly.
+      - format="hunks" (default) returns hunks only; "unified" returns
+        unified_diff only. Never both. An equal hunk carries no text, just
+        {tag:"equal", body_lines_count, file_lines_count, body_range,
+        file_range}; a fully identical pair returns hunks: [].
+      - section_key restricts the body to one heading section (as
+        find_sections reports it) and the file to the heading whose folded
+        text matches (same duplicate-ordinal rule), up to the next heading
+        of any level. body_range is then relative to that body section and
+        file_line_offset is the file line the section starts at.
+      - max_hunks (default 50) caps the changed hunks returned; truncated
+        and remaining_hunks say what was cut.
+
     Returns path, file_path, revision (the "<doc8>:<cmt8>" token),
-    identical (bool), hunks (tagged body_lines/file_lines/body_range/
-    file_range per difflib.SequenceMatcher.get_opcodes()), unified_diff
-    (a unified diff string), warnings, and lossy_elements (present only
-    when non-empty).
+    identical, identical_raw, normalized, truncated, hunks (tagged
+    body_lines/file_lines/body_range/file_range per
+    difflib.SequenceMatcher.get_opcodes()) or unified_diff, warnings, and
+    lossy_elements (present only when non-empty).
 
     Errors:
-      INVALID_INPUT - a bad path, file_path not found, or file_path is
-                       not a regular file
+      INVALID_INPUT      - a bad path, file_path not found, file_path is
+                           not a regular file, a bad format/max_hunks, or
+                           the file has no heading matching section_key
+      SECTION_NOT_FOUND  - section_key names no heading section in the body
     """
     try:
-        return execute_diff_body_vs_file(path, file_path)
+        return execute_diff_body_vs_file(path, file_path, normalize, format, section_key, max_hunks)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

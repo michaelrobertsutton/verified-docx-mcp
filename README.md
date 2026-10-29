@@ -56,6 +56,14 @@ Tools implemented so far:
   which `source` it came from. A file read while a pane session exists
   for that file name carries a `live_session_ignored` warning. See "Live
   reads" under [Live mode](#live-mode).
+  Issue #110, so a caller never has to read a whole body to learn one thing:
+  `read_document(start_para_ref, end_para_ref)` returns only an inclusive
+  `pN`..`pM` paragraph range (a table the range cuts is reported as a
+  `partial_table` in `lossy_elements`); `read_document(to_file=...)` writes
+  the rendered body to an allowed path and returns only
+  `{written_to, sha256, chars, paragraph_count, sections}`;
+  `find_sections` entries carry `chars`, and `find_sections(digests=true)`
+  adds `sha12`, a per-section digest that agrees with the live pane's.
 - **`replace_body_markdown(path, markdown, ...)`**,
   **`replace_range_markdown(path, section_key, markdown, ...)`**,
   **`append_markdown(path, markdown, ...)`** — markdown -> OOXML writes,
@@ -141,15 +149,19 @@ Tools implemented so far:
   Detection only, not prevention (core/document-backend-protocol.md §9):
   the naming patterns it matches are client- and locale-dependent, so
   their absence is not proof no conflict occurred.
-- **`diff_body_vs_file(path, file_path)`** — export the docx body's
-  markdown projection (the same one `read_document(format="markdown")`
-  uses) and diff it against a local markdown file with `difflib`, the
-  same mechanism GoogleDocs-MCP's `diff_tab_vs_file` uses. Read-only and
-  affirmative-only: `identical: true` means no difference was found by
-  this particular projection, not a guarantee none exists (see the
-  tool's own docstring for the docx-specific reasons why, including a
-  trailing newline on the file side alone surfacing as a spurious
-  one-line difference).
+- **`diff_body_vs_file(path, file_path, normalize, format, section_key, max_hunks)`** —
+  export the docx body's markdown projection (the same one
+  `read_document(format="markdown")` uses) and diff it against a local
+  markdown file with `difflib`, the same mechanism GoogleDocs-MCP's
+  `diff_tab_vs_file` uses. Read-only and affirmative-only: `identical: true`
+  means no difference was found by this particular projection, not a
+  guarantee none exists (see the tool's own docstring for the docx-specific
+  reasons why). Issue #110: both sides are normalized by default (curly
+  quotes, dashes, NBSP, soft hyphens, NFC, trailing whitespace) so those
+  never show as edits (`identical_raw` is the byte comparison); the response
+  is hunks **or** a unified diff, never both, with no text for equal hunks;
+  `section_key` scopes the diff to one heading section; `max_hunks` caps it.
+  The response is O(diff), not O(document).
 - **`list_tables(path, part)`**, **`get_table(path, table_id, part)`** —
   enumerate every `w:tbl` (including one nested inside a cell, which gets
   its own `table_id`) and report one table's full row/cell detail,
@@ -390,6 +402,15 @@ normal before the lead opens the pane in Word. `session_collisions`
 a file name connecting at once — `SessionRegistry` keys purely on
 basename, so it can't tell them apart on its own; check this before
 trusting a live write's routing if that's possible.
+
+`live_revision(path)` (issue #110) returns the live body's current
+`revision` token plus a `sha12` digest per heading section in one pane round
+trip, with no body in the response. It re-arms your write baseline exactly
+like a live `read_document`, so a `revision_before` taken from it is accepted.
+It needs the pane capability `body_hash_v1` (reload the pane after upgrading);
+an older pane still works through a `body_ooxml` fallback, reported as
+`via: "body_ooxml_fallback"`. `live_list_sections(compact=true)` returns
+`[[section_key, heading_text, sha12], ...]` instead of the 64-hex hashes.
 
 On POSIX several MCP processes share one bridge by default (one owner, the
 rest attach; automatic re-election if the owner exits). Set
