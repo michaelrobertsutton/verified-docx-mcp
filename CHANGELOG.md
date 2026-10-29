@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- File-mode `list_open_items` now threads comment replies via `w15:paraIdParent`: replies are no longer listed as top-level comments, and each root reports a real `reply_count` and `replies` (`{id, author, date, text}`). The root comment's resolved state governs the thread. Shared threading walk lives in `projection.comment_thread_links`.
+
 ## 0.1.2 — 2026-10-16
 
 - Batch approved cell preflight reads and use direct cell access, retaining fresh mutation-boundary checks and one-attempt independent verification.

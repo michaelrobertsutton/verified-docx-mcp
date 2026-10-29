@@ -101,6 +101,34 @@ def _attr(elem: Any, local_name: str) -> str | None:
     return None
 
 
+def comment_thread_links(
+    ext_root: Any | None,
+) -> tuple[dict[str, str | None], dict[str, str | None], dict[str, list[str]]]:
+    """Parse ``word/commentsExtended.xml`` (*ext_root*, may be None) into
+    ``(done_by_para, parent_by_para, children_by_parent)``, all keyed on
+    ``w15:paraId``. The threading attribute is ``w15:paraIdParent`` (a
+    reply's value is its parent comment's identity paraId, see
+    ``identity_para_id``); ``children_by_parent`` preserves file order.
+    Shared by comments.get_comment_thread and tracked_changes.list_open_items
+    so file-mode threading has one implementation."""
+    done_by_para: dict[str, str | None] = {}
+    parent_by_para: dict[str, str | None] = {}
+    children_by_parent: dict[str, list[str]] = {}
+    if ext_root is not None:
+        for child in ext_root:
+            if _ln(child) != "commentEx":
+                continue
+            pid = _attr(child, "paraId")
+            if not pid:
+                continue
+            done_by_para[pid] = _attr(child, "done")
+            parent_pid = _attr(child, "paraIdParent")
+            parent_by_para[pid] = parent_pid
+            if parent_pid:
+                children_by_parent.setdefault(parent_pid, []).append(pid)
+    return done_by_para, parent_by_para, children_by_parent
+
+
 def identity_para_id(comment_elem: Any, *, ids_root: Any | None = None, ext_root: Any | None = None) -> str | None:
     """Issue #108: the ``w14:paraId`` Word itself keys ``word/commentsIds.xml``
     (``w16cid:commentId/@w16cid:paraId``) and ``word/commentsExtended.xml``
