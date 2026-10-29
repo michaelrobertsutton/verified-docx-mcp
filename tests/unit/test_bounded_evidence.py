@@ -150,8 +150,16 @@ class WholeDocumentToolsTests(unittest.TestCase):
         self.assertNotIn("value", summary)
         self.assertEqual(out.read_text(encoding="utf-8"), one["value"])
         self.assertEqual(summary["chars"], len(one["value"]))
+        again = server.execute_read_audit_evidence(ref, field="after", to_file=str(out), overwrite=True)
+        self.assertEqual(again["written_to"], summary["written_to"])
 
-        for bad in ({"evidence_ref": "0" * 32}, {"evidence_ref": ref, "field": "nope"}):
+        # The output guard is shared with read_document: no overwrite, no non-text names.
+        for bad in (
+            {"evidence_ref": ref, "to_file": str(out)},  # exists now
+            {"evidence_ref": ref, "to_file": str(self.target)},  # the .docx itself
+            {"evidence_ref": "0" * 32},
+            {"evidence_ref": ref, "field": "nope"},
+        ):
             with self.assertRaises(VerifyError) as ctx:
                 server.execute_read_audit_evidence(**bad)
             self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)

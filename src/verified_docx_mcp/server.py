@@ -3616,7 +3616,7 @@ def apply_style(
 
 @mcp.tool(annotations={"readOnlyHint": True})
 def read_audit_evidence(
-    evidence_ref: str, field: str | None = None, to_file: str | None = None
+    evidence_ref: str, field: str | None = None, to_file: str | None = None, overwrite: bool = False
 ) -> dict[str, Any]:
     """Fetch the full audit record behind an ``evidence_ref`` a write returned.
 
@@ -3630,20 +3630,23 @@ def read_audit_evidence(
 
     ``field`` (e.g. ``"before"``, ``"after"``) returns just that evidence field.
     ``to_file`` writes the result (JSON, or the raw text of one string ``field``) to an
-    allowed path and returns only {written_to, sha256, chars}.
+    allowed path (.md, .txt or .json; an existing file is refused unless ``overwrite=true``)
+    and returns only {written_to, sha256, chars}.
 
     Errors: INVALID_INPUT - unknown ``evidence_ref`` or ``field``, or a bad ``to_file``.
     """
     try:
-        return execute_read_audit_evidence(evidence_ref, field, to_file)
+        return execute_read_audit_evidence(evidence_ref, field, to_file, overwrite)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
 def execute_read_audit_evidence(
-    evidence_ref: str, field: str | None = None, to_file: str | None = None
+    evidence_ref: str, field: str | None = None, to_file: str | None = None, overwrite: bool = False
 ) -> dict[str, Any]:
-    target = paths.resolve_output_path(to_file, param="to_file") if to_file is not None else None
+    target = (
+        paths.resolve_text_output_path(to_file, param="to_file", overwrite=overwrite) if to_file is not None else None
+    )
     record = audit.find_audit_record(evidence_ref)
     if record is None:
         raise _make_error(
