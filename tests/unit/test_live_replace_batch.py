@@ -480,7 +480,8 @@ class CompactBatchReportTests(_BatchCase):
         # JennyStack's hook validates exactly these (live_doc_stamp.record_batch_result).
         self.assertEqual(
             set(result),
-            {"applied", "batch_status", "applied_count", "edit_count", "revision_before", "revision_after", "results"},
+            {"applied", "batch_status", "applied_count", "edit_count", "revision_before", "revision_after", "results",
+             "evidence_ref"},
         )
         self.assertIs(result["applied"], True)
         self.assertEqual((result["batch_status"], result["applied_count"], result["edit_count"]), ("complete", 50, 50))

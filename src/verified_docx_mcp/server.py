@@ -72,6 +72,7 @@ from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .live import bridge as live_bridge
 from .live import comments_live, reads_live
+from .lean_envelope import LeanEnvelopeMiddleware
 from .middleware import EvidenceEnforcementMiddleware
 
 mcp = FastMCP(
@@ -90,6 +91,7 @@ mcp = FastMCP(
 )
 
 mcp.add_middleware(EvidenceEnforcementMiddleware())
+mcp.add_middleware(LeanEnvelopeMiddleware())
 
 
 def _raise_tool_error(exc: VerifyError) -> NoReturn:

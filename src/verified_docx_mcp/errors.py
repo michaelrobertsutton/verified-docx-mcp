@@ -185,12 +185,15 @@ class ErrorEnvelope:
     retryable: bool
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "error_code": self.error_code.value,
             "message": self.message,
             "diagnostics": self.diagnostics,
-            "retryable": self.retryable,
         }
+        # Issue #112: omitted when false (nearly every error), present only when a retry can help.
+        if self.retryable:
+            out["retryable"] = True
+        return out
 
 
 class VerifyError(Exception):

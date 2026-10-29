@@ -29,13 +29,16 @@ class MakeErrorTests(unittest.TestCase):
     def test_to_dict_shape(self):
         exc = _make_error(ErrorCode.RENDER_FAILED, "boom", {"detail": "stderr text"})
         d = exc.envelope.to_dict()
-        self.assertEqual(
-            set(d.keys()), {"error_code", "message", "diagnostics", "retryable"}
-        )
+        # Issue #112: retryable is omitted when false.
+        self.assertEqual(set(d.keys()), {"error_code", "message", "diagnostics"})
         self.assertEqual(d["error_code"], "RENDER_FAILED")
         self.assertEqual(d["message"], "boom")
         self.assertEqual(d["diagnostics"], {"detail": "stderr text"})
-        self.assertFalse(d["retryable"])
+        self.assertFalse(exc.envelope.retryable)
+
+    def test_to_dict_includes_retryable_only_when_true(self):
+        d = _make_error(ErrorCode.HOST_SHAPE_READ_FAILED, "boom").envelope.to_dict()
+        self.assertIs(d["retryable"], True)
 
     def test_only_shape_read_failure_is_retryable(self):
         # WP-02 has no revision-stamped write to race against — see

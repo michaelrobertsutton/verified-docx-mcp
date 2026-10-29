@@ -165,7 +165,8 @@ class GuardedToolPassThroughTests(_Env):
             data = result.structured_content or json.loads(result.content[0].text)
             self.assertTrue(data["applied"])
             self.assertIn("concurrent_editor_override", data)
-            self.assertTrue(data["ledger_logged"])
+            # #112: ledger_logged is dropped when true (a false value would still be shown).
+            self.assertNotIn("ledger_logged", data)
 
     async def test_lock_status_tool_reports_external_activity(self):
         async with Client(server.mcp) as client:
