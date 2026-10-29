@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1", "compact_evidence_v1"];
+const PANE_CAPABILITIES = ["table_rows_v1", "table_copy_v1", "heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1", "compact_evidence_v1"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -601,7 +601,8 @@ function connectOpsSocket() {
         socket.send(JSON.stringify({ type: "reply", request_id: requestId, ok: true, result }));
       } catch (err) {
         const code = err && err.code ? err.code : "LIVE_OP_FAILED";
-        const msg = err && err.message ? err.message : String(err);
+        const msg = (err && err.message ? err.message : String(err)) +
+          (err?.debugInfo?.errorLocation ? ` [${err.debugInfo.errorLocation}]` : "");
         logOp(payload.clientId ? `${op} [${payload.clientId.slice(0, 8)}]` : op, false, msg);
         socket.send(
           JSON.stringify({ type: "reply", request_id: requestId, ok: false, error: { code, message: msg } })
@@ -685,7 +686,7 @@ function summarizeResult(op, result) {
 }
 
 const SHAPE_GUARDED_OPS = new Set(["approved_cell_set", "replace", "format", "cell_set", "cells_set",
-  "table_insert", "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
+  "table_insert", "table_row_edit", "table_copy", "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
   "comment_add", "comment_reply", "comment_resolve", "comment_delete", "save", "table_delete", "paragraphs_unlist"]);
 
 // One queue across reconnects. A timed-out write can still be running in Word;
@@ -776,6 +777,10 @@ async function dispatchOpUnchecked(op, payload) {
       return opCellSet(payload);
     case "table_get":
       return opTableGet(payload);
+    case "table_row_edit":
+      return opTableRowEdit(payload);
+    case "table_copy":
+      return opTableCopy(payload);
     case "table_insert":
       return opTableInsert(payload);
     case "cells_set":
@@ -3494,4 +3499,152 @@ async function executionXmlSnapshot(context, slugs) {
   Object.defineProperty(captured,'section_map',{value:{items,sections}});
   Object.defineProperty(captured,'cell_paragraphs',{value:cell_paragraphs});
   return captured;
+}
+
+
+// #106: native insertion inherits row/cell properties without replacing the table.
+async function opTableRowEdit(payload) {
+  let stage="preflight", mutated=false;
+  try { return await measuredWordRun(async context => {
+    const pre = await mutationHash(context, payload);
+    const tableItems = await targetTables(context, payload);
+    const table = tableItems[payload.table_index-1];
+    if (!table) throw refusalError("Table not found", "table_not_found");
+    const range = table.getRange();
+    await (await sectionGuard(context,payload)).check(() => [range]);
+    const xml = range.getOoxml();
+    const grid = await loadRowsAndCells(context,table);
+    await context.sync();
+    const doc = new DOMParser().parseFromString(xml.value, "application/xml");
+    const ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    const sourceTable = [...doc.getElementsByTagNameNS(ns,"tbl")][0];
+    if (!sourceTable || doc.getElementsByTagName("parsererror").length)
+      throw refusalError("Cannot inspect table", "STRUCTURAL_BOUNDARY");
+    if (sourceTable.getElementsByTagNameNS(ns,"tbl").length ||
+        sourceTable.getElementsByTagNameNS(ns,"gridSpan").length ||
+        sourceTable.getElementsByTagNameNS(ns,"vMerge").length)
+      throw refusalError("Merged or nested table", "MERGED_OR_NESTED_TABLE");
+    const xmlRows = [...sourceTable.children].filter(n=>n.localName === "tr");
+    const adjacent = payload.after_row_index || payload.before_row_index;
+    const rowIndex = payload.delete ? payload.row_index : adjacent;
+    if (!Number.isInteger(rowIndex) || rowIndex < 1 || rowIndex > grid.length)
+      throw refusalError("Row not found", "INVALID_INPUT");
+    if (payload.delete && grid.length === 1) throw refusalError("Cannot delete the final row", "INVALID_INPUT");
+    if (!payload.delete && !Office.context.requirements.isSetSupported('WordApiDesktop','1.3'))
+      throw refusalError('Exact row font inheritance requires WordApiDesktop 1.3','LIVE_CAPABILITY_MISSING');
+    const templateIndex = payload.template_row_index || adjacent;
+    let template;
+    if (!payload.delete) {
+      template = xmlRows[templateIndex-1];
+      if (!template || !Array.isArray(payload.cells) || payload.cells.length !== grid[rowIndex-1].length ||
+          payload.cells.some(t=>typeof t !== "string")) throw refusalError("Invalid row template/cells", "INVALID_INPUT");
+      // Native insertion uses the positional row as a template. Other templates
+      // are safe only when row/cell layout agrees; paragraphs are copied below.
+      const layout = row => [...row.children].filter(n=>n.localName === "trPr" || n.localName === "tc")
+        .map(n=>n.localName === "tc" ? [...n.children].find(c=>c.localName === "tcPr") : n)
+        .map(n=>n ? new XMLSerializer().serializeToString(n) : "");
+      if (JSON.stringify(layout(template)) !== JSON.stringify(layout(xmlRows[rowIndex-1])))
+        throw refusalError("Template row layout differs from the positional row; use an adjacent layout template", "LIVE_CAPABILITY_MISSING");
+    }
+    grid[rowIndex-1].forEach(c=>c.body.load("text"));
+    await context.sync();
+    const beforeText = grid[rowIndex-1].map(c=>c.body.text || "").join("\t");
+    const norm = t=>String(t).replace(/\s+/g," ").trim();
+    if (payload.delete && norm(beforeText) !== norm(payload.expected_text))
+      throw refusalError("Row text differs", "CELL_TEXT_MISMATCH");
+    stage="revision guard";
+    await guardRevisions(context,[range]);
+    if (payload.delete) {
+      stage="comment guard";
+      await guardComments(context,[range],false);
+      if (shapeNodes(shapeXml(xml.value)).length)
+        throw refusalError("Row deletion touches an anchored object", "ANCHORED_SHAPES");
+    }
+    // Recheck after all asynchronous preflight work.
+    await requireFreshBody(context,pre);
+    const resultIndex = payload.delete ? rowIndex : adjacent + (payload.after_row_index ? 1 : 0);
+    stage="mutation";
+    await withTracking(context,payload.track_changes,async () => {
+      mutated=true;
+      if (payload.delete) {
+        stage="row delete";
+        table.rows.items[rowIndex-1].delete();
+        await context.sync();
+      } else {
+        stage="row insert";
+        const inserted = table.rows.items[rowIndex-1].insertRows(payload.after_row_index ? "After" : "Before",1);
+        inserted.load("items");
+        await context.sync();
+        inserted.items[0].cells.load("items");
+        await context.sync();
+        stage="cell content import";
+        const sourceCells = [...template.children].filter(n=>n.localName === "tc");
+        inserted.items[0].cells.items.forEach((cell,i)=>{
+          const tc = sourceCells[i];
+          const firstP = [...tc.children].find(n=>n.localName === "p");
+          const pPr = firstP && [...firstP.children].find(n=>n.localName === "pPr");
+          const firstR = firstP && [...firstP.children].find(n=>n.localName === "r");
+          const rPr = firstR && [...firstR.children].find(n=>n.localName === "rPr");
+          const body = doc.createElementNS(ns,"w:body");
+          for (const line of payload.cells[i].replace(/\r\n?/g,"\n").split("\n")) {
+            const p=doc.createElementNS(ns,"w:p"), r=doc.createElementNS(ns,"w:r"), t=doc.createElementNS(ns,"w:t");
+            if(pPr) p.appendChild(pPr.cloneNode(true));
+            if(rPr) r.appendChild(rPr.cloneNode(true));
+            t.setAttributeNS("http://www.w3.org/XML/1998/namespace","xml:space","preserve");
+            t.textContent=line; r.appendChild(t); p.appendChild(r); body.appendChild(p);
+          }
+          const importPackage=doc.cloneNode(true);
+          const importBody=importPackage.getElementsByTagNameNS(ns,'body')[0];
+          while(importBody.firstChild) importBody.removeChild(importBody.firstChild);
+          for(const p of [...body.childNodes]) importBody.appendChild(importPackage.importNode(p,true));
+          // Native insertRows stamps first-run formatting on the empty paragraph
+          // mark. Reset that default before importing the actual template pPr/rPr.
+          cell.body.font.reset();
+          cell.body.insertOoxml(new XMLSerializer().serializeToString(importPackage),"Replace");
+        });
+        await context.sync();
+      }
+    });
+    stage="post hash";
+    return {applied:true,row_index:resultIndex,pre,post:await mutationHash(context,{...payload,expectedBodySha256:undefined})};
+  }); } catch(error) {
+    throw refusalError(`${stage}: ${error.message || error}; ${error.debugInfo?.errorLocation || ''}`,
+      mutated ? "VERIFICATION_FAILED" : (error.code || "LIVE_OP_FAILED"));
+  }
+}
+
+async function opTableCopy(payload) {
+  return measuredWordRun(async context => {
+    const pre = await mutationHash(context,payload);
+    const tables = await loadTopLevelTables(context);
+    const anchor = payload.anchor;
+    let target = context.document.body, location="End";
+    if (anchor && anchor.after_table_index) {
+      target=tables[anchor.after_table_index-1]; location="After";
+      if(!target) throw refusalError("Anchor table not found","table_not_found");
+    } else if (anchor && anchor.paragraph_text !== undefined) {
+      const paragraphs=context.document.body.paragraphs;
+      paragraphs.load("items/text,items/tableNestingLevel"); await context.sync();
+      target=findAnchorParagraph(paragraphs.items,anchor);
+      location=anchor.position === "before" ? "Before" : "After";
+    }
+    const guard = await sectionGuard(context,payload);
+    if (guard.active && target === context.document.body)
+      throw refusalError("Use an explicit anchor under section locks","OUTSIDE_LOCKED_SECTION");
+    await guard.check(() => [target.getRange ? target.getRange(location === "Before" ? "Start" : "End") : target.getRange()]);
+    await requireFreshBody(context,pre);
+    let inserted;
+    await withTracking(context,payload.track_changes,async()=>{
+      inserted=(target === context.document.body ? target : target.getRange()).insertOoxml(payload.ooxml,location);
+      await context.sync();
+    });
+    const all=context.document.body.tables; all.load("items");
+    inserted.tables.load("items"); await context.sync();
+    if(inserted.tables.items.length !== 1) throw refusalError("Cannot identify copied table","VERIFICATION_FAILED");
+    const relations=all.items.map(t=>t.getRange().compareLocationWith(inserted.tables.items[0].getRange()));
+    await context.sync();
+    const index=relations.findIndex(r=>r.value === "Equal");
+    if(index < 0) throw refusalError("Copied table missing","VERIFICATION_FAILED");
+    return {applied:true,table_index:index+1,pre,post:await mutationHash(context,{...payload,expectedBodySha256:undefined})};
+  });
 }

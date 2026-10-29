@@ -64,6 +64,7 @@ from . import (
     paths,
     projection,
     tables,
+    table_structure,
     text_edit,
     tracked_changes,
     write_ledger,
@@ -3279,6 +3280,7 @@ def insert_table(
     style_from_table_id: int | None = None,
     style_builtin: str | None = None,
     font_size_pt: float | None = None,
+    like_table_id: int | None = None,
 ) -> dict[str, Any]:
     """Insert a new table, one markdown string OR cell-spec object per
     cell (issue #100: https://github.com/michaelrobertsutton/JennyStack/issues/100).
@@ -3445,6 +3447,7 @@ def insert_table(
             style_from_table_id=style_from_table_id,
             style_builtin=style_builtin,
             font_size_pt=font_size_pt,
+            like_table_id=like_table_id,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -4546,6 +4549,46 @@ def live_changes_reconcile(path: str, run_id: str, manifest_sha256: str,
     except VerifyError as exc:
         _raise_tool_error(exc)
 
+
+
+@mcp.tool()
+def insert_table_row(path: str, table_id: int, cells: list[str],
+                     after_row_index: int | None = None, before_row_index: int | None = None,
+                     template_row_index: int | None = None, revision_before: str | None = None,
+                     track_changes: bool = False, write_mode: str = "auto",
+                     allow_concurrent_editor: bool = False) -> dict[str, Any]:
+    """Insert a row of plain-text cells, preserving template formatting. Indices are 1-based.
+
+    Supply exactly one of after_row_index/before_row_index. The adjacent row is
+    the default template. Merged/nested tables are refused. Re-read positional IDs
+    after structure changes. Writes are revision-guarded, verified and audited.
+    """
+    try:
+        return table_structure.execute_row(path, table_id, cells=cells,
+            after_row_index=after_row_index, before_row_index=before_row_index,
+            template_row_index=template_row_index, revision_before=revision_before,
+            track_changes=track_changes, write_mode=write_mode,
+            allow_concurrent_editor=allow_concurrent_editor)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def delete_table_row(path: str, table_id: int, row_index: int, expected_text: str,
+                     revision_before: str | None = None, track_changes: bool = False,
+                     write_mode: str = "auto", allow_concurrent_editor: bool = False) -> dict[str, Any]:
+    """Delete one row after matching its tab-joined cell text. Indices are 1-based.
+
+    Refuses the final row, mismatched text, protected content, and merged/nested
+    tables. Re-read row indices after deletion. Verified and audit-logged.
+    """
+    try:
+        return table_structure.execute_row(path, table_id, row_index=row_index,
+            expected_text=expected_text, revision_before=revision_before,
+            track_changes=track_changes, write_mode=write_mode,
+            allow_concurrent_editor=allow_concurrent_editor)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
 
 if __name__ == "__main__":
     main()
