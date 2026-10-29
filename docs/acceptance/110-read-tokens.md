@@ -44,19 +44,30 @@ tokens and defeat the point. `find_sections` has the rest.
 
 ## Real Word
 
-**Pending.** The pane acceptance below has not been run. The pane loads from the fixed ports
-53135/53136 the manifest names, and a process from another agent (a Codex app-server probe,
-pid 6363, started 14:50 on 2026-10-29) holds them with a pane connected. Taking them over
-would disrupt that session, so the run waits for the ports to be free.
+PASS, 13 of 13 checks, Word for Mac on 2026-10-29, `tests/live/read_tokens_probe.py` against a
+disposable copy of the large fixture (150 sections, 300 paragraphs). The pane was v66 from the PR 2
+branch, which includes this PR's pane op unchanged (`body_hash_v1` advertised; this branch's own
+pane is v65).
 
-To run: stop the other owner, open a copy of the large fixture in Word, load the v65 pane
-from this branch, then check
+| Check | Result |
+|---|---|
+| `live_revision` native (`via: "body_hash"`), 300 paragraphs | five calls in a row took 2.31 (cold), 0.66, 0.46, 0.35 and 0.35 s. The 1 s bound holds once warm, not on the first call |
+| its `revision` equals a live `read_document`'s | yes |
+| `find_sections(digests)`, `live_list_sections(compact)`, `live_revision` vs the file's `sha12` | identical for all 150 sections |
+| live ranged read (10 paragraphs) in text, markdown and runs vs the file range | identical |
+| live `read_document(to_file=...)` on the whole body | 382 tokens, sha256 matches the written file |
+| `replace_text_batch` with `live_revision`'s revision as `revision_before` | accepted, `complete` |
+| the same revision after that write | `LIVE_STALE`, nothing written |
+| fallback to `body_ooxml` (capability hidden from the server) | `via: "body_ooxml_fallback"`, same revision and sections as native, 0.31 s |
 
-- `live_revision` returns in under 1 s on the 300-paragraph document with `via: "body_hash"`
-  and a `replace_text_batch` using that `revision` as `revision_before` is accepted;
-- with `body_hash_v1` removed from the pane's capabilities the fallback works and reports
-  `via: "body_ooxml_fallback"` (the 1 s bound applies to the native path only);
-- `find_sections(digests=true)` and `live_list_sections(compact=true)` give the same `sha12`
-  for every unchanged section (field results, tabs and tracked deletions are where file and
-  live paragraph text can differ; fix the file-side text until they agree);
-- a live ranged read and `to_file` return the right paragraphs and a matching sha256.
+Two things the run found. First, a bug: `Body.getOoxml()` appends one empty paragraph that
+`Body.paragraphs` (what the pane digests) does not have, so the last section's digest from the
+fallback and from `find_sections(source="live")` never matched the pane's. `find_sections_impl` now
+takes `ignore_trailing_empty` for live projections; there is a unit test, and the rerun is the
+passing one above. Second, an earlier run had 4 failures that were real edits, not bugs: text typed
+into the Word window (a heading became "Can you please Section 001") and the probe's own rename of
+one heading; the other 148 sections agreed. The passing rerun started from a pristine copy of the
+fixture (the probe expects one and does not enforce it).
+
+Field results, tabs and tracked deletions, where file and live paragraph text can differ, are not in
+this fixture and remain untested.
