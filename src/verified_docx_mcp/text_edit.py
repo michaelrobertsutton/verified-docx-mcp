@@ -81,7 +81,7 @@ from xml.etree import ElementTree as ET
 
 from . import audit, mutations, paths, projection, tables, tracked_changes
 from .author import resolve_author_name
-from .errors import ErrorCode, VerifyError, _make_error
+from .errors import ErrorCode, VerifyError, _make_error, short_hash
 from .live import write_mode as live_write_mode
 from .live.session import LiveDisconnected, LiveOpFailed, LiveStale, LiveStaleAfterWrite
 from .locate import LocateResult, locate
@@ -860,11 +860,14 @@ def _live_replace_once(
             "the pane applied the replace, but its body hash before the op differed from the one "
             "this call expected: the document moved between the read and the write. The write "
             "ALREADY LANDED -- do not retry; re-read the live document and verify it.",
-            {"expected": exc.expected, "actual": exc.actual},
+            {"expected": short_hash(exc.expected), "actual": short_hash(exc.actual)},
         ) from exc
     except LiveStale as exc:
         raise _make_error(
-            ErrorCode.LIVE_STALE, str(exc), {"expected": exc.expected, "actual": exc.actual}
+            ErrorCode.LIVE_STALE,
+            "The live document changed since it was read; nothing was written. Call live_revision or "
+            "re-read, then retry.",
+            {"expected": short_hash(exc.expected), "actual": short_hash(exc.actual)},
         ) from exc
     except LiveOpFailed as exc:
         raise _make_error(

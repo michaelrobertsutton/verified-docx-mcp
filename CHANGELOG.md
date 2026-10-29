@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Bounded write evidence (#112): `append_markdown`, `replace_body_markdown`, `replace_range_markdown` and file-mode accept/reject return hashes, sizes and a 200-character excerpt instead of the whole before/after (`append_markdown` of one paragraph to a 20K-word document: ~98K to ~175 tokens). The full text stays in the audit log under `evidence_ref`; new `read_audit_evidence` fetches it. `verbose` never restores it.
+- Live `delete_paragraph` returns counts and the two neighbouring paragraphs (pane v66, `compact_evidence_v1`). `format_text`/`apply_style` report `text_unchanged`, one excerpt and a `format_delta`; `runs_before`/`runs_after` need `verbose=true`.
+- Compact `replace_text_batch` and approved-run reports (no echo of `run_id`/`manifest_sha256`, `performance` behind `verbose`, `section_diff` cut to 600 characters, `remaining_ranges` beside `remaining`); `live_changes_prepare` previews each operation's text. A lean envelope drops constants (`verified_via`, `document_name`, `audit_logged: true`, ...). Errors list at most five match contexts with `total_matches`, drop `ladder_report` unless `verbose`, use 12-hex stale hashes and omit `retryable` when false.
+
 - `diff_body_vs_file` is normalized (quotes, dashes, NBSP, soft hyphens, NFC, trailing whitespace), returns hunks or a unified diff but never both, drops the text of equal hunks, and can be scoped by `section_key` and capped by `max_hunks`. `identical_raw` keeps the byte comparison. On the ~20K-word fixture an identical-document diff falls from ~99K to ~100 tokens.
 - `read_document` gains inclusive `start_para_ref`/`end_para_ref` ranges (any format, file or live) and `to_file`, which writes the body to an allowed path and returns a summary with the file's sha256. `find_sections` entries carry `chars`; `find_sections(digests=true)` adds a per-section `sha12`.
 - New `live_revision` tool returns the live revision and per-section digests in one pane round trip (pane op `body_hash`, capability `body_hash_v1`; pane v65). Older panes fall back to `body_ooxml`. `live_list_sections(compact=true)` returns `[key, heading, sha12]` rows.

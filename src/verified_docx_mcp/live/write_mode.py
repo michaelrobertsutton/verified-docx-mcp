@@ -69,7 +69,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .. import audit, paths
-from ..errors import ErrorCode, _make_error
+from ..errors import ErrorCode, _make_error, short_hash
 from . import bridge as live_bridge
 from .session import LiveOpFailed, LiveSession
 
@@ -325,10 +325,9 @@ def check_not_stale(revision_before: str | None, current_body_sha256: str) -> No
     if expected != current_body_sha256:
         raise _make_error(
             ErrorCode.LIVE_STALE,
-            f"revision_before {revision_before!r} no longer matches the live document's current "
-            f"body hash ({_LIVE_REVISION_PREFIX}{current_body_sha256}) -- someone (the lead, "
-            "typing) changed the document since that revision was read. Re-read and retry.",
-            {"revision_before": revision_before, "current_body_sha256": current_body_sha256},
+            "The live document changed since revision_before was read (someone typed, or another "
+            "client wrote). Call live_revision or re-read, then retry.",
+            {"expected": short_hash(expected), "actual": short_hash(current_body_sha256)},
         )
 
 

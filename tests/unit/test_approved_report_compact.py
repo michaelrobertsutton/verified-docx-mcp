@@ -1,8 +1,8 @@
 """Issue #112: approved-run reports are compact and the prepare preview is reviewable."""
 
 import json
+from pathlib import Path
 
-import pytest
 from test_approved_changes import Pane, cell, execute, setup  # noqa: F401
 
 from verified_docx_mcp.live import approved_changes as runs
@@ -53,7 +53,7 @@ def test_verbose_brings_performance_back(setup):  # noqa: F811
 
 
 def test_twelve_prewrite_conflicts_stay_under_three_thousand_tokens(setup):  # noqa: F811
-    path, pane, prepared = conflicted_run(setup)
+    path, _pane, prepared = conflicted_run(setup)
     report = execute(path, prepared)
     assert report["status"] in {"partial", "unknown"}
     assert len(report["issues"]) == 12
@@ -67,13 +67,13 @@ def test_twelve_prewrite_conflicts_stay_under_three_thousand_tokens(setup):  # n
 
 
 def test_section_diff_is_cut_and_the_journal_keeps_the_rest(setup):  # noqa: F811
-    path, pane, prepared = conflicted_run(setup, count=3)
+    path, _pane, prepared = conflicted_run(setup, count=3)
     report = execute(path, prepared)
     cut = [i for i in report["issues"] if i.get("section_diff_truncated")]
     assert cut, report["issues"]
     for issue in cut:
         assert len(issue["section_diff"]) == 600
-    journal = json.loads(open(report["journal_path"]).read())
+    journal = json.loads(Path(report["journal_path"]).read_text())
     kept = max(len(v.get("section_diff", "")) for v in journal["deferred"].values())
     assert kept > 600  # the journal still holds the full (4000-character) diff
 
@@ -96,7 +96,7 @@ def test_prepare_preview_shows_what_will_change_truncated_to_200(setup):  # noqa
     assert first["markdown"].startswith("**1:1** word")
     assert first["markdown"].endswith("…") and len(first["markdown"]) == 201
     # The manifest on disk, not the preview, is the authority: it holds the whole text.
-    manifest = json.loads(open(prepared["manifest_path"]).read())
+    manifest = json.loads(Path(prepared["manifest_path"]).read_text())
     assert manifest["operations"][0]["args"]["markdown"].endswith(long_text)
     assert len(manifest["operations"]) == 36
 

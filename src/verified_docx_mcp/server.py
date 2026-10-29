@@ -70,9 +70,9 @@ from . import (
 )
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
+from .lean_envelope import LeanEnvelopeMiddleware
 from .live import bridge as live_bridge
 from .live import comments_live, reads_live
-from .lean_envelope import LeanEnvelopeMiddleware
 from .middleware import EvidenceEnforcementMiddleware
 
 mcp = FastMCP(
@@ -94,14 +94,19 @@ mcp.add_middleware(EvidenceEnforcementMiddleware())
 mcp.add_middleware(LeanEnvelopeMiddleware())
 
 
-def _raise_tool_error(exc: VerifyError) -> NoReturn:
+def _raise_tool_error(exc: VerifyError, verbose: bool = False) -> NoReturn:
     """Raise a FastMCP ToolError carrying a JSON error envelope.
 
-    Mirrors verified-googledocs-mcp's server.py helper of the same name.
+    Mirrors verified-googledocs-mcp's server.py helper of the same name. A ZERO_MATCH's
+    ``ladder_report`` (a count of zero per normalization rung) is dropped unless
+    ``verbose``: ``near_miss`` is the useful part (issue #112).
     """
     from fastmcp.exceptions import ToolError
 
-    raise ToolError(json.dumps(exc.envelope.to_dict(), ensure_ascii=False)) from exc
+    payload = exc.envelope.to_dict()
+    if not verbose and payload.get("error_code") == ErrorCode.ZERO_MATCH.value:
+        payload["diagnostics"] = {k: v for k, v in payload["diagnostics"].items() if k != "ladder_report"}
+    raise ToolError(json.dumps(payload, ensure_ascii=False)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1740,8 +1745,14 @@ def replace_text(
     replacement_segments: list[dict[str, Any]] | None = None,
     scope: str = "body",
     allow_comment_loss_ids: list[dict[str, Any]] | None = None,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Replace every occurrence of `find` with `replace`, atomically.
+
+    `verbose=true` keeps a ZERO_MATCH error's `ladder_report` (a match count of zero per
+    normalization rung); without it the error carries `near_miss` only, which is the useful
+    part. MATCH_COUNT_MISMATCH and STRUCTURAL_BOUNDARY errors list at most five matches as
+    {start, end, context} plus `total_matches`.
 
     Live-only replacement_segments specifies explicit text/format/hyperlink segments.
     Text concatenates exactly to replace; each format includes bold, italic, underline
@@ -1921,7 +1932,7 @@ def replace_text(
             allow_concurrent_editor=allow_concurrent_editor,
         )
     except VerifyError as exc:
-        _raise_tool_error(exc)
+        _raise_tool_error(exc, verbose)
 
 
 @mcp.tool()
@@ -2091,7 +2102,7 @@ def format_text(
             verbose=verbose,
         )
     except VerifyError as exc:
-        _raise_tool_error(exc)
+        _raise_tool_error(exc, verbose)
 
 
 # ---------------------------------------------------------------------------
@@ -3600,7 +3611,7 @@ def apply_style(
             allow_concurrent_editor=allow_concurrent_editor, verbose=verbose,
         )
     except VerifyError as exc:
-        _raise_tool_error(exc)
+        _raise_tool_error(exc, verbose)
 
 
 @mcp.tool(annotations={"readOnlyHint": True})

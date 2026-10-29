@@ -196,6 +196,17 @@ class ErrorEnvelope:
         return out
 
 
+def short_hash(value: str | None, length: int = 12) -> str | None:
+    """The first *length* hex characters of a body hash or ``live:sha256:<hex>`` token.
+
+    A stale-revision error used to carry two full 76-character tokens as ``expected`` /
+    ``actual``; twelve hex characters are enough to tell two revisions apart (issue #112).
+    """
+    if not value:
+        return None
+    return value.removeprefix("live:sha256:")[:length]
+
+
 class VerifyError(Exception):
     """Exception that carries a fully-typed ErrorEnvelope."""
 

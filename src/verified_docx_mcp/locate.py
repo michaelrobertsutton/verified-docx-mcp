@@ -360,6 +360,25 @@ _NEAR_MISS_STRONG_EXIT = 0.92
 _NEAR_MISS_MAX_WINDOWS = 5000
 
 
+_MATCH_DIAGNOSTIC_MAX = 5
+_MATCH_CONTEXT_CHARS = 40
+
+
+def _match_diagnostics(proj: Projection, spans: list[tuple[int, int]]) -> dict[str, Any]:
+    """``matches`` (at most five, each ``{start, end, context}``) and ``total_matches``.
+
+    Bare offsets told a caller nothing: with 40 hits it could not tell them apart. The
+    context is 40 characters starting 20 before the match, so two hits read differently
+    (issue #112)."""
+    text = proj.text
+    shown = []
+    for start, end in spans[:_MATCH_DIAGNOSTIC_MAX]:
+        lo = max(0, start - _MATCH_CONTEXT_CHARS // 2)
+        context = text[lo : lo + _MATCH_CONTEXT_CHARS].replace("\n", " ")
+        shown.append({"start": start, "end": end, "context": context})
+    return {"matches": shown, "total_matches": len(spans)}
+
+
 def _near_miss_scan(needle: str, haystack: str) -> dict[str, Any] | None:
     nl = len(needle)
     if nl == 0 or len(haystack) == 0:
@@ -518,7 +537,7 @@ def locate(
                     f"match crosses a structural boundary: {sorted(kinds)}",
                     {
                         "rung": rung_label,
-                        "spans": [{"start": a, "end": b} for a, b in spans],
+                        **_match_diagnostics(proj, spans),
                         "boundary_kinds": sorted(kinds),
                     },
                 )
@@ -532,7 +551,7 @@ def locate(
                     "rung": rung_label,
                     "expected": expected_matches,
                     "actual": actual_count,
-                    "spans": [{"start": a, "end": b} for a, b in spans],
+                    **_match_diagnostics(proj, spans),
                 },
             )
 
