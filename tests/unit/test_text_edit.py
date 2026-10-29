@@ -251,11 +251,23 @@ class SpanFilterOutOfScopeBoundaryTests(_TempFixtureCase):
 
 
 class FormatTextTests(_TempFixtureCase):
-    def test_bold_whole_phrase_evidence_shape_and_runs(self):
+    def test_default_result_is_compact_for_a_formatting_only_change(self):
+        """#112: the text never changes, so one excerpt and the format delta, no runs."""
         evidence = text_edit.execute_format_text(
             str(self.target), "The quick brown fox jumps over the lazy dog.", {"italic": True}, 1
         )
-        self.assertTrue(_EVIDENCE_KEYS.issubset(evidence.keys()))
+        self.assertTrue((_EVIDENCE_KEYS - {"before", "after"}).issubset(evidence.keys()))
+        self.assertTrue(evidence["text_unchanged"])
+        self.assertEqual(evidence["excerpt"], "The quick brown fox jumps over the lazy dog.")
+        for gone in ("before", "after", "runs_before", "runs_after"):
+            self.assertNotIn(gone, evidence)
+        self.assertEqual(evidence["format_delta"], {"italic": {"before": ["False"], "after": ["True"]}})
+
+    def test_bold_whole_phrase_evidence_shape_and_runs(self):
+        evidence = text_edit.execute_format_text(
+            str(self.target), "The quick brown fox jumps over the lazy dog.", {"italic": True}, 1, verbose=True
+        )
+        self.assertTrue((_EVIDENCE_KEYS - {"before", "after"}).issubset(evidence.keys()))
         self.assertEqual(evidence["rung"], "exact")
         before_runs = evidence["runs_before"][0]
         after_runs = evidence["runs_after"][0]
@@ -305,7 +317,7 @@ class FormatTextColorTests(_TempFixtureCase):
         return xml[max(0, idx - 250) : idx]
 
     def test_sets_color_normalized_uppercase_with_leading_hash_accepted(self):
-        evidence = text_edit.execute_format_text(str(self.target), "brown", {"color": "#3b3838"}, 1)
+        evidence = text_edit.execute_format_text(str(self.target), "brown", {"color": "#3b3838"}, 1, verbose=True)
         self.assertEqual(evidence["runs_after"][0][0]["color"], "3B3838")
         self.assertIn('<w:color w:val="3B3838"', self._rpr_snippet())
 
@@ -509,6 +521,18 @@ class ApplyStyleCharacterTests(_TempFixtureCase):
         # rStyle is rPr's FIRST child per the OOXML schema's fixed element
         # order, ahead of the run's own pre-existing <w:b/>.
         self.assertIn('<w:rStyle w:val="IntenseEmphasis" /><w:b', xml)
+
+    def test_result_is_compact_unless_verbose(self):
+        """#112: text is unchanged, so one excerpt and no runs; verbose brings the runs back."""
+        compact = text_edit.execute_apply_style(str(self.target), "brown", "IntenseEmphasis", 1)
+        self.assertTrue(compact["text_unchanged"])
+        self.assertIn("brown", compact["excerpt"])
+        for gone in ("before", "after", "runs_before", "runs_after"):
+            self.assertNotIn(gone, compact)
+        self.assertEqual((compact["style_id"], compact["style_type"]), ("IntenseEmphasis", "character"))
+        verbose = text_edit.execute_apply_style(str(self.target), "brown", "IntenseEmphasis", 1, verbose=True)
+        self.assertIn("runs_before", verbose)
+        self.assertIn("runs_after", verbose)
 
     def test_unknown_style_id_raises_style_not_found(self):
         with self.assertRaises(VerifyError) as cm:

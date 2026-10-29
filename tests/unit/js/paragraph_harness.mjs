@@ -28,6 +28,13 @@ texts=['same','same',''];await assert.rejects(()=>sandbox.op({anchor_text:'same'
 texts=['previous','target','next',''];broken=true;
 await assert.rejects(()=>sandbox.op({anchor_text:'target',track_changes:true}),e=>e.code==='VERIFICATION_FAILED');assert.equal(mode,'Off');broken=false;
 const r=await sandbox.op({anchor_text:'target',track_changes:true});assert.equal(r.after_count,3);assert.deepEqual(texts,['previous','next','']);assert.equal(mode,'Off');
+// compact_evidence_v1 (#112): counts and the two neighbours, never every paragraph twice.
+assert.equal(r.before_count,4);assert.deepEqual(JSON.parse(JSON.stringify(r.neighbours)),{previous:'previous',next:'next'});
+assert.equal(r.before_paragraphs,undefined);assert.equal(r.after_paragraphs,undefined);
+texts=['x'.repeat(500),'target','y'.repeat(500),''];
+const clipped=await sandbox.op({anchor_text:'target'});
+assert.equal(clipped.neighbours.previous.length,201);assert.ok(clipped.neighbours.previous.endsWith('…'));assert.equal(clipped.neighbours.next.length,201);
+texts=['previous','target','next',''];await sandbox.op({anchor_text:'target'});texts=['previous','target','next',''];
 // Word appends one empty paragraph to a paragraph's OOXML; only that is tolerated.
 const empty={textContent:'',getElementsByTagNameNS:()=>[]};
 trailer={textContent:'stray text',getElementsByTagNameNS:()=>[]};

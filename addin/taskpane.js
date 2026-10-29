@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1"];
+const PANE_CAPABILITIES = ["heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1", "compact_evidence_v1"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -2986,8 +2986,12 @@ async function opParagraphDelete(payload) {
     await context.sync();
     const after = remaining.items.map(p => p.text);
     const expected = before.filter((_,i) => i !== index);
+    // compact_evidence_v1 (#112): counts and the two neighbouring paragraphs, not every
+    // paragraph of the section twice. The read-back above still compares the full lists here.
+    const clip = text => text == null ? null : (text.length <= 200 ? text : text.slice(0, 200) + "…");
     const result = {applied:true,before_count:before.length,after_count:after.length,
-      before_paragraphs:before,after_paragraphs:after,pre,post:await mutationHash(context, {...payload, expectedBodySha256:undefined})};
+      neighbours:{previous:clip(index > 0 ? before[index-1] : null), next:clip(index+1 < before.length ? before[index+1] : null)},
+      pre,post:await mutationHash(context, {...payload, expectedBodySha256:undefined})};
     if (JSON.stringify(after) !== JSON.stringify(expected))
       throw refusalError(`Paragraph deletion read-back failed; observed effects: ${JSON.stringify(result)}`, 'VERIFICATION_FAILED');
     return result;

@@ -272,9 +272,20 @@ class FakeDocument:
             raise OpRefused("MATCH_COUNT_MISMATCH", f"Expected unique whole paragraph, found {len(hits)}")
         if payload["anchor_text"] in self._anchored_texts():
             raise OpRefused("ANCHORED_SHAPES", "Paragraph anchors a shape; re-anchoring is not supported")
+        before = list(lines)
         del lines[hits[0]]
         self.text = "\n".join(lines)
-        return {"applied": True, "pre": pre, "post": self.sha256()}
+        result: dict[str, Any] = {"applied": True, "pre": pre, "post": self.sha256()}
+        if getattr(self, "legacy_delete_lists", False):
+            # A pane predating compact_evidence_v1: every paragraph, before and after.
+            result.update(before_count=len(before), after_count=len(lines),
+                          before_paragraphs=before, after_paragraphs=list(lines))
+        else:
+            i = hits[0]
+            result.update(before_count=len(before), after_count=len(lines),
+                          neighbours={"previous": before[i - 1] if i > 0 else None,
+                                      "next": before[i + 1] if i + 1 < len(before) else None})
+        return result
 
     def sha256(self) -> str:
         payload = self.text

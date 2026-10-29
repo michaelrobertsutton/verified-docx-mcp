@@ -67,7 +67,8 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from . import desktop_word, audit, markdown_to_ooxml, paths, projection, write_ledger
+from . import audit, desktop_word, markdown_to_ooxml, paths, projection, write_ledger
+from . import evidence as evidence_module
 from .errors import ErrorCode, _make_error
 from .live import write_mode as live_write_mode
 from .projection import DEFAULT_PART, R_NS, W_NS
@@ -1491,8 +1492,11 @@ def execute_replace_body_markdown(
         track=track,
         conflict_sweep=conflict_sweep,
     )
-    logged, _ = audit.append_audit(path=str(resolved), tool="replace_body_markdown", evidence=evidence)
+    ref = audit.new_evidence_ref()
+    logged, _ = audit.append_audit(path=str(resolved), tool="replace_body_markdown", evidence=evidence, evidence_ref=ref)
     evidence["audit_logged"] = logged
+    # #112: the full before/after stays in the audit log; the caller gets bounded evidence.
+    evidence_module.compact_whole_document(evidence, evidence_ref=ref if logged else None)
     return evidence
 
 
@@ -1649,8 +1653,11 @@ def execute_replace_range_markdown(
         track=track,
         conflict_sweep=conflict_sweep,
     )
-    logged, _ = audit.append_audit(path=str(resolved), tool="replace_range_markdown", evidence=evidence)
+    ref = audit.new_evidence_ref()
+    logged, _ = audit.append_audit(path=str(resolved), tool="replace_range_markdown", evidence=evidence, evidence_ref=ref)
     evidence["audit_logged"] = logged
+    # #112: the full before/after stays in the audit log; the caller gets bounded evidence.
+    evidence_module.compact_whole_document(evidence, evidence_ref=ref if logged else None)
     return evidence
 
 
@@ -1753,6 +1760,9 @@ def execute_append_markdown(
         track=track,
         conflict_sweep=conflict_sweep,
     )
-    logged, _ = audit.append_audit(path=str(resolved), tool="append_markdown", evidence=evidence)
+    ref = audit.new_evidence_ref()
+    logged, _ = audit.append_audit(path=str(resolved), tool="append_markdown", evidence=evidence, evidence_ref=ref)
     evidence["audit_logged"] = logged
+    # #112: the full before/after stays in the audit log; the caller gets bounded evidence.
+    evidence_module.compact_whole_document(evidence, evidence_ref=ref if logged else None)
     return evidence

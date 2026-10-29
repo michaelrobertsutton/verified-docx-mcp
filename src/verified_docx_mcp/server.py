@@ -54,6 +54,7 @@ from typing import Any, NoReturn
 from fastmcp import FastMCP
 
 from . import (
+    audit,
     comments,
     geometry,
     images,
@@ -1998,9 +1999,15 @@ def format_text(
     within_row_containing: str | None = None,
     allow_concurrent_editor: bool = False,
     scope: str = "body",
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Apply character styling (bold/italic/underline/strike/color) to a
     matched text span, without touching its content.
+
+    The text never changes, so the result carries ``text_unchanged: true`` and one
+    ``excerpt`` instead of a before and an after, plus ``format_delta`` (only the
+    attributes that moved). ``verbose=true`` also returns ``runs_before`` /
+    ``runs_after`` (issue #112).
 
     `write_mode` (issue #106 WP-3, "auto" | "file" | "live", default
     "auto"): identical rule and evidence differences to `replace_text`'s
@@ -2074,6 +2081,7 @@ def format_text(
             within_row_containing=within_row_containing,
             scope=scope,
             allow_concurrent_editor=allow_concurrent_editor,
+            verbose=verbose,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -3502,9 +3510,15 @@ def apply_style(
     force: bool = False,
     track_changes: bool = False,
     allow_concurrent_editor: bool = False,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Apply a NAMED style (from list_styles) to text located via find --
     the named-style counterpart to format_text's four boolean toggles.
+
+    The text never changes, so the result carries ``text_unchanged: true`` and one
+    ``excerpt`` instead of a before and an after, plus ``format_delta`` (only the
+    attributes that moved). ``verbose=true`` also returns ``runs_before`` /
+    ``runs_after`` (issue #112).
 
     This tool has no `write_mode` parameter -- it always writes the
     .docx file directly. Issue #154: that means it now refuses with
@@ -3576,10 +3590,79 @@ def apply_style(
         return text_edit.execute_apply_style(
             path, find, style_id, expected_matches,
             revision_before=revision_before, force=force, track_changes=track_changes,
-            allow_concurrent_editor=allow_concurrent_editor,
+            allow_concurrent_editor=allow_concurrent_editor, verbose=verbose,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def read_audit_evidence(
+    evidence_ref: str, field: str | None = None, to_file: str | None = None
+) -> dict[str, Any]:
+    """Fetch the full audit record behind an ``evidence_ref`` a write returned.
+
+    Writes that rewrite a whole body, section or revision set return hashes, sizes and
+    a short excerpt instead of the whole before/after text; the text itself is in the
+    audit log (``$XDG_STATE_HOME/verified-docx-mcp/audit.jsonl``, default
+    ``~/.local/state/verified-docx-mcp/``). The log is append-only and never rotated by
+    the server, so a ref stays valid until the operator removes the file. If the
+    operator set ``VERIFIED_DOCX_MCP_AUDIT_EXCERPTS=0`` the text was never stored and
+    ``before``/``after`` read ``[redacted; N chars]``.
+
+    ``field`` (e.g. ``"before"``, ``"after"``) returns just that evidence field.
+    ``to_file`` writes the result (JSON, or the raw text of one string ``field``) to an
+    allowed path and returns only {written_to, sha256, chars}.
+
+    Errors: INVALID_INPUT - unknown ``evidence_ref`` or ``field``, or a bad ``to_file``.
+    """
+    try:
+        return execute_read_audit_evidence(evidence_ref, field, to_file)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+def execute_read_audit_evidence(
+    evidence_ref: str, field: str | None = None, to_file: str | None = None
+) -> dict[str, Any]:
+    target = paths.resolve_output_path(to_file, param="to_file") if to_file is not None else None
+    record = audit.find_audit_record(evidence_ref)
+    if record is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"No audit record with evidence_ref {evidence_ref!r}. The ref is only valid on the machine "
+            "and state directory that wrote it, and only while its audit log still holds the record.",
+            {"evidence_ref": evidence_ref},
+        )
+    evidence = record.get("evidence", {})
+    if field is not None and field not in evidence:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"The audit record has no evidence field {field!r}.",
+            {"evidence_ref": evidence_ref, "available_fields": sorted(evidence)},
+        )
+    result: dict[str, Any] = {
+        "evidence_ref": evidence_ref,
+        "tool": record.get("tool"),
+        "path": record.get("path"),
+        "timestamp": record.get("timestamp"),
+    }
+    payload: Any = evidence if field is None else evidence[field]
+    if field is None:
+        result["evidence"] = payload
+    else:
+        result["field"] = field
+        result["value"] = payload
+    if target is None:
+        return result
+    text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    data = paths.write_text_atomic(target, text)
+    return {
+        **{k: result[k] for k in ("evidence_ref", "tool", "path", "timestamp")},
+        "written_to": str(target),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "chars": len(text),
+    }
 
 
 _HEADER_FOOTER_KINDS = frozenset({"header", "footer"})

@@ -72,6 +72,7 @@ over the same span before any accept/reject in between.
 from __future__ import annotations
 
 import copy
+import functools
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -1683,7 +1684,7 @@ def execute_format_text_live(
     return evidence
 
 
-def execute_format_text(
+def _execute_format_text(
     path: str,
     find: str,
     style: dict[str, bool | str],
@@ -1994,7 +1995,7 @@ def _apply_paragraph_style(p_elem: Any, style_id: str, *, track: _TrackContext |
     return True
 
 
-def execute_apply_style(
+def _execute_apply_style(
     path: str,
     find: str,
     style_id: str,
@@ -2185,6 +2186,52 @@ def execute_apply_style(
     logged, _ = audit.append_audit(path=str(resolved), tool="apply_style", evidence=evidence)
     evidence["audit_logged"] = logged
     return evidence
+
+
+_FORMAT_DELTA_ATTRS = ("bold", "italic", "underline", "strike", "color")
+
+
+def _compact_format_evidence(evidence: dict[str, Any], *, verbose: bool) -> dict[str, Any]:
+    """Shape a formatting-only result (issue #112).
+
+    format_text and apply_style never change text, so echoing a before and an after
+    excerpt (and every run, both times) says nothing the caller needs. When the two
+    excerpts are equal the result says ``text_unchanged: true`` with one ``excerpt``,
+    and ``format_delta`` lists only the attributes that moved. ``runs_before`` /
+    ``runs_after`` come back only with ``verbose=true``.
+    """
+    runs_before, runs_after = evidence.get("runs_before"), evidence.get("runs_after")
+    if runs_before is not None and runs_after is not None:
+        delta: dict[str, Any] = {}
+        for attr in _FORMAT_DELTA_ATTRS:
+            old = sorted({str(r.get(attr)) for span in runs_before for r in span})
+            new = sorted({str(r.get(attr)) for span in runs_after for r in span})
+            if old != new:
+                delta[attr] = {"before": old, "after": new}
+        if delta:
+            evidence["format_delta"] = delta
+    if not verbose:
+        evidence.pop("runs_before", None)
+        evidence.pop("runs_after", None)
+    if "before" in evidence and evidence.get("before") == evidence.get("after"):
+        evidence["text_unchanged"] = True
+        evidence["excerpt"] = evidence.pop("before")
+        evidence.pop("after", None)
+    return evidence
+
+
+@functools.wraps(_execute_format_text)
+def execute_format_text(*args: Any, verbose: bool = False, **kwargs: Any) -> dict[str, Any]:
+    """format_text: the parameters are ``_execute_format_text``'s, plus ``verbose``. The
+    result is shaped by ``_compact_format_evidence``."""
+    return _compact_format_evidence(_execute_format_text(*args, **kwargs), verbose=verbose)
+
+
+@functools.wraps(_execute_apply_style)
+def execute_apply_style(*args: Any, verbose: bool = False, **kwargs: Any) -> dict[str, Any]:
+    """apply_style: the parameters are ``_execute_apply_style``'s, plus ``verbose``. The
+    result is shaped by ``_compact_format_evidence``."""
+    return _compact_format_evidence(_execute_apply_style(*args, **kwargs), verbose=verbose)
 
 
 # ---------------------------------------------------------------------------
