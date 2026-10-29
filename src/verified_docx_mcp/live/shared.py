@@ -30,6 +30,7 @@ READ_OPS = frozenset(
         "describe",
         "body_ooxml",
         "search",
+        "replacement_font",
         "comments_list",
         "cell_get",
         "table_get",

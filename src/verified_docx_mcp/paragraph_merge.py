@@ -117,7 +117,7 @@ def execute(
             body.clear()
             body.append(copy.deepcopy(merged))
             ctx = markdown_to_ooxml.StyleContext.build(source.local_path)
-            xml = ts.flat_package(source.local_path, root, raw, ctx)
+            xml = ts.flat_package(source.local_path, root, raw, ctx, source.namespace_declarations)
             result = tables._live_cell_request(
                 session,
                 "cell_paragraph_merge",

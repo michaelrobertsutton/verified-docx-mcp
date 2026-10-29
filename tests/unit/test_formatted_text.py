@@ -25,10 +25,9 @@ def test_explicit_label_and_body():
     assert validate_segments(None, 'legacy') is None
 
 
-@pytest.mark.parametrize('change', ['missing', 'text', 'extra', 'color', 'size', 'link', 'break', 'bool'])
+@pytest.mark.parametrize('change', ['text', 'extra', 'color', 'size', 'link', 'break', 'bool'])
 def test_reject_invalid_segments(change):
     value = copy.deepcopy(segments())
-    if change == 'missing': del value[0]['format']['italic']
     if change == 'text': value[0]['text'] = 'Other'
     if change == 'extra': value[0]['format']['style'] = 'Normal'
     if change == 'color': value[0]['format']['color'] = 'auto'
@@ -70,3 +69,11 @@ def test_pane_formatting_harness():
     from pathlib import Path
     root = Path(__file__).resolve().parents[2]
     subprocess.run(['node', str(root/'tests/unit/js/formatted_harness.mjs'), str(root/'addin/taskpane.js')], check=True, capture_output=True, text=True)
+
+
+def test_partial_font_fields_inherit_from_baseline():
+    from verified_docx_mcp.formatted_text import resolve_segments
+    value=resolve_segments([{'text':'bold','format':{'bold':True}},{'text':' plain'}], 'bold plain', FONT)
+    assert value[0]['format']=={**FONT,'bold':True}
+    assert value[1]['format']==FONT
+    assert validate_segments([{'text':'x','format':{}}], 'x')[0]['format']=={}

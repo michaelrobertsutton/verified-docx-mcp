@@ -316,6 +316,7 @@ VALID_OPS: frozenset[str] = frozenset(
         "describe",
         "body_ooxml",
         "search",
+        "replacement_font",
         "replace",
         "format",
         "comments_list",

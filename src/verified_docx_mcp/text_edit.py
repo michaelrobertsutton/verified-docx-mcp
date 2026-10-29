@@ -833,6 +833,11 @@ def _live_replace_once(
     ``VERIFICATION_FAILED`` mean the write may have landed. Never retries and never audits;
     the caller owns both.
     """
+    if replacement_segments:
+        from .formatted_text import FIELDS
+        if any(set(segment["format"]) != FIELDS for segment in replacement_segments):
+            live_write_mode.require_capability(session,"partial_font_segments_v1",
+                feature_description="partial segment formatting")
     payload: dict[str, Any] = {
         "find": find,
         "expected_matches": expected_matches,

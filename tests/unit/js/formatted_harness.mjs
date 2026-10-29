@@ -11,7 +11,9 @@ const format={bold:false,italic:false,underline:'None',strikeThrough:false,doubl
 const segments=[{text:'Label:',format:{...format,bold:true}},{text:' plain',format}];
 assert.equal(explicitSegments({replace:'Label: plain',replacement_segments:segments})[1].format.bold,false);
 assert.throws(()=>explicitSegments({replace:'different',replacement_segments:segments}),e=>e.code==='INVALID_INPUT');
-assert.throws(()=>explicitSegments({replace:'x',replacement_segments:[{text:'x',format:{bold:true}}]}),e=>e.code==='INVALID_INPUT');
+const partial=explicitSegments({replace:'x',replacement_segments:[{text:'x',format:{bold:true}}]},format);
+assert.equal(partial[0].format.bold,true);assert.equal(partial[0].format.size,11);
+assert.throws(()=>explicitSegments({replace:'x',replacement_segments:[{text:'x',format:{bold:1}}]},format),e=>e.code==='INVALID_INPUT');
 assert.equal(explicitSegments({replace:'legacy'}),null);
 const w='http://schemas.openxmlformats.org/wordprocessingml/2006/main';
 const xml=`<w:document xmlns:w="${w}"><w:body><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>α😀</w:t></w:r><w:r><w:t>: plain</w:t><w:br/><w:t>line</w:t></w:r></w:p></w:body></w:document>`;

@@ -1933,3 +1933,25 @@ def markdown_from_elements(
     walker.walk_block_container(elements, [])
     markdown, _lossy = _events_to_markdown(walker.events, walker.paragraphs, styles_by_id, numbering_index)
     return markdown
+
+
+def project_heading_scope(docx_path: Path, part_name: str, section_key: str) -> Projection | None:
+    """Scope at existing heading boundaries, retaining original paragraph/table IDs."""
+    headings=[s for s in find_sections_impl(docx_path,part_name) if s['kind']=='heading']
+    index=next((i for i,s in enumerate(headings) if s['section_key']==section_key),None)
+    if index is None:
+        return None
+    full=project_part(docx_path,part_name)
+    first=headings[index]['start_para_ref']
+    next_ref=headings[index+1]['start_para_ref'] if index+1<len(headings) else None
+    start=next(i for i,e in enumerate(full.events) if getattr(e,'para_ref',None)==first)
+    end=next((i for i,e in enumerate(full.events) if next_ref and getattr(e,'para_ref',None)==next_ref),len(full.events))
+    first_meta=next(i for i,p in enumerate(full.paragraphs) if p.para_ref==first)
+    end_meta=next((i for i,p in enumerate(full.paragraphs) if next_ref and p.para_ref==next_ref),len(full.paragraphs))
+    walker=_PartWalker()
+    walker.events=full.events[start:end]
+    walker.paragraphs=full.paragraphs[first_meta:end_meta]
+    refs={p.para_ref for p in walker.paragraphs}
+    walker.deleted_spans=[d for d in full.deleted_spans if d.para_ref in refs]
+    walker.warnings=full.warnings
+    return _finalize_projection(walker,f'{part_name}#{section_key}')

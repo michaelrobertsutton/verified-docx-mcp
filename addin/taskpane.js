@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["cell_paragraph_merge_v1", "paragraph_positions_v1", "cell_paragraphs_v1", "cell_font_inheritance_v1", "table_rows_v1", "table_copy_v1", "heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
+const PANE_CAPABILITIES = ["partial_font_segments_v1", "cell_paragraph_merge_v1", "paragraph_positions_v1", "cell_paragraphs_v1", "cell_font_inheritance_v1", "table_rows_v1", "table_copy_v1", "heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -601,7 +601,8 @@ function connectOpsSocket() {
         socket.send(JSON.stringify({ type: "reply", request_id: requestId, ok: true, result }));
       } catch (err) {
         const code = err && err.code ? err.code : "LIVE_OP_FAILED";
-        const msg = err && err.message ? err.message : String(err);
+        const msg = (err && err.message ? err.message : String(err)) +
+          (err?.debugInfo?.errorLocation ? ` [${err.debugInfo.errorLocation}]` : "");
         logOp(payload.clientId ? `${op} [${payload.clientId.slice(0, 8)}]` : op, false, msg);
         socket.send(
           JSON.stringify({ type: "reply", request_id: requestId, ok: false, error: { code, message: msg } })
@@ -700,7 +701,7 @@ function enqueuePaneOperation(operation) {
 }
 const READ_ONLY_OPS = new Set(["ping", "describe", "body_ooxml", "search", "comments_list",
   "cell_get", "table_get", "shapes_list", "textboxes_list", "textboxes_read", "scope_describe",
-  "revisions_list", "autoopen_get", "sections_list", "execution_snapshot", "save"]);
+  "revisions_list", "autoopen_get", "sections_list", "execution_snapshot", "replacement_font", "save"]);
 
 async function dispatchOp(op, payload) {
   if (op === "save" && payload.executionSections)
@@ -752,6 +753,8 @@ async function dispatchOpUnchecked(op, payload) {
       return opBodyOoxml();
     case "search":
       return opSearch(payload);
+    case "replacement_font":
+      return opReplacementFont(payload);
     case "replace":
       return opReplace(payload);
     case "format":
@@ -1257,25 +1260,31 @@ async function searchScoped(context, payload) {
 }
 
 // Explicit segments never derive formatting from a neighbouring run.
-function explicitSegments(payload) {
+function explicitSegments(payload, baseline=null) {
   if (payload.replacement_segments === undefined || payload.replacement_segments === null) return null;
-  const segments = payload.replacement_segments;
-  if (!Array.isArray(segments) || segments.length > 500 || segments.map(s => s.text).join('') !== payload.replace)
-    throw refusalError('Segments must concatenate exactly to replace', 'INVALID_INPUT');
-  for (const s of segments) {
-    if (!s || typeof s.text !== 'string' || !s.text || /[\x00-\x08\x0a\x0c-\x1f]/.test(s.text) ||
-        Object.keys(s).some(k => !['text','format','hyperlink'].includes(k)) ||
-        !s.format || Object.keys(s.format).sort().join(',') !== [...FONT_FIELDS].sort().join(',') ||
-        ['bold','italic','strikeThrough','doubleStrikeThrough','subscript','superscript'].some(k => typeof s.format[k] !== 'boolean') ||
-        (s.format.subscript && s.format.superscript) || !['None','Single','Double'].includes(s.format.underline) ||
-        !/^#[0-9a-f]{6}$/i.test(s.format.color) || typeof s.format.name !== 'string' || !s.format.name.trim() ||
-        typeof s.format.size !== 'number' || !Number.isFinite(s.format.size) || s.format.size < 1 || s.format.size > 1638 ||
-        s.format.size * 2 !== Math.floor(s.format.size * 2) ||
-        (s.hyperlink != null && (typeof s.hyperlink !== 'string' || !/^(https?:|mailto:)/.test(s.hyperlink) || /[\x00-\x1f]/.test(s.hyperlink))))
-      throw refusalError('Explicit segments require complete valid font properties and an optional URL', 'INVALID_INPUT');
-  }
-  return segments;
+  const input=payload.replacement_segments;
+  if(!Array.isArray(input) || input.length>500 || input.map(s=>s?.text).join('')!==payload.replace)
+    throw refusalError('Segments must concatenate exactly to replace','INVALID_INPUT');
+  return input.map(segment=>{
+    const provided=segment?.format === undefined ? {} : segment.format;
+    if(!segment || typeof segment.text!=='string' || !segment.text || /[\x00-\x08\x0a\x0c-\x1f]/.test(segment.text) ||
+       Object.keys(segment).some(k=>!['text','format','hyperlink'].includes(k)) ||
+       !provided || typeof provided!=='object' || Array.isArray(provided) || Object.keys(provided).some(k=>!FONT_FIELDS.includes(k)))
+      throw refusalError('Invalid segment fields','INVALID_INPUT');
+    const font={...(baseline || {}),...provided};
+    const invalid=['bold','italic','strikeThrough','doubleStrikeThrough','subscript','superscript'].some(k=>k in font && typeof font[k]!=='boolean') ||
+      (font.subscript && font.superscript) || ('underline' in font && !['None','Single','Double'].includes(font.underline)) ||
+      ('color' in font && !/^#[0-9a-f]{6}$/i.test(font.color)) ||
+      ('name' in font && (typeof font.name!=='string' || !font.name.trim() || font.name.length>128)) ||
+      ('size' in font && (typeof font.size!=='number' || !Number.isFinite(font.size) || font.size<1 || font.size>1638 || font.size*2!==Math.floor(font.size*2))) ||
+      (segment.hyperlink!=null && (typeof segment.hyperlink!=='string' || !/^(https?:|mailto:)/.test(segment.hyperlink) || /[\x00-\x1f]/.test(segment.hyperlink)));
+    if(invalid || (baseline && FONT_FIELDS.some(k=>!(k in font))))
+      throw refusalError('Invalid or unavailable segment font properties','INVALID_INPUT');
+    if(font.color) font.color=font.color.toUpperCase();
+    return {...segment,format:font,hyperlink:segment.hyperlink || null};
+  });
 }
+
 function xmlSignature(node) {
   if (node.nodeType === 3) return node.nodeValue;
   const attrs = [...(node.attributes || [])].filter(a => !a.name.startsWith('xmlns') && !a.localName.startsWith('rsid'))
@@ -1418,6 +1427,16 @@ async function opReplace(payload) {
     const fonts = matchItems.map(r => fontSnapshot(r.font));
     if (segments === null && policy === "replaced" && fonts.some(f => Object.values(f).some(v => v === null || v === undefined || v === "")))
       throw refusalError("Mixed formatting; choose previous or none explicitly", "MIXED_FORMATTING");
+    let firstRunFonts=null;
+    const partial=segments && segments.some(s=>FONT_FIELDS.some(k=>!(k in s.format)));
+    if (partial || payload.expected_first_font) {
+      const sampled=matchItems.map(r=>r.getRange('Start').font);
+      sampled.forEach(font=>font.load(FONT_FIELDS));await context.sync();
+      firstRunFonts=sampled.map(fontSnapshot);
+      if(payload.expected_first_font && firstRunFonts.some(font=>FONT_FIELDS.some(k=>String(font[k]).toLowerCase()!==String(payload.expected_first_font[k]).toLowerCase())))
+        throw refusalError('Approved first-run formatting changed; prepare again','LIVE_STALE');
+    }
+    const segmentsByMatch=matchItems.map((_,i)=>partial ? explicitSegments(payload,firstRunFonts[i]) : segments);
     const boundaries = segments !== null ? await formattedBoundary(context, matchItems, payload) : null;
     let segmentRanges = [];
     let inserted = [];
@@ -1440,7 +1459,7 @@ async function opReplace(payload) {
         if (segments !== null && segments.length) {
           let first=null, last=null;
           const entries=[];
-          for (const segment of segments) {
+          for (const segment of segmentsByMatch[i]) {
             const target=last ? last.getRange('End').insertText(segment.text, 'After') : range.insertText(segment.text, 'Replace');
             FONT_FIELDS.forEach(k => {target.font[k]=segment.format[k];});
             if (!first) first=target;
@@ -3527,7 +3546,8 @@ async function executionXmlSnapshot(context, slugs) {
 
 // #106: native insertion inherits row/cell properties without replacing the table.
 async function opTableRowEdit(payload) {
-  return measuredWordRun(async context => {
+  let stage="preflight", mutated=false;
+  try { return await measuredWordRun(async context => {
     const pre = await mutationHash(context, payload);
     const tableItems = await targetTables(context, payload);
     const table = tableItems[payload.table_index-1];
@@ -3552,6 +3572,8 @@ async function opTableRowEdit(payload) {
     if (!Number.isInteger(rowIndex) || rowIndex < 1 || rowIndex > grid.length)
       throw refusalError("Row not found", "INVALID_INPUT");
     if (payload.delete && grid.length === 1) throw refusalError("Cannot delete the final row", "INVALID_INPUT");
+    if (!payload.delete && !Office.context.requirements.isSetSupported('WordApiDesktop','1.3'))
+      throw refusalError('Exact row font inheritance requires WordApiDesktop 1.3','LIVE_CAPABILITY_MISSING');
     const templateIndex = payload.template_row_index || adjacent;
     let template;
     if (!payload.delete) {
@@ -3572,24 +3594,32 @@ async function opTableRowEdit(payload) {
     const norm = t=>String(t).replace(/\s+/g," ").trim();
     if (payload.delete && norm(beforeText) !== norm(payload.expected_text))
       throw refusalError("Row text differs", "CELL_TEXT_MISMATCH");
+    stage="revision guard";
     await guardRevisions(context,[range]);
     if (payload.delete) {
+      stage="comment guard";
       await guardComments(context,[range],false);
-      await guardAnchoredParagraphs(context,[range]);
+      if (shapeNodes(shapeXml(xml.value)).length)
+        throw refusalError("Row deletion touches an anchored object", "ANCHORED_SHAPES");
     }
     // Recheck after all asynchronous preflight work.
     await requireFreshBody(context,pre);
     const resultIndex = payload.delete ? rowIndex : adjacent + (payload.after_row_index ? 1 : 0);
+    stage="mutation";
     await withTracking(context,payload.track_changes,async () => {
+      mutated=true;
       if (payload.delete) {
+        stage="row delete";
         table.rows.items[rowIndex-1].delete();
         await context.sync();
       } else {
+        stage="row insert";
         const inserted = table.rows.items[rowIndex-1].insertRows(payload.after_row_index ? "After" : "Before",1);
         inserted.load("items");
         await context.sync();
         inserted.items[0].cells.load("items");
         await context.sync();
+        stage="cell content import";
         const sourceCells = [...template.children].filter(n=>n.localName === "tc");
         inserted.items[0].cells.items.forEach((cell,i)=>{
           const tc = sourceCells[i];
@@ -3605,14 +3635,24 @@ async function opTableRowEdit(payload) {
             t.setAttributeNS("http://www.w3.org/XML/1998/namespace","xml:space","preserve");
             t.textContent=line; r.appendChild(t); p.appendChild(r); body.appendChild(p);
           }
-          const fragment = `<w:document xmlns:w="${ns}">${new XMLSerializer().serializeToString(body)}</w:document>`;
-          cell.body.insertOoxml(fragment,"Replace");
+          const importPackage=doc.cloneNode(true);
+          const importBody=importPackage.getElementsByTagNameNS(ns,'body')[0];
+          while(importBody.firstChild) importBody.removeChild(importBody.firstChild);
+          for(const p of [...body.childNodes]) importBody.appendChild(importPackage.importNode(p,true));
+          // Native insertRows stamps first-run formatting on the empty paragraph
+          // mark. Reset that default before importing the actual template pPr/rPr.
+          cell.body.font.reset();
+          cell.body.insertOoxml(new XMLSerializer().serializeToString(importPackage),"Replace");
         });
         await context.sync();
       }
     });
+    stage="post hash";
     return {applied:true,row_index:resultIndex,pre,post:await mutationHash(context,{...payload,expectedBodySha256:undefined})};
-  });
+  }); } catch(error) {
+    throw refusalError(`${stage}: ${error.message || error}; ${error.debugInfo?.errorLocation || ''}`,
+      mutated ? "VERIFICATION_FAILED" : (error.code || "LIVE_OP_FAILED"));
+  }
 }
 
 async function opTableCopy(payload) {
@@ -3743,5 +3783,15 @@ async function opCellParagraphMerge(payload) {
     if(after.length !== before.length-1)
       throw refusalError('Paragraph merge count differs','VERIFICATION_FAILED');
     return {applied:true,pre,post:await mutationHash(context,{...payload,expectedBodySha256:undefined})};
+  });
+}
+
+
+async function opReplacementFont(payload) {
+  return measuredWordRun(async context=>{
+    const matches=await searchScoped(context,{...payload,scope:'body'});
+    if(matches.length!==1) throw refusalError('Expected one formatting target','MATCH_COUNT_MISMATCH');
+    const font=matches[0].getRange('Start').font;font.load(FONT_FIELDS);await context.sync();
+    return {font:fontSnapshot(font)};
   });
 }

@@ -267,6 +267,16 @@ def prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = F
                 if len(matches) != 1:
                     raise invalid("Table is absent or ambiguous in the prepared section")
                 operation["args"]["table_id"] = matches[0]["local_index"]
+        from ..formatted_text import FIELDS, resolve_segments
+        for operation in operations:
+            args = operation["args"]
+            segments = args.get("replacement_segments")
+            if segments and any(set(segment.get("format", {})) != FIELDS for segment in segments):
+                wm.require_capability(session, "partial_font_segments_v1", feature_description="partial segment preparation")
+                font = session.request_threadsafe("replacement_font", {"find": args["find"],
+                    "executionTargetSection": operation["section"]})["font"]
+                args["replacement_segments"] = resolve_segments(segments, args["replace"], font)
+                operation["font_baseline"] = font
         comments = session.request_threadsafe("comments_list", {"include_anchor": True})
         current = initial
         targets, preconditions = [], []
@@ -349,7 +359,8 @@ def apply(path, operation, track_changes=False):
             if args.get("replacement_segments") is not None:
                 wm.require_capability(session, "formatted_replacements_v1", feature_description="explicit formatted replacements")
             before, after = args["find"], args["replace"]
-            result = session.request_threadsafe("replace", {**args, **common, "allow_comment_loss": False,
+            result = session.request_threadsafe("replace", {**args, **common,
+                **({"expected_first_font": operation["font_baseline"]} if "font_baseline" in operation else {}), "allow_comment_loss": False,
                                                            "inherit_format": "replaced", "scope": "body"})
             if args.get("replacement_segments") is not None:
                 from ..formatted_text import validate_segments

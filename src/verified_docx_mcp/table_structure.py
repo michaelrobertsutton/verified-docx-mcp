@@ -13,7 +13,7 @@ from xml.etree import ElementTree as ET
 
 from . import audit, markdown_to_ooxml, mutations, paths, projection, tables, tracked_changes
 from .author import resolve_author_name
-from .errors import ErrorCode, _make_error
+from .errors import ErrorCode, VerifyError, _make_error
 from .live import reads_live
 from .live import write_mode as wm
 
@@ -332,9 +332,17 @@ def execute_row_live(
             expected_formats.insert(
                 adjacent if args["after_row_index"] else adjacent - 1, property_signature(new_row)
             )
-        result = tables._live_cell_request(
-            session, "table_row_edit", wire, expected_body_sha256=pre
-        )
+        try:
+            result = tables._live_cell_request(
+                session, "table_row_edit", wire, expected_body_sha256=pre
+            )
+        except VerifyError as exc:
+            audit.append_audit(
+                path=path,
+                tool=tool,
+                evidence={"applied": None, "write_mode": "live", "error": exc.envelope.to_dict()},
+            )
+            raise
         actual = tables._live_table_get(session, table_id)
         actual_rows = ["\t".join(c["text"] for c in row) for row in actual["rows"]]
         if not result.get("applied") or [tables._norm_cell_text(t) for t in actual_rows] != [
@@ -447,7 +455,13 @@ def apply_table_template(
             )
 
 
-def flat_package(path: Path, root: Any, raw: bytes, ctx: Any) -> str:
+def flat_package(
+    path: Path,
+    root: Any,
+    raw: bytes,
+    ctx: Any,
+    namespace_declarations: dict[str, str] | None = None,
+) -> str:
     """Build a Flat OPC import preserving styles/relationships of rendered cells."""
     import base64
     import zipfile
@@ -478,7 +492,14 @@ def flat_package(path: Path, root: Any, raw: bytes, ctx: Any) -> str:
             ET.SubElement(part, f"{{{pkg}}}xmlData").append(ET.fromstring(data))
         else:
             ET.SubElement(part, f"{{{pkg}}}binaryData").text = base64.b64encode(data).decode()
-    return ET.tostring(package, encoding="unicode")
+    declarations = namespace_declarations or mutations._capture_source_namespaces(raw)
+    declarations = {**declarations, "pkg": pkg}
+    for prefix, uri in declarations.items():
+        try:
+            ET.register_namespace(prefix, uri)
+        except ValueError:
+            pass
+    return mutations._serialize_xml(package, declarations).decode()
 
 
 def execute_copy_live(
@@ -536,7 +557,7 @@ def execute_copy_live(
         body = mutations._find_body(root)
         body.clear()
         body.append(table)
-        ooxml = flat_package(source.local_path, root, raw, ctx)
+        ooxml = flat_package(source.local_path, root, raw, ctx, source.namespace_declarations)
         intended = [plain_row(row) for row in table.findall(w("tr"))]
         result = tables._live_cell_request(
             session,
