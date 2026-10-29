@@ -113,6 +113,88 @@ class ListOpenItemsCommentsTests(_TempFixtureCase):
         self.assertEqual(comment["w_id"], "0")
 
 
+def _add_reply(docx: Path, *, reply_done: str = "0", root_done: str = "0", extra_reply: bool = False) -> None:
+    """Rewrite commented.docx's zip in place: add a reply (and optionally a
+    reply-to-reply) to its one comment (paraId 79387F2F), no binary fixture."""
+    import zipfile
+
+    def comment(w_id: str, para: str, text: str, author: str) -> str:
+        return (
+            f'<w:comment w:id="{w_id}" w:author="{author}" w:date="2026-09-11T10:00:00Z" w:initials="X">'
+            f'<w:p w14:paraId="{para}"><w:r><w:t>{text}</w:t></w:r></w:p></w:comment>'
+        )
+
+    comments = comment("1", "1111AAAA", "first reply", "Alice")
+    ex = f'<w15:commentEx w15:paraId="1111AAAA" w15:paraIdParent="79387F2F" w15:done="{reply_done}"/>'
+    ids = '<w16cid:commentId w16cid:paraId="1111AAAA" w16cid:durableId="0000AAAA"/>'
+    if extra_reply:
+        comments += comment("2", "2222BBBB", "second reply", "Bob")
+        ex += '<w15:commentEx w15:paraId="2222BBBB" w15:paraIdParent="79387F2F" w15:done="0"/>'
+        ids += '<w16cid:commentId w16cid:paraId="2222BBBB" w16cid:durableId="0000BBBB"/>'
+    with zipfile.ZipFile(docx) as zf:
+        parts = {n: zf.read(n) for n in zf.namelist()}
+        infos = zf.infolist()
+    parts["word/comments.xml"] = parts["word/comments.xml"].replace(b"</w:comments>", comments.encode() + b"</w:comments>")
+    ext = parts["word/commentsExtended.xml"].replace(b'w15:done="0"/>', f'w15:done="{root_done}"/>'.encode(), 1)
+    parts["word/commentsExtended.xml"] = ext.replace(b"</w15:commentsEx>", ex.encode() + b"</w15:commentsEx>")
+    parts["word/commentsIds.xml"] = parts["word/commentsIds.xml"].replace(
+        b"</w16cid:commentsIds>", ids.encode() + b"</w16cid:commentsIds>"
+    )
+    with zipfile.ZipFile(docx, "w", zipfile.ZIP_DEFLATED) as out:
+        for info in infos:
+            out.writestr(info.filename, parts[info.filename])
+
+
+class ListOpenItemsThreadingTests(_TempFixtureCase):
+    fixture_name = "revision/commented.docx"
+
+    def test_reply_is_nested_under_root_not_listed_top_level(self):
+        _add_reply(self.target)
+        result = tracked_changes.execute_list_open_items(str(self.target))
+        self.assertEqual(len(result["comments"]), 1)
+        root = result["comments"][0]
+        self.assertEqual(root["content"], "This is a test comment.")
+        self.assertEqual(root["reply_count"], 1)
+        self.assertEqual(
+            root["replies"],
+            [{"id": "0000AAAA", "author": "Alice", "date": "2026-09-11T10:00:00Z", "text": "first reply"}],
+        )
+
+    def test_replies_keep_comment_order_and_count_matches(self):
+        _add_reply(self.target, extra_reply=True)
+        root = tracked_changes.execute_list_open_items(str(self.target))["comments"][0]
+        self.assertEqual(root["reply_count"], 2)
+        self.assertEqual([r["text"] for r in root["replies"]], ["first reply", "second reply"])
+
+    def test_root_resolved_state_governs_the_thread(self):
+        _add_reply(self.target, root_done="1", reply_done="0")
+        self.assertEqual(tracked_changes.execute_list_open_items(str(self.target))["comments"], [])
+
+    def test_resolved_reply_does_not_resolve_open_root(self):
+        _add_reply(self.target, root_done="0", reply_done="1")
+        comments = tracked_changes.execute_list_open_items(str(self.target))["comments"]
+        self.assertEqual(len(comments), 1)
+        self.assertFalse(comments[0]["resolved"])
+        self.assertEqual(comments[0]["reply_count"], 1)
+
+    def test_unthreaded_comment_reports_zero_replies(self):
+        root = tracked_changes.execute_list_open_items(str(self.target))["comments"][0]
+        self.assertEqual((root["reply_count"], root["replies"]), (0, []))
+
+
+class ListOpenItemsGoldenThreadingTests(_TempFixtureCase):
+    fixture_name = "comments/golden-comment.docx"
+
+    def test_golden_root_has_its_real_reply_and_resolved_thread_is_hidden(self):
+        result = tracked_changes.execute_list_open_items(str(self.target))
+        # golden: id=0 root (open) + id=1 reply; id=2 is a resolved root (filtered).
+        self.assertEqual(len(result["comments"]), 1)
+        root = result["comments"][0]
+        self.assertEqual(root["reply_count"], 1)
+        self.assertEqual(root["replies"][0]["text"], "reply.")
+        self.assertEqual(root["replies"][0]["id"] != root["comment_id"], True)
+
+
 class OverlappingWriteRefusalTests(_TempFixtureCase):
     """Acceptance: overlapping replace_text refuses; accept clears it and
     the write then proceeds.

@@ -2211,10 +2211,12 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     ("insertion"|"deletion"), text, author, date, anchor_context -- the
     owning paragraph's own live text).
 
-    Scope limit: comment REPLY THREADING (commentsExtended's parent/child
-    linking) is not resolved in file mode -- every comment reports
-    reply_count=0/replies=[]. reply_count/replies are still present,
-    structurally, for forward compatibility.
+    Comment replies are threaded (commentsExtended's w15:paraIdParent):
+    `comments` lists ROOT comments only, each with reply_count ==
+    len(replies) and replies = [{id, author, date, text}] in comment order;
+    a reply never appears as its own top-level entry. The root comment's
+    resolved state governs the thread (a resolved root is omitted together
+    with its replies; a reply's own resolved flag is ignored).
 
     Each comment's identity is keyed on its LAST paragraph (Word itself
     keys commentsIds.xml/commentsExtended.xml this way for a
