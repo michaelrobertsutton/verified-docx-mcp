@@ -195,7 +195,7 @@ class ReadSource:
     warnings: list[str] = field(default_factory=list)
     live: dict[str, Any] | None = None
     live_session: dict[str, Any] | None = None
-    namespace_declarations: dict[str, str] | None = None  # Internal import fidelity.
+    flat_opc: str | None = None  # Internal import fidelity; never returned.
     revision: str | None = None  # "live:sha256:<hex>" for a live read, else None
 
     def annotate(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -325,8 +325,6 @@ def read_source(path: str, source: str, part: str = DEFAULT_PART) -> Iterator[Re
     if use_live:
         assert session is not None
         reply = _fetch_body_ooxml(session)
-        from ..mutations import _capture_source_namespaces
-        namespace_declarations = _capture_source_namespaces(reply["ooxml"].encode())
         with tempfile.TemporaryDirectory(prefix="verified-docx-live-read-") as tmp:
             temp_docx = Path(tmp) / document_name
             built = flat_opc_to_docx(reply["ooxml"], temp_docx)
@@ -341,7 +339,7 @@ def read_source(path: str, source: str, part: str = DEFAULT_PART) -> Iterator[Re
                     "stripped_parts": reply.get("strippedParts") or [],
                 },
                 revision=f"{LIVE_REVISION_PREFIX}{reply['bodySha256']}",
-                namespace_declarations=namespace_declarations,
+                flat_opc=reply["ooxml"],
             )
         return
 

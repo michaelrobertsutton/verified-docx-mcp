@@ -28,6 +28,9 @@ def doc(tmp_path, monkeypatch):
         ET.SubElement(
             borders, ts.w(edge), {ts.w("val"): "single", ts.w("sz"): "4", ts.w("color"): "A6A6A6"}
         )
+    margins = ET.SubElement(pr, ts.w("tblCellMar"))
+    for edge, width in (("top", 14), ("bottom", 14), ("left", 72), ("right", 72)):
+        ET.SubElement(margins, ts.w(edge), {ts.w("w"): str(width), ts.w("type"): "dxa"})
     for row in table.findall(ts.w("tr")):
         rp = row.find(ts.w("trPr"))
         if rp is None:
@@ -52,6 +55,18 @@ def doc(tmp_path, monkeypatch):
                 ET.SubElement(rp, ts.w("sz"), {ts.w("val"): "17"})
     with zipfile.ZipFile(path) as z:
         parts = {n: z.read(n) for n in z.namelist()}
+    styles = ET.fromstring(parts["word/styles.xml"])
+    if not any(n.get(ts.w("styleId")) == "Compact" for n in styles):
+        compact = ET.SubElement(
+            styles, ts.w("style"), {ts.w("type"): "paragraph", ts.w("styleId"): "Compact"}
+        )
+        ET.SubElement(compact, ts.w("name"), {ts.w("val"): "Compact"})
+        ET.SubElement(compact, ts.w("basedOn"), {ts.w("val"): "Normal"})
+        pp = ET.SubElement(compact, ts.w("pPr"))
+        ET.SubElement(pp, ts.w("spacing"), {ts.w("after"): "0"})
+    parts["word/styles.xml"] = mutations._serialize_xml(
+        styles, mutations._capture_source_namespaces(parts["word/styles.xml"])
+    )
     parts[projection.DEFAULT_PART] = mutations._serialize_xml(
         root, mutations._capture_source_namespaces(raw)
     )
@@ -120,3 +135,69 @@ def test_tracked_row_has_structural_marker(doc):
     )
     row = root_table(doc).findall(ts.w("tr"))[1]
     assert row.find(f"{ts.w('trPr')}/{ts.w('ins')}") is not None
+
+
+def test_final_row_cannot_be_deleted(doc):
+    ts.execute_row(str(doc), 1, row_index=1, expected_text="R1C1\tR1C2", write_mode="file")
+    before = doc.read_bytes()
+    with pytest.raises(VerifyError, match="final row"):
+        ts.execute_row(str(doc), 1, row_index=1, expected_text="R2C1\tR2C2", write_mode="file")
+    assert doc.read_bytes() == before
+
+
+def test_stale_live_row_never_dispatches(doc, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from verified_docx_mcp.live import reads_live, write_mode
+
+    pane = SimpleNamespace(
+        document_name=doc.name, hello=SimpleNamespace(capabilities={"table_rows_v1"})
+    )
+    monkeypatch.setattr(write_mode, "resolve_write_mode", lambda *args: "live")
+    monkeypatch.setattr(write_mode, "live_session_for", lambda *args: pane)
+
+    @contextmanager
+    def source(*args):
+        yield SimpleNamespace(local_path=doc, live={"body_sha256": "b" * 64})
+
+    monkeypatch.setattr(reads_live, "read_source", source)
+
+    def dispatch(*args, **kwargs):
+        pytest.fail("A stale row write must not reach Word")
+
+    monkeypatch.setattr(tables, "_live_cell_request", dispatch)
+    with pytest.raises(VerifyError, match="changed since revision_before"):
+        ts.execute_row(
+            str(doc),
+            1,
+            after_row_index=1,
+            cells=["x", "y"],
+            revision_before="live:sha256:" + "a" * 64,
+        )
+
+
+def test_flat_package_keeps_untouched_style_namespace_declarations(doc):
+    from xml.dom import minidom
+
+    from verified_docx_mcp import markdown_to_ooxml
+
+    pkg = "http://schemas.microsoft.com/office/2006/xmlPackage"
+    word = projection.W_NS
+    source = f'''<pkg:package xmlns:pkg="{pkg}">
+      <pkg:part pkg:name="/word/document.xml" pkg:contentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"><pkg:xmlData><w:document xmlns:w="{word}"><w:body><w:p/></w:body></w:document></pkg:xmlData></pkg:part>
+      <pkg:part pkg:name="/word/styles.xml" pkg:contentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"><pkg:xmlData><w:styles xmlns:w="{word}" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" mc:Ignorable="w14"><w:style w:styleId="Compact" w:type="paragraph"/></w:styles></pkg:xmlData></pkg:part>
+    </pkg:package>'''
+    root, raw = mutations._load_document(doc)
+    output = ts.flat_package(doc, root, raw, markdown_to_ooxml.StyleContext.build(doc), source)
+
+    def style(xml):
+        dom = minidom.parseString(xml)
+        return next(
+            p.toxml()
+            for p in dom.getElementsByTagNameNS(pkg, "part")
+            if p.getAttributeNS(pkg, "name") == "/word/styles.xml"
+        )
+
+    assert style(output) == style(source)
+    assert "xmlns:w14=" in output

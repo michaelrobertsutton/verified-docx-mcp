@@ -63,12 +63,22 @@ def inherit_cell(template: Any, cell: Any) -> None:
     first_p = template.find(w("p"))
     if first_p is None:
         return
-    first_r = first_p.find(w("r"))
+    first_r = next(first_p.iter(w("r")), None)
     for paragraph in cell.iter(w("p")):
         inherit_properties(first_p, paragraph, "pPr")
         if first_r is not None:
-            for run in paragraph.iter(w("r")):
+            runs = list(paragraph.iter(w("r")))
+            for run in runs:
                 inherit_properties(first_r, run, "rPr")
+            if not any(n.text for n in paragraph.iter(w("t"))):
+                # Word stores the font of an empty paragraph on its paragraph mark.
+                props = paragraph.find(w("pPr"))
+                if props is None:
+                    props = ET.Element(w("pPr"))
+                    paragraph.insert(0, props)
+                inherit_properties(first_r, props, "rPr")
+                for run in runs:
+                    paragraph.remove(run)
 
 
 def clone_row(template: Any, cells: list[str]) -> Any:
@@ -383,6 +393,12 @@ def execute_row_live(
             document_name=session.document_name,
             tool=tool,
             path=path,
+            extra={
+                "table_id": table_id,
+                "row_index": result["row_index"],
+                "rows_before": len(rows),
+                "rows_after": len(actual_rows),
+            },
         )
         evidence.update(
             table_id=table_id,
@@ -422,6 +438,16 @@ def apply_table_template(
     if dest_pr is not None:
         dest.remove(dest_pr)
     inherit_properties(source, dest, "tblPr")
+    if grid_explicit:
+        props = dest.find(w("tblPr"))
+        if props is None:
+            props = ET.Element(w("tblPr"))
+            dest.insert(0, props)
+        width = props.find(w("tblW"))
+        if width is None:
+            width = ET.SubElement(props, w("tblW"))
+        width.set(w("type"), "dxa")
+        width.set(w("w"), str(sum(int(n.get(w("w"))) for n in dest.find(w("tblGrid")))))
     if not grid_explicit:
         grid = dest.find(w("tblGrid"))
         original = source.find(w("tblGrid"))
@@ -455,51 +481,42 @@ def apply_table_template(
             )
 
 
-def flat_package(
-    path: Path,
-    root: Any,
-    raw: bytes,
-    ctx: Any,
-    namespace_declarations: dict[str, str] | None = None,
-) -> str:
-    """Build a Flat OPC import preserving styles/relationships of rendered cells."""
-    import base64
-    import zipfile
+def flat_package(path: Path, root: Any, raw: bytes, ctx: Any, source_flat_opc: str) -> str:
+    """Patch Word's package without reserializing untouched parts/namespaces."""
+    from xml.dom import minidom
 
-    overrides = mutations._build_overrides(path, root, raw, ctx)
     pkg = "http://schemas.microsoft.com/office/2006/xmlPackage"
-    ct = "http://schemas.openxmlformats.org/package/2006/content-types"
-    package = ET.Element(f"{{{pkg}}}package")
-    with zipfile.ZipFile(path) as archive:
-        parts = {n: archive.read(n) for n in archive.namelist()}
-    parts.update(overrides)
-    types = ET.fromstring(parts["[Content_Types].xml"])
-    defaults = {n.get("Extension"): n.get("ContentType") for n in types.findall(f"{{{ct}}}Default")}
-    specific = {n.get("PartName"): n.get("ContentType") for n in types.findall(f"{{{ct}}}Override")}
-    for name, data in parts.items():
+    package = minidom.parseString(source_flat_opc)
+    parts = {
+        p.getAttributeNS(pkg, "name").lstrip("/"): p
+        for p in package.getElementsByTagNameNS(pkg, "part")
+    }
+    source_doc = parts[projection.DEFAULT_PART].getElementsByTagNameNS(pkg, "xmlData")[0]
+    original = next(n for n in source_doc.childNodes if n.nodeType == n.ELEMENT_NODE)
+    # Prefixes named only in mc:Ignorable must survive the new document part.
+    declarations = mutations._capture_source_namespaces(original.toxml().encode())
+    overrides = mutations._build_overrides(path, root, raw, ctx)
+    overrides[projection.DEFAULT_PART] = mutations._serialize_xml(root, declarations)
+    for name, data in overrides.items():
         if name == "[Content_Types].xml":
-            continue
-        content_type = specific.get("/" + name) or defaults.get(name.rsplit(".", 1)[-1])
-        part = ET.SubElement(
-            package,
-            f"{{{pkg}}}part",
-            {
-                f"{{{pkg}}}name": "/" + name,
-                f"{{{pkg}}}contentType": content_type or "application/octet-stream",
-            },
-        )
-        if name.endswith((".xml", ".rels")):
-            ET.SubElement(part, f"{{{pkg}}}xmlData").append(ET.fromstring(data))
-        else:
-            ET.SubElement(part, f"{{{pkg}}}binaryData").text = base64.b64encode(data).decode()
-    declarations = namespace_declarations or mutations._capture_source_namespaces(raw)
-    declarations = {**declarations, "pkg": pkg}
-    for prefix, uri in declarations.items():
-        try:
-            ET.register_namespace(prefix, uri)
-        except ValueError:
-            pass
-    return mutations._serialize_xml(package, declarations).decode()
+            continue  # Flat OPC represents content types on each pkg:part.
+        part = parts.get(name)
+        if part is None:
+            part = package.createElementNS(pkg, "pkg:part")
+            part.setAttributeNS(pkg, "pkg:name", "/" + name)
+            content_type = (
+                "application/vnd.openxmlformats-package.relationships+xml"
+                if name.endswith(".rels")
+                else "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"
+            )
+            part.setAttributeNS(pkg, "pkg:contentType", content_type)
+            package.documentElement.appendChild(part)
+        while part.firstChild:
+            part.removeChild(part.firstChild)
+        xml_data = package.createElementNS(pkg, "pkg:xmlData")
+        xml_data.appendChild(package.importNode(minidom.parseString(data).documentElement, True))
+        part.appendChild(xml_data)
+    return package.toxml()
 
 
 def execute_copy_live(
@@ -522,10 +539,28 @@ def execute_copy_live(
         raise _make_error(ErrorCode.INVALID_INPUT, "Use style_id for a faithful OOXML copy")
     session = wm.live_session_for(path)
     wm.require_capability(session, "table_copy_v1", feature_description="faithful table copy")
+    if grid_dxa is not None and (
+        not isinstance(grid_dxa, list)
+        or not grid_dxa
+        or any(type(n) is not int or n <= 0 for n in grid_dxa)
+    ):
+        raise _make_error(ErrorCode.INVALID_INPUT, "grid_dxa must contain positive integer widths")
     norm, cols = tables._normalize_rows(rows, grid_dxa)
     if type(header_rows) is not int or not 0 <= header_rows < len(norm):
         raise _make_error(ErrorCode.INVALID_INPUT, "header_rows must be smaller than the row count")
     wire_anchor, _ = tables._live_anchor(anchor)
+    if wire_anchor:
+        if "after_table_index" in wire_anchor:
+            positive(wire_anchor["after_table_index"], "anchor.after_table_id")
+        elif (
+            not isinstance(wire_anchor.get("paragraph_text"), str)
+            or not wire_anchor["paragraph_text"].strip()
+            or wire_anchor.get("position") not in {"before", "after"}
+        ):
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                "Anchor requires nonempty paragraph_text and before/after position",
+            )
     with reads_live.read_source(path, "live") as source:
         pre = source.live["body_sha256"]
         wm.check_not_stale(revision_before, pre)
@@ -549,6 +584,11 @@ def execute_copy_live(
         if style_from_table_id is not None:
             override_style = tables._style_id_of_table(source.local_path, style_from_table_id)
         if override_style is not None:
+            if not any(
+                s.get("style_id") == override_style and s.get("type") == "table"
+                for s in projection.list_styles_impl(source.local_path)
+            ):
+                raise _make_error(ErrorCode.STYLE_NOT_FOUND, "Requested table style does not exist")
             pr = table.find(w("tblPr"))
             old = pr.find(w("tblStyle"))
             if old is not None:
@@ -557,19 +597,27 @@ def execute_copy_live(
         body = mutations._find_body(root)
         body.clear()
         body.append(table)
-        ooxml = flat_package(source.local_path, root, raw, ctx, source.namespace_declarations)
+        ooxml = flat_package(source.local_path, root, raw, ctx, source.flat_opc)
         intended = [plain_row(row) for row in table.findall(w("tr"))]
-        result = tables._live_cell_request(
-            session,
-            "table_copy",
-            {
-                "ooxml": ooxml,
-                "anchor": wire_anchor,
-                "expectedBodySha256": pre,
-                "track_changes": track_changes,
-            },
-            expected_body_sha256=pre,
-        )
+        try:
+            result = tables._live_cell_request(
+                session,
+                "table_copy",
+                {
+                    "ooxml": ooxml,
+                    "anchor": wire_anchor,
+                    "expectedBodySha256": pre,
+                    "track_changes": track_changes,
+                },
+                expected_body_sha256=pre,
+            )
+        except VerifyError as exc:
+            audit.append_audit(
+                path=path,
+                tool="insert_table",
+                evidence={"applied": None, "write_mode": "live", "error": exc.envelope.to_dict()},
+            )
+            raise
         new_id = result.get("table_index")
         if type(new_id) is not int:
             problems = ["Missing inserted table index"]
@@ -610,6 +658,7 @@ def execute_copy_live(
             document_name=session.document_name,
             tool="insert_table",
             path=path,
+            extra={"table_id": new_id, "like_table_id": like_table_id},
         )
         evidence.update(table_id=new_id, like_table_id=like_table_id)
         return evidence

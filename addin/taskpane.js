@@ -3629,13 +3629,22 @@ async function opTableCopy(payload) {
       location=anchor.position === "before" ? "Before" : "After";
     }
     const guard = await sectionGuard(context,payload);
+    if (guard.active && location === 'Before')
+      throw refusalError('Under section locks copy after an anchor','OUTSIDE_LOCKED_SECTION');
     if (guard.active && target === context.document.body)
       throw refusalError("Use an explicit anchor under section locks","OUTSIDE_LOCKED_SECTION");
     await guard.check(() => [target.getRange ? target.getRange(location === "Before" ? "Start" : "End") : target.getRange()]);
     await requireFreshBody(context,pre);
+    // Materialize a paragraph before importing: importing table+paragraph at
+    // the table boundary lets Word merge/split tables and normalize source width.
     let inserted;
     await withTracking(context,payload.track_changes,async()=>{
-      inserted=(target === context.document.body ? target : target.getRange()).insertOoxml(payload.ooxml,location);
+      let insertionTarget=target;
+      if(anchor && anchor.after_table_index) {
+        insertionTarget=target.getRange().insertParagraph('', 'After');
+        await context.sync();
+      }
+      inserted=(insertionTarget === context.document.body ? insertionTarget : insertionTarget.getRange()).insertOoxml(payload.ooxml,location);
       await context.sync();
     });
     const all=context.document.body.tables; all.load("items");
