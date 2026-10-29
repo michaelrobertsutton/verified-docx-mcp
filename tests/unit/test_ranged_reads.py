@@ -182,6 +182,31 @@ class FindSectionsSizeAndDigestTests(RangedReadTestCase):
         self.assertEqual(digested["background-1"]["sha12"], expected)
         self.assertEqual(digested["background-1"]["chars"], len("Background\nBackground text."))
 
+    def test_live_body_trailing_empty_paragraph_is_ignored_for_digests(self):
+        """Real Word (#110): Body.getOoxml() appends one empty paragraph Body.paragraphs lacks,
+        so a live body projection's last section must be digested without it."""
+        import zipfile
+
+        padded = Path(self._tmp.name) / "padded.docx"
+        with zipfile.ZipFile(self.sections) as src, zipfile.ZipFile(padded, "w", zipfile.ZIP_DEFLATED) as dst:
+            for item in src.infolist():
+                data = src.read(item.filename)
+                if item.filename == "word/document.xml":
+                    xml = data.decode("utf-8")
+                    marker = "<w:sectPr"
+                    self.assertIn(marker, xml)
+                    xml = xml.replace(marker, "<w:p/>" + marker, 1)
+                    data = xml.encode("utf-8")
+                dst.writestr(item, data)
+        plain = {s["section_key"]: s["sha12"] for s in projection.find_sections_impl(self.sections, digests=True)}
+        raw = {s["section_key"]: s["sha12"] for s in projection.find_sections_impl(padded, digests=True)}
+        trimmed = {
+            s["section_key"]: s["sha12"]
+            for s in projection.find_sections_impl(padded, digests=True, ignore_trailing_empty=True)
+        }
+        self.assertNotEqual(raw["next-steps-1"], plain["next-steps-1"])  # the extra paragraph shows
+        self.assertEqual(trimmed, plain)  # and is ignored when asked
+
     def test_textbox_entries_carry_chars(self):
         box = Path(self._tmp.name) / "textbox.docx"
         shutil.copyfile(FIXTURES / "textbox.docx", box)

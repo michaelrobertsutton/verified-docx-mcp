@@ -1280,7 +1280,9 @@ def execute_find_sections(
             {
                 "path": str(rs.resolved),
                 "part": part,
-                "sections": projection.find_sections_impl(rs.local_path, part, digests=digests),
+                "sections": projection.find_sections_impl(
+                    rs.local_path, part, digests=digests, ignore_trailing_empty=rs.source == "live"
+                ),
             }
         )
 

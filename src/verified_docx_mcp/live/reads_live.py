@@ -420,7 +420,7 @@ def live_revision(path: str) -> dict[str, Any]:
             flat_opc_to_docx(reply["ooxml"], temp_docx)
             digests = [
                 [sec["section_key"], sec["sha12"]]
-                for sec in projection.find_sections_impl(temp_docx, digests=True)
+                for sec in projection.find_sections_impl(temp_docx, digests=True, ignore_trailing_empty=True)
                 if sec["kind"] == "heading"
             ]
         via = "body_ooxml_fallback"

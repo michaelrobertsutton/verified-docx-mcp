@@ -1469,7 +1469,11 @@ def _section_ranges(proj: Projection, headings: list[tuple[int, str]]) -> list[t
 
 
 def find_sections_impl(
-    docx_path: Path, part_name: str = DEFAULT_PART, *, digests: bool = False
+    docx_path: Path,
+    part_name: str = DEFAULT_PART,
+    *,
+    digests: bool = False,
+    ignore_trailing_empty: bool = False,
 ) -> list[dict[str, Any]]:
     """Heading ranges PLUS text-box sub-scopes, both keyed by
     ``section_key`` — this is the one discovery call a caller uses to find
@@ -1519,6 +1523,11 @@ def find_sections_impl(
     sections: list[dict[str, Any]] = []
     all_para_refs = [m.para_ref for m in projection.paragraphs]
     texts = paragraph_texts(projection)
+    if ignore_trailing_empty and texts and texts[-1] == "":
+        # Word's Body.getOoxml() appends one empty paragraph that Body.paragraphs (what the
+        # pane digests) does not have. Real Word, #110: without this the last section's
+        # digest of a live body read would never match the pane's.
+        texts = texts[:-1]
 
     for idx, (meta, level, heading_text) in enumerate(heading_paras):
         base_slug = _slugify(heading_text)
