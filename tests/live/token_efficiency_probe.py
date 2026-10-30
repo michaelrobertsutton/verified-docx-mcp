@@ -42,11 +42,11 @@ def check(name: str, ok: bool, **detail) -> None:
 
 registry = bridge.start_in_background()
 deadline = time.monotonic() + 900
-while registry.get(Path(path).name) is None:
+# An older pane may reconnect first; wait for one that reports the #108 capability.
+while (session := registry.get(Path(path).name)) is None or "partial_font_segments_v1" not in session.hello.capabilities:
     if time.monotonic() > deadline:
-        sys.exit("pane never connected")
+        sys.exit("no pane with partial_font_segments_v1 connected (reopen the pane in Word)")
     time.sleep(1)
-session = registry.get(Path(path).name)
 caps = sorted(session.hello.capabilities)
 check("pane connected with partial_font_segments_v1", "partial_font_segments_v1" in caps)
 
