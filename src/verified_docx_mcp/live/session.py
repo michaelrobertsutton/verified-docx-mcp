@@ -319,7 +319,7 @@ class LiveSession:
         ``request()``. Not called directly by anything outside this
         class."""
         guarded = {"approved_cell_set", "replace", "format", "cell_set", "cells_set", "table_insert",
-                   "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
+                   "cell_paragraph_merge", "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
                    "comment_add", "comment_reply", "comment_resolve", "comment_delete", "save",
                    "paragraphs_unlist", "table_delete"}
         if op in guarded and "shape_guard" not in self.hello.capabilities:

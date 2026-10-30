@@ -261,9 +261,13 @@ def _fetch_body_ooxml(session: LiveSession) -> dict[str, Any]:
 
 
 @contextmanager
-def read_source(path: str, source: str, part: str = DEFAULT_PART) -> Iterator[ReadSource]:
+def read_source(path: str, source: str, part: str = DEFAULT_PART, *, observe: bool = True) -> Iterator[ReadSource]:
     """Resolve *source* for a read of *path* and yield a ``ReadSource``;
-    temporary files are removed on exit. See the module docstring."""
+    temporary files are removed on exit. See the module docstring.
+
+    ``observe=False`` (issue #107) reads through the session's non-observing view, so in
+    shared-bridge mode the read does not acknowledge the caller's write baseline: a write
+    tool that reads before and after its own write must not re-arm the client by doing so."""
     from .. import server as _server
 
     if source not in VALID_SOURCES:
@@ -323,7 +327,8 @@ def read_source(path: str, source: str, part: str = DEFAULT_PART) -> Iterator[Re
 
     if use_live:
         assert session is not None
-        reply = _fetch_body_ooxml(session)
+        view = getattr(session, "status_view", None) if not observe else None
+        reply = _fetch_body_ooxml(view() if view is not None else session)
         with tempfile.TemporaryDirectory(prefix="verified-docx-live-read-") as tmp:
             temp_docx = Path(tmp) / document_name
             built = flat_opc_to_docx(reply["ooxml"], temp_docx)

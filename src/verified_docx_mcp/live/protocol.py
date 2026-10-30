@@ -337,6 +337,7 @@ VALID_OPS: frozenset[str] = frozenset(
         "table_get",
         "table_insert",
         "cells_set",
+        "cell_paragraph_merge",
         "paragraph_delete",
         "paragraph_insert",
         # issue #79: clear_numbering / delete_table
