@@ -86,10 +86,10 @@ def test_resolve_refuses_to_inherit_an_unrepresentable_field():
 
 
 class PartialLiveTests(LiveWriteBridgeTestCase):
-    async def connect(self, text="alpha beta gamma delta", caps=CAPS):
+    async def connect(self, text="alpha beta gamma delta", caps=CAPS, **pane_kwargs):
         doc = FakeDocument(text=text)
         doc.fonts.append(("gamma", GEORGIA))
-        pane = await self.connect_pane(doc, capabilities=[*FakeDocPaneCaps, *caps])
+        pane = await self.connect_pane(doc, capabilities=[*FakeDocPaneCaps, *caps], **pane_kwargs)
         sent: list[tuple[str, dict]] = []
         original = pane._dispatch
 
@@ -116,6 +116,30 @@ class PartialLiveTests(LiveWriteBridgeTestCase):
         self.assertEqual(write["expected_first_font"], GEORGIA)
         self.assertEqual(write["replacement_segments"][0]["format"], {**GEORGIA, "bold": True})
         self.assertTrue(result["applied"])
+
+    async def test_anchored_find_with_partial_segments_looks_up_the_resolved_text(self):
+        # #108 x #113: the font lookup names the span the anchored find resolved to.
+        sentence = "Skyward will modernize the claims platform with care by 2027."
+        doc, _, sent = await self.connect(text=f"Intro. {sentence} Outro.", caps=[*CAPS, "body_ooxml", "anchored_find_v1"], body_ooxml_from_text=True)
+        result = await asyncio.to_thread(
+            text_edit.execute_replace_text, str(self.target), "Skyward will moder…with care by 2027.", "New text.",
+            None, expected_length=len(sentence), write_mode="live",
+            replacement_segments=[{"text": "New text.", "format": {"bold": True}}])
+        self.assertTrue(result["applied"])
+        lookups = [p for op, p in sent if op == "replacement_font"]
+        self.assertEqual([(p["find"], p["expected_matches"]) for p in lookups], [(sentence, 1)])
+        self.assertEqual(doc.text, "Intro. New text. Outro.")
+
+    async def test_anchored_span_over_the_search_cap_refuses_partial_segments(self):
+        sentence = "Skyward will modernize the claims platform " + "with care " * 25 + "by 2027."
+        _, _, sent = await self.connect(text=f"Intro. {sentence} Outro.", caps=[*CAPS, "body_ooxml", "anchored_find_v1"], body_ooxml_from_text=True)
+        with self.assertRaises(VerifyError) as ctx:
+            await asyncio.to_thread(
+                text_edit.execute_replace_text, str(self.target), "Skyward will moder…with care by 2027.", "New.",
+                None, expected_length=len(sentence), write_mode="live",
+                replacement_segments=[{"text": "New.", "format": {"bold": True}}])
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        self.assertFalse([op for op, _ in sent if op in {"replacement_font", "replace"}])
 
     async def test_full_segments_need_no_lookup_and_no_new_capability(self):
         doc, _, sent = await self.connect(caps=["formatted_replacements_v1"])
