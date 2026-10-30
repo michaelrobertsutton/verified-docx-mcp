@@ -758,7 +758,6 @@ class GoldenFixtureListOpenItemsRegressionTests(unittest.TestCase):
                 "w_id": "0",
                 "content": "comment.",
                 "resolved": False,
-                "reply_count": 1,
                 "replies": [
                     {
                         "id": "7E7E1D27",
@@ -771,10 +770,9 @@ class GoldenFixtureListOpenItemsRegressionTests(unittest.TestCase):
                 "tree-lined streets help soften the hard edges ",
                 "author": "Michael Sutton",
                 "created_time": "2026-09-10T21:33:00Z",
-                "modified_time": "",
-                "scope": "document",
             },
         ]
+        # modified_time ("") and scope ("document") are constant in file mode and no longer sent (#111).
         self.assertEqual(open_items["comments"], expected)
 
 

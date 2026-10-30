@@ -58,6 +58,34 @@ class LiveReadsTestCase(LiveCommentsTestCase):
         return await self.call(server.execute_read_document, str(self.target), **kwargs)
 
 
+class LeanReadEnvelopeTests(LiveReadsTestCase):
+    """Issue #111: the model-facing envelope of a live / ignored-live read."""
+
+    async def test_live_read_drops_duplicate_hash_and_null_noise(self) -> None:
+        from verified_docx_mcp.lean_envelope import lean_read_result
+
+        await self.connect_live()
+        args = {"path": str(self.target), "format": "text"}
+        full = await self.read()
+        lean = lean_read_result("read_document", args, full)
+        self.assertTrue(lean["revision"].startswith(reads_live.LIVE_REVISION_PREFIX))
+        self.assertNotIn("body_sha256", lean["live"])
+        self.assertIn("document_url", lean["live"])
+        for gone in ("section_key", "revision_detail"):
+            self.assertNotIn(gone, lean)
+        self.assertEqual(lean["text"], self.live_text())
+
+    async def test_ignored_live_session_is_short(self) -> None:
+        from verified_docx_mcp.lean_envelope import lean_read_result
+
+        await self.connect_live()
+        full = await self.read(source="file")
+        self.assertIn("action", full["live_session"])
+        lean = lean_read_result("read_document", {"path": str(self.target)}, full)
+        self.assertEqual(set(lean["live_session"]), {"document_url", "reason"})
+        self.assertIn(reads_live.WARNING_LIVE_SESSION_IGNORED, lean["warnings"])
+
+
 class IssueReproTests(LiveReadsTestCase):
     async def test_placeholder_and_live_bodies_differ(self) -> None:
         self.assertNotEqual(self.live_text(), self.placeholder_text())
@@ -128,6 +156,14 @@ class LiveReadShapeTests(LiveReadsTestCase):
         listed = await self.call(tables.execute_list_tables, str(self.target))
         self.assertEqual(listed["source"], "live")
         self.assertEqual(listed["tables"], tables.list_tables_impl(LIVE_TABLES))
+
+    async def test_list_tables_over_live_has_header_row_and_anchor_section_key(self) -> None:
+        approved = FIXTURES / "approved-changes.docx"
+        await self.connect_live(approved)
+        listed = await self.call(tables.execute_list_tables, str(self.target))
+        self.assertEqual(listed["source"], "live")
+        self.assertEqual(listed["tables"][0]["header_row"][0], "Original 1:1")
+        self.assertEqual(listed["tables"][0]["anchor_section_key"], "target-1")
 
     async def test_a_non_pkg_namespace_prefix_is_fine(self) -> None:
         await self.connect_live(body_ooxml=docx_to_flat_opc(LIVE_BODY, prefix="x1"))

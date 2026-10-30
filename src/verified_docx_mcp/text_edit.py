@@ -2086,7 +2086,7 @@ def _execute_apply_style(
         raise _make_error(
             ErrorCode.STYLE_NOT_FOUND,
             f"style_id {style_id!r} is not a style in this document's styles.xml.",
-            {"style_id": style_id, "available_style_ids": sorted(styles_by_style_id)},
+            {"style_id": style_id, **projection.style_near_matches(style_records, style_id)},
         )
     style_type = style_info.get("type")
     if style_type not in _SUPPORTED_STYLE_TYPES:

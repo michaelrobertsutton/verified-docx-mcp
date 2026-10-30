@@ -1096,9 +1096,10 @@ below), so the tool now makes a gap visible instead of guessing:
 - **Advisory only.** A stale Office.js collection still reports matching
   counts, so nothing here proves completeness. Agents must say a comment is
   "not visible to the pane", never "does not exist".
-- **Warnings.** `scope_body_only` (the pane reads `body.getComments()`, so
-  comments anchored in headers, footers or text boxes, issue #35, are not
-  seen); `same_document_duplicate` (a second pane for this document was
+- **Scope.** The top-level `scope: "body"` replaces the old `scope_body_only`
+  warning (#111): the pane reads `body.getComments()`, so comments anchored in
+  headers, footers or text boxes, issue #35, are not seen.
+- **Warnings.** `same_document_duplicate` (a second pane for this document was
   connected when this one connected: Word Online + desktop, two windows, or a
   reloaded pane whose old socket had not closed); `file_has_unlisted_comments`
   (the saved file has open comments no live comment matched, listed in
@@ -1149,7 +1150,7 @@ below), so the tool now makes a gap visible instead of guessing:
 1. Compare `pane.instance_id`/`platform`/`observed_at` with the pane the user
    is looking at; check `warnings` and `live_status.session_collisions`.
 2. Check where the missing comments are anchored (body text, a table, a text
-   box, a header). Outside the body means `scope_body_only` explains it.
+   box, a header). Outside the body means `scope: "body"` explains it.
 3. Close and reopen the pane, then list again. If the count changes, the
    earlier read was stale.
 4. Compare ids against Word's own list (AppleScript `Word comments of

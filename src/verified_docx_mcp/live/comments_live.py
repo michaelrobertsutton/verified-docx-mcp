@@ -421,8 +421,11 @@ def _resolve_comment_handle(comment_id: str, correlation: list[dict[str, Any]]) 
     for both."""
     from ..errors import ErrorCode
 
+    # Both handle forms list_open_items emits -- live:<id> and
+    # live:<epoch>:<id> -- reduce to the pane's raw Comment.id; the epoch
+    # travels separately (_handle_epoch) so the pane can refuse a stale one.
     if comment_id.startswith(_LIVE_HANDLE_PREFIX):
-        return comment_id[len(_LIVE_HANDLE_PREFIX) :], "live-handle"
+        return _split_live_handle(comment_id)[1], "live-handle"
 
     candidates = [entry for entry in correlation
                   if entry["confidence"] == "exact" and
@@ -430,7 +433,7 @@ def _resolve_comment_handle(comment_id: str, correlation: list[dict[str, Any]]) 
     if len(candidates) == 1:
         entry = candidates[0]
         via = "durableId-correlation" if entry["comment_id"] == comment_id else "w_id-correlation"
-        return entry["live_comment_id"][len(_LIVE_HANDLE_PREFIX):], via
+        return _split_live_handle(entry["live_comment_id"])[1], via
     if len(candidates) > 1:
         raise _make_error(ErrorCode.INVALID_INPUT, "Ambiguous comment correlation; use a live handle", {})
 
@@ -648,7 +651,79 @@ def _file_only_open_comments(
 # ---------------------------------------------------------------------------
 
 
-def execute_list_open_items_live(path: str) -> dict[str, Any]:
+# Per-record fields list_open_items(fields="full") drops from a live comment: each is constant
+# (w_id, modified_time, scope), equal to another field (quoted_text == anchor_text) or emitted once
+# at the top level (session_epoch), or derivable (reply_count == len(replies); an empty `replies`
+# is dropped too). JennyStack's loader treats both as optional (comment_dispositions.py:171-175).
+_LIVE_DROPPED_FIELDS = ("quoted_text", "w_id", "modified_time", "scope", "session_epoch", "reply_count")
+
+
+def _live_scope_index(
+    session: LiveSession, section_key: str | None, within_text: str | None
+) -> tuple[dict[str, tuple[int, int]], dict[str, tuple[int, int]]]:
+    """(comment index, suggestion index) of the live body for list_open_items scoping: the first
+    keys on paragraph text as Word reports it, the second on revision-markup text (deleted text
+    included) as live revisions carry it in ``paragraph_context``.
+
+    *session* is the NON-observing session (``write_mode.live_session_for``), so this body read
+    never re-arms a shared-bridge client's write baseline: only an explicit read_document does."""
+    import tempfile
+    from pathlib import Path
+
+    from .. import open_items, projection
+    from . import reads_live, write_mode
+
+    write_mode.require_capability(
+        session, reads_live.BODY_OOXML_CAPABILITY, feature_description="list_open_items scoping (section_key/within_text)"
+    )
+    reply = reads_live._fetch_body_ooxml(session)
+    with tempfile.TemporaryDirectory(prefix="verified-docx-live-scope-") as tmp:
+        docx = Path(tmp) / "body.docx"
+        reads_live.flat_opc_to_docx(reply["ooxml"], docx)
+        proj = projection.project_part(docx)
+        scope = open_items.paragraph_scope(docx, proj, section_key, within_text)
+        assert scope is not None
+        return (
+            open_items.paragraph_text_index(proj, scope),
+            open_items.paragraph_text_index(proj, scope, markup=True),
+        )
+
+
+def _scope_live(
+    items: list[dict[str, Any]], index: dict[str, tuple[int, int]], text_of: Any, *, squash: bool = False
+) -> tuple[list[dict[str, Any]], set[int]]:
+    """(items kept, ids of the uncertain ones) -- the items whose paragraph text *text_of*(item)
+    is in scope, plus any that cannot be placed (flagged, never silently dropped)."""
+    from .. import open_items
+
+    kept: list[dict[str, Any]] = []
+    uncertain: set[int] = set()
+    for item in items:
+        verdict = open_items.classify_text(index, text_of(item), squash=squash)
+        if verdict == "out":
+            continue
+        kept.append(item)
+        if verdict == "uncertain":
+            uncertain.add(id(item))
+    return kept, uncertain
+
+
+def _suggestion_paragraph(rev: dict[str, Any]) -> str | None:
+    context = rev.get("paragraph_context")
+    return context[0] if isinstance(context, list) and context else None
+
+
+def execute_list_open_items_live(
+    path: str,
+    *,
+    fields: str = "full",
+    section_key: str | None = None,
+    within_text: str | None = None,
+    include_correlation: bool = False,
+) -> dict[str, Any]:
+    from .. import open_items
+
+    open_items.validate_fields(fields)
     resolved, _name = _document_name_and_path(path)
     session = _session_for(path)
     raw_comments, correlation, pane_result, file_result = _live_state_full(path, session)
@@ -668,6 +743,17 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
     # sees resolved comments too, so this filter has to happen here
     # rather than being naturally absent from what the pane reports.
     open_raw = [c for c in raw_comments if not c.get("resolved", False)]
+    open_total, suggestions_total = len(open_raw), len(suggestions) if suggestions is not None else None
+    uncertain_comments: set[int] = set()
+    uncertain_revisions: set[int] = set()
+    scoped = section_key is not None or within_text is not None
+    if scoped:
+        index, rev_index = _live_scope_index(session, section_key, within_text)
+        open_raw, uncertain_comments = _scope_live(open_raw, index, lambda c: c.get("anchorParagraphText"))
+        if suggestions is not None:
+            suggestions, uncertain_revisions = _scope_live(
+                suggestions, rev_index, _suggestion_paragraph, squash=True
+            )
     open_ids = {f"{_LIVE_HANDLE_PREFIX}{c.get('id')}" for c in open_raw}
 
     # Issue #39: the new fields come FIRST so a client that clips the tail of
@@ -677,18 +763,12 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
     pane_counts = pane_result.get("counts")
     older_pane = not isinstance(pane_counts, dict)
     live_total = len(raw_comments) if older_pane else pane_counts["total"]
-    live_open = len(open_raw) if older_pane else pane_counts["open"]
+    live_open = open_total if older_pane else pane_counts["open"]
     warnings: list[dict[str, Any]] = []
 
+    # `scope` ("body": headers, footers and text boxes are NOT read) is a top-level value rather
+    # than a per-call warning sentence.
     scope = pane_result.get("scope") or "body"
-    if scope == "body":
-        warnings.append(
-            {
-                "code": "scope_body_only",
-                "message": "only comments in the main document body are visible to the pane; comments "
-                "anchored in headers, footers or text boxes are not listed",
-            }
-        )
 
     # A second pane on this same document displaced another (or this one
     # displaced it): the two can disagree about the document.
@@ -731,6 +811,13 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
     counts_out: dict[str, Any] = {"live_total": live_total, "live_open": live_open, "returned": len(open_raw)}
     if ooxml is not None:
         counts_out["ooxml_open"] = ooxml["open_threads"]
+    if scoped:
+        counts_out["in_scope"] = {
+            "comments": len(open_raw),
+            "suggestions": len(suggestions) if suggestions is not None else None,
+        }
+        counts_out["open_comments"] = open_total
+        counts_out["suggestions"] = suggestions_total
     if complete is False and ooxml is not None:
         ooxml_ids = [str(i) for i in (ooxml.get("ids") or []) if i is not None]
         returned_ids = {str(c.get("id")) for c in raw_comments}
@@ -752,6 +839,7 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
     result: dict[str, Any] = {
         "counts": counts_out,
         "scope": scope,
+        "scoped": True if scoped else None,
         "pane": {
             "instance_id": session.hello.instance_id,
             "platform": session.hello.platform,
@@ -762,28 +850,90 @@ def execute_list_open_items_live(path: str) -> dict[str, Any]:
         "path": str(resolved),
         "source": "live",
         "session_epoch": raw_comments[0].get("session_epoch") if raw_comments else _request(session, "describe").get("session_epoch"),
-        "comments": [_live_comment_record(c) for c in open_raw],
-        "pending_suggestions": suggestions,
-        "pending_suggestions_source": "live" if suggestions is not None else None,
-        "pending_suggestions_reason": revision_state.get("reason"),
-        "revision_coverage": revision_state["coverage"],
-        "file_side_available": file_result is not None,
-        "file_only_open_comments": file_only,
-        "correlation": [entry for entry in correlation if entry["live_comment_id"] in open_ids],
     }
+    records = [_live_comment_record(c) for c in open_raw]
+    for record, raw in zip(records, open_raw, strict=True):
+        if id(raw) in uncertain_comments:
+            record["scope_uncertain"] = True
+    if fields == "summary":
+        # Columnar: key names once, rows as lists (ids stay complete: they are write inputs).
+        result["comment_columns"], result["comment_rows"] = open_items.columnar(
+            [open_items.summary_comment(r, r["anchor_text"]) for r in records], open_items.COMMENT_COLUMNS
+        )
+        # No `comments`/`suggestions` keys in summary: JennyStack's recorder stores any response whose
+        # `comments` is a list and would read the row lists as objects.
+        result["suggestion_rows"] = None  # unknown (no live revision inventory), not "none"
+        if suggestions is not None:
+            result["suggestion_columns"], result["suggestion_rows"] = open_items.columnar(
+                [
+                    {
+                        "revision_id": rev.get("revision_id"),
+                        "type": rev.get("type"),
+                        "author": rev.get("author"),
+                        "anchor": open_items.clip(rev.get("text") or _suggestion_paragraph(rev)),
+                        "scope_uncertain": id(rev) in uncertain_revisions,
+                    }
+                    for rev in suggestions
+                ],
+                open_items.LIVE_SUGGESTION_COLUMNS,
+            )
+        result["file_only_open_comments"] = (
+            None
+            if file_only is None
+            else [
+                {"comment_id": f["comment_id"], "author": f["author"], "anchor": open_items.clip(f["quoted_text"])}
+                for f in file_only
+            ]
+        )
+    else:
+        result["comments"] = [
+            {k: v for k, v in r.items() if k not in _LIVE_DROPPED_FIELDS and (k != "replies" or v)} for r in records
+        ]
+        result["pending_suggestions"] = [
+            {**rev, "scope_uncertain": True} if id(rev) in uncertain_revisions else rev for rev in suggestions
+        ] if suggestions is not None else None
+        result["file_only_open_comments"] = file_only
+    result.update(
+        {
+            "pending_suggestions_source": "live" if suggestions is not None else None,
+            "pending_suggestions_reason": revision_state.get("reason"),
+            "revision_coverage": revision_state["coverage"],
+            "file_side_available": file_result is not None,
+        }
+    )
+    # Advisory live<->file id correlation, opt-in: a caller holding a live:<id> handle needs none,
+    # and reply_to_comment/resolve_comment rebuild it fresh for themselves.
+    if include_correlation:
+        result["correlation"] = [entry for entry in correlation if entry["live_comment_id"] in open_ids]
     result["complete"] = complete
     if older_pane:
         result["pane_note"] = STALE_PANE_NOTE_COUNTS
-    return result
+    return open_items.lean_top(result, summary=fields == "summary")
 
 
-def execute_list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
+def execute_list_open_items(
+    path: str,
+    source: str = "auto",
+    *,
+    fields: str = "full",
+    section_key: str | None = None,
+    within_text: str | None = None,
+    include_correlation: bool = False,
+) -> dict[str, Any]:
     from .. import tracked_changes
 
     mode = _resolve_source(path, source)
     if mode == "live":
-        return execute_list_open_items_live(path)
-    result = tracked_changes.execute_list_open_items(path)
+        return execute_list_open_items_live(
+            path,
+            fields=fields,
+            section_key=section_key,
+            within_text=within_text,
+            include_correlation=include_correlation,
+        )
+    result = tracked_changes.execute_list_open_items(
+        path, fields=fields, section_key=section_key, within_text=within_text
+    )
     result["source"] = "file"
     return result
 
@@ -894,7 +1044,8 @@ def execute_reply_to_comment_live(path: str, comment_id: str, text: str, address
     parent_raw = next((c for c in raw_comments if c.get("id") == live_handle), None)
     parent_anchor = (parent_raw or {}).get("anchorText", "")
 
-    result = _request(session, "comment_reply", {"comment_id": live_handle, "text": text, **(address or {})})
+    result = _request(session, "comment_reply", {"comment_id": live_handle, "text": text,
+                                                 **_handle_epoch(comment_id), **(address or {})})
 
     # Verify by re-listing rather than trusting the op's own ok=true --
     # same discipline as file mode's own post-write re-read. Only the target
@@ -960,7 +1111,8 @@ def execute_resolve_comment_live(path: str, comment_id: str, address: dict[str, 
         _raw_comments, correlation = _live_state(path, session)
         live_handle, resolved_via = _resolve_comment_handle(comment_id, correlation)
 
-    result = _request(session, "comment_resolve", {"comment_id": live_handle, "resolved": True, **(address or {})})
+    result = _request(session, "comment_resolve", {"comment_id": live_handle, "resolved": True,
+                                                   **_handle_epoch(comment_id), **(address or {})})
 
     # Independent post-op re-read -- the pane's own reply is not trusted
     # on its own, same discipline as file mode's own resolve_comment. Only
@@ -1083,6 +1235,16 @@ def _split_live_handle(comment_id: str) -> tuple[str | None, str]:
     if len(parts) == 3:
         return parts[1], parts[2]
     return None, parts[1]
+
+
+def _handle_epoch(comment_id: str) -> dict[str, str]:
+    """``{"session_epoch": ...}`` for an epoch-qualified live handle, so the
+    pane's checkCommentEpoch refuses a handle from an earlier epoch; ``{}``
+    for any other id."""
+    if not comment_id.startswith(_LIVE_HANDLE_PREFIX):
+        return {}
+    epoch, _raw = _split_live_handle(comment_id)
+    return {"session_epoch": epoch} if epoch else {}
 
 
 def _pane_state_or_none(session: LiveSession, epoch: Any) -> list[dict[str, Any]] | None:

@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from . import audit, mutations, paths, projection
+from . import audit, mutations, open_items, paths, projection
 from . import evidence as evidence_module
 from .errors import ErrorCode, _make_error
 from .projection import W_NS
@@ -74,12 +74,16 @@ def _collect_text(elem: Any, tag_names: set[str]) -> str:
     return "".join(parts)
 
 
-def _find_pending_suggestions(root: Any) -> list[dict[str, Any]]:
+def _find_pending_suggestions(root: Any, para_refs: dict[int, str] | None = None) -> list[dict[str, Any]]:
     """Every w:ins/w:del in *root* (any nesting depth -- a body paragraph,
     or one inside a table cell), each with the owning paragraph's own live
     text as `anchor_context` (Google's suggestions.py: "the full text of
     the paragraph that contains the suggestion, assembled from all runs, so
-    the change is locatable")."""
+    the change is locatable").
+
+    *para_refs* (``id(w:p element)`` -> para_ref, from a projection of the SAME
+    tree) adds a ``para_ref`` key (None for a paragraph the projection does not
+    walk, e.g. inside a text box)."""
     suggestions: list[dict[str, Any]] = []
 
     def walk(elem: Any, current_para: Any | None) -> None:
@@ -89,6 +93,7 @@ def _find_pending_suggestions(root: Any) -> list[dict[str, Any]]:
             if tag == "ins":
                 suggestions.append(
                     {
+                        **({"para_ref": para_refs.get(id(next_para))} if para_refs is not None else {}),
                         "suggestion_id": projection._attr(child, "id") or "",
                         "kind": "insertion",
                         "text": _collect_text(child, {"t"}),
@@ -101,6 +106,7 @@ def _find_pending_suggestions(root: Any) -> list[dict[str, Any]]:
             if tag == "del":
                 suggestions.append(
                     {
+                        **({"para_ref": para_refs.get(id(next_para))} if para_refs is not None else {}),
                         "suggestion_id": projection._attr(child, "id") or "",
                         "kind": "deletion",
                         "text": _collect_text(child, {"delText"}),
@@ -237,7 +243,35 @@ def _parse_comments(local_path: Path, proj: projection.Projection) -> list[dict[
     return roots
 
 
-def execute_list_open_items(path: str) -> dict[str, Any]:
+_FILE_CONSTANT_FIELDS = ("modified_time", "scope")  # always "" / "document" in file mode
+
+
+def _comment_scope(
+    comments: list[dict[str, Any]], proj: projection.Projection, scope: set[int]
+) -> list[tuple[dict[str, Any], bool]]:
+    """[(comment, scope_uncertain)] for the comments with a run (via RunEvent.comment_ids,
+    keyed by w:id) in *scope*. A comment with no anchored run cannot be placed: it is kept,
+    flagged uncertain, rather than silently dropped."""
+    index_by_ref = {m.para_ref: i for i, m in enumerate(proj.paragraphs)}
+    anchored: dict[str, set[int]] = {}
+    for event in proj.events:
+        if isinstance(event, projection.RunEvent) and event.comment_ids and event.para_ref in index_by_ref:
+            for cid in event.comment_ids:
+                anchored.setdefault(cid, set()).add(index_by_ref[event.para_ref])
+    out: list[tuple[dict[str, Any], bool]] = []
+    for comment in comments:
+        paras = anchored.get(comment["w_id"])
+        if not paras:
+            out.append((comment, True))
+        elif paras & scope:
+            out.append((comment, False))
+    return out
+
+
+def execute_list_open_items(
+    path: str, *, fields: str = "full", section_key: str | None = None, within_text: str | None = None
+) -> dict[str, Any]:
+    open_items.validate_fields(fields)
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     # Read-only tool: never refuses for a lock (core/document-backend-
     # protocol.md §4) -- reads a validated snapshot instead, same as every
@@ -247,9 +281,12 @@ def execute_list_open_items(path: str) -> dict[str, Any]:
 
     local_path, is_temp = _server._read_local_copy(resolved)
     try:
-        proj = projection.project_part(local_path)
         document_root, _raw = mutations._load_document(local_path)
-        suggestions = _find_pending_suggestions(document_root)
+        # Project the SAME tree the suggestions are walked from, so each w:ins/w:del can be
+        # mapped to its para_ref (issue #111).
+        proj = projection.project_document_root(document_root)
+        para_refs = {id(m.element): m.para_ref for m in proj.paragraphs if m.element is not None}
+        suggestions = _find_pending_suggestions(document_root, para_refs)
         # New for issue #28 WP-09: "list_open_items filters resolved" -- an
         # "open item" is, by definition, not a resolved one (matching the
         # shipped GoogleDocs-MCP server's own list_comments, which only
@@ -262,7 +299,87 @@ def execute_list_open_items(path: str) -> dict[str, Any]:
         # of THIS list does not remove it from the package (verified in
         # test_comments.py: ResolvedCommentStillFetchableTests).
         comments = [c for c in _parse_comments(local_path, proj) if not c["resolved"]]
-        return {"path": str(resolved), "comments": comments, "pending_suggestions": suggestions}
+        total_comments, total_suggestions = len(comments), len(suggestions)
+
+        scope = open_items.paragraph_scope(local_path, proj, section_key, within_text)
+        uncertain: set[str] = set()
+        uncertain_sugg: set[int] = set()
+        if scope is not None:
+            placed = _comment_scope(comments, proj, scope)
+            comments = [c for c, _u in placed]
+            uncertain = {c["comment_id"] for c, u in placed if u}
+            index_by_ref = {m.para_ref: i for i, m in enumerate(proj.paragraphs)}
+            # A suggestion with no para_ref (text-box content, table-row revisions) cannot be
+            # placed: kept and flagged, like an unplaceable comment, never silently dropped.
+            uncertain_sugg = {id(s) for s in suggestions if s["para_ref"] is None}
+            suggestions = [s for s in suggestions if id(s) in uncertain_sugg or index_by_ref.get(s["para_ref"]) in scope]
+
+        counts: dict[str, Any] = {"comments": total_comments, "suggestions": total_suggestions}
+        if scope is not None:
+            counts["in_scope"] = {"comments": len(comments), "suggestions": len(suggestions)}
+
+        if fields == "summary":
+            # Columnar: key names once, rows as lists (ids stay complete: they are write inputs).
+            ccols, crows = open_items.columnar(
+                [
+                    open_items.summary_comment({**c, "scope_uncertain": c["comment_id"] in uncertain}, c["quoted_text"])
+                    for c in comments
+                ],
+                open_items.COMMENT_COLUMNS,
+            )
+            scols, srows = open_items.columnar(
+                [
+                    {
+                        "suggestion_id": s["suggestion_id"],
+                        "kind": s["kind"],
+                        "author": s["author"],
+                        "anchor": open_items.clip(s["text"] or s["anchor_context"]),
+                        "scope_uncertain": id(s) in uncertain_sugg,
+                    }
+                    for s in suggestions
+                ],
+                open_items.FILE_SUGGESTION_COLUMNS,
+            )
+            return open_items.lean_top(
+                {
+                    "path": str(resolved),
+                    "counts": counts,
+                    "comment_columns": ccols,
+                    "comment_rows": crows,
+                    "suggestion_columns": scols,
+                    "suggestion_rows": srows,
+                    "scoped": True if scope is not None else None,
+                },
+                summary=True,
+            )
+
+        # Full: drop what is constant (modified_time, scope) and emit each paragraph's text once
+        # in anchor_contexts instead of once per tracked run. reply_count (== len(replies)) and an
+        # empty replies list are dropped; JennyStack's loader treats both as optional.
+        out_comments = []
+        for c in comments:
+            row = {k: v for k, v in c.items() if k not in _FILE_CONSTANT_FIELDS and k != "reply_count"}
+            if not row["replies"]:
+                del row["replies"]
+            if c["comment_id"] in uncertain:
+                row["scope_uncertain"] = True
+            out_comments.append(row)
+        anchor_contexts: dict[str, str] = {}
+        out_suggestions = []
+        for s in suggestions:
+            row = dict(s)
+            if id(s) in uncertain_sugg:
+                row["scope_uncertain"] = True
+            if row["para_ref"] is not None:
+                anchor_contexts.setdefault(row["para_ref"], row.pop("anchor_context"))
+            out_suggestions.append(row)
+        result: dict[str, Any] = {"path": str(resolved), "comments": out_comments, "pending_suggestions": out_suggestions}
+        if anchor_contexts:
+            result["anchor_contexts"] = anchor_contexts
+        if scope is not None:
+            result["counts"] = counts
+            result["scoped"] = True
+        return result
     finally:
         if is_temp:
             local_path.unlink(missing_ok=True)

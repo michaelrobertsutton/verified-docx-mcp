@@ -177,6 +177,103 @@ class ListStylesToolTests(ReadToolsTestCase):
         self.assertIn("Normal", ids)
 
 
+class ListStylesFilterTests(ReadToolsTestCase):
+    """Issue #111: list_styles(type=, name_contains=)."""
+
+    def _ids(self, **kwargs):
+        return [s["style_id"] for s in server.execute_list_styles(str(self.target), **kwargs)["styles"]]
+
+    def test_type_and_name_contains_return_only_matches(self):
+        result = server.execute_list_styles(str(self.target), type="paragraph", name_contains="Heading")
+        self.assertTrue(result["styles"])
+        for style in result["styles"]:
+            self.assertEqual(style["type"], "paragraph")
+            self.assertIn("heading", f"{style['name']} {style['style_id']}".lower())
+        # the "Heading 1 Char" character styles are excluded by type
+        self.assertNotIn("Heading1Char", [s["style_id"] for s in result["styles"]])
+        self.assertIn("Heading2", [s["style_id"] for s in result["styles"]])
+
+    def test_name_contains_is_case_insensitive_on_name_or_style_id(self):
+        self.assertEqual(self._ids(name_contains="HEADING 2"), ["Heading2", "Heading2Char"])
+        self.assertIn("TableNormal", self._ids(name_contains="tablenormal"))  # by style_id
+        self.assertIn("TableNormal", self._ids(name_contains="normal table"))  # by name
+
+    def test_type_alone_and_no_filter(self):
+        everything = self._ids()
+        self.assertGreater(len(everything), 25)
+        tables_only = server.execute_list_styles(str(self.target), type="table")["styles"]
+        self.assertTrue(tables_only)
+        self.assertTrue(all(s["type"] == "table" for s in tables_only))
+
+    def test_unknown_type_is_invalid_input(self):
+        with self.assertRaises(VerifyError) as ctx:
+            server.execute_list_styles(str(self.target), type="font")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+
+class StyleNotFoundNearMatchTests(ReadToolsTestCase):
+    """Issue #111: STYLE_NOT_FOUND names up to 5 near matches and a count, not the whole list."""
+
+    def _assert_near(self, diagnostics, expect_id):
+        self.assertEqual(diagnostics["near_matches"][0]["style_id"], expect_id)
+        self.assertLessEqual(len(diagnostics["near_matches"]), 5)
+        self.assertEqual(set(diagnostics["near_matches"][0]), {"style_id", "name"})
+        self.assertIsInstance(diagnostics["available_count"], int)
+        for gone in ("available_style_ids", "available_paragraph_styles", "available_table_styles"):
+            self.assertNotIn(gone, diagnostics)
+
+    def test_paragraph_insert_name_typo_lists_heading_2(self):
+        from verified_docx_mcp import paragraph_insert
+
+        with self.assertRaises(VerifyError) as ctx:
+            paragraph_insert.execute_insert_paragraphs(
+                str(self.target), "The quick brown fox jumps over the lazy dog.",
+                [{"text": "x", "style": "Headng 2"}], 1,
+            )
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.STYLE_NOT_FOUND)
+        diagnostics = ctx.exception.envelope.diagnostics
+        self._assert_near(diagnostics, "Heading2")
+        self.assertEqual(diagnostics["near_matches"][0]["name"], "heading 2")
+
+    def test_apply_style_id_typo_lists_heading_2(self):
+        from verified_docx_mcp import text_edit
+
+        with self.assertRaises(VerifyError) as ctx:
+            text_edit.execute_apply_style(str(self.target), "quick", "Headng2", 1)
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.STYLE_NOT_FOUND)
+        self._assert_near(ctx.exception.envelope.diagnostics, "Heading2")
+
+    def test_insert_table_unknown_style_names_table_style_near_matches(self):
+        from verified_docx_mcp import tables
+
+        with self.assertRaises(VerifyError) as ctx:
+            tables.execute_insert_table(str(self.target), [["A"]], "TableNormel")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.STYLE_NOT_FOUND)
+        diagnostics = ctx.exception.envelope.diagnostics
+        self._assert_near(diagnostics, "TableNormal")
+        self.assertEqual(diagnostics["available_count"], 1)  # table styles only
+
+    def test_nothing_close_gives_empty_near_matches_not_the_full_list(self):
+        from verified_docx_mcp import text_edit
+
+        with self.assertRaises(VerifyError) as ctx:
+            text_edit.execute_apply_style(str(self.target), "quick", "zzzzqqqq", 1)
+        diagnostics = ctx.exception.envelope.diagnostics
+        self.assertEqual(diagnostics["near_matches"], [])
+        self.assertGreater(diagnostics["available_count"], 25)
+        # nothing close: the caller still gets real names to choose from
+        sample = diagnostics["available_sample"]
+        self.assertEqual(len(sample), 20)
+        self.assertEqual(sample, sorted(sample, key=str.lower))
+
+    def test_available_sample_only_when_nothing_is_close(self):
+        from verified_docx_mcp import projection
+
+        styles = [{"style_id": "Heading1", "name": "heading 1", "type": "paragraph"}]
+        self.assertNotIn("available_sample", projection.style_near_matches(styles, "headng 1"))
+        self.assertEqual(projection.style_near_matches(styles, "zzzzqq")["available_sample"], ["heading 1"])
+
+
 class ReadsNeverRefuseTests(ReadToolsTestCase):
     """core/document-backend-protocol.md §4: DOCX_LOCKED gates writes
     only. Every WP-03 read tool must still succeed — via a validated

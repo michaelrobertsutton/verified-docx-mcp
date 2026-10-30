@@ -49,7 +49,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from fastmcp import FastMCP
 
@@ -77,6 +77,9 @@ from .live import bridge as live_bridge
 from .live import comments_live, reads_live
 from .middleware import EvidenceEnforcementMiddleware
 
+_READ_ONLY: dict[str, bool] = {"readOnlyHint": True, "idempotentHint": True}
+_DESTRUCTIVE: dict[str, bool] = {"destructiveHint": True}
+
 mcp = FastMCP(
     "verified-docx-mcp",
     instructions=(
@@ -88,7 +91,13 @@ mcp = FastMCP(
         "reports Word/LibreOffice owner-file and sync-quiesce state as data "
         "only — it never refuses a call by itself. live_status starts the "
         "local live-mode bridge lazily and reports connected Word task-pane "
-        "sessions; empty sessions is normal, not an error."
+        "sessions; empty sessions is normal, not an error. Workflow: prefer "
+        'format="markdown" for reads (format="runs" is 5-10x larger); use '
+        "replace_text_batch for two or more edits; chain each result's "
+        "revision_after into the next call's revision_before; "
+        'source="auto" / write_mode="auto" route to a connected pane without '
+        "a live_status call; live_revision is the cheap way to get a fresh "
+        "live revision (and re-arms writes after LIVE_STALE)."
     ),
 )
 
@@ -306,7 +315,7 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def export_pdf(
     path: str,
     output_path: str,
@@ -548,6 +557,10 @@ def _find_tmp_siblings(directory: Path, target_name: str) -> list[str]:
     return hits
 
 
+# recent / ledger are what the write guard refuses on (EXTERNAL_EDITOR_ACTIVE), so they stay visible.
+_EXTERNAL_ACTIVITY_COMPACT_KEYS = ("divergent", "still_current", "recent", "ledger")
+
+
 def execute_lock_status(
     path: str,
     *,
@@ -600,8 +613,8 @@ def execute_lock_status(
     return result
 
 
-@mcp.tool()
-def lock_status(path: str) -> dict[str, Any]:
+@mcp.tool(annotations=_READ_ONLY)
+def lock_status(path: str, verbose: bool = False) -> dict[str, Any]:
     """Report Word/LibreOffice owner-file presence and sync-quiesce state.
 
     Data only — never refuses. Owner-file detection recognizes Word's
@@ -613,9 +626,11 @@ def lock_status(path: str) -> dict[str, Any]:
     directory (OneDrive/iCloud staging artifacts); "sync_quiesced" is
     false if either signal suggests the file is still being written.
 
-    Returns path, owner_file ({present, path, format, owner_name}),
-    sync_quiesced, sync_detail ({sample_1, sample_2, interval_seconds,
-    tmp_siblings}), and external_activity (issue #27): how the file on
+    Returns (default) owner_file ({present, path, format, owner_name}),
+    desktop_word, sync_quiesced, and external_activity reduced to
+    {divergent, still_current, recent, ledger} (what the write guard decides on). verbose=True also returns path, sync_detail
+    ({sample_1, sample_2, interval_seconds, tmp_siblings}) and the full
+    external_activity (issue #27): how the file on
     disk compares with what THIS server last wrote --
     {ledger: "ok"|"none"|"unreadable", ledger_reason, last_write
     ({token, written_at}), still_current (null with no ledger),
@@ -635,9 +650,17 @@ def lock_status(path: str) -> dict[str, Any]:
       INVALID_INPUT - path does not exist or is outside the allowed roots
     """
     try:
-        return execute_lock_status(path)
+        result = execute_lock_status(path)
     except VerifyError as exc:
         _raise_tool_error(exc)
+    if verbose:
+        return result
+    result.pop("sync_detail", None)
+    result.pop("path", None)
+    activity = result.get("external_activity")
+    if isinstance(activity, dict):
+        result["external_activity"] = {k: activity.get(k) for k in _EXTERNAL_ACTIVITY_COMPACT_KEYS}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -654,8 +677,16 @@ def _revision_status(session: Any) -> dict[str, Any]:
             "revision_coverage": state["coverage"], "revision_reason": state.get("reason")}
 
 
-def execute_live_status() -> dict[str, Any]:
+_LIVE_STATUS_VERBOSE_SESSION_FIELDS = ("heartbeat_count", "hash_sample_count", "requirement_sets")
+
+
+def execute_live_status(path: str | None = None, verbose: bool = False) -> dict[str, Any]:
     """Start the live bridge lazily (idempotent) and report its state.
+
+    *path* scopes ``sessions`` to that document's basename; default (non-verbose)
+    output omits the per-session counters / ``requirement_sets`` and the top-level
+    ``recent_boots`` and ``shared`` blocks (issue #111); ``locks`` (and this client's ``client_id``)
+    are always included in shared mode.
 
     Never raises for "no pane connected yet" -- an empty ``sessions``
     list is the normal, expected answer before the lead opens the task
@@ -677,9 +708,20 @@ def execute_live_status() -> dict[str, Any]:
     ports = live_bridge.current_ports()
     port, ops_port = ports if ports is not None else (None, None)
 
+    from .live import write_mode as _write_mode
+
+    wanted_name: str | None = None
+    if path:
+        try:
+            wanted_name = _write_mode._document_name(path)
+        except VerifyError:
+            # A path outside the allowed roots can still name a pane's document.
+            wanted_name = os.path.basename(path.replace("\\", "/").rstrip("/"))
     sessions: list[dict[str, Any]] = []
     for session in registry.list():
-        sessions.append(
+        if wanted_name is not None and session.document_name != wanted_name:
+            continue
+        entry = (
             {
                 "document_name": session.document_name,
                 "document_url": session.document_url,
@@ -697,6 +739,16 @@ def execute_live_status() -> dict[str, Any]:
                 **_revision_status(session.status_view() if hasattr(session, "status_view") else session),
             }
         )
+        if not verbose:
+            for key in _LIVE_STATUS_VERBOSE_SESSION_FIELDS:
+                entry.pop(key, None)
+            for key in ("revision_reason", "revision_count"):
+                if entry.get(key) is None:
+                    entry.pop(key, None)
+            for key in ("last_heartbeat_age_s", "body_hash_age_s"):
+                if isinstance(entry.get(key), float):
+                    entry[key] = round(entry[key], 1)
+        sessions.append(entry)
 
     shared_status = registry.status() if hasattr(registry, "status") else None
     pid = os.getpid()
@@ -725,9 +777,24 @@ def execute_live_status() -> dict[str, Any]:
         # such basename collision is recorded here so it is visible
         # rather than a silent misroute -- empty when none have happened.
         "session_collisions": registry.collisions(),
-        "shared": shared_status,
-        "recent_boots": recent_boots,
     }
+    # Who holds a document lease / section locks is the only way to see the holder behind
+    # LOCKED_BY_OTHER_CLIENT, so `locks` (and this client's id) are always surfaced; the rest of
+    # `shared` stays behind verbose.
+    if shared_status is not None:
+        locks = list(shared_status.get("locks") or [])
+        if wanted_name is not None:
+            urls = {s.document_url for s in registry.list() if s.document_name == wanted_name}
+            locks = [lk for lk in locks if lk.get("document_url") in urls]
+        for lk in locks:
+            if isinstance(lk.get("remaining_s"), float):
+                lk["remaining_s"] = round(lk["remaining_s"], 1)
+        result["locks"] = locks
+        if shared_status.get("client_id"):
+            result["client_id"] = shared_status["client_id"]
+    if verbose:
+        result["shared"] = shared_status
+        result["recent_boots"] = recent_boots
     boot_warnings = _pane_reload_loop_warnings(recent_boots)
     if boot_warnings:
         result.setdefault("warnings", []).extend(boot_warnings)
@@ -795,7 +862,7 @@ def live_document_lock(path: str, release: bool = False, lease_s: float = 60) ->
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def live_list_sections(path: str, compact: bool = False) -> dict[str, Any]:
     """List the live document's heading sections as the Word pane sees them.
 
@@ -835,7 +902,7 @@ def live_list_sections(path: str, compact: bool = False) -> dict[str, Any]:
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def live_revision(path: str) -> dict[str, Any]:
     """The live document's current revision and per-section digests, without
     reading the body.
@@ -920,10 +987,10 @@ def live_section_lock(
         _raise_tool_error(exc)
 
 
-@mcp.tool()
-def live_status() -> dict[str, Any]:
+@mcp.tool(annotations=_READ_ONLY)
+def live_status(path: str | None = None, verbose: bool = False) -> dict[str, Any]:
     """Report live-bridge state: whether it is running, its ports, and
-    every currently connected Word task-pane session.
+    the connected Word task-pane sessions (all of them, or just *path*'s).
 
     Starts the bridge lazily (idempotent -- a second call, or any future
     ``write_mode="live"`` tool call from WP-3/WP-4, reuses the same
@@ -934,19 +1001,29 @@ def live_status() -> dict[str, Any]:
     Read-only: never modifies a .docx, so it is not in ``MUTATING_TOOLS``
     (middleware.py).
 
-    Returns ``bridge_running``, ``port`` (the static HTTPS pane server),
-    ``ops_port`` (the WSS ``/ops`` channel), ``sessions`` (list of
-    ``{document_name, document_url, connected_since,
-    last_heartbeat_age_s, body_sha256, requirement_sets}`` -- one per
-    connected pane, ``[]`` before any pane connects), and
-    ``session_collisions`` (issue #22 B3 follow-up: every basename
-    collision the registry has seen -- two DIFFERENT documents (different
-    ``document_url``) connecting under the same file name, which the
-    registry's own basename-only keying cannot tell apart -- each entry
-    is ``{document_name, displaced_document_url, new_document_url, at}``;
-    ``[]`` when none have happened. Never itself a refusal; check this
-    before trusting a live write's routing if two people might have a
-    same-named document open at once).
+    path (optional) scopes ``sessions`` to that document's file name.
+    verbose=True adds the per-session ``heartbeat_count``,
+    ``hash_sample_count`` and ``requirement_sets`` plus the top-level
+    ``recent_boots`` and broker ``shared`` blocks. In shared-bridge mode the
+    result always carries ``locks`` (document leases and section locks:
+    ``{document_url, client_id, scope, remaining_s, ...}``, filtered to
+    *path*'s document when given) plus this client's ``client_id``: read
+    them to see who holds a lock after LOCKED_BY_OTHER_CLIENT.
+
+    Returns ``bridge_running``, ``pid``, ``owner_pid``, ``is_owner``,
+    ``mode`` ("local"|"shared"; stated once, never repeated in nested
+    blocks), ``port`` (static HTTPS pane server), ``ops_port`` (WSS
+    ``/ops``), ``sessions`` (one per connected pane, ``[]`` before any pane
+    connects; each ``{document_name, document_url, connected_since,
+    last_heartbeat_age_s, body_sha256, body_hash_state, body_hash_age_s,
+    instance_id, platform, revision_count, revision_coverage}``),
+    ``session_collisions`` (two DIFFERENT documents (different
+    ``document_url``) that connected under the same file name, which the
+    registry's basename-only keying cannot tell apart; each entry is
+    ``{document_name, displaced_document_url, new_document_url, at}``;
+    ``[]`` when none; never itself a refusal, but check it before trusting
+    a live write's routing), and ``warnings`` (e.g. ``pane_reload_loop``)
+    only when there is something to say.
 
     Errors:
       LIVE_UNAVAILABLE - the bridge itself failed to start (e.g. no
@@ -955,7 +1032,7 @@ def live_status() -> dict[str, Any]:
         yet", which is not an error.
     """
     try:
-        return execute_live_status()
+        return execute_live_status(path, verbose)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -1001,7 +1078,7 @@ def execute_list_parts(path: str) -> dict[str, Any]:
             local_path.unlink(missing_ok=True)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_parts(path: str) -> dict[str, Any]:
     """List the package parts of a .docx that read_document(part=...) can
     target: the document body (word/document.xml), every header/footer,
@@ -1172,7 +1249,7 @@ def _read_document_from(
     return render(whole, [])
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def read_document(
     path: str,
     format: str = "markdown",
@@ -1183,6 +1260,7 @@ def read_document(
     end_para_ref: str | None = None,
     to_file: str | None = None,
     overwrite: bool = False,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Read a .docx part's content as markdown, flat text, or a run-level
     structural list.
@@ -1196,11 +1274,19 @@ def read_document(
     carries "source". A file read while a pane session exists for the name
     also carries the "live_session_ignored" warning and a live_session
     {document_url, reason, action} object, so a same-named placeholder file
-    can never pass as the live body. A live read never falls back to the
+    can never pass as the live body. live_session.reason says why the live body
+    was not read: "requested_file" (pass source="live" or "auto" to read the live
+    document), "part_not_in_live" (live reads cover the document body only),
+    "pane_missing_capability" (older pane build: close and reopen the Live pane in
+    Word, then retry), "basename_collision" (another document connected under this
+    file name: confirm which is open, then pass source="live" explicitly) or
+    "session_mismatch" (the pane's document_url names a different local file; this
+    read is of the file you named). A live read never falls back to the
     file: a pane failure is an error. In a live read revision is
     "live:sha256:<body hash>" (the token live writes accept as
-    revision_before), revision_detail is None, and "live" carries
-    {document_url, body_sha256, stripped_parts}; images are not included.
+    revision_before), revision_detail is absent, and "live" carries
+    {document_url, stripped_parts} (the body hash is the revision);
+    images are not included.
     A live read may also warn "live_styles_missing" or
     "live_numbering_missing" when Word's export omitted a part the body
     references. para_ref and table_id values are positional: use them only
@@ -1269,11 +1355,13 @@ def read_document(
     to_file or ranged read still counts as this client's baseline read
     (the server saw the whole body).
 
-    Returns path, part, format, section_key (echoed back, None unless
-    passed), revision (the "<doc8>:<cmt8>" token), revision_detail (the
-    full {document_sha256, comments_sha256, size, mtime_ns} tuple),
-    warnings, lossy_elements (format="markdown" only, present only when
-    non-empty), plus text|runs|markdown per format.
+    Returns path, part, format, revision (the "<doc8>:<cmt8>" token), plus
+    text|runs|markdown per format. section_key (echoed back), warnings and
+    lossy_elements (format="markdown" only) appear only when non-null /
+    non-empty; revision_detail (the full {document_sha256, comments_sha256,
+    size, mtime_ns} tuple, file reads only) only with verbose=True; in a live
+    read "live" carries {document_url, stripped_parts} (its body hash is the
+    revision).
 
     Not gated by DOCX_LOCKED — see list_parts' docstring.
 
@@ -1306,7 +1394,7 @@ def execute_find_sections(
         )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def find_sections(
     path: str, part: str = projection.DEFAULT_PART, source: str = "auto", digests: bool = False
 ) -> dict[str, Any]:
@@ -1378,7 +1466,7 @@ def execute_list_page_sections(path: str, part: str = projection.DEFAULT_PART) -
             local_path.unlink(missing_ok=True)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_page_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[str, Any]:
     """List w:sectPr PAGE-LAYOUT sections in a .docx part.
 
@@ -1411,18 +1499,33 @@ def list_page_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[s
         _raise_tool_error(exc)
 
 
-def execute_list_styles(path: str) -> dict[str, Any]:
+def execute_list_styles(
+    path: str, type: str | None = None, name_contains: str | None = None
+) -> dict[str, Any]:
+    if type is not None and type not in projection.STYLE_TYPES:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"type must be one of {projection.STYLE_TYPES}, got {type!r}",
+            {"type": type},
+        )
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     local_path, is_temp = _read_local_copy(resolved)
     try:
-        return {"path": str(resolved), "styles": projection.list_styles_impl(local_path)}
+        styles = projection.list_styles_impl(local_path)
+        if type is not None or name_contains:
+            styles = projection.filter_styles(styles, style_type=type, name_contains=name_contains)
+        return {"path": str(resolved), "styles": styles}
     finally:
         if is_temp:
             local_path.unlink(missing_ok=True)
 
 
-@mcp.tool()
-def list_styles(path: str) -> dict[str, Any]:
+@mcp.tool(annotations=_READ_ONLY)
+def list_styles(
+    path: str,
+    type: Literal["paragraph", "character", "table", "numbering"] | None = None,
+    name_contains: str | None = None,
+) -> dict[str, Any]:
     """Enumerate word/styles.xml's styles: ids, names, types, outline
     levels.
 
@@ -1434,6 +1537,8 @@ def list_styles(path: str) -> dict[str, Any]:
     targeting one.
 
     Returns path, styles (list of {style_id, name, type, outline_lvl}).
+    type narrows to one style type; name_contains keeps styles whose name
+    or style_id contains it (case-insensitive). Both default to no filter.
 
     Not gated by DOCX_LOCKED — see list_parts' docstring.
 
@@ -1442,7 +1547,7 @@ def list_styles(path: str) -> dict[str, Any]:
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
-        return execute_list_styles(path)
+        return execute_list_styles(path, type, name_contains)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -1474,7 +1579,7 @@ def list_styles(path: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 def replace_body_markdown(
     path: str,
     markdown: str,
@@ -2228,19 +2333,60 @@ def live_save(path: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
-def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
+@mcp.tool(annotations=_READ_ONLY)
+def list_open_items(
+    path: str,
+    source: str = "auto",
+    fields: Literal["summary", "full"] = "full",
+    section_key: str | None = None,
+    within_text: str | None = None,
+    include_correlation: bool = False,
+) -> dict[str, Any]:
     """List every open comment and pending tracked change (w:ins/w:del) in
     a .docx.
 
+    fields (issue #111): "full" (default) is the whole record; "summary"
+    is columnar -- `counts`, `comment_columns` ["comment_id", "author",
+    "resolved", "anchor" (first 60 chars), "reply_count"] with `comment_rows`
+    as a list of row lists, and `suggestion_columns` (file: suggestion_id,
+    kind, author, anchor; live: revision_id, type, author, anchor) with
+    `suggestion_rows` as row lists (a trailing "scope_uncertain" column
+    appears only when scoping flagged a row) -- and keeps `path`,
+    `complete`, `scope`, `warnings` and `source`. Ids are complete. Use it
+    for guard reads and to pick ids. A summary NEVER has `comments`,
+    `suggestions` or `pending_suggestions` keys: JennyStack's recorder and
+    comment loader treat a `comments` list as full objects, so the rows
+    live under `comment_rows`/`suggestion_rows`. In full, `reply_count`
+    (== len(replies)) and an empty `replies` are omitted.
+
+    section_key / within_text scope the result: a find_sections key (the
+    heading section), and/or a text span (must match exactly once, like
+    replace_text's find; both given = their intersection). `counts` then
+    adds `in_scope` next to the document-wide totals, and the response
+    carries top-level `scoped: true` (absent when unscoped) so a consumer
+    can tell a partial `comments` list from a whole-document one. `counts`
+    keys differ by source: file mode has `comments`/`suggestions`; live
+    mode has `live_total`/`live_open`/`returned` (plus `in_scope`, and
+    `open_comments`/`suggestions`, when scoped; an unknown live suggestion
+    inventory is null, not 0). File mode places a
+    comment by its anchored runs; a suggestion with no paragraph (text
+    box, table-row revision) is kept and flagged `scope_uncertain`. Live mode only knows a comment's anchor
+    PARAGRAPH TEXT, so it matches that text against the live body (read
+    without re-arming your write baseline); an item whose text cannot be
+    placed, or that occurs both inside and outside the scope, is kept and
+    flagged `scope_uncertain: true`; so is a comment anchored across
+    several paragraphs (live mode sees only one anchor paragraph). An unknown section_key is
+    INVALID_INPUT listing the available keys.
+
     Returns `comments` (from word/comments.xml + commentsExtended.xml's
-    resolved flag; each with comment_id, content, resolved, reply_count,
-    replies, quoted_text, author, created_time, modified_time, scope --
-    the same shape the GoogleDocs-MCP server returns, "scope": "document"
-    always since a docx comment anchor is not tab-scoped) and
-    `pending_suggestions` (every w:ins/w:del, with suggestion_id, kind
-    ("insertion"|"deletion"), text, author, date, anchor_context -- the
-    owning paragraph's own live text).
+    resolved flag; each with comment_id, w_id, content, resolved,
+    replies (omitted when empty), quoted_text, author, created_time -- the
+    constant modified_time/scope of the GoogleDocs-MCP shape are not
+    sent) and `pending_suggestions` (every w:ins/w:del, with
+    suggestion_id, kind ("insertion"|"deletion"), text, author, date,
+    para_ref; the owning paragraph's own live text is sent ONCE per
+    paragraph in the top-level `anchor_contexts` {para_ref: text}, not
+    per suggestion).
 
     Comment replies are threaded (commentsExtended's w15:paraIdParent):
     `comments` lists ROOT comments only, each with reply_count ==
@@ -2269,12 +2415,14 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     In live mode: `source: "live"`; each comment's `comment_id` is a live
     handle `live:<Comment.id>` (Office.js's own id, unrelated to the OOXML
     durableId/w:id -- docs/live-mode.md's WP-1 finding; it does not
-    survive a Word restart), `w_id` is null, and each comment also carries
-    `anchor_text`/`author`/`created_time`/`resolved`/`replies` read
-    straight from the pane (including real reply threading, since the
-    pane sees it and file mode's own reply_count=0/replies=[] limit above
-    does not apply here). Resolved comments are filtered out the same way
-    file mode does, even though the pane reports them too.
+    survive a Word restart), and each comment carries
+    `anchor_text`/`anchor_paragraph_text`/`author`/`created_time`/
+    `resolved`/`replies` read straight from the pane (`session_epoch` is
+    sent once at the top level; there is no `w_id`/`quoted_text`, which
+    was always null / equal to `anchor_text`). Live mode already returns
+    the FULL reply threads, so get_comment_thread is only needed in file
+    mode. Resolved comments are filtered out the same way file mode does,
+    even though the pane reports them too.
 
     Issue #39 -- READ THESE BEFORE TELLING A USER A COMMENT DOES NOT EXIST.
     The live response leads with `counts` (`live_total`/`live_open`: the
@@ -2283,7 +2431,7 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     document body is read, so comments anchored in headers, footers or text
     boxes are NOT visible), `pane` (`instance_id`/`platform`/`host`/
     `observed_at`: WHICH pane answered and when it read), and `warnings`
-    (`scope_body_only`, `same_document_duplicate` when a second pane for
+    (`pane_collection_incomplete`, `same_document_duplicate` when a second pane for
     this document was connected, `file_has_unlisted_comments` when the saved
     file has open comments the pane did not report). `file_only_open_comments`
     lists those. All of it is advisory: a pane that returns a stale
@@ -2295,7 +2443,7 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     `comments` list, or `counts` that disagree with the comments returned)
     raises LIVE_OP_FAILED rather than reporting an empty result.
 
-    The response
+    With include_correlation=true the response
     also carries a top-level `correlation` list: for each listed live
     comment, the best-matching file-mode comment_id (durableId, or a raw
     w:id fallback) from this same document's on-disk snapshot, matched by
@@ -2337,18 +2485,27 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
 
     Errors:
       INVALID_INPUT    - path does not exist or is outside the allowed
-                          roots, or source is not "auto"/"file"/"live"
+                          roots, source is not "auto"/"file"/"live", fields
+                          is not "summary"/"full", or section_key is unknown
+      ZERO_MATCH / MATCH_COUNT_MISMATCH - within_text did not match exactly once
       SNAPSHOT_FAILED  - the read-path snapshot could not be validated
       LIVE_UNAVAILABLE - source="live" requested but no connected pane
                           session for this document
     """
     try:
-        return comments_live.execute_list_open_items(path, source)
+        return comments_live.execute_list_open_items(
+            path,
+            source,
+            fields=fields,
+            section_key=section_key,
+            within_text=within_text,
+            include_correlation=include_correlation,
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 def accept_tracked_changes(
     path: str,
     revision_ids: list[str] | None = None,
@@ -2421,7 +2578,7 @@ def accept_tracked_changes(
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 def reject_tracked_changes(
     path: str,
     revision_ids: list[str] | None = None,
@@ -2593,7 +2750,7 @@ def add_anchored_comment(
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def get_comment_thread(path: str, comment_id: str | None = None,
                        source: str = "auto", session_epoch: str | None = None,
                        match_spec: dict[str, str] | None = None) -> dict[str, Any]:
@@ -2857,7 +3014,7 @@ def resolve_comment(
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 def delete_comment(
     path: str,
     comment_id: str | None = None,
@@ -2933,7 +3090,7 @@ def delete_comment(
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 def delete_resolved_comments(
     path: str,
     comment_ids: list[str],
@@ -3002,7 +3159,7 @@ def delete_resolved_comments(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_tables(
     path: str, part: str = projection.DEFAULT_PART, source: str = "auto"
 ) -> dict[str, Any]:
@@ -3033,7 +3190,7 @@ def list_tables(
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def get_table(
     path: str, table_id: int, part: str = projection.DEFAULT_PART, source: str = "auto"
 ) -> dict[str, Any]:
@@ -3638,7 +3795,7 @@ def apply_style(
         _raise_tool_error(exc, verbose)
 
 
-@mcp.tool(annotations={"readOnlyHint": True})
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
 def read_audit_evidence(
     evidence_ref: str, field: str | None = None, to_file: str | None = None, overwrite: bool = False
 ) -> dict[str, Any]:
@@ -3738,7 +3895,7 @@ def execute_read_header_footer(path: str) -> dict[str, Any]:
             local_path.unlink(missing_ok=True)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def read_header_footer(path: str) -> dict[str, Any]:
     """Read every header/footer part's content as markdown, in one call --
     list_parts already discovers these parts (kind "header"/"footer",
@@ -3993,7 +4150,7 @@ def execute_diff_body_vs_file(
             local_path.unlink(missing_ok=True)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def diff_body_vs_file(
     path: str,
     file_path: str,
@@ -4091,7 +4248,7 @@ def diff_body_vs_file(
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
 def diff_table_vs_markdown(
     path: str,
     table_id: int | None = None,
@@ -4385,7 +4542,7 @@ def doctor() -> int:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_textboxes(path: str) -> dict[str, Any]:
     """List live text-bearing shapes with epoch handles, coverage and revisions."""
     from .live.scopes_live import read_scope
@@ -4396,7 +4553,7 @@ def list_textboxes(path: str) -> dict[str, Any]:
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def read_textbox(path: str, textbox_id: str) -> dict[str, Any]:
     """Read one live text box. Host failures are distinct from verified empty text."""
     from .live.scopes_live import read_scope
@@ -4407,7 +4564,7 @@ def read_textbox(path: str, textbox_id: str) -> dict[str, Any]:
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 def delete_paragraph(path: str, anchor_text: str, revision_before: str,
                      track_changes: bool = False) -> dict[str, Any]:
     """Delete exactly one whole live paragraph (body or table cell); refuse anchors,
@@ -4503,7 +4660,7 @@ def clear_numbering(
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 def delete_table(
     path: str,
     table_id: int,
@@ -4609,7 +4766,7 @@ def insert_paragraphs(
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_shapes(path: str) -> dict[str, Any]:
     """List live body anchored shapes with paragraph anchors and OOXML geometry.
 
@@ -4734,7 +4891,7 @@ def insert_table_row(path: str, table_id: int, cells: list[str],
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"destructiveHint": True})
 def delete_table_row(path: str, table_id: int, row_index: int, expected_text: str,
                      revision_before: str | None = None, track_changes: bool = False,
                      write_mode: str = "auto", allow_concurrent_editor: bool = False) -> dict[str, Any]:

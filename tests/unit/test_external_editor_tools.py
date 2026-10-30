@@ -181,7 +181,24 @@ class GuardedToolPassThroughTests(_Env):
             bad = await self.call(client, "lock_status")
             data = bad.structured_content or json.loads(bad.content[0].text)
             self.assertFalse(data["external_activity"]["still_current"])
+            self.assertTrue(data["external_activity"]["divergent"])
+            self.assertEqual(set(data["external_activity"]), {"divergent", "still_current", "recent", "ledger"})
+            full = await self.call(client, "lock_status", verbose=True)
+            data = full.structured_content or json.loads(full.content[0].text)
             self.assertTrue(data["external_activity"]["recent"])
+
+    async def test_compact_lock_status_shows_unreadable_ledger(self):
+        async with Client(server.mcp) as client:
+            await self.call(
+                client, "replace_cell_markdown",
+                table_id=1, row_index=1, cell_index=1, markdown="seed", write_mode="file",
+            )
+            write_ledger._record_path(self.target.resolve()).write_text("{not json")
+            res = await self.call(client, "lock_status")
+            data = res.structured_content or json.loads(res.content[0].text)
+            # The write guard refuses on `ledger == "unreadable"`; compact output must show it.
+            self.assertEqual(data["external_activity"]["ledger"], "unreadable")
+            self.assertIn("recent", data["external_activity"])
 
 
 class LedgerRaceTests(unittest.TestCase):

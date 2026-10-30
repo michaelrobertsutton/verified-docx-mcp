@@ -16,11 +16,13 @@ fixture's own golden-comment.docx, untouched here) and is not tested.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest import mock
 
@@ -79,7 +81,8 @@ class ListOpenItemsTrackedChangesTests(_TempFixtureCase):
         self.assertEqual(insertion["author"], "Michael Sutton")
         self.assertTrue(insertion["date"])
         self.assertIn("suggestion_id", insertion)
-        self.assertIn("anchor_context", insertion)
+        self.assertNotIn("anchor_context", insertion)  # sent once per paragraph in anchor_contexts (#111)
+        self.assertIn("revision-token base fixture", result["anchor_contexts"][insertion["para_ref"]])
 
         deletion = by_kind["deletion"]
         self.assertEqual(deletion["text"], "he re")
@@ -93,12 +96,13 @@ class ListOpenItemsCommentsTests(_TempFixtureCase):
         result = tracked_changes.execute_list_open_items(str(self.target))
         self.assertEqual(len(result["comments"]), 1)
         comment = result["comments"][0]
-        for key in ("comment_id", "content", "resolved", "reply_count", "replies", "quoted_text", "author", "scope"):
+        for key in ("comment_id", "content", "resolved", "quoted_text", "author"):
             self.assertIn(key, comment)
+        for gone in ("scope", "modified_time", "reply_count", "replies"):  # constant/derivable/empty (#111)
+            self.assertNotIn(gone, comment)
         self.assertEqual(comment["content"], "This is a test comment.")
         self.assertEqual(comment["quoted_text"], "This")
         self.assertFalse(comment["resolved"])
-        self.assertEqual(comment["scope"], "document")
         self.assertEqual(result["pending_suggestions"], [])
 
     def test_comment_id_is_the_durable_id_not_the_raw_w_id(self):
@@ -154,7 +158,7 @@ class ListOpenItemsThreadingTests(_TempFixtureCase):
         self.assertEqual(len(result["comments"]), 1)
         root = result["comments"][0]
         self.assertEqual(root["content"], "This is a test comment.")
-        self.assertEqual(root["reply_count"], 1)
+        self.assertNotIn("reply_count", root)  # derivable: len(replies) (#111)
         self.assertEqual(
             root["replies"],
             [{"id": "0000AAAA", "author": "Alice", "date": "2026-09-11T10:00:00Z", "text": "first reply"}],
@@ -163,7 +167,7 @@ class ListOpenItemsThreadingTests(_TempFixtureCase):
     def test_replies_keep_comment_order_and_count_matches(self):
         _add_reply(self.target, extra_reply=True)
         root = tracked_changes.execute_list_open_items(str(self.target))["comments"][0]
-        self.assertEqual(root["reply_count"], 2)
+        self.assertEqual(len(root["replies"]), 2)
         self.assertEqual([r["text"] for r in root["replies"]], ["first reply", "second reply"])
 
     def test_root_resolved_state_governs_the_thread(self):
@@ -175,11 +179,150 @@ class ListOpenItemsThreadingTests(_TempFixtureCase):
         comments = tracked_changes.execute_list_open_items(str(self.target))["comments"]
         self.assertEqual(len(comments), 1)
         self.assertFalse(comments[0]["resolved"])
-        self.assertEqual(comments[0]["reply_count"], 1)
+        self.assertEqual(len(comments[0]["replies"]), 1)
 
     def test_unthreaded_comment_reports_zero_replies(self):
         root = tracked_changes.execute_list_open_items(str(self.target))["comments"][0]
-        self.assertEqual((root["reply_count"], root["replies"]), (0, []))
+        self.assertNotIn("replies", root)  # empty list omitted (#111)
+        self.assertNotIn("reply_count", root)
+
+
+class ListOpenItemsSummaryAndScopeTests(_TempFixtureCase):
+    """Issue #111 (file mode): fields="summary", the trimmed full shape, section_key/within_text.
+
+    sections.docx: Overview (p0-p1), Background (p2-p3), Next Steps (p4-p5). Comments sit in p1, p3
+    and p5; tracked changes in p1, p4 and p5 (an insertion + a deletion each, so every paragraph's
+    text would repeat per run in the old shape).
+    """
+
+    fixture_name = "sections.docx"
+
+    def setUp(self):
+        super().setUp()
+        from verified_docx_mcp import comments
+
+        path = str(self.target)
+        comments.execute_add_anchored_comment(path, "overview", "c-overview", 1)
+        comments.execute_add_anchored_comment(path, "Background text", "c-background", 1)
+        comments.execute_add_anchored_comment(path, "steps text", "c-next", 1)
+        text_edit.execute_replace_text(path, "Some ", "Any ", 1, track_changes=True)
+        text_edit.execute_replace_text(path, "Next", "Upcoming", 2, track_changes=True)
+
+    def _list(self, **kwargs):
+        return tracked_changes.execute_list_open_items(str(self.target), **kwargs)
+
+    def test_full_drops_constants_and_sends_each_paragraph_once(self):
+        result = self._list()
+        for comment in result["comments"]:
+            self.assertNotIn("modified_time", comment)
+            self.assertNotIn("scope", comment)
+            # kept: JennyStack reads these in file mode
+            for key in ("comment_id", "w_id", "quoted_text", "author", "resolved"):
+                self.assertIn(key, comment)
+            self.assertNotIn("reply_count", comment)
+            self.assertNotIn("replies", comment)  # none of these has replies
+        suggestions = result["pending_suggestions"]
+        self.assertEqual(len(suggestions), 6)
+        self.assertEqual(sorted(result["anchor_contexts"]), ["p1", "p4", "p5"])  # one entry per paragraph
+        for suggestion in suggestions:
+            self.assertNotIn("anchor_context", suggestion)
+            self.assertIn(suggestion["para_ref"], result["anchor_contexts"])
+        self.assertIn("overview text.", result["anchor_contexts"]["p1"])
+        self.assertNotIn("counts", result)  # only when scoped or summary
+
+    def test_summary_rows_and_counts(self):
+        result = self._list(fields="summary")
+        self.assertEqual(result["counts"], {"comments": 3, "suggestions": 6})
+        self.assertEqual(result["comment_columns"], ["comment_id", "author", "resolved", "anchor", "reply_count"])
+        self.assertEqual([c[3] for c in result["comment_rows"]], ["overview", "Background text", "steps text"])
+        self.assertEqual(result["suggestion_columns"], ["suggestion_id", "kind", "author", "anchor"])
+        self.assertEqual(len(result["suggestion_rows"][0]), 4)
+        self.assertNotIn("pending_suggestions", result)
+        self.assertNotIn("comments", result)
+        self.assertNotIn("suggestions", result)
+        self.assertIn("path", result)
+        full = self._list()
+        self.assertLess(len(json.dumps(result)), len(json.dumps(full)))
+        # summary ids are exactly the full ids
+        self.assertEqual(
+            [c[0] for c in result["comment_rows"]], [c["comment_id"] for c in full["comments"]]
+        )
+        self.assertEqual(
+            [s[0] for s in result["suggestion_rows"]],
+            [s["suggestion_id"] for s in full["pending_suggestions"]],
+        )
+
+    def test_section_key_scopes_comments_and_suggestions(self):
+        result = self._list(section_key="background-1")
+        self.assertEqual([c["content"] for c in result["comments"]], ["c-background"])
+        self.assertEqual(result["pending_suggestions"], [])
+        self.assertEqual(result["counts"], {"comments": 3, "suggestions": 6, "in_scope": {"comments": 1, "suggestions": 0}})
+        self.assertIs(result["scoped"], True)
+        self.assertNotIn("scoped", self._list())
+
+        result = self._list(section_key="overview-1")
+        self.assertEqual([c["content"] for c in result["comments"]], ["c-overview"])
+        self.assertEqual({s["para_ref"] for s in result["pending_suggestions"]}, {"p1"})
+        self.assertEqual(result["counts"]["in_scope"], {"comments": 1, "suggestions": 2})
+
+    def test_section_key_scope_applies_to_summary_too(self):
+        result = self._list(fields="summary", section_key="upcoming-steps-1")
+        self.assertEqual([c[3] for c in result["comment_rows"]], ["steps text"])
+        self.assertEqual(len(result["suggestion_rows"]), 4)
+        self.assertIs(result["scoped"], True)
+        self.assertEqual(result["counts"]["in_scope"], {"comments": 1, "suggestions": 4})
+
+    def test_unplaceable_suggestions_are_kept_and_flagged_in_file_scope(self):
+        real = tracked_changes._find_pending_suggestions
+
+        def with_orphan(root, para_refs=None):
+            found = real(root, para_refs)
+            found.append(
+                {"para_ref": None, "suggestion_id": "tb-1", "kind": "insertion", "text": "in a text box",
+                 "author": "A", "date": None, "anchor_context": "in a text box"}
+            )
+            return found
+
+        with unittest.mock.patch.object(tracked_changes, "_find_pending_suggestions", with_orphan):
+            full = self._list(section_key="background-1")
+            summary = self._list(section_key="background-1", fields="summary")
+        orphans = [s for s in full["pending_suggestions"] if s["suggestion_id"] == "tb-1"]
+        self.assertEqual(len(orphans), 1)
+        self.assertIs(orphans[0]["scope_uncertain"], True)
+        self.assertEqual([s for s in full["pending_suggestions"] if s["suggestion_id"] != "tb-1"], [])
+        self.assertEqual(full["counts"]["in_scope"]["suggestions"], 1)
+        self.assertEqual(summary["suggestion_columns"][-1], "scope_uncertain")
+        self.assertEqual([r[0] for r in summary["suggestion_rows"]], ["tb-1"])
+        self.assertIs(summary["suggestion_rows"][0][-1], True)
+
+    def test_within_text_scopes_to_the_matched_paragraph(self):
+        result = self._list(within_text="overview text")
+        self.assertEqual([c["content"] for c in result["comments"]], ["c-overview"])
+        self.assertEqual({s["para_ref"] for s in result["pending_suggestions"]}, {"p1"})
+
+    def test_section_key_and_within_text_intersect(self):
+        result = self._list(section_key="background-1", within_text="overview text")
+        self.assertEqual(result["comments"], [])
+        self.assertEqual(result["counts"]["in_scope"], {"comments": 0, "suggestions": 0})
+
+    def test_unknown_section_key_lists_available_keys(self):
+        with self.assertRaises(VerifyError) as ctx:
+            self._list(section_key="nope")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        self.assertEqual(
+            ctx.exception.envelope.diagnostics["available_section_keys"],
+            ["overview-1", "background-1", "upcoming-steps-1"],
+        )
+
+    def test_within_text_must_match_once(self):
+        with self.assertRaises(VerifyError) as ctx:
+            self._list(within_text="no such text anywhere")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.ZERO_MATCH)
+
+    def test_unknown_fields_value_refused(self):
+        with self.assertRaises(VerifyError) as ctx:
+            self._list(fields="brief")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
 
 
 class ListOpenItemsGoldenThreadingTests(_TempFixtureCase):
@@ -190,7 +333,7 @@ class ListOpenItemsGoldenThreadingTests(_TempFixtureCase):
         # golden: id=0 root (open) + id=1 reply; id=2 is a resolved root (filtered).
         self.assertEqual(len(result["comments"]), 1)
         root = result["comments"][0]
-        self.assertEqual(root["reply_count"], 1)
+        self.assertEqual(len(root["replies"]), 1)
         self.assertEqual(root["replies"][0]["text"], "reply.")
         self.assertEqual(root["replies"][0]["id"] != root["comment_id"], True)
 
