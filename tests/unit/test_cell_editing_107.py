@@ -277,6 +277,71 @@ def test_merge_refuses_any_revision_markup_even_the_configured_authors(doc, mark
     assert doc.read_bytes() == before
 
 
+def test_merge_refuses_a_pair_separated_by_other_cell_content(doc):
+    add_second_paragraph(doc)
+    root, _ = mutations._load_document(doc)
+    cell = tables._find_table_element(root, 1).findall(W("tr"))[0].findall(W("tc"))[0]
+    first, second = cell.findall(W("p"))
+    middle = copy.deepcopy(first)
+    middle.find(W("r")).find(W("t")).text = "middle"
+    sdt = ET.Element(W("sdt"))
+    ET.SubElement(sdt, W("sdtContent")).append(middle)
+    cell.insert(list(cell).index(second), sdt)  # first / content control / second
+    rewrite(doc, root)
+    before = doc.read_bytes()
+    with pytest.raises(VerifyError) as exc:
+        paragraph_merge.execute(str(doc), 1, 1, 1, 1, write_mode="file")
+    assert exc.value.envelope.error_code == ErrorCode.STRUCTURAL_BOUNDARY
+    assert "not adjacent" in exc.value.envelope.message
+    assert doc.read_bytes() == before
+
+
+def test_paragraph_text_matches_the_projections_character_handling():
+    para = ET.fromstring(
+        f'<w:p xmlns:w="{projection.W_NS}"><w:r><w:t>non</w:t><w:noBreakHyphen/><w:t>breaking</w:t>'
+        '<w:softHyphen/><w:sym w:font="Symbol" w:char="F0B7"/></w:r></w:p>'
+    )
+    text = ts.paragraph_text(para)
+    assert text == "non-breaking­•"
+    assert text.replace("­", "") == projection.project_document_root(
+        ET.fromstring(f'<w:document xmlns:w="{projection.W_NS}"><w:body>' + ET.tostring(para, encoding="unicode") + "</w:body></w:document>")
+    ).text.replace("­", "").strip()
+
+
+def test_merge_text_guard_accepts_the_text_a_read_returned(doc):
+    add_second_paragraph(doc, text="x", bold=False)
+    root, _ = mutations._load_document(doc)
+    cell = tables._find_table_element(root, 1).findall(W("tr"))[0].findall(W("tc"))[0]
+    cell.find(W("p")).find(W("r")).append(ET.Element(W("noBreakHyphen")))
+    rewrite(doc, root)
+    paragraph_merge.execute(str(doc), 1, 1, 1, 1, expected_text=["R1C1-", "x"], write_mode="file")
+    assert "".join(ts.paragraph_text(p) for p in cell_of(doc).findall(W("p"))) == "R1C1-x"
+
+
+@pytest.mark.parametrize("child", ["sym", "softHyphen"])
+def test_fill_refuses_a_paragraph_that_displays_a_symbol_or_hyphen(doc, child):
+    paragraph_insert.execute_insert_paragraphs(
+        str(doc), {"after_table_id": 1}, [{"text": "Caption"}], 1, write_mode="file"
+    )
+    root, _ = mutations._load_document(doc)
+    children = list(mutations._find_body(root))
+    target = children[children.index(tables._find_table_element(root, 1)) + 1]
+    for old in list(target):
+        target.remove(old)
+    run = ET.SubElement(target, W("r"))
+    attrs = {W("font"): "Symbol", W("char"): "F0B7"} if child == "sym" else {}
+    ET.SubElement(run, W(child), attrs)
+    rewrite(doc, root)
+    before = doc.read_bytes()
+    with pytest.raises(VerifyError) as exc:
+        paragraph_insert.execute_insert_paragraphs(
+            str(doc), {"empty_paragraph_after_table_id": 1}, [{"text": "Nope"}], 1,
+            write_mode="file", allow_concurrent_editor=True,
+        )
+    assert exc.value.envelope.error_code == ErrorCode.STRUCTURAL_BOUNDARY
+    assert doc.read_bytes() == before
+
+
 def test_a_hyperlink_in_a_paragraph_outside_the_merged_pair_does_not_fail_verification(doc):
     add_second_paragraph(doc, text="second", bold=False)
     root, _ = mutations._load_document(doc)

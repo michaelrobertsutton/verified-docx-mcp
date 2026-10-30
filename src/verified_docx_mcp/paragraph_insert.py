@@ -31,7 +31,8 @@ POSITIONAL_ANCHOR_KEYS = ("after_table_id", "empty_paragraph_after_table_id")
 # move something. File mode applies it to the parsed body; it is sent to the pane, which
 # applies the same list to the OOXML it reads, so the two modes refuse the same paragraphs.
 EMPTY_PARAGRAPH_FORBIDDEN_TAGS = (
-    "drawing", "pict", "object", "sectPr", "tab", "br", "cr", "noBreakHyphen", "bookmarkStart", "bookmarkEnd",
+    "drawing", "pict", "object", "sectPr", "tab", "br", "cr", "noBreakHyphen", "softHyphen", "sym",
+    "bookmarkStart", "bookmarkEnd",
     "fldChar", "fldSimple", "instrText", "hyperlink", "footnoteReference", "endnoteReference",
     "commentRangeStart", "commentRangeEnd", "commentReference", "ins", "del", "moveFrom", "moveTo",
 )

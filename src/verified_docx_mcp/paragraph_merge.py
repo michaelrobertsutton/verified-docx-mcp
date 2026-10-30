@@ -22,7 +22,7 @@ from xml.etree import ElementTree as ET
 from . import audit, markdown_to_ooxml, mutations, paths, tables
 from . import table_structure as ts
 from .author import resolve_author_name
-from .errors import ErrorCode, _make_error
+from .errors import ErrorCode, VerifyError, _make_error
 from .live import reads_live
 from .live import write_mode as wm
 
@@ -106,7 +106,13 @@ def prepare(root, rels, table_id, row_index, cell_index, paragraph_index, expect
     if paragraph_index >= len(paragraphs):
         raise _make_error(ErrorCode.STRUCTURAL_BOUNDARY, "There is no next paragraph in the same cell")
     first, second = paragraphs[paragraph_index - 1 : paragraph_index + 1]
-    texts = [ts.paragraph_text(p) for p in (first, second)]
+    blocks = list(cell)
+    if blocks.index(second) != blocks.index(first) + 1:
+        # A content control or other block sits between them: merging would reorder the cell.
+        raise _make_error(
+            ErrorCode.STRUCTURAL_BOUNDARY, "Other content sits between the two paragraphs; they are not adjacent"
+        )
+    texts =[ts.paragraph_text(p) for p in (first, second)]
     if expected_text is not None and texts != expected_text:
         raise _make_error(
             ErrorCode.CELL_TEXT_MISMATCH, "Paragraph texts differ from expected_text", {"actual": texts}
@@ -261,14 +267,23 @@ def _execute_live(path, table_id, row_index, cell_index, paragraph_index, expect
         body.append(copy.deepcopy(merged))
         ctx = markdown_to_ooxml.StyleContext.build(source.local_path)
         xml = ts.flat_package(source.local_path, root, raw, ctx)
-    result = tables._live_cell_request(
-        session,
-        "cell_paragraph_merge",
-        {"table_index": table_id, "row_index": row_index, "cell_index": cell_index,
-         "paragraph_index": paragraph_index, "ooxml": xml, "before_xml": before_xml,
-         "expectedBodySha256": pre, "track_changes": False},
-        expected_body_sha256=pre,
-    )
+    try:
+        result = tables._live_cell_request(
+            session,
+            "cell_paragraph_merge",
+            {"table_index": table_id, "row_index": row_index, "cell_index": cell_index,
+             "paragraph_index": paragraph_index, "ooxml": xml, "before_xml": before_xml,
+             "expectedBodySha256": pre, "track_changes": False},
+            expected_body_sha256=pre,
+        )
+    except VerifyError as exc:
+        # The pane runs insertOoxml and THEN checks the paragraph count, so these may have landed.
+        if exc.envelope.error_code in (ErrorCode.VERIFICATION_FAILED, ErrorCode.LIVE_STALE_AFTER_WRITE):
+            wm.audit_live_failure(
+                tool="merge_paragraph_with_next", path=path, document_name=session.document_name,
+                pre_body_sha256=pre, post_body_sha256=None, reason=exc.envelope.message,
+            )
+        raise
     problems: list[str] = []
     warnings: list[str] = []
     if result.get("applied") is not True:

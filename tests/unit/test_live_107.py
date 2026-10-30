@@ -19,7 +19,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fake_pane import FakeDocument, docx_to_flat_opc
+from fake_pane import FakeDocument, OpRefused, docx_to_flat_opc
 from test_cell_editing_107 import add_second_paragraph
 from test_live_write_mode import LiveWriteBridgeTestCase
 
@@ -172,6 +172,19 @@ class MergeLiveTests(LiveWriteBridgeTestCase):
         self.assertEqual(cm.exception.envelope.error_code, ErrorCode.VERIFICATION_FAILED)
         self.assertIn("paragraphs differ", cm.exception.envelope.message)
         self.assertEqual(len(pane.merge_payloads), 1)
+        self.assertIn("merge_paragraph_with_next:verification_failed", _audit_tools()[records:])
+
+    async def test_a_pane_reported_verification_failure_after_the_write_is_audited(self) -> None:
+        pane = await self.connect(merged_body=False)
+
+        def refuse(p, payload):
+            raise OpRefused("VERIFICATION_FAILED", "Paragraph merge count differs")
+
+        pane.on_cell_paragraph_merge = refuse
+        records = len(_audit_tools())
+        with self.assertRaises(VerifyError) as cm:
+            await self.merge()
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.VERIFICATION_FAILED)
         self.assertIn("merge_paragraph_with_next:verification_failed", _audit_tools()[records:])
 
     async def test_a_pane_that_does_not_report_applied_fails_verification(self) -> None:
