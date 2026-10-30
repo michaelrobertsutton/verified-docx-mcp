@@ -261,6 +261,35 @@ def _fetch_body_ooxml(session: LiveSession) -> dict[str, Any]:
     return result
 
 
+def live_projection(session: LiveSession, *, expected_body_sha256: str | None) -> Any:
+    """The live body as a ``Projection``, read only to resolve a write target
+    (issue #113: an anchored find or a ``para_ref``).
+
+    *session* must be the non-observing view ``write_mode.live_session_for``
+    returns: on the shared bridge this read never re-arms the caller's
+    baseline, so a stale client stays refused at the mutation. When
+    *expected_body_sha256* is given and the body moved since, LIVE_STALE
+    (nothing was written).
+    """
+    from .. import projection
+
+    write_mode.require_capability(
+        session, BODY_OOXML_CAPABILITY, feature_description="anchored find / para_ref targets (a live body read)"
+    )
+    reply = _fetch_body_ooxml(session)
+    if expected_body_sha256 and reply["bodySha256"] != expected_body_sha256:
+        raise _make_error(
+            ErrorCode.LIVE_STALE,
+            "The live document changed while its write target was being resolved; nothing was written. "
+            "Re-read and retry.",
+            {"expected": expected_body_sha256[:12], "actual": reply["bodySha256"][:12]},
+        )
+    with tempfile.TemporaryDirectory(prefix="verified-docx-live-target-") as tmp:
+        temp_docx = Path(tmp) / "target.docx"
+        flat_opc_to_docx(reply["ooxml"], temp_docx)
+        return projection.project_part(temp_docx)
+
+
 @contextmanager
 def read_source(path: str, source: str, part: str = DEFAULT_PART) -> Iterator[ReadSource]:
     """Resolve *source* for a read of *path* and yield a ``ReadSource``;
