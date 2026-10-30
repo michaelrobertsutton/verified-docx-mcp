@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Section content digests (#117): `find_sections(digests=true)` adds `content_sha12` per heading section and `preamble_content_sha12`, covering text, tracked deletions, table structure (merged and nested cells) and anchored comment threads (author, text, resolved, replies). `live_revision` and `live_list_sections` take `content_digests=true` (one `body_ooxml` export; adds `content_sections` and `preamble_content_sha12`). Computed server-side only, from OOXML, so no pane change; `sha12` and section locks are unchanged.
 - Trimmed read payloads (#111):
   - `list_open_items` gains `fields="summary"` (columnar, ~577 tokens for 27 comments; rows under `comment_rows`/`suggestion_rows`, never a `comments` key, `path` kept; scoped results carry `scoped: true`), `section_key`/`within_text` scoping and `include_correlation`. Its default `full` shape drops constant or derivable fields (`modified_time`, `scope`, live `w_id`/`quoted_text`, `reply_count`, empty `replies`, null top-level keys) and is 39.9% smaller on the 27-comment fixture.
   - `list_tables` reports `header_row` and `anchor_section_key`.

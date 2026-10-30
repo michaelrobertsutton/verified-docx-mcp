@@ -1215,6 +1215,17 @@ same way unless the document has a nested table, which `table_get` refuses.)
   `paragraph_count` is one higher. Markdown, tables and run text are
   otherwise identical (checked on real Word against a Word-saved copy of
   the same document: headings, bullets, numbered list, table, image).
+- **Content digests (#117).** `content_sha12` (sections) and
+  `preamble_content_sha12` cover text, tracked deletions, table structure and
+  anchored comment threads. They are computed only by the server, from this
+  same `body_ooxml` export (no pane capability; any pane with `body_ooxml`
+  works), with the appended empty paragraph above dropped, so a live value
+  equals the file value of a Word-saved copy. `find_sections(source="live",
+  digests=true)`, `live_revision(content_digests=true)` and
+  `live_list_sections(content_digests=true)` each take exactly one export.
+  `live_revision` stays an observed read that re-arms the shared-bridge write
+  baseline; `live_list_sections` stays non-observing. `sha12`,
+  `sectionSha256` and section locks are unchanged.
 - **Warnings specific to live reads.** `live_styles_missing` /
   `live_numbering_missing`: the body references styles or numbering but
   Word's export omitted that part, so headings or lists may render wrongly.
