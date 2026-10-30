@@ -63,6 +63,7 @@ from . import (
     paragraph_insert,
     paths,
     projection,
+    table_diff,
     tables,
     table_structure,
     text_edit,
@@ -4086,6 +4087,80 @@ def diff_body_vs_file(
     """
     try:
         return execute_diff_body_vs_file(path, file_path, normalize, format, section_key, max_hunks)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def diff_table_vs_markdown(
+    path: str,
+    table_id: int | None = None,
+    markdown: str | None = None,
+    markdown_path: str | None = None,
+    md_heading: str | None = None,
+    md_header_row: str | None = None,
+    section_key: str | None = None,
+    source: str = "auto",
+    strip_emphasis: bool = True,
+) -> dict[str, Any]:
+    """Report the cells that differ between a Word table and a markdown pipe
+    table (issue #109). Read-only: nothing is written, nothing is audited.
+
+    Give exactly one markdown input (`markdown` inline, or `markdown_path`, a
+    local file under the same allowlist/denylist as diff_body_vs_file) and
+    exactly one Word selector:
+
+    - `table_id` (single mode): one table, as list_tables reports it. The
+      markdown table is chosen by `md_heading` (the first table under that
+      heading) and/or `md_header_row` (a pipe row such as "| Name | Role |",
+      matched on normalized text; with both, it must be one table under that
+      heading). With neither, the markdown must hold exactly one table. Zero
+      or several candidates, or a heading that appears twice in the markdown,
+      is refused (INVALID_INPUT), never guessed.
+    - `section_key` (multi mode, from find_sections): every Word table in that
+      section is paired with the markdown tables under `md_heading` (default:
+      the section's own heading text) by their header-row cells. A repeated
+      header on either side, a missing markdown heading, or no table on either
+      side is refused.
+
+    Cells are compared as visible text. The Word side is read from the cell
+    XML (runs, tabs, line breaks, hyperlink text), the markdown side from the
+    parsed table (escaped pipes, links, inline code), then both are folded
+    (curly quotes, dashes, NBSP, NFC) and whitespace-collapsed. Bold/italic
+    are ignored unless `strip_emphasis=false`, which compares them as `**`/`*`
+    markers. A literal `*x*` typed in Word is therefore a difference from a
+    markdown `*x*` (which is emphasis, i.e. `x`).
+
+    A table with merged cells, a nested table, or a cell holding a field,
+    drawing or text box is NOT compared: it is listed under `unsupported`
+    with a reason and `identical` is false. `identical` is true only when
+    every table involved was fully compared with no cell, dimension, unmatched
+    or unsupported finding.
+
+    `source` ("auto" | "file" | "live") reads the Word table as read_document
+    does, and the result carries the same provenance (`source`, `live`,
+    `live_session`, warnings).
+
+    Single mode returns path, table_id, md_table_index, identical,
+    differences ([{row, col, docx_text, md_text}], 1-based, header row = row
+    1, only differing cells; a row/column present on one side only has null on
+    the other), dimensions (only when they differ), unsupported (only when
+    non-empty) and warnings. Multi mode returns path, identical, tables
+    ([{table_id, md_table_index, header, differences, dimensions?}]),
+    unmatched_docx (table_ids), unmatched_md (md_table_index values) and
+    unsupported. md_table_index is the 0-based position of the table among all
+    tables in the markdown.
+
+    Errors:
+      INVALID_INPUT     - selector/markdown violations above, a bad path or source
+      TABLE_NOT_FOUND   - table_id does not match any table
+      SECTION_NOT_FOUND - section_key names no heading section
+      LIVE_UNAVAILABLE / LIVE_CAPABILITY_MISSING / LIVE_DISCONNECTED / LIVE_OP_FAILED - source="live"
+    """
+    try:
+        return table_diff.diff_table_vs_markdown_impl(
+            path, table_id, markdown, markdown_path, md_heading, md_header_row, section_key, source, strip_emphasis
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
