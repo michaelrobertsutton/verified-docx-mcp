@@ -162,6 +162,14 @@ Tools implemented so far:
   is hunks **or** a unified diff, never both, with no text for equal hunks;
   `section_key` scopes the diff to one heading section; `max_hunks` caps it.
   The response is O(diff), not O(document).
+- **`diff_table_vs_markdown(path, table_id, markdown, markdown_path, md_heading, md_header_row, section_key, source, strip_emphasis)`** —
+  read-only. Reports only the cells that differ between a Word table and a
+  markdown pipe table (single mode, `table_id`), or between every table in a
+  heading section and the markdown tables under a heading, paired by header
+  row (multi mode, `section_key`). Unsupported tables (merged cells, nested
+  tables, fields/drawings/text boxes in a cell) are listed, never compared,
+  and `identical` is true only when everything was compared and matched.
+  Issue #109.
 - **`list_tables(path, part)`**, **`get_table(path, table_id, part)`** —
   enumerate every `w:tbl` (including one nested inside a cell, which gets
   its own `table_id`) and report one table's full row/cell detail,

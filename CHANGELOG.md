@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- New read-only `diff_table_vs_markdown` (#109): reports only the cells that differ between one Word table (`table_id`) or every table under a heading (`section_key`) and a markdown pipe table, as `{row, col, docx_text, md_text}`. Cell text is compared structurally (quotes, dashes, NBSP and whitespace folded; emphasis ignored unless `strip_emphasis=false`; escaped pipes, links and inline code handled). Merged-cell/nested tables and cells with fields, drawings or text boxes are listed under `unsupported`, and ambiguous selectors are refused: nothing missing or ambiguous is ever reported as equal. Works on file or live (`source`).
 - Add guarded file/live `insert_table_row` and `delete_table_row` with 1-based positions, template formatting and expected-text deletion checks. Add `insert_table(like_table_id=...)` for direct-formatting copies with explicit overrides (pane v67). Live after-table copies insert a separator paragraph to preserve distinct tables. See `docs/acceptance/106-table-structure.md` for native acceptance and bounded template support.
 
 - Bounded write evidence (#112): `append_markdown`, `replace_body_markdown`, `replace_range_markdown` and file-mode accept/reject return hashes, sizes and a 200-character excerpt instead of the whole before/after (`append_markdown` of one paragraph to a 20K-word document: ~98K to ~175 tokens). The full text stays in the audit log under `evidence_ref`; new `read_audit_evidence` fetches it. `verbose` never restores it.
