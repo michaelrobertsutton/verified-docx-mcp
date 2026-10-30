@@ -307,7 +307,44 @@ def get_table_impl(docx_path: Path, table_id: int, part_name: str = DEFAULT_PART
     }
 
 
+LIVE_MERGE_UNAVAILABLE_WARNING = "live_merge_metadata_unavailable"
+
+
+def compact_table_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Compact a detailed get_table result: ``rows`` become cell-text lists and
+    per-cell merge info becomes a ``merged`` list holding only merged cells.
+
+    A live result with ``has_merged_cells`` cannot name the merged cells (the
+    pane does not report them), so ``merged`` is None and a warning says so --
+    never an empty list that would claim no merges.
+    """
+    out = dict(result)
+    detailed = result["rows"]
+    out["rows"] = [[cell["text"] for cell in row] for row in detailed]
+    if result.get("source") == "live":
+        if result["has_merged_cells"]:
+            out["merged"] = None
+            out["warnings"] = [*result.get("warnings", []), LIVE_MERGE_UNAVAILABLE_WARNING]
+        else:
+            out["merged"] = []
+    else:
+        out["merged"] = [
+            {k: cell[k] for k in ("row_index", "cell_index", "grid_span", "v_merge")}
+            for row in detailed
+            for cell in row
+            if cell["grid_span"] > 1 or cell["v_merge"] != "none"
+        ]
+    return out
+
+
 def execute_get_table(
+    path: str, table_id: int, part: str = DEFAULT_PART, *, source: str = "auto", compact: bool = True
+) -> dict[str, Any]:
+    result = _execute_get_table_detailed(path, table_id, part, source=source)
+    return compact_table_result(result) if compact else result
+
+
+def _execute_get_table_detailed(
     path: str, table_id: int, part: str = DEFAULT_PART, *, source: str = "auto"
 ) -> dict[str, Any]:
     if source not in _LIVE_SOURCES:

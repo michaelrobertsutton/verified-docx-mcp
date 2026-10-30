@@ -366,7 +366,7 @@ class GetTableLiveTests(_TableCase):
         doc.table_meta[0]["style"] = "Fancy"
         doc.table_meta[0]["header"] = 1
         await self.connect_pane(doc)
-        result = await self.get(1)
+        result = await self.get(1, compact=False)
         self.assertEqual(result["source"], "live")
         self.assertEqual(result["table_id"], 1)
         self.assertEqual((result["row_count"], result["col_count"]), (2, 2))
@@ -376,6 +376,26 @@ class GetTableLiveTests(_TableCase):
         self.assertEqual(result["header_row_count"], 1)
         self.assertEqual([[c["text"] for c in row] for row in result["rows"]], [["R1C1", "R1C2"], ["R2C1", "R2C2"]])
         self.assertEqual(result["rows"][1][0], {"row_index": 2, "cell_index": 1, "grid_span": 1, "v_merge": "none", "text": "R2C1"})
+
+    async def test_compact_live_read_is_text_rows(self) -> None:
+        await self.connect_pane(_two_by_two())
+        result = await self.get(1)
+        self.assertEqual(result["rows"], [["R1C1", "R1C2"], ["R2C1", "R2C2"]])
+        self.assertEqual(result["merged"], [])
+        self.assertEqual(result["source"], "live")
+        self.assertNotIn("live_merge_metadata_unavailable", result.get("warnings", []))
+
+    async def test_compact_live_merged_table_flags_unavailable_metadata(self) -> None:
+        doc = _two_by_two()
+        doc.merged_tables = {0}
+        await self.connect_pane(doc)
+        result = await self.get(1)
+        self.assertTrue(result["has_merged_cells"])
+        self.assertIsNone(result["merged"])
+        self.assertIn("live_merge_metadata_unavailable", result["warnings"])
+        detailed = await self.get(1, compact=False)
+        self.assertNotIn("merged", detailed)
+        self.assertNotIn("live_merge_metadata_unavailable", detailed.get("warnings", []))
 
     async def test_merged_flag(self) -> None:
         doc = _two_by_two()
