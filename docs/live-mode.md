@@ -160,6 +160,33 @@ routes that exact situation — the lead has the pursuit's document open,
 with the Live pane loaded — into a live edit instead: the same call that
 would have refused now applies immediately, in front of the lead.
 
+### Anchored find and paragraph targets (issue #113, pane v68)
+
+`replace_text`, `replace_text_batch`, `format_text`, `apply_style`,
+`delete_paragraph` and approved-run `replace_text` accept an anchored find,
+`"<prefix>…<suffix>"` (or `[...]`), with `expected_length` (characters of the
+normalized span, ±2) and/or `find_sha256`. Only those two arguments make a find
+anchored; without them a literal `…` (Word's AutoCorrect makes one) is plain
+text. `replace_text` and its batch also take `para_ref` + `expected_sha256` to
+replace a whole paragraph. Both hashes are `locate.span_sha256` (sha256 of the
+text with straight quotes, whitespace runs collapsed to one space, soft hyphens
+removed); no read returns a paragraph's hash yet, so the caller computes it
+(a read-side hash is a follow-up).
+
+In live mode the server resolves the target on a read of the live body that
+never re-arms a stale shared-bridge client; `revision_before`, the broker's
+baseline and section locks still decide at the write. A span of at most 230
+UTF-16 units without a line break goes to the pane as a plain `find` with
+`expected_matches: 1`, so older panes handle it. A longer span (or one holding a
+soft line break) is sent as a literal prefix and suffix plus the span's hash and
+needs the pane capability `anchored_find_v1` (pane v68,
+`taskpane.js?v=68b`); an older pane gets `LIVE_CAPABILITY_MISSING`. The pane
+pairs each prefix hit with the nearest suffix in the same paragraph, keeps the
+span whose hash matches, and re-checks the hash right before writing. It looks
+at the first 50 prefix hits only, so the server refuses with `AMBIGUOUS_SPAN`
+when the prefix it would send occurs more often. Body only: text-box scopes and
+`within_row_containing` take a plain find in live mode.
+
 ### Why a file-mode write refuses under a live pane (issue #154)
 
 `auto` originally required BOTH a connected pane session AND

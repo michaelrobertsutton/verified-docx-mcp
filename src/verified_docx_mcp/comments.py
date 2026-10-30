@@ -50,6 +50,8 @@ from __future__ import annotations
 import copy
 import secrets
 import zipfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -297,6 +299,70 @@ class _CommentParts:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class StagedComment:
+    """One comment staged on an in-memory document (``stage_anchored_comment``)."""
+
+    locate_result: LocateResult
+    before_excerpt: str
+    durable_ids: list[str]  # one per matched span
+    anchored_text: dict[str, str]  # w:id -> the document text its anchor must bracket
+    next_comment_id: int
+
+
+def stage_anchored_comment(
+    document_root: Any,
+    parts: _CommentParts,
+    *,
+    quote: str,
+    text: str,
+    expected_matches: int,
+    author: str,
+    date: str,
+    taken_hex: set[str],
+    next_comment_id: int,
+    span_filter_for: Callable[[projection.Projection], Callable[[int, int], bool]] | None = None,
+) -> StagedComment:
+    """Locate *quote* in *document_root* (projected fresh, so earlier staged comments are
+    seen) and stage a comment on every match: anchors into the tree, the comment into
+    *parts*. ``span_filter_for`` builds a ``locate`` span_filter from the projection
+    (``add_anchored_comment_batch``'s ``section_key``). Writes nothing to disk."""
+    proj = projection.project_document_root(document_root)
+    span_filter = span_filter_for(proj) if span_filter_for is not None else None
+    locate_result: LocateResult = locate(quote, proj, expected_matches, span_filter=span_filter)
+    before_excerpt = text_edit._excerpt(proj.text, locate_result.spans[0][0], locate_result.spans[0][1])
+
+    durable_ids: list[str] = []
+    anchored: dict[str, str] = {}
+    for start, end in locate_result.spans:
+        cid = str(next_comment_id)
+        next_comment_id += 1
+        para_id = _new_hex_id(taken_hex)
+        durable_id = _new_hex_id(taken_hex)
+        durable_ids.append(durable_id)
+        anchored[cid] = proj.text[start:end]
+
+        _insert_anchor(proj, start, end, comment_id=cid)
+        _append_comment(parts.comments_root, comment_id=cid, para_id=para_id, author=author, date=date, text=text)
+        _append_comment_ex(parts.ext_root, para_id=para_id)
+        _append_comment_id(parts.ids_root, para_id=para_id, durable_id=durable_id)
+        _append_comment_extensible(parts.cex_root, durable_id=durable_id, date_utc=date)
+    return StagedComment(locate_result, before_excerpt, durable_ids, anchored, next_comment_id)
+
+
+def assert_ids_bracket_text(proj: projection.Projection, expected: dict[str, str]) -> None:
+    """Every comment w:id in *expected* anchors text equal (modulo whitespace) to its value."""
+    by_id: dict[str, list[str]] = {}
+    for event in proj.events:
+        if isinstance(event, projection.RunEvent):
+            for cid in event.comment_ids:
+                by_id.setdefault(cid, []).append(event.text)
+    for cid, want in expected.items():
+        got = "".join(by_id.get(cid, []))
+        if " ".join(got.split()) != " ".join(want.split()):
+            raise ValueError(f"comment anchor {cid} brackets {got!r}, expected {want!r} (modulo whitespace)")
+
+
 def execute_add_anchored_comment(
     path: str,
     quote: str,
@@ -316,8 +382,6 @@ def execute_add_anchored_comment(
     )
 
     document_root, raw_xml = mutations._load_document(resolved)
-    proj = projection.project_document_root(document_root)
-    locate_result: LocateResult = locate(quote, proj, expected_matches)
 
     author = resolve_author_name()
     date = tracked_changes.current_revision_date()
@@ -326,21 +390,13 @@ def execute_add_anchored_comment(
     next_comment_id = _next_comment_id(parts.comments_root if not parts.comments_created else None)
     taken_hex = _existing_hex_ids(parts.ext_root, parts.ids_root)
 
-    before_excerpt = text_edit._excerpt(proj.text, locate_result.spans[0][0], locate_result.spans[0][1])
-
-    comment_ids_created: list[str] = []
-    for start, end in locate_result.spans:
-        cid = str(next_comment_id)
-        next_comment_id += 1
-        para_id = _new_hex_id(taken_hex)
-        durable_id = _new_hex_id(taken_hex)
-        comment_ids_created.append(durable_id)
-
-        _insert_anchor(proj, start, end, comment_id=cid)
-        _append_comment(parts.comments_root, comment_id=cid, para_id=para_id, author=author, date=date, text=text)
-        _append_comment_ex(parts.ext_root, para_id=para_id)
-        _append_comment_id(parts.ids_root, para_id=para_id, durable_id=durable_id)
-        _append_comment_extensible(parts.cex_root, durable_id=durable_id, date_utc=date)
+    staged = stage_anchored_comment(
+        document_root, parts, quote=quote, text=text, expected_matches=expected_matches,
+        author=author, date=date, taken_hex=taken_hex, next_comment_id=next_comment_id,
+    )
+    locate_result = staged.locate_result
+    before_excerpt = staged.before_excerpt
+    comment_ids_created = staged.durable_ids
 
     _ensure_person(parts.people_root, author=author)
 
