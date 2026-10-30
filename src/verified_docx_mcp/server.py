@@ -865,7 +865,7 @@ def live_document_lock(path: str, release: bool = False, lease_s: float = 60) ->
 
 
 @mcp.tool(annotations=_READ_ONLY)
-def live_list_sections(path: str, compact: bool = False) -> dict[str, Any]:
+def live_list_sections(path: str, compact: bool = False, content_digests: bool = False) -> dict[str, Any]:
     """List the live document's heading sections as the Word pane sees them.
 
     Each entry has ``section_key`` (the find_sections convention: heading slug plus
@@ -878,23 +878,70 @@ def live_list_sections(path: str, compact: bool = False) -> dict[str, Any]:
     body_sha12}`` instead (no 64-hex hashes, slugs or counts, so much smaller): sha12 is
     the first 12 hex of ``sectionSha256``, which find_sections(digests=true) also
     reports for unchanged text. Section locks still key on the full hash internally.
+
+    ``content_digests=true`` adds ``content_sections: [[section_key, content_sha12],
+    ...]`` and ``preamble_content_sha12`` (see find_sections) beside ``sections``,
+    computed server-side from one body_ooxml export taken after the section list
+    (LIVE_OP_FAILED if the body changed between the two and a re-list does not
+    match). content_sections is keyed by the server's own section keys; if they
+    differ from the pane's, ``warnings`` carries ``content_sections_key_mismatch``
+    and ``content_sections_key_mismatch`` lists them (never silently paired).
+    Export fidelity warnings (``live_styles_missing``, ...) also go in
+    ``warnings``. Like the list itself, this never re-arms a shared-bridge write
+    baseline.
     """
-    from .live import comments_live, write_mode
+    from .live import comments_live, reads_live, write_mode
     from .live.session import LiveError
 
     try:
         session = write_mode.live_session_for(path)
         write_mode.require_capability(session, "section_locks", feature_description="live_list_sections")
         reply = comments_live._request(session, "sections_list", {})
-        if not compact:
-            return reply
-        return {
-            "sections": [
-                [sec["section_key"], sec["heading_text"], sec["sectionSha256"][:12]]
-                for sec in reply.get("sections", [])
-            ],
-            "body_sha12": str(reply.get("bodySha256", ""))[:12],
-        }
+        content: reads_live.BodyDigests | None = None
+        if content_digests:
+            write_mode.require_capability(
+                session, reads_live.BODY_OOXML_CAPABILITY, feature_description="live_list_sections(content_digests=true)"
+            )
+            content = reads_live.body_digests_from_ooxml(session, write_mode._document_name(path), content=True)
+            if reply.get("bodySha256") != content.body_sha256:
+                # The body moved between the list and the export: re-list once (cheap).
+                reply = comments_live._request(session, "sections_list", {})
+                if reply.get("bodySha256") != content.body_sha256:
+                    raise _make_error(
+                        ErrorCode.LIVE_OP_FAILED,
+                        "the live document changed while its sections were being digested; retry.",
+                        {"stage": "content_digests_snapshot"},
+                    )
+        result: dict[str, Any]
+        if compact:
+            result = {
+                "sections": [
+                    [sec["section_key"], sec["heading_text"], sec["sectionSha256"][:12]]
+                    for sec in reply.get("sections", [])
+                ],
+                "body_sha12": str(reply.get("bodySha256", ""))[:12],
+            }
+        else:
+            result = reply
+        if content is not None:
+            result = {
+                **result,
+                "content_sections": content.content_sections,
+                "preamble_content_sha12": content.preamble_content_sha12,
+            }
+            warnings = list(content.warnings)
+            pane_keys = [sec.get("section_key") for sec in reply.get("sections", [])]
+            server_keys = [key for key, _sha in content.content_sections]
+            if pane_keys != server_keys:
+                warnings.append("content_sections_key_mismatch")
+                result["content_sections_key_mismatch"] = {
+                    "pane_only": [k for k in pane_keys if k not in server_keys],
+                    "server_only": [k for k in server_keys if k not in pane_keys],
+                    "order_differs": sorted(map(str, pane_keys)) == sorted(server_keys),
+                }
+            if warnings:
+                result["warnings"] = warnings
+        return result
     except LiveError as exc:
         try:
             comments_live._raise_from_live_error(exc)
@@ -905,7 +952,7 @@ def live_list_sections(path: str, compact: bool = False) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=_READ_ONLY)
-def live_revision(path: str) -> dict[str, Any]:
+def live_revision(path: str, content_digests: bool = False) -> dict[str, Any]:
     """The live document's current revision and per-section digests, without
     reading the body.
 
@@ -922,14 +969,23 @@ def live_revision(path: str) -> dict[str, Any]:
     discards it (``via: "body_ooxml_fallback"``): correct, not cheap. Reload the
     pane to get the fast path.
 
+    ``content_digests=true`` also returns ``content_sections: [[section_key,
+    content_sha12], ...]`` and ``preamble_content_sha12`` (see find_sections):
+    one body_ooxml export (``via: "body_ooxml"``) from which every value in the
+    reply is computed, so they describe the same snapshot; ``sections`` then
+    comes from this server's projection of the export, not from the pane. Costs a body transfer;
+    use it to decide which sections to sync, and sha12 for "did the prose change".
+
     Errors: LIVE_UNAVAILABLE (no pane), LIVE_SESSION_MISMATCH, LIVE_OP_FAILED,
-    LIVE_CAPABILITY_MISSING (the pane offers neither body_hash_v1 nor body_ooxml).
+    LIVE_CAPABILITY_MISSING (the pane offers neither body_hash_v1 nor body_ooxml,
+    or no body_ooxml with content_digests=true), INVALID_INPUT (comment threading
+    that cannot be interpreted, content_digests=true only).
     """
     from .live import comments_live, reads_live
     from .live.session import LiveError
 
     try:
-        return reads_live.live_revision(path)
+        return reads_live.live_revision(path, content_digests=content_digests)
     except LiveError as exc:
         try:
             comments_live._raise_from_live_error(exc)
@@ -1385,15 +1441,33 @@ def execute_find_sections(
     path: str, part: str = projection.DEFAULT_PART, source: str = "auto", digests: bool = False
 ) -> dict[str, Any]:
     with reads_live.read_source(path, source, part) as rs:
-        return rs.annotate(
-            {
-                "path": str(rs.resolved),
-                "part": part,
-                "sections": projection.find_sections_impl(
-                    rs.local_path, part, digests=digests, ignore_trailing_empty=rs.source == "live"
-                ),
+        trailing = rs.source == "live"
+        unavailable: VerifyError | None = None
+        try:
+            sections, preamble = projection.find_sections_and_preamble(
+                rs.local_path, part, digests=digests, content_digests=digests, ignore_trailing_empty=trailing
+            )
+        except VerifyError as exc:
+            if not digests or exc.envelope.diagnostics.get("stage") != "content_digest":
+                raise
+            # A caller who wants sha12 must not lose it to comment/table canonicalization.
+            unavailable = exc
+            sections, preamble = projection.find_sections_and_preamble(
+                rs.local_path, part, digests=True, ignore_trailing_empty=trailing
+            )
+            for sec in sections:
+                if sec["kind"] == "heading":
+                    sec["content_sha12"] = None
+        result: dict[str, Any] = {"path": str(rs.resolved), "part": part, "sections": sections}
+        if digests:
+            result["preamble_content_sha12"] = preamble
+        if unavailable is not None:
+            result["warnings"] = ["content_digest_unavailable"]
+            result["content_digest_unavailable"] = {
+                "reason": unavailable.envelope.message,
+                "diagnostics": unavailable.envelope.diagnostics,
             }
-        )
+        return rs.annotate(result)
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -1440,6 +1514,28 @@ def find_sections(
     compact=true, live_revision) for unchanged text. Checked against real Word for
     plain text, soft line breaks and <w:tab/> tabs; field results, tracked deletions
     and a literal tab character typed inside a w:t are NOT verified and may differ.
+    sha12 is what section locks compare; use it for "did the prose change".
+
+    digests=true also adds content_sha12 to each heading entry and a top-level
+    preamble_content_sha12 (content before the first heading; the whole part if
+    it has none): a digest of what sync acts on -- paragraph texts, tracked
+    deletions (text and position), table structure (rows, cells, gridSpan,
+    vMerge, nested tables) and the root comments anchored in the section (author,
+    text, resolved, replies in order, orphaned replies). Formatting, images, text
+    boxes, footnotes/endnotes, rsids/paraIds, bookmarks, proofing marks and
+    comment dates/ids are excluded; so are accepting a tracked insertion (it is
+    plain text), anchor moves within the same paragraph, tblGrid column count,
+    gridBefore/gridAfter, legacy hMerge and tracked paragraph-mark deletions.
+    Computed only by this server from OOXML (a live read uses the pane's
+    body_ooxml export); file and live agreed on Word-saved documents in the
+    real-Word probe (docs/acceptance/117-content-digest.md), though Word's
+    "remove personal information on save" rewrites saved comment authors.
+    live_revision / live_list_sections return the same value with
+    content_digests=true. When the
+    comments or tables cannot be canonicalized (duplicate comment ids, a parent
+    cycle, a non-numeric gridSpan, ...), content_sha12 and preamble_content_sha12
+    are null, sha12 is still returned, and warnings carries
+    "content_digest_unavailable" with the reason in content_digest_unavailable.
 
     Not gated by DOCX_LOCKED — see list_parts' docstring.
 

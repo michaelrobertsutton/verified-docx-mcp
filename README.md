@@ -63,7 +63,8 @@ Tools implemented so far:
   the rendered body to an allowed path and returns only
   `{written_to, sha256, chars, paragraph_count, sections}`;
   `find_sections` entries carry `chars`, and `find_sections(digests=true)`
-  adds `sha12`, a per-section digest that agrees with the live pane's.
+  adds `sha12` and `content_sha12` per section plus `preamble_content_sha12`
+  (see [Section digests](#section-digests-sha12-and-content_sha12)).
 - **`replace_body_markdown(path, markdown, ...)`**,
   **`replace_range_markdown(path, section_key, markdown, ...)`**,
   **`append_markdown(path, markdown, ...)`** — markdown -> OOXML writes,
@@ -473,6 +474,53 @@ It needs the pane capability `body_hash_v1` (reload the pane after upgrading);
 an older pane still works through a `body_ooxml` fallback, reported as
 `via: "body_ooxml_fallback"`. `live_list_sections(compact=true)` returns
 `[[section_key, heading_text, sha12], ...]` instead of the 64-hex hashes.
+
+#### Section digests: `sha12` and `content_sha12`
+
+Two per-section digests, keyed by the same `section_key` (heading slug plus
+ordinal; a section runs from its heading to the next heading at any level):
+
+| | `sha12` | `content_sha12` (issue #117) |
+|---|---|---|
+| Covers | The section's paragraph texts joined with `\n`, table-cell paragraphs included (soft break = U+000B) | Paragraph texts, tracked deletions (text and position), table structure (rows, cells, `gridSpan`, `vMerge`, nested tables) and the root comments anchored in the section (author, text, resolved state, replies in order, orphaned replies) |
+| Ignores | Everything else | Formatting, images, text boxes, footnotes/endnotes, rsids/paraIds, bookmarks, proofing marks, comment dates and ids (see the limits below) |
+| Computed by | The pane (`sectionSha256`) and the server, defined to agree | The server only, from OOXML: the `.docx` in file mode, the pane's `body_ooxml` export in live mode. File and live agreed on Word-saved documents in the recorded real-Word probe ([docs/acceptance/117-content-digest.md](docs/acceptance/117-content-digest.md)) |
+| Returned by | `find_sections(digests=true)`, `live_revision`, `live_list_sections` | `find_sections(digests=true)`, `live_revision(content_digests=true)`, `live_list_sections(content_digests=true)` |
+| Use it for | "Did the prose change"; section locks compare it | Deciding whether a section needs syncing (text, tables or comments) |
+
+`content_sha12` is the first 12 hex of the sha256 of the canonical JSON item
+list documented in `projection.section_content_items`. Content before the first
+heading (the whole body if there is none) has its own `preamble_content_sha12`.
+A comment spanning two sections counts in both. With `content_digests=true`,
+`live_revision` and `live_list_sections` take one `body_ooxml` export (a body
+transfer, not the one-round-trip `body_hash`) and add `content_sections:
+[[section_key, content_sha12], ...]` beside the unchanged `sections` rows, so a
+stored digest is still looked up by `section_key`. In `live_revision(content_digests=true)`
+the `sha12` rows also come from the server's projection of that export, not from the
+pane. `live_list_sections` keys `content_sections` by the server's own section keys and
+reports `content_sections_key_mismatch` in `warnings` if they differ from the pane's;
+export fidelity warnings such as `live_styles_missing` are passed through too.
+
+When comments or tables cannot be canonicalized (a parent cycle, duplicate comment
+ids, a non-numeric `gridSpan`), `find_sections(digests=true)` still returns `sha12`,
+sets `content_sha12` and `preamble_content_sha12` to null and adds the warning
+`content_digest_unavailable` (reason in `content_digest_unavailable`). An explicit
+`content_digests=true` on the live tools raises `INVALID_INPUT` instead.
+
+Coverage limits of `content_sha12`, so a skip built on it knows what it misses:
+
+- A tracked insertion counts as plain text, so accepting one does not change the
+  digest (rejecting it does, since the text goes away).
+- Comments are placed by paragraph: moving an anchor within the same paragraph(s)
+  is not seen. Only the order of roots, by `commentRangeStart`, is.
+- Excluded: the `tblGrid` column count, `gridBefore`/`gridAfter`, legacy `hMerge`,
+  tracked paragraph-mark deletions, footnotes/endnotes and text boxes.
+- Word's "remove personal information from file properties on save" replaces
+  comment authors in the saved file, so a saved file's digest can differ from the
+  live one.
+- A deletion split across runs or `w:del` elements (some non-Word producers) is
+  merged before hashing; other run-splitting differences between producers are not
+  normalized beyond what `sha12` already does.
 
 On POSIX several MCP processes share one bridge by default (one owner, the
 rest attach; automatic re-election if the owner exits). Set

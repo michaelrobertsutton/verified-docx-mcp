@@ -99,6 +99,19 @@ class LiveRevisionTests(LiveRevisionTestCase):
         ]
         self.assertEqual(result["sections"], file_side)
 
+    async def test_content_digests_take_one_body_ooxml_and_no_body_hash(self) -> None:
+        """Issue #117: every value comes from one body_ooxml snapshot, even on a body_hash_v1 pane."""
+        pane = await self.connect_live()
+        result = await self.call(reads_live.live_revision, str(self.target), content_digests=True)
+        self.assertEqual((pane.body_ooxml_requests, pane.body_hash_requests), (1, 0))
+        self.assertEqual(result["via"], "body_ooxml")
+        self.assertEqual(result["revision"], f"live:sha256:{pane.document.sha256()}")
+        file_sections, preamble = projection.find_sections_and_preamble(LIVE_BODY, digests=True, content_digests=True)
+        heads = [s for s in file_sections if s["kind"] == "heading"]
+        self.assertEqual(result["sections"], [[s["section_key"], s["sha12"]] for s in heads])
+        self.assertEqual(result["content_sections"], [[s["section_key"], s["content_sha12"]] for s in heads])
+        self.assertEqual(result["preamble_content_sha12"], preamble)
+
     async def test_pane_with_neither_capability_is_refused(self) -> None:
         await self.connect_live(capabilities=[])
         with self.assertRaises(VerifyError) as ctx:

@@ -203,6 +203,16 @@ class FindSectionsSizeAndDigestTests(RangedReadTestCase):
         self.assertEqual(digested["background-1"]["sha12"], expected)
         self.assertEqual(digested["background-1"]["chars"], len("Background\nBackground text."))
 
+    def test_content_sha12_is_the_canonical_items_digest(self):
+        """Issue #117: digests=true also carries content_sha12 and preamble_content_sha12."""
+        result = server.execute_find_sections(str(self.sections), digests=True)
+        digested = {s["section_key"]: s for s in result["sections"]}
+        items = [["p", "Background"], ["p", "Background text."]]
+        canonical = json.dumps(items, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        self.assertEqual(digested["background-1"]["content_sha12"], hashlib.sha256(canonical.encode()).hexdigest()[:12])
+        self.assertEqual(result["preamble_content_sha12"], hashlib.sha256(b"[]").hexdigest()[:12])
+        self.assertNotIn("preamble_content_sha12", server.execute_find_sections(str(self.sections)))
+
     def test_live_body_trailing_empty_paragraph_is_ignored_for_digests(self):
         """Real Word (#110): Body.getOoxml() appends one empty paragraph Body.paragraphs lacks,
         so a live body projection's last section must be digested without it."""

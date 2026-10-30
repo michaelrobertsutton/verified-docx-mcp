@@ -1242,6 +1242,29 @@ same way unless the document has a nested table, which `table_get` refuses.)
   `paragraph_count` is one higher. Markdown, tables and run text are
   otherwise identical (checked on real Word against a Word-saved copy of
   the same document: headings, bullets, numbered list, table, image).
+- **Content digests (#117).** `content_sha12` (sections) and
+  `preamble_content_sha12` cover text, tracked deletions, table structure and
+  anchored comment threads. They are computed only by the server, from this
+  same `body_ooxml` export (no pane capability; any pane with `body_ooxml`
+  works), with the appended empty paragraph above dropped. Live and file values
+  agreed on Word-saved documents in the recorded real-Word probe
+  (`docs/acceptance/117-content-digest.md`); the saved file can still differ
+  if Word's "remove personal information on save" rewrites comment authors.
+  `find_sections(source="live", digests=true)`,
+  `live_revision(content_digests=true)` and
+  `live_list_sections(content_digests=true)` each take exactly one export.
+  With `content_digests=true`, `live_revision`'s `sha12` rows are the server's
+  projection of that export, not the pane's digests; `live_list_sections`
+  keeps the pane's rows, keys `content_sections` by the server's keys, and
+  warns `content_sections_key_mismatch` when the two key lists differ. Export
+  fidelity warnings (`live_styles_missing`, ...) come back in `warnings`.
+  `live_revision` stays an observed read that re-arms the shared-bridge write
+  baseline; `live_list_sections` stays non-observing. `sha12`,
+  `sectionSha256` and section locks are unchanged. Not covered: accepting a
+  tracked insertion (insertions count as plain text), anchor moves within the
+  same paragraph, `tblGrid` column count, `gridBefore`/`gridAfter`, legacy
+  `hMerge`, tracked paragraph-mark deletions, footnotes/endnotes and text
+  boxes (see the README's "Section digests").
 - **Warnings specific to live reads.** `live_styles_missing` /
   `live_numbering_missing`: the body references styles or numbering but
   Word's export omitted that part, so headings or lists may render wrongly.
