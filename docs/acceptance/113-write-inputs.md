@@ -34,7 +34,7 @@ accepted separately (`docs/acceptance/107-cell-editing.md`).
 
 ## Unit gate
 
-`uv run pytest tests/unit`: 1634 passed on the combined branch.
+`uv run pytest tests/unit`: 1577 passed on the combined branch.
 `test_shared_bridge.py::test_sigterm_terminates_stdio_server` is deselected: it is a timing flake
 that predates this branch.
 
