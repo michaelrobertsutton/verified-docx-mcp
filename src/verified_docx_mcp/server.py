@@ -4539,6 +4539,11 @@ def live_changes_prepare(path: str, operations: list[dict[str, Any]], track_chan
     replace_text args may also include replacement_segments with the complete
     explicit font/hyperlink schema documented on replace_text; concatenated segment
     text must equal replace. The approval preview includes the exact segments.
+    replace_text may name its target as an anchored find ("<prefix>…<suffix>" with
+    expected_length and/or find_sha256) or as {para_ref, expected_sha256} where pN counts
+    the section's paragraphs (p0 = its heading). Prepare resolves it against the section as
+    the earlier operations leave it; the manifest stores the resolved full find (no 230-
+    character limit then; over 230 needs anchored_find_v1) and the preview shows it.
     Requires approved_changes_v1; explicit segments also require formatted_replacements_v1.
     """
     from .live.approved_changes import prepare

@@ -16,15 +16,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fake_pane import FakeDocument, FakePane, OpRefused  # noqa: E402
-from test_anchored_find import FIND, LONG  # noqa: E402
-from test_live_write_mode import LiveWriteBridgeTestCase  # noqa: E402
+from fake_pane import FakeDocument, FakePane, OpRefused
+from test_anchored_find import FIND, LONG
+from test_live_write_mode import LiveWriteBridgeTestCase
 
-from verified_docx_mcp import locate, paths, text_edit  # noqa: E402
-from verified_docx_mcp.errors import ErrorCode, VerifyError  # noqa: E402
-from verified_docx_mcp.live import bridge, paragraphs_live, shared  # noqa: E402
-from verified_docx_mcp.live.protocol import HelloMessage  # noqa: E402
-from verified_docx_mcp.live.session import LiveOpFailed  # noqa: E402
+from verified_docx_mcp import locate, paths, text_edit
+from verified_docx_mcp.errors import ErrorCode, VerifyError
+from verified_docx_mcp.live import bridge, paragraphs_live, shared
+from verified_docx_mcp.live.protocol import HelloMessage
+from verified_docx_mcp.live.session import LiveOpFailed
 
 DEFAULT_CAPS = FakePane().capabilities
 CAPS = [*DEFAULT_CAPS, "anchored_find_v1", "delete_paragraph"]
@@ -101,7 +101,7 @@ class LiveAnchoredTests(LiveWriteBridgeTestCase):
             await pane.close()
 
     async def test_anchored_format_text_live(self) -> None:
-        doc, pane = await self.open()
+        _doc, pane = await self.open()
         evidence = await asyncio.to_thread(
             text_edit.execute_format_text, str(self.target), FIND, {"bold": True}, None,
             find_sha256=locate.span_sha256(LONG), write_mode="live",
@@ -147,7 +147,7 @@ class LiveAnchoredTests(LiveWriteBridgeTestCase):
             self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
 
     async def test_delete_paragraph_with_an_anchored_anchor_text(self) -> None:
-        doc, pane = await self.open()
+        doc, _pane = await self.open()
         evidence = await asyncio.to_thread(
             paragraphs_live.delete_paragraph, str(self.target), FIND, _rev(doc), False, 412, None
         )

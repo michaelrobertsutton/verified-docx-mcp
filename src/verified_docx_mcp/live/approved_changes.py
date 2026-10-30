@@ -37,7 +37,7 @@ RETRY = {"LIVE_STALE", "LOCKED_BY_OTHER_CLIENT"}
 REFUSED = RETRY | {"MATCH_COUNT_MISMATCH", "ZERO_MATCH", "INVALID_INPUT", "CELL_TEXT_MISMATCH",
                    "LIVE_CAPABILITY_MISSING", "OUTSIDE_LOCKED_SECTION", "ANCHORED_SHAPES",
                    "WOULD_DELETE_COMMENTS", "LOCK_SCOPE_UNRESOLVED", "MIXED_FORMATTING",
-                   "STRUCTURAL_BOUNDARY", "TRACKED_CHANGES_PRESENT"}
+                   "STRUCTURAL_BOUNDARY", "TRACKED_CHANGES_PRESENT", "AMBIGUOUS_SPAN", "PARA_HASH_MISMATCH"}
 
 
 def invalid(message):
@@ -211,14 +211,40 @@ def changed_targets(before, after):
     return changed
 
 
+# Issue #113: a replace_text operation may name its target as an anchored find
+# ("<prefix>…<suffix>" + expected_length and/or find_sha256) or as a paragraph of its
+# section (para_ref "pN", N counted within the section with p0 its heading, +
+# expected_sha256). prepare() resolves either against the projected section state and
+# stores the resolved full find in the manifest, so the digest binds the exact text.
+_ANCHORED_ARGS = {"find", "replace", "expected_matches", "expected_length", "find_sha256"}
+_PARA_ARGS = {"para_ref", "expected_sha256", "replace"}
+_RESOLVED_ARGS = ("prefix", "suffix", "expected_text_sha256")
+
+
+def _replace_target_kind(args):
+    """"plain" / "anchored" / "para_ref" for replace_text args, or None when malformed."""
+    from ..locate import split_anchored
+    keys = set(args) - {"replacement_segments"}
+    if "para_ref" in keys:
+        return "para_ref" if keys == _PARA_ARGS else None
+    find = args.get("find")
+    if isinstance(find, str) and split_anchored(find) is not None:
+        ok = {"find", "replace"} <= keys <= _ANCHORED_ARGS and keys & {"expected_length", "find_sha256"}
+        return "anchored" if ok else None
+    return "plain" if keys == OPS["replace_text"] else None
+
+
 def validate(operations):
+    from ..locate import check_anchored_args
     if not isinstance(operations, list) or not 1 <= len(operations) <= 500:
         raise invalid("Supply 1..500 ordered operations")
     for i, item in enumerate(operations):
         if not isinstance(item, dict) or set(item) != {"op", "section", "args"} or item.get("op") not in OPS:
             raise invalid(f"Operation {i} requires op, section and args from the supported operation set")
         op, args = item["op"], item["args"]
-        if not isinstance(args, dict) or set(args) - ({"replacement_segments"} if op == "replace_text" else set()) != OPS[op]:
+        kind = _replace_target_kind(args) if op == "replace_text" and isinstance(args, dict) else None
+        if not isinstance(args, dict) or (op == "replace_text" and kind is None) or (
+                op != "replace_text" and set(args) != OPS[op]):
             raise invalid(f"Operation {i} has unexpected or missing arguments")
         if op != "live_save" and (not isinstance(item["section"], str) or not item["section"]):
             raise invalid("Every text operation must name its protected section slug")
@@ -237,13 +263,81 @@ def validate(operations):
             elif key == "expected_matches":
                 if type(value) is not int or value != 1:
                     raise invalid("expected_matches must be integer 1")
+            elif key == "expected_length":
+                if type(value) is not int or value < 1:
+                    raise invalid("expected_length must be a positive integer")
             elif not isinstance(value, str):
                 raise invalid(f"{key} must be text")
-        if op == "replace_text" and (not args["find"] or len(args["find"]) > 230 or
-                                     any(c in args["find"] + args["replace"] for c in "\r\n")):
+        if kind == "anchored":
+            check_anchored_args(args.get("expected_length"), args.get("find_sha256"))
+        if kind == "para_ref" and not re.fullmatch(r"[0-9a-fA-F]{64}", args["expected_sha256"]):
+            raise invalid("expected_sha256 must be 64 hex characters")
+        if kind == "plain" and (not args["find"] or len(args["find"]) > 230):
+            raise invalid("Text replacements need a nonempty find <=230 characters and no paragraph breaks")
+        if op == "replace_text" and any(c in args.get("find", "") + args["replace"] for c in "\r\n"):
             raise invalid("Text replacements need a nonempty find <=230 characters and no paragraph breaks")
         if op == "live_save" and i != len(operations) - 1:
             raise invalid("live_save must be the last operation")
+
+
+def resolve_target(sections, operation, session):
+    """Resolve an anchored or para_ref replace_text against the projected section state
+    *sections* (so an operation can target an earlier operation's output). Returns the
+    resolved args: the full ``find`` plus ``prefix``, ``suffix`` and ``expected_text_sha256``.
+    A resolved find over 230 characters is sent to the pane in the anchored form and needs
+    ``anchored_find_v1``; the pane's own pairing is replayed over the section first, so a
+    span it could not single out is refused here, not at execution."""
+    from .. import locate, projection
+    args = operation["args"]
+    kind = _replace_target_kind(args)
+    if kind == "plain":
+        return args
+    found = [s for s in sections if s["slug"] == operation["section"]]
+    if len(found) != 1:
+        raise invalid("Operation needs one prepared section")
+    section = found[0]
+    units = list(section["paragraphs"]) + [c for t in section["tables"] for row in t["rows"] for c in row]
+    if kind == "para_ref":
+        try:
+            index = projection.para_index(args["para_ref"])
+        except ValueError:
+            index = -1
+        if not 1 <= index < len(section["paragraphs"]):
+            raise invalid(f"para_ref must name a body paragraph p1..p{len(section['paragraphs']) - 1} of the "
+                          "section (p0 is its protected heading)")
+        resolved = section["paragraphs"][index]
+        if locate.span_sha256(resolved) != args["expected_sha256"].lower():
+            raise _make_error(ErrorCode.PARA_HASH_MISMATCH,
+                              f"paragraph {args['para_ref']} of the section no longer matches expected_sha256",
+                              {"para_ref": args["para_ref"], "excerpt": resolved[:80]})
+        anchors = locate.pane_anchors(resolved) if resolved else ("", "")
+    else:
+        unit, span = locate.resolve_anchored_in_units(
+            args["find"], units, expected_length=args.get("expected_length"), find_sha256=args.get("find_sha256"))
+        resolved = units[unit][span.start:span.end]
+        if any(c in resolved for c in "\r\n\v"):
+            raise invalid("The resolved span crosses a line break; approved text replacements stay within one line")
+        anchors = locate.pane_anchors(resolved, span.prefix_end - span.start, span.end - span.suffix_start)
+    if not resolved or any(c in resolved for c in "\r\n\v"):
+        raise invalid("The target paragraph is empty or holds a line break; use a plain find")
+    digest = locate.span_sha256(resolved)
+    if len(resolved) > locate.PANE_SEARCH_MAX:
+        wm.require_capability(session, "anchored_find_v1",
+                              feature_description=f"a {len(resolved)}-character approved replacement")
+        offsets, cursor = [], 0
+        for text in units:
+            offsets.append((cursor, text))
+            cursor += len(text) + 1
+        hits = locate.exact_anchored_spans(offsets, anchors[0], anchors[1], digest)
+        if len(hits) != 1:
+            raise _make_error(ErrorCode.AMBIGUOUS_SPAN if len(hits) > 1 else ErrorCode.INVALID_INPUT,
+                              "Word's search cannot single out the resolved span in its section",
+                              {"total": len(hits)})
+    out = {"find": resolved, "replace": args["replace"], "expected_matches": 1,
+           "prefix": anchors[0], "suffix": anchors[1], "expected_text_sha256": digest}
+    if "replacement_segments" in args:
+        out["replacement_segments"] = args["replacement_segments"]
+    return out
 
 
 def prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = False) -> dict:
@@ -271,6 +365,8 @@ def prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = F
         current = initial
         targets, preconditions = [], []
         for operation in operations:
+            if operation["op"] == "replace_text":
+                operation["args"] = resolve_target(current, operation, session)
             keys = target_keys(current, operation)
             targets.append(keys)
             preconditions.append({key:target_value(current,key) for key in keys})
@@ -315,6 +411,9 @@ def preview_entry(operation: dict[str, Any]) -> dict[str, Any]:
         entry["cells"] = [_clip(c) for c in args["cells"]]
     if operation["op"] == "replace_text":
         entry["expected_matches"] = args.get("expected_matches", 1)
+        if "expected_text_sha256" in args:  # resolved from an anchored find or para_ref (issue #113)
+            entry["find_chars"] = len(args["find"])
+            entry["find_sha256"] = args["expected_text_sha256"]
     if "replacement_segments" in args:
         entry["replacement_segments"] = args["replacement_segments"]
     return entry
@@ -379,7 +478,14 @@ def apply(path, operation, track_changes=False):
             if args.get("replacement_segments") is not None:
                 wm.require_capability(session, "formatted_replacements_v1", feature_description="explicit formatted replacements")
             before, after = args["find"], args["replace"]
-            result = session.request_threadsafe("replace", {**args, **common, "allow_comment_loss": False,
+            send = {k: v for k, v in args.items() if k not in _RESOLVED_ARGS}
+            if "expected_text_sha256" in args and len(args["find"]) > 230:
+                # Issue #113: longer than one Word search; the pane pairs prefix and suffix and
+                # re-checks the approved span's hash at the mutation boundary.
+                wm.require_capability(session, "anchored_find_v1", feature_description="long approved replacements")
+                send.pop("find")
+                send.update({k: args[k] for k in _RESOLVED_ARGS})
+            result = session.request_threadsafe("replace", {**send, **common, "allow_comment_loss": False,
                                                            "inherit_format": "replaced", "scope": "body"})
             if args.get("replacement_segments") is not None:
                 from ..formatted_text import validate_segments
