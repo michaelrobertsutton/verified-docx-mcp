@@ -31,7 +31,11 @@ were replaced; the fake-pane tests could not have shown either.
 | Merge of two paragraphs with different properties | PASS (refused before writing; see below) |
 | `insert_paragraphs` `after_table_id`; `empty_paragraph_after_table_id`; fill of a non-empty paragraph | PASS (inserted; filled; refused) |
 | `replace_text_batch` with identical text in two tables, one `within_row_containing` per edit | PASS: both edits applied (the original `MATCH_COUNT_MISMATCH` case) |
-| `live_save` through the shared broker | PASS (see "Not covered") |
+| `live_save` through the shared broker | PASS |
+| **`live_save` after a person typed** (baseline read, then text typed into the document through Word, then save) | PASS: saved. A content write on the pre-typing baseline is still refused `LIVE_STALE` (control) |
+| **File-mode output opened in Word** (font-inheriting replace with a link and a list, two merges, a fill plus an extra paragraph, an insert after a table) | PASS: opens, both tables present, all expected text read back through Word. Not inspected: a repair prompt's absence beyond the document opening, and the rendered sizes of that file |
+| **Approved run** (`live_changes_prepare` / `execute`): two cell writes and a save under a protected section | PASS: complete, 3/3 applied; the font and a multi-paragraph write kept 8.5pt Arial (the font read-back of the just-written proxy worked) |
+| **`diff_table_vs_markdown` (#109) against the live body** | PASS: identical text (including a two-paragraph cell and a hyperlink) reported identical; three edited cells reported as exactly those three; a missing row reported with a null side; a person's edit appeared in the diff |
 
 ## Found in real Word (the fake pane could not show these)
 
@@ -89,15 +93,26 @@ were replaced; the fake-pane tests could not have shown either.
 
 ## Not covered (still to verify)
 
-- `live_save` **while a second person is typing**: the shared-mode baseline refusal is
-  fixed and exercised against the real pane code, but a concurrent human edit was not
-  simulated against real Word.
-- The approved-run font write (`approved_cell_set`) in real Word: its font read-back reads the
-  just-written proxy, which Word may invalidate.
-- Filling an empty paragraph that holds a bookmark, field or other forbidden content, a table
-  inside a content control, and an empty or style-only fill text (live mode treats an
-  unchanged body as a failed insert).
-- Complex-script size (live mode cannot set it) and list marks in live cells.
+- **Two MCP clients** on one document (a second client saving or writing while the first holds a
+  baseline, a document lease or a section lock): only fakes have seen this. The save run above
+  had one client and a person typing.
+- The approved-run font path with the `approved_cell_stream_v1` capability was exercised, but
+  not under another client's concurrent edit in the same section.
+- Filling an empty paragraph that holds a bookmark, field or other forbidden content (unit
+  tests only), one given a named style, one with its own properties, a table inside a content
+  control, and an empty or style-only fill text (live mode treats an unchanged body as a failed
+  insert). Word saw one plain empty paragraph, filled with plain text.
+- Tracked changes: tracked font writes, tracked cell-paragraph deletes and tracked inserts, and
+  documents that already contain revisions (only merge's refusal while Track Changes is on was run).
+- Merge variants: cells with three or more paragraphs, lists or numbering, other hyperlinks, and
+  the `expected_text` guard succeeding in Word.
+- Fonts beyond explicit name/size/colour on plain paragraphs: theme fonts and colours,
+  mixed-format first paragraphs, bold/italic first runs, bulleted cells, an empty cell (font on
+  the paragraph mark), a link in a rewritten cell (colour kept), complex-script and East Asian
+  fonts (live mode cannot set the complex-script size).
+- The rendered result of the file-mode output (sizes, spacing, bullets) was not inspected in Word.
+- Real documents, SharePoint/OneDrive co-authoring, Word for Windows and the web: everything above
+  ran on a synthetic fixture on Word for Mac 16.114.3.
 
 ## Automated coverage
 
