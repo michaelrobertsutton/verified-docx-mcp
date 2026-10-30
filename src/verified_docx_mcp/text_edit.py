@@ -80,11 +80,18 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from . import audit, mutations, paths, projection, tables, tracked_changes
+from . import locate as locate_mod
 from .author import resolve_author_name
 from .errors import ErrorCode, VerifyError, _make_error, short_hash
 from .live import write_mode as live_write_mode
 from .live.session import LiveDisconnected, LiveOpFailed, LiveStale, LiveStaleAfterWrite
-from .locate import LocateResult, locate
+from .locate import (
+    LocateResult,
+    locate,
+    locate_anchored,
+    locate_find,
+    locate_paragraph,
+)
 from .projection import W_NS, RunEvent
 
 _XML_NS = "http://www.w3.org/XML/1998/namespace"
@@ -809,6 +816,165 @@ def _require_live_replace_capabilities(
         )
 
 
+# ---------------------------------------------------------------------------
+# Write targets (issue #113): a plain find, an anchored find
+# ("<prefix>…<suffix>" + expected_length / find_sha256), or a whole
+# paragraph (para_ref + expected_sha256).
+#
+# File mode resolves the target on the file's own projection. Live mode
+# resolves it on a projection of the live body read through the
+# NON-OBSERVING session live_session_for returns, so the read never re-arms
+# the caller's shared-bridge baseline: revision_before, the broker's
+# baseline and section-lock checks still decide at the mutation. The pane
+# then gets the resolved text itself (<= 230 characters, one Word search,
+# expected_matches=1) or a literal prefix + suffix + the span's normalized
+# sha256 (anchored_find_v1), which it re-checks at the mutation boundary.
+# ---------------------------------------------------------------------------
+
+ANCHORED_FIND_CAPABILITY = "anchored_find_v1"
+
+
+def check_target_args(
+    find: str | None,
+    expected_matches: Any,
+    *,
+    expected_length: Any = None,
+    find_sha256: Any = None,
+    para_ref: Any = None,
+    expected_sha256: Any = None,
+    allow_para_ref: bool = True,
+) -> str:
+    """Validate which target a call names, before any I/O: ``"plain"``,
+    ``"anchored"`` or ``"para_ref"``. INVALID_INPUT for any mix the
+    contract does not allow."""
+    if para_ref is not None or expected_sha256 is not None:
+        if not allow_para_ref:
+            raise _make_error(ErrorCode.INVALID_INPUT, "para_ref is accepted by replace_text only")
+        if find:
+            raise _make_error(ErrorCode.INVALID_INPUT, "pass find or para_ref, not both")
+        if para_ref is None or expected_sha256 is None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "para_ref and expected_sha256 go together")
+        if expected_length is not None or find_sha256 is not None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "expected_length/find_sha256 apply to an anchored find, not para_ref")
+        if expected_matches not in (None, 1) or isinstance(expected_matches, bool):
+            raise _make_error(ErrorCode.INVALID_INPUT, "a para_ref target is one paragraph; omit expected_matches")
+        return "para_ref"
+    if not isinstance(find, str) or not find:
+        raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty (or pass para_ref + expected_sha256)")
+    if locate_mod.anchored_requested(expected_length, find_sha256):
+        # Only expected_length/find_sha256 make a find anchored; a literal "…" is plain text otherwise.
+        locate_mod.require_anchored(find)
+        locate_mod.check_anchored_expected_matches(expected_matches)
+        locate_mod.check_anchored_args(expected_length, find_sha256)
+        return "anchored"
+    locate_mod.check_plain_find_args(expected_matches, expected_length, find_sha256)
+    return "plain"
+
+
+def _locate_file_target(
+    proj: projection.Projection,
+    kind: str,
+    find: str | None,
+    expected_matches: int | None,
+    *,
+    expected_length: int | None,
+    find_sha256: str | None,
+    para_ref: str | None,
+    expected_sha256: str | None,
+    span_filter: Callable[[int, int], bool] | None = None,
+) -> LocateResult:
+    if kind == "para_ref":
+        assert para_ref is not None and expected_sha256 is not None
+        return locate_paragraph(proj, para_ref, expected_sha256)
+    assert find is not None
+    return locate_find(
+        find, proj, expected_matches, expected_length=expected_length, find_sha256=find_sha256, span_filter=span_filter
+    )
+
+
+def _check_live_target_scope(kind: str, *, scope: str, within_row_containing: str | None) -> None:
+    if kind == "plain":
+        return
+    if scope != "body" or within_row_containing:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "in live mode an anchored find or para_ref target works on the document body only "
+            "(no text-box scope, no within_row_containing)",
+        )
+
+
+def _ambiguous_text(text: str, positions: list[tuple[int, int]], what: str) -> VerifyError:
+    return _make_error(
+        ErrorCode.AMBIGUOUS_SPAN,
+        f"{what} occurs {len(positions)} times in the live document; Word cannot tell the copies apart",
+        {
+            "candidates": [
+                {"start": s, "end": e, "context": text[max(0, s - 20) : s + 20].replace("\n", " ")}
+                for s, e in positions[:5]
+            ],
+            "total": len(positions),
+        },
+    )
+
+
+def pane_target(session, proj: projection.Projection, result: LocateResult) -> dict[str, Any]:
+    """What the pane is sent for a resolved span: ``{"text", "find"}`` when the
+    span fits one Word search and occurs once, else ``{"text", "prefix",
+    "suffix", "expected_text_sha256"}`` (requires ``anchored_find_v1``).
+    AMBIGUOUS_SPAN when Word could not single the span out."""
+    start, end = result.spans[0]
+    text = proj.text[start:end]
+    if locate_mod.utf16_len(text) <= locate_mod.PANE_SEARCH_MAX and not any(c in text for c in "\r\n\v"):
+        positions = [(p, p + len(text)) for p in locate_mod._find_all(text, proj.text)]
+        if len(positions) != 1:
+            raise _ambiguous_text(proj.text, positions, "the target text")
+        return {"text": text, "find": text}
+    if session is not None:
+        live_write_mode.require_capability(
+            session,
+            ANCHORED_FIND_CAPABILITY,
+            feature_description=f"a {len(text)}-character target (longer than one Word search)",
+        )
+    prefix, suffix = locate_mod.pane_anchors(text, result.anchors[1] - start if result.anchors else None)
+    digest = locate_mod.span_sha256(text)
+    locate_mod.check_pane_target(locate_mod.paragraph_units(proj), prefix, suffix, digest, (start, end))
+    return {"text": text, "prefix": prefix, "suffix": suffix, "expected_text_sha256": digest}
+
+
+def resolve_live_target(
+    session,
+    pre_hash: str,
+    kind: str,
+    *,
+    find: str | None,
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
+    para_ref: str | None = None,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Resolve an anchored find or para_ref against the live body (a
+    non-observing read, checked against *pre_hash*) and return ``pane_target``."""
+    from .live.reads_live import live_projection
+
+    proj = live_projection(session, expected_body_sha256=pre_hash)
+    if kind == "para_ref":
+        assert para_ref is not None and expected_sha256 is not None
+        result = locate_paragraph(proj, para_ref, expected_sha256)
+    else:
+        assert find is not None
+        result = locate_anchored(find, proj, expected_length=expected_length, find_sha256=find_sha256)
+    return pane_target(session, proj, result)
+
+
+def _apply_pane_target(payload: dict[str, Any], target: dict[str, Any] | None) -> None:
+    if target is None or "find" in target:
+        return
+    payload.pop("find", None)
+    payload["expected_matches"] = 1
+    for key in ("prefix", "suffix", "expected_text_sha256"):
+        payload[key] = target[key]
+
+
 def _live_replace_once(
     session,
     *,
@@ -816,6 +982,7 @@ def _live_replace_once(
     replace: str,
     expected_matches: int,
     pre_hash: str,
+    target: dict[str, Any] | None = None,
     track_changes: bool = False,
     allow_comment_loss: bool = False,
     allow_comment_loss_ids: list[dict[str, Any]] | None = None,
@@ -852,6 +1019,7 @@ def _live_replace_once(
         payload["expectedScopeSha256"] = scope_info["scopeSha256"]
     if within_row_containing:
         payload["rowAnchor"] = within_row_containing
+    _apply_pane_target(payload, target)
     try:
         result = session.request_threadsafe("replace", payload, expected_body_sha256=pre_hash)
     except LiveStaleAfterWrite as exc:
@@ -915,9 +1083,9 @@ def _audit_stale_after_write(exc: VerifyError, *, tool: str, path: str, document
 
 def execute_replace_text_live(
     path: str,
-    find: str,
+    find: str | None,
     replace: str,
-    expected_matches: int,
+    expected_matches: int | None,
     *,
     revision_before: str | None = None,
     track_changes: bool = False,
@@ -927,6 +1095,10 @@ def execute_replace_text_live(
     inherit_format: str = "replaced",
     replacement_segments: list[dict[str, Any]] | None = None,
     scope: str = "body",
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
+    para_ref: str | None = None,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Live-mode ``replace_text`` (issue #106 WP-3): sends a ``replace``
     op over the pane's WSS ops channel instead of editing the .docx file.
@@ -970,8 +1142,11 @@ def execute_replace_text_live(
     """
     if inherit_format not in ("replaced", "previous", "none"):
         raise _make_error(ErrorCode.INVALID_INPUT, "Invalid inherit_format")
-    if not find:
-        raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty")
+    kind = check_target_args(
+        find, expected_matches, expected_length=expected_length, find_sha256=find_sha256,
+        para_ref=para_ref, expected_sha256=expected_sha256,
+    )
+    _check_live_target_scope(kind, scope=scope, within_row_containing=within_row_containing)
     allow_comment_loss_ids = validate_comment_loss_ids(allow_comment_loss_ids)
     if allow_comment_loss and allow_comment_loss_ids is not None:
         raise _make_error(
@@ -996,16 +1171,21 @@ def execute_replace_text_live(
         else:
             scope_info = None
             pre_hash = _live_describe(session, path, revision_before)
+        target = None if kind == "plain" else resolve_live_target(
+            session, pre_hash, kind, find=find, expected_length=expected_length,
+            find_sha256=find_sha256, para_ref=para_ref, expected_sha256=expected_sha256,
+        )
     except LiveDisconnected as exc:
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
 
     try:
         result = _live_replace_once(
             session,
-            find=find,
+            find=target["text"] if target else (find or ""),
             replace=replace,
-            expected_matches=expected_matches,
+            expected_matches=1 if target else (expected_matches or 0),
             pre_hash=pre_hash,
+            target=target,
             track_changes=track_changes,
             allow_comment_loss=allow_comment_loss,
             allow_comment_loss_ids=allow_comment_loss_ids,
@@ -1076,10 +1256,17 @@ _BATCH_REFUSED_CODES = frozenset(
         ErrorCode.LOCKED_BY_OTHER_CLIENT,
         ErrorCode.OUTSIDE_LOCKED_SECTION,
         ErrorCode.INVALID_INPUT,
+        ErrorCode.AMBIGUOUS_SPAN,
+        ErrorCode.PARA_HASH_MISMATCH,
     }
 )
 _BATCH_REFUSED_PANE_CODES = frozenset(
-    {"LOCK_SCOPE_UNRESOLVED", "WOULD_DELETE_COMMENTS", "ANCHORED_SHAPES", "zero_match", "match_count_mismatch", "stale"}
+    {"LOCK_SCOPE_UNRESOLVED", "WOULD_DELETE_COMMENTS", "ANCHORED_SHAPES", "zero_match", "match_count_mismatch", "stale",
+     "AMBIGUOUS_SPAN"}
+)
+_BATCH_EDIT_KEYS = frozenset(
+    {"find", "replace", "expected_matches", "allow_comment_loss_ids", "within_row_containing",
+     "expected_length", "find_sha256", "para_ref", "expected_sha256"}
 )
 
 
@@ -1104,17 +1291,19 @@ def _validate_batch_edits(edits: Any) -> list[dict[str, Any]]:
                 ErrorCode.INVALID_INPUT,
                 f"edits[{i}]: allow_comment_loss is not accepted in a batch; use allow_comment_loss_ids",
             )
-        unknown = set(edit) - {"find", "replace", "expected_matches", "allow_comment_loss_ids", "within_row_containing"}
+        unknown = set(edit) - _BATCH_EDIT_KEYS
         if unknown:
             raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}]: unknown key(s) {sorted(unknown)}")
         find, replace, expected = edit.get("find"), edit.get("replace"), edit.get("expected_matches")
-        if not isinstance(find, str) or not find:
+        if find is not None and (not isinstance(find, str) or not find):
             raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}].find must be a non-empty string")
         if not isinstance(replace, str):
             raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}].replace must be a string")
-        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 1:
-            raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}].expected_matches must be a positive integer")
+        target_args: dict[str, Any] = {k: edit.get(k) for k in ("expected_length", "find_sha256", "para_ref", "expected_sha256")}
         try:
+            kind = check_target_args(find, expected, **target_args)
+            if kind == "plain" and (isinstance(expected, bool) or not isinstance(expected, int) or expected < 1):
+                raise _make_error(ErrorCode.INVALID_INPUT, "expected_matches must be a positive integer")
             ids = validate_comment_loss_ids(edit.get("allow_comment_loss_ids"))
         except VerifyError as exc:
             raise _make_error(
@@ -1123,8 +1312,13 @@ def _validate_batch_edits(edits: Any) -> list[dict[str, Any]]:
         row_scope = edit.get("within_row_containing")
         if row_scope is not None and (not isinstance(row_scope, str) or not row_scope.strip()):
             raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}].within_row_containing must be non-empty text")
-        out.append({"find": find, "replace": replace, "expected_matches": expected,
-                    "allow_comment_loss_ids": ids, "within_row_containing": row_scope})
+        if row_scope is not None and kind != "plain":
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"edits[{i}]: within_row_containing applies to a plain find only, not an anchored or para_ref target",
+            )
+        out.append({"find": find, "replace": replace, "expected_matches": expected, "allow_comment_loss_ids": ids,
+                    "within_row_containing": row_scope, "kind": kind, **target_args})
     return out
 
 
@@ -1224,13 +1418,33 @@ def execute_replace_text_batch_live(
         if unknown or (results and results[-1]["status"] in ("refused_before_write", "not_attempted")):
             _record(i, "not_attempted")
             continue
+        target = None
+        if edit["kind"] != "plain":
+            # Resolved against the body as edit i-1 left it; nothing is sent on a failure.
+            try:
+                target = resolve_live_target(
+                    session, current, edit["kind"], find=edit["find"], expected_length=edit["expected_length"],
+                    find_sha256=edit["find_sha256"], para_ref=edit["para_ref"],
+                    expected_sha256=edit["expected_sha256"],
+                )
+            except VerifyError as exc:
+                _record(i, "refused_before_write", code=exc.envelope.error_code.value, message=exc.envelope.message)
+                continue
+            except LiveDisconnected as exc:
+                _record(i, "refused_before_write", code=ErrorCode.LIVE_DISCONNECTED.value, message=str(exc))
+                continue
+            except Exception as exc:  # noqa: BLE001 - a read/parse failure before dispatch: nothing was sent
+                _record(i, "refused_before_write", code=ErrorCode.LIVE_OP_FAILED.value,
+                        message=f"could not resolve the edit's target: {type(exc).__name__}: {exc}")
+                continue
         try:
             result = _live_replace_once(
                 session,
-                find=edit["find"],
+                find=target["text"] if target else edit["find"],
                 replace=edit["replace"],
-                expected_matches=edit["expected_matches"],
+                expected_matches=1 if target else edit["expected_matches"],
                 pre_hash=current,
+                target=target,
                 track_changes=track_changes,
                 allow_comment_loss_ids=edit["allow_comment_loss_ids"],
                 within_row_containing=edit["within_row_containing"],
@@ -1444,9 +1658,9 @@ def _resolve_row_span_filter(proj: projection.Projection, within_row_containing:
 
 def execute_replace_text(
     path: str,
-    find: str,
+    find: str | None,
     replace: str,
-    expected_matches: int,
+    expected_matches: int | None,
     *,
     revision_before: str | None = None,
     force: bool = False,
@@ -1459,7 +1673,20 @@ def execute_replace_text(
     replacement_segments: list[dict[str, Any]] | None = None,
     scope: str = "body",
     allow_comment_loss_ids: list[dict[str, Any]] | None = None,
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
+    para_ref: str | None = None,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any]:
+    """replace_text: *find* is a plain needle (with *expected_matches*), an
+    anchored ``"<prefix>…<suffix>"`` (with *expected_length* and/or
+    *find_sha256*), or None with *para_ref* + *expected_sha256* (the whole
+    paragraph). See server.replace_text."""
+    target_args: dict[str, Any] = {"expected_length": expected_length, "find_sha256": find_sha256,
+                   "para_ref": para_ref, "expected_sha256": expected_sha256}
+    kind = check_target_args(find, expected_matches, **target_args)
+    if kind == "para_ref" and within_row_containing:
+        raise _make_error(ErrorCode.INVALID_INPUT, "within_row_containing does not apply to a para_ref target")
     allow_comment_loss_ids = validate_comment_loss_ids(allow_comment_loss_ids)
     if allow_comment_loss and allow_comment_loss_ids is not None:
         raise _make_error(
@@ -1490,6 +1717,7 @@ def execute_replace_text(
             allow_comment_loss_ids=allow_comment_loss_ids,
             inherit_format=inherit_format,
             replacement_segments=replacement_segments,
+            **target_args,
         )
 
     if scope != "body":
@@ -1506,7 +1734,9 @@ def execute_replace_text(
     proj = projection.project_document_root(document_root)
 
     span_filter = _resolve_row_span_filter(proj, within_row_containing) if within_row_containing else None
-    locate_result: LocateResult = locate(find, proj, expected_matches, span_filter=span_filter)
+    locate_result: LocateResult = _locate_file_target(
+        proj, kind, find, expected_matches, span_filter=span_filter, **target_args
+    )
     own_author = resolve_author_name()
     _check_tracked_changes_guard(proj, locate_result, force, own_author)
 
@@ -1561,12 +1791,14 @@ def execute_format_text_live(
     path: str,
     find: str,
     style: dict[str, bool | str],
-    expected_matches: int,
+    expected_matches: int | None,
     *,
     revision_before: str | None = None,
     track_changes: bool = False,
     within_row_containing: str | None = None,
     scope: str = "body",
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Live-mode ``format_text`` (issue #106 WP-3): sends a ``format`` op
     over the pane's WSS ops channel instead of editing the .docx file.
@@ -1599,8 +1831,10 @@ def execute_format_text_live(
     ``execute_replace_text_live`` -- see that function's own docstring.
     """
     style = _validate_style(style)
-    if not find:
-        raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty")
+    kind = check_target_args(
+        find, expected_matches, expected_length=expected_length, find_sha256=find_sha256, allow_para_ref=False
+    )
+    _check_live_target_scope(kind, scope=scope, within_row_containing=within_row_containing)
 
     session = live_write_mode.live_session_for(path)
     document_name = session.document_name
@@ -1618,12 +1852,15 @@ def execute_format_text_live(
         else:
             scope_info = None
             pre_hash = _live_describe(session, path, revision_before)
+        target = None if kind == "plain" else resolve_live_target(
+            session, pre_hash, kind, find=find, expected_length=expected_length, find_sha256=find_sha256
+        )
     except LiveDisconnected as exc:
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
 
     payload = {
-        "find": find,
-        "expected_matches": expected_matches,
+        "find": target["text"] if target else find,
+        "expected_matches": 1 if target else expected_matches,
         "bold": style.get("bold"),
         "italic": style.get("italic"),
         "underline": style.get("underline"),
@@ -1637,6 +1874,7 @@ def execute_format_text_live(
         payload["expectedScopeSha256"] = scope_info["scopeSha256"]
     if within_row_containing:
         payload["rowAnchor"] = within_row_containing
+    _apply_pane_target(payload, target)
     try:
         result = session.request_threadsafe("format", payload, expected_body_sha256=pre_hash)
     except LiveStaleAfterWrite as exc:
@@ -1753,7 +1991,7 @@ def _execute_format_text(
     path: str,
     find: str,
     style: dict[str, bool | str],
-    expected_matches: int,
+    expected_matches: int | None,
     *,
     revision_before: str | None = None,
     force: bool = False,
@@ -1762,8 +2000,12 @@ def _execute_format_text(
     write_mode: str = "auto",
     within_row_containing: str | None = None,
     scope: str = "body",
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
 ) -> dict[str, Any]:
     style = _validate_style(style)
+    target_args: dict[str, Any] = {"expected_length": expected_length, "find_sha256": find_sha256}
+    kind = check_target_args(find, expected_matches, allow_para_ref=False, **target_args)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
         return execute_format_text_live(
@@ -1775,6 +2017,7 @@ def _execute_format_text(
             track_changes=track_changes,
             within_row_containing=within_row_containing,
             scope=scope,
+            **target_args,
         )
 
     if scope != "body":
@@ -1791,7 +2034,9 @@ def _execute_format_text(
     proj = projection.project_document_root(document_root)
 
     span_filter = _resolve_row_span_filter(proj, within_row_containing) if within_row_containing else None
-    locate_result: LocateResult = locate(find, proj, expected_matches, span_filter=span_filter)
+    locate_result: LocateResult = _locate_file_target(
+        proj, kind, find, expected_matches, span_filter=span_filter, para_ref=None, expected_sha256=None, **target_args
+    )
     own_author = resolve_author_name()
     _check_tracked_changes_guard(proj, locate_result, force, own_author)
     _check_foreign_rpr_change(proj, locate_result.spans, force, own_author)
@@ -2064,13 +2309,17 @@ def _execute_apply_style(
     path: str,
     find: str,
     style_id: str,
-    expected_matches: int,
+    expected_matches: int | None,
     *,
     revision_before: str | None = None,
     force: bool = False,
     allow_concurrent_editor: bool = False,
     track_changes: bool = False,
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
 ) -> dict[str, Any]:
+    target_args: dict[str, Any] = {"expected_length": expected_length, "find_sha256": find_sha256}
+    kind = check_target_args(find, expected_matches, allow_para_ref=False, **target_args)
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(
         resolved,
@@ -2100,7 +2349,9 @@ def _execute_apply_style(
     document_root, raw_xml = mutations._load_document(resolved)
     proj = projection.project_document_root(document_root)
 
-    locate_result: LocateResult = locate(find, proj, expected_matches)
+    locate_result: LocateResult = _locate_file_target(
+        proj, kind, find, expected_matches, para_ref=None, expected_sha256=None, **target_args
+    )
     own_author = resolve_author_name()
     _check_tracked_changes_guard(proj, locate_result, force, own_author)
 

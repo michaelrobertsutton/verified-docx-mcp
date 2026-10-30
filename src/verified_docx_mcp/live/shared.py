@@ -69,6 +69,9 @@ PRE_MUTATION_REFUSALS = frozenset(
         "TRACKED_CHANGES_PRESENT",
         "TABLE_NOT_FOUND",
         "CELL_TEXT_MISMATCH",
+        # Issue #113: the anchored-find search refusals (and the pane's argument checks,
+        # every one of which runs before its op writes anything).
+        "AMBIGUOUS_SPAN",
         "INVALID_INPUT",
     }
 )

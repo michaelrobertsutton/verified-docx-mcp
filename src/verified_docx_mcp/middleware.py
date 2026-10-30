@@ -55,6 +55,8 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         "reject_tracked_changes",
         # issue #28 WP-08 (get_comment_thread is read-only, not listed here):
         "add_anchored_comment",
+        # issue #113:
+        "add_anchored_comment_batch",
         # issue #28 WP-09:
         "reply_to_comment",
         "resolve_comment",
