@@ -377,6 +377,8 @@ class BodyDigests:
     sections: list[list[str]]  # [[section_key, sha12], ...]
     content_sections: list[list[str]]  # [[section_key, content_sha12], ...]; [] unless asked
     preamble_content_sha12: str | None
+    # flat_opc_to_docx fidelity warnings (live_styles_missing, ...): headings may be misread.
+    warnings: list[str] = field(default_factory=list)
 
 
 def body_digests_from_ooxml(session: Any, document_name: str, *, content: bool) -> BodyDigests:
@@ -390,7 +392,7 @@ def body_digests_from_ooxml(session: Any, document_name: str, *, content: bool) 
     reply = _fetch_body_ooxml(session)
     with tempfile.TemporaryDirectory(prefix="verified-docx-live-rev-") as tmp:
         temp_docx = Path(tmp) / document_name
-        flat_opc_to_docx(reply["ooxml"], temp_docx)
+        built = flat_opc_to_docx(reply["ooxml"], temp_docx)
         sections, preamble = projection.find_sections_and_preamble(
             temp_docx, digests=True, ignore_trailing_empty=True, content_digests=content
         )
@@ -400,6 +402,7 @@ def body_digests_from_ooxml(session: Any, document_name: str, *, content: bool) 
         sections=[[sec["section_key"], sec["sha12"]] for sec in headings],
         content_sections=[[sec["section_key"], sec["content_sha12"]] for sec in headings] if content else [],
         preamble_content_sha12=preamble,
+        warnings=list(built.warnings),
     )
 
 
@@ -413,9 +416,11 @@ def live_revision(path: str, content_digests: bool = False) -> dict[str, Any]:
     the reply says ``via: "body_ooxml_fallback"``.
 
     *content_digests* (issue #117) takes exactly one ``body_ooxml`` export
-    instead (never ``body_hash``) and computes ``revision``, ``sections`` and
-    the new ``content_sections`` / ``preamble_content_sha12`` from that one
-    snapshot (``via: "body_ooxml"``).
+    instead (never ``body_hash``) and computes ``revision``, ``sections`` (the
+    server's projection of the export, not the pane's own digests) and the new
+    ``content_sections`` / ``preamble_content_sha12`` from that one snapshot
+    (``via: "body_ooxml"``); export fidelity warnings (``live_styles_missing``,
+    ...) come back as ``warnings``.
 
     Like ``read_document(source="live")`` this goes through the registry
     session (observe=True), so in shared-bridge mode it re-arms the caller's
@@ -449,15 +454,19 @@ def live_revision(path: str, content_digests: bool = False) -> dict[str, Any]:
             session, BODY_OOXML_CAPABILITY, feature_description="live_revision(content_digests=true)"
         )
         computed = body_digests_from_ooxml(session, document_name, content=True)
-        return {
+        result: dict[str, Any] = {
             "revision": f"{LIVE_REVISION_PREFIX}{computed.body_sha256}",
             "body_sha12": computed.body_sha256[:12],
+            # Server projection of the export (same definition as the pane's sha12).
             "sections": computed.sections,
             "content_sections": computed.content_sections,
             "preamble_content_sha12": computed.preamble_content_sha12,
             "observed_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
             "via": "body_ooxml",
         }
+        if computed.warnings:
+            result["warnings"] = computed.warnings
+        return result
 
     if BODY_HASH_CAPABILITY in session.hello.capabilities:
         reply = _request(session, "body_hash", {})

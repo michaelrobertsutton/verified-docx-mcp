@@ -131,7 +131,29 @@ def comment_thread_links(
     return done_by_para, parent_by_para, children_by_parent
 
 
-def identity_para_id(comment_elem: Any, *, ids_root: Any | None = None, ext_root: Any | None = None) -> str | None:
+def known_comment_para_ids(ids_root: Any | None, ext_root: Any | None) -> set[str]:
+    """Every paraId ``commentsIds.xml`` / ``commentsExtended.xml`` key on, for
+    ``identity_para_id(..., known=...)`` over many comments (one scan, not one
+    per comment)."""
+    known: set[str] = set()
+    for root, tag in ((ids_root, "commentId"), (ext_root, "commentEx")):
+        if root is None:
+            continue
+        for child in root:
+            if _ln(child) == tag:
+                pid = _attr(child, "paraId")
+                if pid:
+                    known.add(pid)
+    return known
+
+
+def identity_para_id(
+    comment_elem: Any,
+    *,
+    ids_root: Any | None = None,
+    ext_root: Any | None = None,
+    known: set[str] | None = None,
+) -> str | None:
     """Issue #108: the ``w14:paraId`` Word itself keys ``word/commentsIds.xml``
     (``w16cid:commentId/@w16cid:paraId``) and ``word/commentsExtended.xml``
     (``w15:commentEx/@w15:paraId``) on for *comment_elem* (a
@@ -150,6 +172,8 @@ def identity_para_id(comment_elem: Any, *, ids_root: Any | None = None, ext_root
     should still resolve, rather than this helper insisting on Word's own
     convention against evidence in the file itself. With neither root
     given, the last paragraph's paraId is returned unconditionally.
+    *known* (``known_comment_para_ids(ids_root, ext_root)``) replaces the
+    per-call scan of both roots when the caller resolves many comments.
 
     Returns None if *comment_elem* has no ``w:p`` children with a paraId at
     all (malformed input)."""
@@ -164,10 +188,12 @@ def identity_para_id(comment_elem: Any, *, ids_root: Any | None = None, ext_root
         return None
 
     last = para_ids[-1]
-    if ids_root is None and ext_root is None:
+    if known is None and ids_root is None and ext_root is None:
         return last
 
     def _known(pid: str) -> bool:
+        if known is not None:
+            return pid in known
         if ids_root is not None:
             for child in ids_root:
                 if _ln(child) == "commentId" and _attr(child, "paraId") == pid:
@@ -676,6 +702,11 @@ class _PartWalker:
         author = _attr(del_elem, "author")
         date = _attr(del_elem, "date")
         for run in del_elem:
+            if _ln(run) in ("commentRangeStart", "commentRangeEnd"):
+                # Issue #117: a comment anchored inside a tracked deletion is
+                # still placed (anchor record only; comment_ids unchanged).
+                self._note_comment_mark(run, para_index(para_ref))
+                continue
             if _ln(run) != "r":
                 continue
             for piece in run:
@@ -683,6 +714,8 @@ class _PartWalker:
                     self.deleted_spans.append(
                         DeletedSpan(piece.text or "", para_ref, author, date, offset=self._para_len)
                     )
+                elif _ln(piece) == "commentReference":
+                    self._note_comment_mark(piece, para_index(para_ref))
 
     def _walk_fld_simple(self, fld: Any, para_ref: str, counter: list[int]) -> None:
         instr = _attr(fld, "instr") or ""
@@ -1692,6 +1725,7 @@ def _content_comment_threads(
     if comments_root is None:
         return {}
     done_by_para, parent_by_para, _children = comment_thread_links(ext_root)
+    known = known_comment_para_ids(ids_root, ext_root)
     records: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for elem in comments_root:
@@ -1716,7 +1750,7 @@ def _content_comment_threads(
                 "w_id": w_id,
                 "author": _attr(elem, "author") or "",
                 "text": _comment_text(elem),
-                "para_id": identity_para_id(elem, ids_root=ids_root, ext_root=ext_root),
+                "para_id": identity_para_id(elem, known=known),
             }
         )
 
@@ -1911,8 +1945,16 @@ def _content_items_by_range(
             for tbl in tables_at.get(i, []):
                 items.append(["tbl", _table_shape(tbl)])
             items.append(["p", texts[i]])
+            merged: list[list[Any]] = []
             for span in dels_at.get(i, []):
-                items.append(["del", i - start, span.offset, span.text])
+                # Consecutive deletions at the same point are one deletion split
+                # across runs (producer-specific); merge them so the split
+                # never shows in the digest.
+                if merged and merged[-1][2] == span.offset:
+                    merged[-1][3] += span.text
+                else:
+                    merged.append(["del", i - start, span.offset, span.text])
+            items.extend(merged)
         for _order, first, last, item in placed:
             if first < end and last >= start and start < count:
                 items.append(item)
@@ -1937,7 +1979,8 @@ def section_content_items(
       included, deletions not).
     - ``["del", para_ordinal_within_section, offset_in_para, text]`` per
       tracked deletion (``w:delText``); offset is the code-point offset in the
-      paragraph's projected text at the deletion point.
+      paragraph's projected text at the deletion point. Deletions at the same
+      point (one deletion split across runs or ``w:del`` elements) are merged.
     - ``["tbl", rows]`` per top-level table: rows of cells ``[grid_span,
       v_merge ("none"|"restart"|"continue"), nested]``, *nested* being the
       cell's nested tables in the same shape. Cell text is in the ``p`` items.
