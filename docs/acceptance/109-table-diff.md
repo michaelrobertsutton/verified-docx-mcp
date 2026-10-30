@@ -47,5 +47,17 @@ Gate: `uv run pytest tests/unit` (see the PR for pass counts).
 
 ## Real Word acceptance
 
-PENDING. The live path is covered only by FakePane (the pane's `body_ooxml` Flat OPC export); it
-has not yet been run against real Word.
+PASS (Word for Mac 16.114.3, disposable scratch fixture, live source through the default shared
+bridge, run on the #109 branch's own package and pane build, taskpane `?v=66`).
+
+1. Markdown identical to a 3x3 table whose cells include a two-paragraph cell and a hyperlink
+   paragraph: `identical: true`, no differences.
+2. Three cells edited in the markdown: exactly those three reported (`row`/`col`/`docx_text`/
+   `md_text`), nothing else, `source: "live"`.
+3. A 2x2 table compared with a 1-row markdown table: the missing row's cells reported with
+   `md_text: null`, plus a `dimensions` entry.
+4. A person's edit made in Word was reflected in the next live diff.
+
+Not covered in Word: multi-table mode (`section_key` plus `md_heading`) and heading-scoped
+selection, merged or nested tables reported as unsupported, tables with fields or text boxes,
+`source="auto"` behaviour with a pane connected, and documents with real styles or co-authoring.
