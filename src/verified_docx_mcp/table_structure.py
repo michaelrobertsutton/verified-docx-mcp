@@ -107,6 +107,30 @@ def clone_row(template: Any, cells: list[str]) -> Any:
     return row
 
 
+def _node_text(node: Any) -> str:
+    """One element's contribution to a paragraph's text, with the projection's own character
+    handling (``projection.py``): hyphens, soft hyphens and mapped symbols are text (#107)."""
+    name = projection._ln(node)
+    if name == "t":
+        return node.text or ""
+    if name == "tab":
+        return "\t"
+    if name in {"br", "cr"}:
+        return "\n"
+    if name == "noBreakHyphen":
+        return "-"
+    if name == "softHyphen":
+        return "­"
+    if name == "sym":
+        mapped = projection._map_sym(projection._attr(node, "font"), projection._attr(node, "char"))
+        return mapped if mapped is not None else "�"
+    return ""
+
+
+def paragraph_text(p: Any) -> str:
+    return "".join(_node_text(node) for node in p.iter())
+
+
 def plain_row(row: Any) -> str:
     def paragraph_text(p):
         return "".join(

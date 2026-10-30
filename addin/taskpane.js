@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["table_rows_v1", "table_copy_v1", "heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1", "compact_evidence_v1"];
+const PANE_CAPABILITIES = ["paragraph_positions_v1", "cell_paragraph_merge_v1", "cell_font_inheritance_v1", "table_rows_v1", "table_copy_v1", "heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1", "compact_evidence_v1"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -686,7 +686,7 @@ function summarizeResult(op, result) {
 }
 
 const SHAPE_GUARDED_OPS = new Set(["approved_cell_set", "replace", "format", "cell_set", "cells_set",
-  "table_insert", "table_row_edit", "table_copy", "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
+  "table_insert", "table_row_edit", "table_copy", "cell_paragraph_merge", "paragraph_delete", "paragraph_insert", "revisions_accept", "revisions_reject",
   "comment_add", "comment_reply", "comment_resolve", "comment_delete", "save", "table_delete", "paragraphs_unlist"]);
 
 // One queue across reconnects. A timed-out write can still be running in Word;
@@ -709,9 +709,13 @@ async function dispatchOp(op, payload) {
   const sectionScoped = !!((payload.ownSections && payload.ownSections.length) ||
     (payload.executionSections && payload.executionSections.length));
   if (!READ_ONLY_OPS.has(op) && payload.clientId && !sectionScoped) {
-    if (!payload.expectedBodySha256)
+    // issue #107: save persists, it neither reads nor changes the body, so it needs no baseline and must
+    // not be refused "because someone is typing" (the broker no longer sends one). A hash that IS
+    // supplied is still honoured, like any other write.
+    if (!payload.expectedBodySha256 && op !== "save")
       throw refusalError("Shared write requires a body baseline", "LIVE_STALE");
-    await measuredWordRun(async context => requireFreshBody(context, payload.expectedBodySha256));
+    if (payload.expectedBodySha256)
+      await measuredWordRun(async context => requireFreshBody(context, payload.expectedBodySha256));
   }
   if (op === "approved_cell_set") return dispatchOpUnchecked(op, payload); // verifies scoped shapes inside its boundary snapshots
   if (!SHAPE_GUARDED_OPS.has(op)) return dispatchOpUnchecked(op, payload);
@@ -785,6 +789,8 @@ async function dispatchOpUnchecked(op, payload) {
       return opTableInsert(payload);
     case "cells_set":
       return opCellsSet(payload);
+    case "cell_paragraph_merge":
+      return opCellParagraphMerge(payload);
     case "paragraph_delete":
       return opParagraphDelete(payload);
     case "paragraph_insert":
@@ -1825,9 +1831,38 @@ async function opCellGet(payload) {
     const cell = await resolveTableCell(context, payload);
     cell.body.load("text");
     cell.body.paragraphs.load("items/text");
+    // issue #107: the font at the start of the cell's first paragraph (a collapsed range: the first
+    // character, or the paragraph mark of an empty cell). NOT cell.body.getOoxml(): real Word returns the
+    // whole TABLE for that, so a "first run" read from it belongs to another cell.
+    const startFont = payload.include_font ? cell.body.paragraphs.getFirst().getRange("Start").font : null;
+    if (startFont) startFont.load("name,size,color");
     await context.sync();
-    return { text: cell.body.text || "", paragraphs: cell.body.paragraphs.items.map((p) => p.text || "") };
+    const result = { text: cell.body.text || "", paragraphs: cell.body.paragraphs.items.map((p) => p.text || "") };
+    if (startFont) result.font = { name: startFont.name, size: startFont.size, color: startFont.color };
+    return result;
   });
+}
+
+// issue #107: the font the server read from the cell's first run, applied to the whole
+// cell after a write and read back. Name, size and colour only: the Word API cannot
+// set the complex-script size.
+function applyInheritedFont(cell, font) {
+  for (const key of ["name", "size", "color"]) {
+    const value = font[key];
+    if (value !== null && value !== undefined && value !== "") cell.body.font[key] = key === "color" && !String(value).startsWith("#") ? `#${value}` : value;
+  }
+}
+
+async function verifyInheritedFont(context, cell, font) {
+  cell.body.font.load("name,size,color");
+  await context.sync();
+  for (const key of ["name", "size", "color"]) {
+    const want = font[key];
+    if (want === null || want === undefined || want === "") continue;
+    const got = cell.body.font[key];
+    const same = key === "color" ? String(got).replace("#", "").toUpperCase() === String(want).replace("#", "").toUpperCase() : got === want;
+    if (!same) throw refusalError(`Inherited cell font ${key} failed readback (wanted ${want}, found ${got})`, "VERIFICATION_FAILED");
+  }
 }
 
 async function opCellSet(payload) {
@@ -1878,6 +1913,7 @@ async function opCellSet(payload) {
       const strategies = payload.track_changes ? CELL_WRITE_STRATEGIES.slice(0, 1) : CELL_WRITE_STRATEGIES;
       for (const strategy of strategies) {
         await writeCellParagraphs(context, cell, payload.paragraphs || [], strategy);
+        if (payload.inherit_font) applyInheritedFont(cell, payload.inherit_font);
         await context.sync();
         got = await readCellParagraphs(context, cell);
         if (sameParagraphs(want, got)) {
@@ -1891,6 +1927,7 @@ async function opCellSet(payload) {
         await context.sync();
       }
     }
+    if (usedStrategy !== null && payload.inherit_font) await verifyInheritedFont(context, cell, payload.inherit_font);
     if (usedStrategy === null) {
       const detail = `expected ${JSON.stringify(want.map(normCellText))}, found ${JSON.stringify(got.map(normCellText))}`;
       if (payload.track_changes) {
@@ -2967,8 +3004,22 @@ async function opParagraphDelete(payload) {
     if (indexes.length !== 1) throw refusalError(`Expected unique whole paragraph, found ${indexes.length}`, 'MATCH_COUNT_MISMATCH');
     const index = indexes[0];
     const target = paragraphs.items[index];
-    if (index === before.length-1 || target.tableNestingLevel !== 0)
-      throw refusalError('Cannot delete final or table-cell paragraph', 'STRUCTURAL_BOUNDARY');
+    // issue #107: a paragraph inside a (non-nested) table cell may go, but never the cell's last one.
+    if (target.tableNestingLevel > 1)
+      throw refusalError('Cannot delete a paragraph inside a nested table', 'STRUCTURAL_BOUNDARY');
+    if (target.tableNestingLevel === 1) {
+      const cellParagraphs = target.parentTableCell.body.paragraphs;
+      cellParagraphs.load('items/text');
+      await context.sync();
+      // Real Word (16.114.3): a cell's FINAL paragraph cannot be removed -- delete() blanks its text and
+      // leaves an empty paragraph, so the write would land and then fail read-back. Refuse before writing.
+      // `anchor_text` is unique in the whole body (checked above), so equal text identifies the paragraph.
+      const last = cellParagraphs.items[cellParagraphs.items.length-1];
+      if (cellParagraphs.items.length <= 1 || (last && last.text === payload.anchor_text))
+        throw refusalError("Cannot delete the last paragraph of a cell (Word keeps a cell's final paragraph); delete an earlier one or use merge_paragraph_with_next", 'STRUCTURAL_BOUNDARY');
+    } else if (index === before.length-1) {
+      throw refusalError('Cannot delete the final body paragraph', 'STRUCTURAL_BOUNDARY');
+    }
     const range = target.getRange(Word.RangeLocation.whole);
     await (await sectionGuard(context, payload)).check(() => [range]);
     const xml = target.getOoxml();
@@ -3138,6 +3189,7 @@ async function resolveParagraphStyle(context, spec) {
 }
 
 async function opParagraphInsert(payload) {
+  if (payload.anchor && typeof payload.anchor === "object") return opParagraphInsertPositional(payload);
   return measuredWordRun(async context => {
     const pre = await requireFreshBody(context, payload.expectedBodySha256);
     const specs = payload.paragraphs || [];
@@ -3395,6 +3447,8 @@ async function opApprovedCellSet(payload) {
       if (previousMode!==null) context.document.changeTrackingMode=Word.ChangeTrackingMode.trackAll;
       // Exactly one write. An uncertain or failed write never switches strategies.
       await writeCellParagraphs(context,cell,payload.paragraphs,'load-items');
+      // The font rides in the same batch as the write (issue #107), so it is never a second write.
+      if (payload.inherit_font) applyInheritedFont(cell,payload.inherit_font);
       await context.sync();
     } finally {
       if (previousMode!==null) {context.document.changeTrackingMode=previousMode;await context.sync();}
@@ -3402,6 +3456,7 @@ async function opApprovedCellSet(payload) {
     setExecutionPhase('verification');
     // Freshly resolve the section/table/grid; no read from the mutated proxy.
     try {
+    if (payload.inherit_font) await verifyInheritedFont(context,cell,payload.inherit_font);
     const post=await executionXmlSnapshot(context,payload.executionSections.map(s=>s.slug));
     const shapeIdentity=shapes=>shapes.map(({anchor_paragraph,...shape})=>JSON.stringify(shape)).sort();
     if (JSON.stringify(shapeIdentity(shapesBefore))!==JSON.stringify(shapeIdentity(post.shapes)))
@@ -3501,6 +3556,150 @@ async function executionXmlSnapshot(context, slugs) {
   return captured;
 }
 
+// -- structural paragraph anchors (issue #107) -------------------------------
+
+// {after_table_id: N} inserts after top-level table N; {empty_paragraph_after_table_id: N} fills the
+// empty body paragraph directly after it. The "empty" policy is the server's list
+// (payload.forbidden_empty_tags), applied to the OOXML read here, so both modes refuse the same paragraphs.
+async function opParagraphInsertPositional(payload) {
+  return measuredWordRun(async context => {
+    const pre = await requireFreshBody(context, payload.expectedBodySha256);
+    const specs = payload.paragraphs || [];
+    if (!specs.length) throw refusalError("No paragraphs to insert", "INVALID_INPUT");
+    const fill = payload.anchor.empty_paragraph_after_table_id !== undefined;
+    const tableId = fill ? payload.anchor.empty_paragraph_after_table_id : payload.anchor.after_table_id;
+    const styles = [];
+    for (const spec of specs) styles.push(await resolveParagraphStyle(context, spec));
+    const tables = await loadTopLevelTables(context);
+    const table = tables[tableId - 1];
+    if (!table) throw refusalError(`no table ${tableId} (the document has ${tables.length})`, "TABLE_NOT_FOUND");
+
+    let empty = null;
+    if (fill) {
+      const ooxml = context.document.body.getOoxml();
+      await context.sync();
+      const doc = new DOMParser().parseFromString(ooxml.value, "application/xml");
+      const ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+      const children = [...doc.getElementsByTagNameNS(ns, "body")[0].children];
+      const xmlTables = children.filter(n => n.localName === "tbl");
+      // Word's table numbering (body.tables) and the body's direct children must agree, or the paragraph
+      // checked here could belong to a different table (a table inside a content control).
+      if (xmlTables.length !== tables.length)
+        throw refusalError("Table numbering differs between Word and the body XML (a table inside a content control?); refusing to fill a paragraph it cannot identify", "STRUCTURAL_BOUNDARY");
+      const xmlTable = xmlTables[tableId - 1];
+      const next = xmlTable ? children[children.indexOf(xmlTable) + 1] : null;
+      if (!next || next.localName !== "p")
+        throw refusalError("There is no paragraph immediately after the table to fill", "STRUCTURAL_BOUNDARY");
+      const forbidden = new Set(payload.forbidden_empty_tags || []);
+      const hit = [...next.getElementsByTagName("*")].find(n =>
+        (n.namespaceURI === ns && forbidden.has(n.localName)) || (n.namespaceURI === ns && n.localName === "t" && n.textContent));
+      if (hit) throw refusalError(`The paragraph after the table is not empty (${hit.localName})`, "STRUCTURAL_BOUNDARY");
+      if (shapeNodes(next).length) throw refusalError("The paragraph after the table anchors a shape", "ANCHORED_SHAPES");
+      empty = table.getRange("After").paragraphs.getFirst();
+      empty.load("text,tableNestingLevel"); await context.sync();
+      if (empty.text || empty.tableNestingLevel)
+        throw refusalError("The paragraph after the table is not empty", "STRUCTURAL_BOUNDARY");
+      await guardComments(context, [empty.getRange()], false);
+      await guardRevisions(context, [empty.getRange()]);
+    }
+    // The destination is what gets written: the empty paragraph itself, else the gap after the table.
+    const destination = fill ? empty.getRange() : table.getRange("After");
+    await (await sectionGuard(context, payload)).check(() => [destination]);
+
+    const body = context.document.body.paragraphs;
+    body.load("items/text"); await context.sync();
+    const before = body.items.map(p => p.text);
+    const inserted = [];
+    await withTracking(context, payload.track_changes, async () => {
+      let previous = null;
+      specs.forEach((spec, i) => {
+        let para;
+        if (i === 0 && fill) { para = empty; para.insertText(spec.text, "Replace"); }
+        else para = (previous || table).insertParagraph(spec.text, "After");
+        if (!(i === 0 && fill && !spec.style)) {  // a fill keeps the paragraph's own style unless one is named
+          if (styles[i].kind === "name") para.style = styles[i].value;
+          else para.styleBuiltIn = styles[i].value;
+        }
+        if (spec.color) para.font.color = withHash(spec.color);
+        inserted.push(para); previous = para;
+      });
+      await context.sync();
+    });
+    inserted.forEach(p => { p.load("text,style,styleBuiltIn"); p.font.load("color"); });
+    const fresh = context.document.body.paragraphs;
+    fresh.load("items/text"); await context.sync();
+    const observed = inserted.map((p, i) => ({text: String(p.text || "").replace(/[\r\n]+$/, ""), style: p.style,
+      style_builtin: p.styleBuiltIn, color: p.font.color, requested_style: styles[i]}));
+    const after = fresh.items.map(p => p.text);
+    const problems = [];
+    observed.forEach((o, i) => { if (o.text !== specs[i].text) problems.push(`paragraph ${i + 1} text`); });
+    // Paragraph count and neighbours: the filled paragraph replaces one, an insert adds none.
+    if (after.length !== before.length + specs.length - (fill ? 1 : 0)) problems.push("paragraph count");
+    if (problems.length)
+      throw refusalError(`Positional paragraph insertion did not read back as written (${problems.join(", ")}); observed: ${JSON.stringify(observed)}`, "VERIFICATION_FAILED");
+    return {applied: true, inserted: observed, position: "after", before_count: before.length, after_count: after.length,
+      pre, post: await mutationHash(context, {...payload, expectedBodySha256: undefined})};
+  });
+}
+
+// -- merge two adjacent paragraphs of one cell (issue #107) ------------------
+
+// The server sends `expected_text` (the pair as it read them) and an optional `separator`. The pair must
+// still read that way, or nothing is written. The paragraphs are joined by deleting the paragraph mark
+// between them through the object model: no OOXML is imported (real Word 16.114.3 throws GeneralException
+// on insertOoxml into a cell range), so runs and hyperlinks stay exactly where they are. Which paragraph's
+// properties survive is Word's rule; the server verifies the merged paragraph still has the first's.
+// Tracked merges are not offered: how Word records them is unproven.
+async function opCellParagraphMerge(payload) {
+  if (payload.track_changes) throw refusalError('Tracked paragraph merges are not supported', 'INVALID_INPUT');
+  // Office.js reports a bare "GeneralException": say which stage threw, keeping the error's own code.
+  let stage='hash';
+  const staged=async(name,fn)=>{stage=name;return fn();};
+  return measuredWordRun(async context=>{
+   try {
+    const pre=await staged('hash',()=>mutationHash(context,payload));
+    const cell=await staged('resolve-cell',()=>resolveTableCell(context,payload));
+    const paragraphs=cell.body.paragraphs;paragraphs.load('items/text');await context.sync();
+    const i=payload.paragraph_index-1;
+    if(!Number.isInteger(i) || i<0 || i+1>=paragraphs.items.length)
+      throw refusalError('No next paragraph in this cell','STRUCTURAL_BOUNDARY');
+    const before=paragraphs.items.map(p=>p.text);
+    const pair=paragraphs.items.slice(i,i+2);
+    // The pair must still read as the server read it. Text, not XML: real Word's per-paragraph getOoxml does
+    // not canonicalize like the body export (every merge was refused LIVE_STALE), and the body-hash check
+    // below (requireFreshBody) already guards everything else that could have changed.
+    const flat=t=>String(t||'').replace(/[\r\n\u000b\u0007]/g,'');
+    if(!Array.isArray(payload.expected_text) || payload.expected_text.length!==2)
+      throw refusalError('Merge needs the two paragraph texts','INVALID_INPUT');
+    pair.forEach((p,j)=>{
+      if(flat(p.text)!==flat(payload.expected_text[j]))
+        throw refusalError('Paragraph changed during preparation','LIVE_STALE');
+    });
+    stage='range';
+    const range=pair[0].getRange('Content').getRange('Start').expandTo(pair[1].getRange('Content').getRange('End'));
+    await staged('section-guard',async()=>(await sectionGuard(context,payload)).check(()=>[range]));
+    await staged('comments-revisions-guard',async()=>{await guardComments(context,[range],false);await guardRevisions(context,[range]);});
+    await staged('anchored-guard',async()=>{await guardAnchoredParagraphs(context,[range]);await requireFreshBody(context,pre);});
+    // Word's own tracking mode applies to the edit even when track_changes is false, which would
+    // record the merge as a tracked change: a mode this op declares unsupported. Refuse, don't switch.
+    await staged('tracking-mode',async()=>{context.document.load('changeTrackingMode');await context.sync();});
+    if (context.document.changeTrackingMode !== Word.ChangeTrackingMode.off)
+      throw refusalError('Track Changes is on in Word; turn it off to merge paragraphs (tracked merges are not supported)','TRACKED_CHANGES_PRESENT');
+    const separator=typeof payload.separator==='string'?payload.separator:'';
+    await staged('separator',async()=>{if(separator){pair[0].getRange('Content').insertText(separator,'End');await context.sync();}});
+    await staged('delete-paragraph-mark',async()=>{
+      const mark=pair[0].getRange('Content').getRange('End').expandTo(pair[1].getRange('Content').getRange('Start'));
+      mark.delete();await context.sync();});
+    const after=await staged('readback',()=>readCellParagraphs(context,cell));
+    if(after.length !== before.length-1)
+      throw refusalError('Paragraph merge count differs','VERIFICATION_FAILED');
+    return {applied:true,pre,post:await staged('post-hash',()=>mutationHash(context,{...payload,expectedBodySha256:undefined}))};
+   } catch (error) {
+    if (error && typeof error.message === 'string' && !error.message.startsWith('[merge stage')) error.message=`[merge stage: ${stage}] ${error.message}`;
+    throw error;
+   }
+  });
+}
 
 // #106: native insertion inherits row/cell properties without replacing the table.
 async function opTableRowEdit(payload) {

@@ -1955,9 +1955,11 @@ def replace_text_batch(
     "live:sha256:<hex>" revision from a live read.
 
     `edits` is a list of {"find", "replace", "expected_matches",
-    "allow_comment_loss_ids"?} objects; semantics per edit are those of
-    `replace_text` (expected_matches required, row/scope options not
-    available). `allow_comment_loss_ids` is [{"comment_id", "reply_count"}]
+    "allow_comment_loss_ids"?, "within_row_containing"?} objects; semantics per
+    edit are those of `replace_text` (expected_matches required).
+    `within_row_containing` is per edit (see replace_text): it scopes that edit
+    to the table row holding that text, so identical text elsewhere does not
+    stop the batch. `allow_comment_loss_ids` is [{"comment_id", "reply_count"}]
     (see replace_text); `allow_comment_loss` inside an edit is refused.
     `track_changes` and `inherit_format` apply to every edit.
 
@@ -3181,6 +3183,7 @@ def replace_cell_markdown(
     allow_concurrent_editor: bool = False,
     write_mode: str = "auto",
     expected_before: str | None = None,
+    inherit_format: str = "first_run",
 ) -> dict[str, Any]:
     """Replace one table cell's content with rendered markdown, leaving
     its own w:tcPr byte-identical -- the only write path safe on a merged
@@ -3217,6 +3220,21 @@ def replace_cell_markdown(
     `expected_before` (the cell's current text, plain or markdown; compared
     modulo markdown marks and whitespace) to guard against a wrong index or
     a stale read: a mismatch is CELL_TEXT_MISMATCH and nothing is written.
+
+    `inherit_format` (issue #107, "first_run" | "none", default "first_run"):
+    markdown carries no font, so by default every rendered run takes the font
+    name, size and colour of the cell's first text run (else its first paragraph
+    mark), where the markdown does not set them. FILE mode copies that run's
+    DIRECT properties (so a cell whose font comes only from its style inherits
+    nothing), also the complex-script size and the paragraph marks, and verifies
+    every run on re-read. LIVE mode applies the font Word reports at the start of
+    the cell (name, size and colour; Word's API cannot set the complex-script
+    size) and reads it back (VERIFICATION_FAILED otherwise). A link keeps its own
+    colour. Without this a multi-paragraph write into an 8.5pt cell came back at
+    the style's size (reproduced on Word 16.114.3). "none" keeps the old
+    behaviour (the style's font). A live write with "first_run" needs the
+    pane's "cell_font_inheritance_v1" capability (LIVE_CAPABILITY_MISSING:
+    reload the pane, or pass "none" to accept the style's font).
 
     Supports multi-level bulleted/numbered markdown inside the cell
     (issue #28 WP-16a): rendered through the SAME markdown_to_ooxml
@@ -3258,7 +3276,7 @@ def replace_cell_markdown(
             path, table_id, row_index, cell_index, markdown,
             revision_before=revision_before, force=force, track_changes=track_changes,
             allow_concurrent_editor=allow_concurrent_editor, write_mode=write_mode,
-            expected_before=expected_before,
+            expected_before=expected_before, inherit_format=inherit_format,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
@@ -4392,13 +4410,67 @@ def read_textbox(path: str, textbox_id: str) -> dict[str, Any]:
 @mcp.tool()
 def delete_paragraph(path: str, anchor_text: str, revision_before: str,
                      track_changes: bool = False) -> dict[str, Any]:
-    """Delete exactly one whole live body paragraph; refuse anchors, comments,
-    revisions, table cells, section boundaries and the final paragraph.
+    """Delete exactly one whole live paragraph (body or table cell); refuse anchors,
+    comments, revisions, section boundaries, the final body paragraph, a nested
+    table's paragraph and a cell's LAST paragraph (issue #107: a cell paragraph
+    may go while the cell keeps another; use merge_paragraph_with_next to join).
+    `anchor_text` must equal exactly one paragraph in the whole body.
     """
     from .live.paragraphs_live import delete_paragraph as execute
 
     try:
         return execute(path, anchor_text, revision_before, track_changes)
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def merge_paragraph_with_next(
+    path: str,
+    table_id: int,
+    row_index: int,
+    cell_index: int,
+    paragraph_index: int,
+    expected_text: list[str] | None = None,
+    separator: str = "",
+    revision_before: str | None = None,
+    track_changes: bool = False,
+    write_mode: str = "auto",
+    allow_concurrent_editor: bool = False,
+) -> dict[str, Any]:
+    """Merge two adjacent paragraphs of ONE table cell into one (issue #107).
+
+    The first paragraph's properties win; both paragraphs' runs and hyperlinks are kept
+    as they are, not flattened to text. LIVE MODE: Word keeps the SECOND paragraph's
+    properties when it joins two (checked on Word 16.114.3), so a live merge of two
+    paragraphs whose properties differ (style, alignment, indents, ...) is refused
+    before anything is written (STRUCTURAL_BOUNDARY): make them match, or use
+    write_mode="file". All indices are 1-based: `paragraph_index` is the
+    FIRST of the pair, so it must not be the cell's last paragraph (STRUCTURAL_BOUNDARY).
+    `expected_text` ([first, second]) guards both texts (CELL_TEXT_MISMATCH, nothing
+    written). `separator` (inline text, default "") is placed between the two texts.
+
+    Refuses (nothing written) comments, tracked changes, anchored shapes, fields,
+    bookmarks, footnote references and section breaks in either paragraph, and tables
+    with merged or nested cells. `track_changes=true` is refused in both modes
+    (INVALID_INPUT): how Word records a tracked paragraph merge is unproven.
+
+    `write_mode` ("auto" | "file" | "live"): the live write needs the pane's
+    "cell_paragraph_merge_v1" capability (LIVE_CAPABILITY_MISSING: reload the pane).
+    Both modes verify the result independently: the cell's paragraph texts and count,
+    the merged paragraph's properties, every hyperlink's target and text, and every other
+    cell of the table. Live reads around the write do not re-arm this client's baseline;
+    a document that moved after the write adds a `warnings` entry rather than hiding it.
+    VERIFICATION_FAILED means the write may have landed: re-read the table before retrying.
+    Audited. Returns the eight evidence keys.
+    """
+    from .paragraph_merge import execute
+
+    try:
+        return execute(
+            path, table_id, row_index, cell_index, paragraph_index, expected_text, separator,
+            revision_before, track_changes, write_mode, allow_concurrent_editor,
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -4463,7 +4535,7 @@ def delete_table(
 @mcp.tool()
 def insert_paragraphs(
     path: str,
-    anchor: str,
+    anchor: str | dict[str, Any],
     paragraphs: list[dict[str, Any]],
     expected_matches: int,
     position: str = "after",
@@ -4488,6 +4560,20 @@ def insert_paragraphs(
     once (`expected_matches` must be 1); the anchor must sit in a top-level
     body paragraph, not a table cell. `position` is "after" (default) or
     "before"; under live section locks only "after" is allowed.
+
+    STRUCTURAL ANCHORS (issue #107): instead of text, `anchor` may be one of
+    {"after_table_id": N} (insert after top-level table N, the id list_tables
+    reports) or {"empty_paragraph_after_table_id": N} (fill the empty body
+    paragraph directly after table N, keeping its own style unless a `style` is
+    given; STRUCTURAL_BOUNDARY if there is none, or it holds text, a field,
+    bookmark, tab, break, hyperlink, drawing, comment anchor or tracked change).
+    Both need position="after" and expected_matches=1. File mode verifies the
+    paragraph count and the content on either side; live mode verifies the inserted
+    texts and the whole-document paragraph count. Live mode refuses to fill when
+    Word's table numbering and the body's disagree (a table inside a content
+    control). Live mode needs the
+    pane's "paragraph_positions_v1" capability (LIVE_CAPABILITY_MISSING:
+    reload the pane).
 
     `track_changes=True`: live mode records the insertions as Word's
     signed-in user; file mode wraps the new runs in `w:ins` under the

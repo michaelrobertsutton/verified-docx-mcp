@@ -15,7 +15,8 @@ from verified_docx_mcp.live.session import LiveOpFailed
 class Pane:
     document_name = "collaborative.docx"
     document_url = "https://example.test/collaborative.docx"
-    hello = SimpleNamespace(capabilities=["approved_changes_v1", "cell_edit", "cell_multiline", "table_edit"])
+    hello = SimpleNamespace(capabilities=["approved_changes_v1", "cell_edit", "cell_multiline", "table_edit",
+                                          "cell_font_inheritance_v1"])
 
     def __init__(self):
         self.sections = [{"slug": "target", "paragraphs": ["Target", "Proof is current.", "Delete the whole paragraph."],
@@ -24,6 +25,9 @@ class Pane:
         self.outside = 0
         self.after = None
         self.fail = None
+        self.font_requests = []
+        self.cell_font = {"size": 8.5}  # what Word reports at the cell's start: an 8.5pt table
+        self.cell_payloads = []
 
     def request_threadsafe(self, op, payload=None, **kwargs):
         self.calls[op] += 1
@@ -41,7 +45,12 @@ class Pane:
         row = self.sections[0]["tables"][0]["rows"]
         if op == "cell_get":
             text = row[payload["row_index"]-1][payload["cell_index"]-1]
-            return {"text": text, "paragraphs": text.split("\n")}
+            reply = {"text": text, "paragraphs": text.split("\n")}
+            if payload.get("include_font"):
+                self.font_requests.append(payload["include_font"])
+                if self.cell_font:
+                    reply["font"] = dict(self.cell_font)
+            return reply
         if op == "table_get":
             return {"rows": [[{"text": c} for c in r] for r in row], "merged": False,
                     "style": "Table Grid", "headerRowCount": 1}
@@ -53,6 +62,7 @@ class Pane:
             if self.fail:
                 raise self.fail
             if op == "cell_set":
+                self.cell_payloads.append(payload)
                 row[payload["row_index"]-1][payload["cell_index"]-1] = "\n".join(
                     "".join("\n" if r.get("hard_break") else r["text"] for r in p) for p in payload["paragraphs"])
             if op == "cells_set":
@@ -130,7 +140,10 @@ def test_same_section_change_stops_before_next_write_and_resumes_suffix(setup):
     pane.sections[0]["paragraphs"][1] = "Proof is current."
     resumed = runs.execute(path, prepared["run_id"], prepared["manifest_sha256"])
     assert resumed["status"] == "complete"
-    assert pane.calls["cell_get"] == 2  # verified operations never replay
+    # Every cell write is preceded by exactly one first-run font read (issue #107); the
+    # readbacks (two) are unchanged, and verified operations never replay.
+    assert len(pane.font_requests) == pane.calls["cell_set"]
+    assert pane.calls["cell_get"] - len(pane.font_requests) == 2
 
 
 def test_unknown_after_dispatch_cannot_resume(setup):
@@ -142,6 +155,57 @@ def test_unknown_after_dispatch_cannot_resume(setup):
     result = execute(path, prepared)
     assert result["status"] == "unknown"
     with pytest.raises(VerifyError, match="Unknown write outcome"):
+        runs.execute(path, prepared["run_id"], prepared["manifest_sha256"])
+    assert pane.calls["cell_set"] == 1
+
+
+def test_approved_cell_write_carries_the_first_run_font_in_its_single_write(setup):
+    path, pane = setup
+    result = execute(path, runs.prepare(path, [cell()]))
+    assert result["status"] == "complete", result
+    assert pane.calls["cell_set"] == 1  # the font rides in the same write, never a second one
+    assert pane.cell_payloads[0]["inherit_font"] == {"size": 8.5}
+
+
+def test_approved_cell_without_a_direct_font_sends_no_font(setup):
+    path, pane = setup
+    pane.cell_font = None
+    assert execute(path, runs.prepare(path, [cell()]))["status"] == "complete"
+    assert "inherit_font" not in pane.cell_payloads[0]
+
+
+def test_approved_inherit_format_none_is_bound_into_the_manifest_and_skips_the_font_read(setup):
+    path, pane = setup
+    op = cell()
+    op["args"]["inherit_format"] = "none"
+    assert execute(path, runs.prepare(path, [op]))["status"] == "complete"
+    assert pane.font_requests == [] and "inherit_font" not in pane.cell_payloads[0]
+    op["args"]["inherit_format"] = "sometimes"
+    with pytest.raises(VerifyError, match="inherit_format"):
+        runs.prepare(path, [op])
+
+
+def test_approved_cell_write_on_a_pane_without_font_inheritance_is_refused_before_writing(setup):
+    path, pane = setup
+    pane.hello = SimpleNamespace(capabilities=[c for c in pane.hello.capabilities if c != "cell_font_inheritance_v1"])
+    result = execute(path, runs.prepare(path, [cell()]))
+    assert result["status"] != "complete"
+    assert pane.calls["cell_set"] == 0  # refused before dispatch: a font reset is never silent
+
+
+def test_a_save_in_the_run_does_not_settle_an_uncertain_write(setup):
+    path, pane = setup
+    ops = [cell(), {"op": "live_save", "section": "", "args": {}}]
+    prepared = runs.prepare(path, ops)
+    def disconnect(p):
+        if p.calls["cell_set"] and not p.calls["save"]:
+            raise RuntimeError("connection lost after mutation")
+    pane.after = disconnect
+    result = execute(path, prepared)
+    assert result["status"] in {"unknown", "partial"}
+    assert result["applied"] is False
+    # Whatever the save did, the uncertain cell write is still uncertain and is never replayed.
+    with pytest.raises(VerifyError, match="Unknown write outcome|uncertain"):
         runs.execute(path, prepared["run_id"], prepared["manifest_sha256"])
     assert pane.calls["cell_set"] == 1
 

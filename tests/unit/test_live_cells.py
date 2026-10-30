@@ -153,8 +153,12 @@ class ReplaceCellLiveTests(LiveWriteBridgeTestCase):
                 envelope = await self.assertRefusedWith(ErrorCode.LIVE_CAPABILITY_MISSING, markdown)
                 self.assertIn("multi-paragraph", envelope.message)
         self.assertEqual(doc.tables[0][0][0], "R1C1")
-        # a single paragraph still works on an older pane
-        self.assertTrue((await self.replace("single"))["applied"])
+        # a single paragraph still works on an older pane when it opts out of font
+        # inheritance (issue #107); by default that pane is refused rather than silently
+        # resetting the cell's font.
+        self.assertTrue((await self.replace("single", inherit_format="none"))["applied"])
+        envelope = await self.assertRefusedWith(ErrorCode.LIVE_CAPABILITY_MISSING, "single again")
+        self.assertIn("inherit_format='none'", envelope.message)
 
     async def test_merged_paragraphs_fail_the_paragraph_aware_readback_and_are_audited(self) -> None:
         doc = _two_by_two()

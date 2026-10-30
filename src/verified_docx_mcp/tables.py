@@ -58,7 +58,7 @@ from xml.etree import ElementTree as ET
 
 from . import audit, locate, markdown_to_ooxml, mutations, paths, projection, tracked_changes
 from .author import resolve_author_name
-from .errors import ErrorCode, _make_error
+from .errors import ErrorCode, VerifyError, _make_error
 from .live import protocol as live_protocol
 from .live import reads_live
 from .live import write_mode as live_write_mode
@@ -330,6 +330,139 @@ def _render_cell_markdown(markdown: str, ctx: markdown_to_ooxml.StyleContext) ->
     return elements
 
 
+# ---------------------------------------------------------------------------
+# Cell font inheritance (issue #107): markdown carries no font name, size or
+# colour, so a rewritten cell would fall back to the style default (a 8.5pt
+# table came out at 10.5pt). ONE server-side definition of "the cell's first
+# run" feeds both file mode and the live pane (which receives explicit values).
+# ---------------------------------------------------------------------------
+
+_INHERIT_FORMATS = ("first_run", "none")
+_INHERITED_RPR = ("rFonts", "sz", "szCs", "color")
+# CT_RPr child order (ECMA-376), so an added property lands where Word expects it.
+_RPR_ORDER = (
+    "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline",
+    "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing",
+    "w", "kern", "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd", "fitText",
+    "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout", "specVanish", "oMath",
+)
+
+
+def _validate_inherit_format(inherit_format: str) -> None:
+    if inherit_format not in _INHERIT_FORMATS:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"inherit_format must be one of {_INHERIT_FORMATS}, got {inherit_format!r}",
+            {"inherit_format": inherit_format},
+        )
+
+
+def _wattr(element: Any, name: str) -> str | None:
+    return element.get(f"{{{W_NS}}}{name}")
+
+
+def _inherited_cell_font(container: Any) -> dict[str, Any] | None:
+    """Direct font properties of *container*'s (a ``w:tc`` or a body fragment) first
+    text-bearing run, looking through hyperlinks; else its first paragraph mark's.
+
+    Returns ``{"props": [rFonts/sz/szCs/color elements], "wire": {name?, size?, color?}}``
+    or ``None`` when there is nothing direct to inherit (the style supplies the font).
+    ``wire`` is what the live pane applies; it cannot set the complex-script size.
+    """
+    source = None
+    has_text_run = False
+    for run in container.iter(_w("r")):
+        if any(t.text for t in run.iter(_w("t"))):
+            has_text_run = True
+            source = run.find(_w("rPr"))
+            break
+    if not has_text_run:
+        # Only a cell with no text at all falls back to its first paragraph mark. A text run that
+        # simply has no direct font means the style supplies it: a stray mark must not shrink it.
+        paragraph = next(container.iter(_w("p")), None)
+        source = paragraph.find(f"{_w('pPr')}/{_w('rPr')}") if paragraph is not None else None
+    if source is None:
+        return None
+    props = [n for n in source if projection._ln(n) in _INHERITED_RPR]
+    if not props:
+        return None
+    wire: dict[str, Any] = {}
+    for n in props:
+        kind = projection._ln(n)
+        if kind == "rFonts":
+            name = _wattr(n, "ascii") or _wattr(n, "hAnsi")
+            if name:
+                wire["name"] = name
+        elif kind == "sz":
+            val = _wattr(n, "val")
+            if val and val.isdigit():
+                wire["size"] = int(val) / 2
+        elif kind == "color":
+            val = _wattr(n, "val")
+            if val and val.lower() != "auto":
+                wire["color"] = val.upper()
+    return {"props": props, "wire": wire}
+
+
+def _sort_rpr(rpr: Any) -> None:
+    rank = {name: i for i, name in enumerate(_RPR_ORDER)}
+    children = sorted(list(rpr), key=lambda n: rank.get(projection._ln(n), len(rank)))
+    for child in list(rpr):
+        rpr.remove(child)
+    for child in children:
+        rpr.append(child)
+
+
+def _add_font_props(rpr: Any, font: dict[str, Any], *, keep_colour: bool) -> None:
+    import copy
+
+    for prop in font["props"]:
+        if projection._ln(prop) == "color" and not keep_colour:
+            continue
+        if rpr.find(prop.tag) is None:
+            rpr.append(copy.deepcopy(prop))
+    _sort_rpr(rpr)
+
+
+def _apply_inherited_font(elements: list[Any], font: dict[str, Any]) -> None:
+    """Add the inherited properties to every rendered run that does not set them, and to each
+    paragraph mark (so an empty paragraph's height and a list bullet follow the cell's size too).
+
+    A run inside a hyperlink, or one with a character style, keeps its own colour: a direct
+    colour would beat the Hyperlink style and the link would stop looking like a link."""
+    for element in elements:
+        linked = {id(r) for link in element.iter(_w("hyperlink")) for r in link.iter(_w("r"))}
+        for run in element.iter(_w("r")):
+            rpr = run.find(_w("rPr"))
+            if rpr is None:
+                rpr = ET.Element(_w("rPr"))
+                run.insert(0, rpr)
+            styled = rpr.find(_w("rStyle")) is not None
+            _add_font_props(rpr, font, keep_colour=id(run) not in linked and not styled)
+        for paragraph in element.iter(_w("p")):
+            ppr = paragraph.find(_w("pPr"))
+            if ppr is None:
+                ppr = ET.Element(_w("pPr"))
+                paragraph.insert(0, ppr)
+            mark = ppr.find(_w("rPr"))
+            if mark is None:
+                mark = ET.SubElement(ppr, _w("rPr"))
+            _add_font_props(mark, font, keep_colour=True)
+
+
+def _rpr_key(node: Any) -> tuple:
+    return (node.tag, tuple(sorted(node.attrib.items())), node.text or "", tuple(_rpr_key(c) for c in node))
+
+
+def _run_rpr_keys(elements: list[Any]) -> list[tuple | None]:
+    keys: list[tuple | None] = []
+    for element in elements:
+        for run in element.iter(_w("r")):
+            rpr = run.find(_w("rPr"))
+            keys.append(_rpr_key(rpr) if rpr is not None else None)
+    return keys
+
+
 def _replace_cell_content(
     tc: Any, new_elements: list[Any], *, track: Any | None
 ) -> list[Any]:
@@ -533,7 +666,9 @@ def execute_replace_cell_markdown(
     track_changes: bool = False,
     write_mode: str = "auto",
     expected_before: str | None = None,
+    inherit_format: str = "first_run",
 ) -> dict[str, Any]:
+    _validate_inherit_format(inherit_format)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
         return execute_replace_cell_markdown_live(
@@ -545,6 +680,7 @@ def execute_replace_cell_markdown(
             revision_before=revision_before,
             track_changes=track_changes,
             expected_before=expected_before,
+            inherit_format=inherit_format,
         )
 
     own_author = resolve_author_name()
@@ -584,6 +720,10 @@ def execute_replace_cell_markdown(
     # tree across levels via increasing w:ilvl (issue #28 WP-16a; see
     # StyleContext.allocate_list_root/ensure_list_level).
     new_elements = _render_cell_markdown(markdown, ctx)
+    inherited = _inherited_cell_font(tc) if inherit_format == "first_run" else None
+    if inherited is not None:
+        _apply_inherited_font(new_elements, inherited)
+    expected_run_props = _run_rpr_keys(new_elements)
 
     # tcPr snapshot, purely for the byte-identity acceptance check this
     # tool exists to satisfy -- never read from again, never mutated.
@@ -618,6 +758,8 @@ def execute_replace_cell_markdown(
         diff = mutations._diff_modulo_whitespace(intended_after, actual)
         if diff:
             raise ValueError(f"re-read cell does not match the intended rendering modulo whitespace: {diff}")
+        if inherited is not None and _run_rpr_keys(actual_children) != expected_run_props:
+            raise ValueError("re-read cell runs do not carry the inherited font properties")
 
     conflict_sweep = mutations._write_and_verify(resolved, document_root, raw_xml, ctx, post_verify=_post_verify)
 
@@ -678,6 +820,55 @@ def _live_cell_request(
         ) from exc
     except LiveDisconnected as exc:
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
+
+
+_FONT_INHERITANCE_CAPABILITY = "cell_font_inheritance_v1"  # issue #107
+
+
+def _require_font_inheritance(session: Any) -> None:
+    live_write_mode.require_capability(
+        session,
+        _FONT_INHERITANCE_CAPABILITY,
+        feature_description="cell first-run font inheritance (pass inherit_format='none' to keep the style's font)",
+    )
+
+
+def _wire_font(font: Any, *, drop_colour: bool) -> dict[str, Any] | None:
+    """The pane-reported font at the start of the cell, as what ``cell_set`` should apply.
+
+    Word reports the EFFECTIVE font there (direct formatting resolved with the style), and an
+    empty string / 0 for a mixed value: those are left out, so only what is known is applied.
+    Black is left out too: it is how Word reports Automatic, and forcing it would pin a colour
+    the cell never had. ``drop_colour``: the markdown holds a link, and a direct colour would
+    beat the Hyperlink style (the pane cannot colour only the non-link runs)."""
+    if not isinstance(font, dict):
+        return None
+    wire: dict[str, Any] = {}
+    name = font.get("name")
+    if isinstance(name, str) and name.strip():
+        wire["name"] = name
+    size = font.get("size")
+    if isinstance(size, (int, float)) and not isinstance(size, bool) and size > 0:
+        wire["size"] = float(size)
+    colour = font.get("color")
+    if (not drop_colour and isinstance(colour, str) and re.fullmatch(r"#?[0-9A-Fa-f]{6}", colour)
+            and colour.lstrip("#").upper() != "000000"):
+        wire["color"] = colour.lstrip("#").upper()
+    return wire or None
+
+
+def live_cell_read_with_font(
+    session: Any, address: dict[str, Any], inherit_format: str, *, drop_colour: bool = False
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """``cell_get`` plus (when ``inherit_format == "first_run"``) the font to inherit, from one
+    pane round trip (``include_font``: the font at the start of the cell's first paragraph; NOT
+    the cell's OOXML, which real Word returns for the whole table). The capability is required up
+    front: a pane that cannot report the font must not silently reset it."""
+    if inherit_format != "first_run":
+        return _live_cell_request(session, "cell_get", address), None
+    _require_font_inheritance(session)
+    reply = _live_cell_request(session, "cell_get", {**address, "include_font": True})
+    return reply, _wire_font(reply.get("font"), drop_colour=drop_colour)
 
 
 def _runs_to_wire(paragraphs: list[list[markdown_to_ooxml.RunSpec]]) -> list[list[dict[str, Any]]]:
@@ -750,6 +941,7 @@ def execute_replace_cell_markdown_live(
     revision_before: str | None = None,
     track_changes: bool = False,
     expected_before: str | None = None,
+    inherit_format: str = "first_run",
 ) -> dict[str, Any]:
     """Live-mode ``replace_cell_markdown`` (issue #27, #75).
 
@@ -794,7 +986,10 @@ def execute_replace_cell_markdown_live(
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
     live_write_mode.check_not_stale(revision_before, pre_hash)
 
-    before_text = _live_cell_request(session, "cell_get", address)["text"]
+    before_reply, inherit_font = live_cell_read_with_font(
+        session, address, inherit_format, drop_colour=any(run.link for paragraph in paragraphs for run in paragraph)
+    )
+    before_text = before_reply["text"]
     _check_expected_before(
         expected_before, before_text, table_id=table_id, row_index=row_index, cell_index=cell_index
     )
@@ -807,6 +1002,7 @@ def execute_replace_cell_markdown_live(
                 "paragraphs": _runs_to_wire(paragraphs),
                 "expected_before_text": before_text,
                 "track_changes": track_changes,
+                **({"inherit_font": inherit_font} if inherit_font else {}),
             },
             expected_body_sha256=pre_hash,
             passthrough_codes=(
@@ -814,6 +1010,16 @@ def execute_replace_cell_markdown_live(
                 live_protocol.OP_ERROR_CELL_WRITE_NOT_ROLLED_BACK,
             ),
         )
+    except VerifyError as exc:
+        # The pane writes the cell and THEN reads the font back, so a VERIFICATION_FAILED here (the
+        # inherited font did not stick) means the new text may already be in the cell.
+        if exc.envelope.error_code == ErrorCode.VERIFICATION_FAILED:
+            live_write_mode.audit_live_failure(
+                tool="replace_cell_markdown", path=path, document_name=document_name,
+                pre_body_sha256=pre_hash, post_body_sha256=None,
+                reason=f"the pane reported a failed read-back after writing: {exc.envelope.message}",
+            )
+        raise
     except LiveOpFailed as exc:
         rolled_back = exc.code == live_protocol.OP_ERROR_CELL_WRITE_ROLLED_BACK
         if rolled_back:

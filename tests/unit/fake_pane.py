@@ -65,7 +65,7 @@ from verified_docx_mcp.live.protocol import OP_ERROR_MATCH_COUNT_MISMATCH, OP_ER
 
 # Mirrors SHAPE_GUARDED_OPS in addin/taskpane.js.
 SHAPE_GUARDED_OPS = frozenset({
-    "replace", "format", "cell_set", "cells_set", "table_insert", "paragraph_delete", "paragraph_insert",
+    "replace", "format", "cell_set", "cells_set", "table_insert", "cell_paragraph_merge", "paragraph_delete", "paragraph_insert",
     "revisions_accept", "revisions_reject", "comment_add", "comment_reply", "comment_resolve",
     "comment_delete", "save", "table_delete", "paragraphs_unlist",
 })
@@ -206,6 +206,16 @@ class FakeDocument:
         # self-check outcomes).
         self.merge_cell_paragraphs = False
         self.cell_set_failure: tuple[str, str] | None = None
+        # Issue #107: the font Word reports at the start of a cell's first paragraph
+        # (cell_get include_font; keyed by 0-based (table, row, cell); absent = nothing
+        # to inherit); the font the server asked cell_set to apply is kept in
+        # applied_cell_fonts. A key in font_readback_mismatch makes the fake refuse like
+        # the pane's font readback.
+        self.cell_font: dict[tuple[int, int, int], dict[str, Any]] = {}
+        self.applied_cell_fonts: dict[tuple[int, int, int], dict[str, Any]] = {}
+        self.font_readback_mismatch: set[tuple[int, int, int]] = set()
+        self.cell_get_payloads: list[dict[str, Any]] = []
+        self.positional_payloads: list[dict[str, Any]] = []
         # Issue #34 (live tables). table_meta is parallel to `tables`; the
         # other three are fake-only knobs.
         self.table_meta: list[dict[str, Any]] = []
@@ -310,9 +320,13 @@ class FakeDocument:
         return t, r, c
 
     def cell_get(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.cell_get_payloads.append(dict(payload))
         t, r, c = self._cell(payload)
         text = self.tables[t][r][c]
-        return {"text": text, "paragraphs": text.split("\n")}
+        reply: dict[str, Any] = {"text": text, "paragraphs": text.split("\n")}
+        if payload.get("include_font") and (t, r, c) in self.cell_font:
+            reply["font"] = dict(self.cell_font[(t, r, c)])
+        return reply
 
     def cell_set(self, payload: dict[str, Any]) -> dict[str, Any]:
         pre = self.sha256()
@@ -339,6 +353,10 @@ class FakeDocument:
                 self.tables[t][r][c] = "".join(paragraphs) + "\n"
             else:
                 self.tables[t][r][c] = "\n".join(paragraphs)
+            if payload.get("inherit_font"):
+                if (t, r, c) in self.font_readback_mismatch:
+                    raise OpRefused("VERIFICATION_FAILED", "Inherited cell font size failed readback")
+                self.applied_cell_fonts[(t, r, c)] = dict(payload["inherit_font"])
         return {"applied": True, "before": before, "after": self.tables[t][r][c], "pre": pre, "post": self.sha256()}
 
     # -- live tables (issue #34) --------------------------------------
@@ -574,13 +592,19 @@ class FakeDocument:
         Every refusal happens before the text is touched, like the real pane."""
         pre = self._check_fresh(payload)
         anchor = payload["anchor"]
-        expected = int(payload["expected_matches"])
-        found = self.text.count(anchor)
-        if found != expected:
-            raise OpRefused(
-                "ZERO_MATCH" if found == 0 else "MATCH_COUNT_MISMATCH",
-                f"expected {expected} match(es) for {anchor!r}, found {found}",
-            )
+        structural = isinstance(anchor, dict)
+        if structural:
+            # Issue #107: the fake has no table model, so a structural anchor is recorded and
+            # the paragraphs go after the last line; the server-side contract is what is tested.
+            self.positional_payloads.append(dict(payload))
+        else:
+            expected = int(payload["expected_matches"])
+            found = self.text.count(anchor)
+            if found != expected:
+                raise OpRefused(
+                    "ZERO_MATCH" if found == 0 else "MATCH_COUNT_MISMATCH",
+                    f"expected {expected} match(es) for {anchor!r}, found {found}",
+                )
         specs = payload["paragraphs"]
         requested: list[dict[str, str]] = []
         for spec in specs:
@@ -592,7 +616,7 @@ class FakeDocument:
             else:
                 raise OpRefused("STYLE_NOT_FOUND", f"paragraph style {style!r} was not found in the document")
         lines = self.text.split("\n")
-        index = next(i for i, line in enumerate(lines) if anchor in line)
+        index = len(lines) - 1 if structural else next(i for i, line in enumerate(lines) if anchor in line)
         position = "before" if payload.get("position") == "before" else "after"
         at = index if position == "before" else index + 1
         lines[at:at] = [spec["text"] for spec in specs]
@@ -957,6 +981,8 @@ class FakePane:
         # refusal such as ("too_large", "...") to answer with instead.
         self.body_ooxml = body_ooxml
         self.body_ooxml_error = body_ooxml_error
+        self.merge_payloads: list[dict[str, Any]] = []
+        self.on_cell_paragraph_merge: Any = None
         self.body_ooxml_requests = 0
         # issue #110: the heading sections `sections_list` / `body_hash` answer
         # with, as the pane reports them ({section_key, slug, heading_text,
@@ -976,7 +1002,7 @@ class FakePane:
         # already-connected pane predating the capability, for
         # LIVE_CAPABILITY_MISSING coverage.
         self.capabilities = (
-            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1"]
+            ["row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "comment_loss_guard", "replacement_formatting", "format_readback", "shape_guard", "comment_counts", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1", "cell_font_inheritance_v1", "cell_paragraph_merge_v1", "paragraph_positions_v1"]
             if capabilities is None
             else list(capabilities)
         )
@@ -1090,6 +1116,12 @@ class FakePane:
             return doc.shapes_list()
         if op == "paragraph_delete":
             return doc.paragraph_delete(payload)
+        if op == "cell_paragraph_merge":
+            # Issue #107: the fake has no OOXML model, so a test supplies the post-merge
+            # Flat OPC through on_cell_paragraph_merge (which may also raise OpRefused).
+            self.merge_payloads.append(dict(payload))
+            overrides = (self.on_cell_paragraph_merge(self, payload) if self.on_cell_paragraph_merge else None) or {}
+            return {"applied": True, "pre": doc.sha256(), "post": doc.sha256(), **overrides}
         if op == "ping":
             return {}
         if op == "describe":

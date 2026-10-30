@@ -25,22 +25,49 @@ _FORBIDDEN_TEXT_CHARS = ("\r", "\n", "\v", "\t")
 _MAX_ANCHOR_LEN = 255  # Word's body.search limit
 _MAX_PARAGRAPHS = 50
 _SPEC_KEYS = frozenset({"text", "style", "color"})
+# Issue #107: structural anchors that address a gap without searching for text.
+POSITIONAL_ANCHOR_KEYS = ("after_table_id", "empty_paragraph_after_table_id")
+# ONE policy for "empty paragraph": filling a paragraph holding any of these would lose or
+# move something. File mode applies it to the parsed body; it is sent to the pane, which
+# applies the same list to the OOXML it reads, so the two modes refuse the same paragraphs.
+EMPTY_PARAGRAPH_FORBIDDEN_TAGS = (
+    "drawing", "pict", "object", "sectPr", "tab", "br", "cr", "noBreakHyphen", "softHyphen", "sym",
+    "bookmarkStart", "bookmarkEnd",
+    "fldChar", "fldSimple", "instrText", "hyperlink", "footnoteReference", "endnoteReference",
+    "commentRangeStart", "commentRangeEnd", "commentReference", "ins", "del", "moveFrom", "moveTo",
+)
 
 
 def _invalid(message: str, **diagnostics: Any) -> Exception:
     return _make_error(ErrorCode.INVALID_INPUT, message, diagnostics)
 
 
+def positional_anchor(anchor: Any) -> tuple[str, int] | None:
+    """``(kind, table_id)`` for a structural anchor, ``None`` for a text anchor;
+    ``INVALID_INPUT`` for a malformed object."""
+    if not isinstance(anchor, dict):
+        return None
+    if len(anchor) != 1 or next(iter(anchor)) not in POSITIONAL_ANCHOR_KEYS:
+        raise _invalid(f"a structural anchor holds exactly one of {list(POSITIONAL_ANCHOR_KEYS)}")
+    (kind, table_id), = anchor.items()
+    if type(table_id) is not int or table_id < 1:
+        raise _invalid(f"{kind} must be a positive integer table_id")
+    return kind, table_id
+
+
 def validate_insert_request(
-    anchor: str, position: str, paragraphs: list[dict[str, Any]], expected_matches: int
+    anchor: str | dict[str, Any], position: str, paragraphs: list[dict[str, Any]], expected_matches: int
 ) -> list[dict[str, Any]]:
     """Return normalized paragraph specs (``text``, ``style``, ``color``: uppercase
     6-hex without ``#``, or ``None``); raise ``INVALID_INPUT`` otherwise."""
-    if not isinstance(anchor, str) or not anchor:
-        raise _invalid("anchor must be a non-empty string")
-    if any(ch in anchor for ch in _FORBIDDEN_TEXT_CHARS):
+    if positional_anchor(anchor) is not None:
+        if position != "after":
+            raise _invalid("a structural table anchor inserts position='after' only")
+    elif not isinstance(anchor, str) or not anchor:
+        raise _invalid("anchor must be a non-empty string (or a structural table anchor object)")
+    elif any(ch in anchor for ch in _FORBIDDEN_TEXT_CHARS):
         raise _invalid("anchor must be one line of text (no newline, vertical tab or tab characters)")
-    if len(anchor) > _MAX_ANCHOR_LEN:
+    elif len(anchor) > _MAX_ANCHOR_LEN:
         raise _invalid(f"anchor is {len(anchor)} characters; Word searches at most {_MAX_ANCHOR_LEN}")
     if position not in ("after", "before"):
         raise _invalid(f"position must be 'after' or 'before', got {position!r}")
@@ -76,7 +103,7 @@ def validate_insert_request(
 
 def execute_insert_paragraphs(
     path: str,
-    anchor: str,
+    anchor: str | dict[str, Any],
     paragraphs: list[dict[str, Any]],
     expected_matches: int,
     *,
@@ -150,9 +177,37 @@ def _paragraph_style_id(p_elem: Any) -> str | None:
     return None
 
 
+def empty_paragraph_problem(p_elem: Any) -> str | None:
+    """Why *p_elem* cannot be filled as an "empty" paragraph, or ``None`` when it is empty
+    under the shared policy (no text, none of ``EMPTY_PARAGRAPH_FORBIDDEN_TAGS``)."""
+    for node in p_elem.iter():
+        name = projection._ln(node)
+        if name == "t" and node.text:
+            return "it holds text"
+        if name in EMPTY_PARAGRAPH_FORBIDDEN_TAGS:
+            return f"it holds a {name} element"
+    return None
+
+
+def _fill_paragraph(target: Any, built: Any, style_id: str | None) -> None:
+    """Put *built*'s content into the existing *target* paragraph, keeping its own
+    properties; only a given style replaces the paragraph style."""
+    if style_id is not None:
+        ppr = next((c for c in target if projection._ln(c) == "pPr"), None)
+        if ppr is None:
+            ppr = ET.Element(text_edit._w("pPr"))
+            target.insert(0, ppr)
+        for old in [c for c in ppr if projection._ln(c) == "pStyle"]:
+            ppr.remove(old)
+        ppr.insert(0, ET.Element(text_edit._w("pStyle"), {text_edit._w("val"): style_id}))
+    for child in list(built):
+        if projection._ln(child) != "pPr":
+            target.append(child)
+
+
 def _insert_paragraphs_file(
     path: str,
-    anchor: str,
+    anchor: str | dict[str, Any],
     specs: list[dict[str, Any]],
     expected_matches: int,
     *,
@@ -167,19 +222,53 @@ def _insert_paragraphs_file(
     style_ids = _resolve_style_ids(resolved, specs)
 
     document_root, raw_xml = mutations._load_document(resolved)
-    proj = projection.project_document_root(document_root)
-    locate_result = locate(anchor, proj, expected_matches)
-    start, end = locate_result.spans[0]
-    atoms = text_edit._atoms_for_span(proj, start, end)
     parent_map = text_edit._build_parent_map(document_root)
-    p_elem = text_edit._enclosing_paragraph(parent_map, atoms[0][2].r_elem) if atoms else None
     body = mutations._find_body(document_root)
-    if p_elem is None or parent_map.get(id(p_elem)) is not body:
-        raise _make_error(
-            ErrorCode.STRUCTURAL_BOUNDARY,
-            "the anchor is not in a top-level body paragraph (a table cell or other container); "
-            "anchor on text in a body paragraph.",
-            {"anchor": anchor})
+    structural = positional_anchor(anchor)
+    fill = structural is not None and structural[0] == "empty_paragraph_after_table_id"
+    locate_result = None
+    if structural is not None:
+        from . import tables
+
+        table = tables._find_table_element(document_root, structural[1])
+        if parent_map.get(id(table)) is not body:
+            raise _make_error(
+                ErrorCode.STRUCTURAL_BOUNDARY, "the anchor table is not a top-level table", {"anchor": anchor})
+        p_elem = table
+        start = end = 0
+        before_excerpt = ""
+    else:
+        proj = projection.project_document_root(document_root)
+        locate_result = locate(anchor, proj, expected_matches)
+        start, end = locate_result.spans[0]
+        atoms = text_edit._atoms_for_span(proj, start, end)
+        p_elem = text_edit._enclosing_paragraph(parent_map, atoms[0][2].r_elem) if atoms else None
+        if p_elem is None or parent_map.get(id(p_elem)) is not body:
+            raise _make_error(
+                ErrorCode.STRUCTURAL_BOUNDARY,
+                "the anchor is not in a top-level body paragraph (a table cell or other container); "
+                "anchor on text in a body paragraph.",
+                {"anchor": anchor})
+        before_excerpt = text_edit._excerpt(proj.text, start, end)
+
+    target = None
+    if fill:
+        children = list(body)
+        following = children[children.index(p_elem) + 1] if children.index(p_elem) + 1 < len(children) else None
+        if following is None or following.tag != text_edit._w("p"):
+            raise _make_error(
+                ErrorCode.STRUCTURAL_BOUNDARY,
+                "there is no paragraph immediately after the table to fill", {"anchor": anchor})
+        problem = empty_paragraph_problem(following)
+        if problem:
+            raise _make_error(
+                ErrorCode.STRUCTURAL_BOUNDARY,
+                f"the paragraph after the table is not empty: {problem}", {"anchor": anchor})
+        mutations._check_hazards_or_raise(mutations._scan_range_hazards([following]), False, resolve_author_name())
+        target = following
+        # Filling keeps the paragraph's own style unless the caller names one.
+        if style_ids[0] is None:
+            style_ids = [_paragraph_style_id(target), *style_ids[1:]]
 
     new_ps = [_build_paragraph(spec, style_id) for spec, style_id in zip(specs, style_ids, strict=True)]
     track = None
@@ -188,11 +277,20 @@ def _insert_paragraphs_file(
         tracked_changes.wrap_all_runs(
             new_ps,
             lambda r: tracked_changes.wrap_insertion(r, rid=track.next_id(), author=track.author, date=track.date))
-    at = list(body).index(p_elem) + (1 if position == "after" else 0)
-    for offset, new_p in enumerate(new_ps):
+    at = list(body).index(p_elem) + (0 if position == "before" and structural is None else 1)
+    body_count_before = len(list(body))
+    next_sibling = list(body)[at + (1 if fill else 0)] if at + (1 if fill else 0) < body_count_before else None
+    next_text = "".join(next_sibling.itertext()) if next_sibling is not None else None
+    if fill:
+        _fill_paragraph(target, new_ps[0], style_ids[0])
+        remaining = new_ps[1:]
+        at += 1
+    else:
+        remaining = new_ps
+    for offset, new_p in enumerate(remaining):
         body.insert(at + offset, new_p)
+    first_written = at - 1 if fill else at
 
-    before_excerpt = text_edit._excerpt(proj.text, start, end)
     intended_text = projection.project_document_root(document_root).text
 
     def _post_verify(written_path: Path) -> None:
@@ -200,18 +298,28 @@ def _insert_paragraphs_file(
         if diff:
             raise ValueError(f"re-read document does not match the intended text modulo whitespace: {diff}")
         new_root, _ = mutations._load_document(written_path)
-        written = list(mutations._find_body(new_root))[at : at + len(specs)]
+        children = list(mutations._find_body(new_root))
+        written = children[first_written : first_written + len(specs)]
         if len(written) != len(specs):
             raise ValueError("re-read body does not hold the inserted paragraphs where expected")
         for i, (p, style_id) in enumerate(zip(written, style_ids, strict=True), start=1):
             if _paragraph_style_id(p) != style_id:
                 raise ValueError(f"re-read inserted paragraph {i} does not carry w:pStyle {style_id!r}")
+        if structural is not None:
+            if len(children) != body_count_before + len(specs) - (1 if fill else 0):
+                raise ValueError("re-read body paragraph count differs from the intended count")
+            after_index = first_written + len(specs)
+            following_text = "".join(children[after_index].itertext()) if after_index < len(children) else None
+            if following_text != next_text:
+                raise ValueError("the content after the inserted paragraphs changed")
+            if children[first_written - 1].tag != text_edit._w("tbl"):
+                raise ValueError("the inserted paragraphs are not directly after the anchor table")
 
     conflict_sweep = text_edit._serialize_and_write(resolved, document_root, raw_xml, post_verify=_post_verify)
     evidence = text_edit._evidence(
         applied=True,
         match_count=1,
-        rung=locate_result.rung,
+        rung=locate_result.rung if locate_result is not None else 1,
         before=before_excerpt,
         after="\n".join(spec["text"] for spec in specs),
         revision_before=pre_revision["token"],
@@ -219,7 +327,7 @@ def _insert_paragraphs_file(
         audit_logged=False,
         runs_before=[],
         runs_after=[],
-        warnings=locate_result.warnings,
+        warnings=locate_result.warnings if locate_result is not None else [],
         track=track,
         conflict_sweep=conflict_sweep,
     )
