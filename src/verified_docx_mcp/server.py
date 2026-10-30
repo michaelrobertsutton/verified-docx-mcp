@@ -3032,10 +3032,16 @@ def list_tables(
 
 @mcp.tool()
 def get_table(
-    path: str, table_id: int, part: str = projection.DEFAULT_PART, source: str = "auto"
+    path: str, table_id: int, part: str = projection.DEFAULT_PART, source: str = "auto", compact: bool = True
 ) -> dict[str, Any]:
-    """Full row/cell detail for one table, addressed by the table_id
-    list_tables reports.
+    """One table's content, addressed by the table_id list_tables reports.
+
+    compact=true (default): rows is a list of rows of cell-text strings and
+    merged lists only merged cells ({row_index, cell_index, grid_span,
+    v_merge}). compact=false returns the detailed shape: rows of
+    {row_index, cell_index, grid_span, v_merge, text} for every cell, and no
+    merged key. Live compact reads of a table with merged cells cannot say
+    which cells: merged is null and warnings has "live_merge_metadata_unavailable".
 
     `source` (issue #34, "auto" | "file" | "live", default "auto"): "auto"
     reads the open document through the Live pane when one is connected for
@@ -3057,8 +3063,8 @@ def get_table(
     table_id when the document has no nested table.
 
     Returns path, part, table_id, row_count, col_count, has_merged_cells,
-    has_nested_table, rows (list of list of {row_index, cell_index,
-    grid_span, v_merge, text}). grid_span is w:tcPr/w:gridSpan (1 when
+    has_nested_table, rows (detailed mode: list of list of {row_index,
+    cell_index, grid_span, v_merge, text}). grid_span is w:tcPr/w:gridSpan (1 when
     absent); v_merge is "none"/"restart"/"continue" from w:tcPr/w:vMerge
     (a continuation cell's own text is always ""). text is the same
     per-cell markdown rendering read_document(format="markdown") uses for
@@ -3076,7 +3082,7 @@ def get_table(
       LIVE_UNAVAILABLE / LIVE_CAPABILITY_MISSING / LIVE_DISCONNECTED / LIVE_OP_FAILED - source="live"
     """
     try:
-        return tables.execute_get_table(path, table_id, part, source=source)
+        return tables.execute_get_table(path, table_id, part, source=source, compact=compact)
     except VerifyError as exc:
         _raise_tool_error(exc)
 

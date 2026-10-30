@@ -213,6 +213,58 @@ class GetTableReadTests(unittest.TestCase):
         self.assertEqual(texts, [["Nested A"], ["Nested B"]])
 
 
+class GetTableCompactTests(unittest.TestCase):
+    def _get(self, name, table_id=1, **kwargs):
+        return tables.execute_get_table(str(FIXTURES / name), table_id, source="file", **kwargs)
+
+    def test_compact_is_the_default_and_plain(self):
+        result = self._get("tables.docx")
+        self.assertEqual(result["rows"], [["R1C1", "R1C2"], ["R2C1", "R2C2"]])
+        self.assertEqual(result["merged"], [])
+        self.assertEqual(result["source"], "file")
+        for key in ("table_id", "row_count", "col_count", "has_merged_cells", "has_nested_table"):
+            self.assertIn(key, result)
+
+    def test_compact_lists_only_merged_cells(self):
+        result = self._get("tables-merged.docx")
+        self.assertEqual(result["rows"][0], ["H1", "H2"])
+        self.assertTrue(result["has_merged_cells"])
+        self.assertEqual(
+            result["merged"],
+            [
+                {"row_index": 2, "cell_index": 1, "grid_span": 1, "v_merge": "restart"},
+                {"row_index": 3, "cell_index": 1, "grid_span": 1, "v_merge": "continue"},
+                {"row_index": 4, "cell_index": 1, "grid_span": 2, "v_merge": "none"},
+            ],
+        )
+
+    def test_compact_false_is_the_detailed_shape(self):
+        result = self._get("tables-merged.docx", compact=False)
+        self.assertNotIn("merged", result)
+        self.assertEqual(
+            set(result["rows"][0][0]), {"row_index", "cell_index", "grid_span", "v_merge", "text"}
+        )
+        compact = self._get("tables-merged.docx")
+        self.assertEqual(compact["rows"], [[c["text"] for c in row] for row in result["rows"]])
+
+    def test_the_tool_defaults_to_compact(self):
+        import asyncio
+
+        from fastmcp import Client
+
+        from verified_docx_mcp.server import mcp
+
+        async def run(**extra):
+            async with Client(mcp) as client:
+                res = await client.call_tool(
+                    "get_table", {"path": str(FIXTURES / "tables.docx"), "table_id": 1, "source": "file", **extra}
+                )
+                return res.structured_content
+
+        self.assertEqual(asyncio.run(run())["rows"][0], ["R1C1", "R1C2"])
+        self.assertIsInstance(asyncio.run(run(compact=False))["rows"][0][0], dict)
+
+
 class ReplaceTableRowTests(_TempFixtureCase):
     fixture_name = "tables.docx"
 
