@@ -1070,7 +1070,7 @@ class DocPane:
     hello = HelloMessage(
         document_url, "Word", "Mac", {}, "initial",
         frozenset({"shared_queue", "section_locks", "body_hash_v1", "replacement_formatting",
-                   "comment_loss_guard"}),
+                   "comment_loss_guard", "formatted_replacements_v1", "partial_font_segments_v1"}),
         "pane-1",
     )
 
@@ -1099,6 +1099,11 @@ class DocPane:
             return {"bodySha256": self.doc.sha256(), "sections": [
                 {"section_key": "scope-1", "slug": "scope", "heading_text": "Scope", "level": 1,
                  "slug_unique": True, "sectionSha256": "s"}]}
+        if op == "replacement_font":
+            try:
+                return self.doc.replacement_font(payload["find"], int(payload["expected_matches"]))
+            except OpRefused as exc:
+                raise LiveOpFailed(exc.code, exc.message) from None
         if op != "replace":
             raise AssertionError(op)
         if payload.get("forbiddenSections"):
@@ -1107,6 +1112,8 @@ class DocPane:
             result = self.doc.replace(
                 payload["find"], int(payload["expected_matches"]), payload["replace"],
                 expected_body_sha256=payload.get("expectedBodySha256"),
+                replacement_segments=payload.get("replacement_segments"),
+                expected_first_font=payload.get("expected_first_font"),
             )
         except OpRefused as exc:
             raise LiveOpFailed(exc.code, exc.message) from None
@@ -1286,3 +1293,48 @@ def test_resync_keeps_lease_and_section_lock_barriers(doc_broker):
         _replace("gamma", "G", report["revision_after"])
     assert _code(exc) == "LOCKED_BY_OTHER_CLIENT"
     assert pane.doc.text == "A beta gamma delta epsilon"
+
+
+def test_partial_segment_font_lookup_never_rearms_a_stale_client(doc_broker):
+    """#108: replace_text's replacement_font lookup is read-only and non-observing, so a
+    client staled by another client's write is still refused, and nothing is written."""
+    from verified_docx_mcp import text_edit
+    from verified_docx_mcp.errors import VerifyError
+
+    pane, _, a, b, use = doc_broker
+    use(b)
+    stale = _revision()
+    use(a)
+    _replace("alpha", "A", _revision())
+    use(b)
+    with pytest.raises(VerifyError) as exc:
+        text_edit.execute_replace_text_live(
+            _DOC["path"], "gamma", "G", 1, revision_before=f"live:sha256:{pane.doc.sha256()}",
+            replacement_segments=[{"text": "G", "format": {"bold": True}}])
+    assert _code(exc) == "LIVE_STALE"
+    assert [op for op, _ in pane.calls].count("replacement_font") == 1
+    assert pane.doc.text == "A beta gamma delta epsilon"
+    assert stale != f"live:sha256:{pane.doc.sha256()}"
+    _revision()  # an explicit read re-arms; the partial segment then resolves and lands
+    text_edit.execute_replace_text_live(
+        _DOC["path"], "gamma", "G", 1, revision_before=f"live:sha256:{pane.doc.sha256()}",
+        replacement_segments=[{"text": "G", "format": {"bold": True}}])
+    assert pane.doc.text == "A beta G delta epsilon"
+
+
+def test_format_drift_refusal_does_not_stale_other_clients(setup_broker):
+    pane, _, a, b, call = setup_broker
+    call(a)
+    call(b)
+    original = pane.request_threadsafe
+
+    def drift(op, payload=None, **kwargs):
+        if op == "replace":
+            raise LiveOpFailed("FORMAT_DRIFT", "first run changed")
+        return original(op, payload, **kwargs)
+
+    pane.request_threadsafe = drift
+    with pytest.raises(LiveOpFailed, match="FORMAT_DRIFT"):
+        call(a, "replace")
+    pane.request_threadsafe = original
+    call(b, "replace")
