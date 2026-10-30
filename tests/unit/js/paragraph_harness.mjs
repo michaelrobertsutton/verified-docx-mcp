@@ -3,8 +3,9 @@ import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
 let texts=['previous','target','next',''];
-let trailer=null; let mode='Off', table=false, anchored=false, section=false, malformed=false, comments=false, revisions=false, broken=false;
-const collection={load(){},get items(){return texts.map((text,i)=>({text,tableNestingLevel:table&&i===1?1:0,
+let trailer=null; let mode='Off', nesting=0, cellCount=1, anchored=false, section=false, malformed=false, comments=false, revisions=false, broken=false;
+const collection={load(){},get items(){return texts.map((text,i)=>({text,tableNestingLevel:nesting&&i===1?nesting:0,
+  parentTableCell:{body:{paragraphs:{load(){},items:Array.from({length:cellCount},()=>({}))}}},
   getOoxml:()=>({value:'xml'}),getRange:()=>({getComments:()=>({items:comments?[comment]:[],load(){}}),
     getTrackedChanges:()=>({items:revisions?[{}]:[],load(){}})}),delete(){if(!broken)texts.splice(i,1);}}));}};
 const comment={id:'c',content:'question',authorName:'A',resolved:false,
@@ -16,13 +17,21 @@ class DOMParser {parseFromString(){const p={textContent:'target',getElementsByTa
 const sandbox={crypto:webcrypto,TextEncoder,console,DOMParser,document:{getElementById:()=>({addEventListener(){}})},
   Office:{onReady(){},context:{requirements:{isSetSupported:()=>true}}},Word:{run:fn=>fn(context),RangeLocation:{whole:'Whole'},ChangeTrackingMode:{trackAll:'TrackAll'}}};
 vm.createContext(sandbox);vm.runInContext(fs.readFileSync(process.argv[2],'utf8')+'\nglobalThis.op=opParagraphDelete;',sandbox);
-for(const flag of ['table','anchored','section','malformed','comments','revisions']){
-  if(flag==='table')table=true;if(flag==='anchored')anchored=true;if(flag==='section')section=true;
+for(const flag of ['nested','anchored','section','malformed','comments','revisions']){
+  if(flag==='nested')nesting=2;if(flag==='anchored')anchored=true;if(flag==='section')section=true;
   if(flag==='malformed')malformed=true;if(flag==='comments')comments=true;if(flag==='revisions')revisions=true;
   await assert.rejects(()=>sandbox.op({anchor_text:'target',track_changes:true}));
   assert.equal(texts.length,4);assert.equal(mode,'Off');
-  table=anchored=section=malformed=comments=revisions=false;
+  nesting=0;anchored=section=malformed=comments=revisions=false;
 }
+// issue #107: a paragraph in a (non-nested) cell may be deleted, but never the cell's last one.
+nesting=1;cellCount=1;
+await assert.rejects(()=>sandbox.op({anchor_text:'target'}),e=>e.code==='STRUCTURAL_BOUNDARY'&&/last paragraph in a cell/.test(e.message));
+assert.equal(texts.length,4);
+cellCount=2;
+const cellDelete=await sandbox.op({anchor_text:'target'});
+assert.equal(cellDelete.after_count,3);assert.deepEqual(texts,['previous','next','']);
+nesting=0;cellCount=1;texts=['previous','target','next',''];
 await assert.rejects(()=>sandbox.op({anchor_text:''}),e=>e.code==='STRUCTURAL_BOUNDARY');
 texts=['same','same',''];await assert.rejects(()=>sandbox.op({anchor_text:'same'}));
 texts=['previous','target','next',''];broken=true;

@@ -1,0 +1,418 @@
+"""File-mode coverage for issue #107: cell font inheritance, cell paragraph merge,
+structural paragraph anchors and per-edit row scope. Every case runs against a real
+table with 8.5pt direct formatting (the #106 fixture shape) and asserts that runs the
+edit does not touch keep their size. Live-mode (fake pane) coverage is in test_live_107.py;
+real Word acceptance is separate (docs/acceptance/107-cell-editing.md)."""
+
+import copy
+import shutil
+import sys
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+from xml.etree import ElementTree as ET
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+
+from verified_docx_mcp import mutations, paragraph_insert, paragraph_merge, paths, projection, tables
+from verified_docx_mcp import table_structure as ts
+from verified_docx_mcp.errors import ErrorCode, VerifyError
+
+W = ts.w
+REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+FONT = "Arial"
+COLOR = "1F3864"
+
+
+def rewrite(path, root):
+    with zipfile.ZipFile(path) as z:
+        parts = {n: z.read(n) for n in z.namelist()}
+    parts[projection.DEFAULT_PART] = mutations._serialize_xml(
+        root, mutations._capture_source_namespaces(parts[projection.DEFAULT_PART])
+    )
+    with zipfile.ZipFile(path, "w") as z:
+        for n, data in parts.items():
+            z.writestr(n, data)
+
+
+def add_hyperlink_relationship(path, rid="rIdLink107", target="https://example.test/proof"):
+    with zipfile.ZipFile(path) as z:
+        parts = {n: z.read(n) for n in z.namelist()}
+    rels = ET.fromstring(parts["word/_rels/document.xml.rels"])
+    pkg = rels.tag.split("}")[0] + "}"
+    ET.SubElement(
+        rels,
+        pkg + "Relationship",
+        {"Id": rid, "Type": REL_NS + "/hyperlink", "Target": target, "TargetMode": "External"},
+    )
+    parts["word/_rels/document.xml.rels"] = ET.tostring(rels, encoding="utf-8")
+    with zipfile.ZipFile(path, "w") as z:
+        for n, data in parts.items():
+            z.writestr(n, data)
+
+
+@pytest.fixture
+def doc(tmp_path, monkeypatch):
+    monkeypatch.setenv(paths._ALLOWED_FILE_ROOTS_ENV, str(tmp_path))
+    monkeypatch.setattr(mutations, "_QUIESCE_INTERVAL_SECONDS", 0.001)
+    path = tmp_path / "cells.docx"
+    shutil.copyfile(Path(__file__).parents[1] / "fixtures/tables.docx", path)
+    root, _ = mutations._load_document(path)
+    table = tables._find_table_element(root, 1)
+    for p in table.iter(W("p")):
+        pr = p.find(W("pPr"))
+        if pr is None:
+            pr = ET.Element(W("pPr"))
+            p.insert(0, pr)
+        for old in pr.findall(W("pStyle")):
+            pr.remove(old)
+        ET.SubElement(pr, W("pStyle"), {W("val"): "Compact"})
+        ET.SubElement(pr, W("spacing"), {W("after"): "0"})
+        for r in p.findall(W("r")):
+            rp = r.find(W("rPr"))
+            if rp is None:
+                rp = ET.Element(W("rPr"))
+                r.insert(0, rp)
+            ET.SubElement(rp, W("rFonts"), {W("ascii"): FONT, W("hAnsi"): FONT})
+            ET.SubElement(rp, W("color"), {W("val"): COLOR})
+            ET.SubElement(rp, W("sz"), {W("val"): "17"})
+            ET.SubElement(rp, W("szCs"), {W("val"): "17"})
+    rewrite(path, root)
+    return path
+
+
+def table_of(path):
+    return tables._find_table_element(mutations._load_document(path)[0], 1)
+
+
+def cell_of(path, row=1, col=1):
+    return table_of(path).findall(W("tr"))[row - 1].findall(W("tc"))[col - 1]
+
+
+def sizes(element):
+    return {
+        (r.find(f"{W('rPr')}/{W('sz')}").get(W("val")) if r.find(f"{W('rPr')}/{W('sz')}") is not None else None)
+        for r in element.iter(W("r"))
+    }
+
+
+def add_second_paragraph(path, text="second", bold=True, link=False):
+    root, _ = mutations._load_document(path)
+    cell = tables._find_table_element(root, 1).findall(W("tr"))[0].findall(W("tc"))[0]
+    first = cell.find(W("p"))
+    second = copy.deepcopy(first)
+    ppr = second.find(W("pPr"))
+    if ppr is None:
+        ppr = ET.Element(W("pPr"))
+        second.insert(0, ppr)
+    style = ppr.find(W("pStyle"))
+    if style is None:
+        style = ET.Element(W("pStyle"))
+        ppr.insert(0, style)
+    style.set(W("val"), "Normal")
+    run = second.find(W("r"))
+    run.find(W("t")).text = text
+    if bold:
+        rpr = run.find(W("rPr"))
+        if rpr is None:
+            rpr = ET.Element(W("rPr"))
+            run.insert(0, rpr)
+        ET.SubElement(rpr, W("b"))
+    if link:
+        second.remove(run)
+        hyperlink = ET.SubElement(second, W("hyperlink"), {f"{{{REL_NS}}}id": "rIdLink107"})
+        hyperlink.append(run)
+    cell.append(second)
+    rewrite(path, root)
+    if link:
+        add_hyperlink_relationship(path)
+    return first.find(W("pPr"))
+
+
+# ---- 1. font inheritance ---------------------------------------------------
+
+
+def test_cell_markdown_inherits_the_first_run_font_without_touching_neighbors(doc):
+    before = copy.deepcopy(table_of(doc))
+    tables.execute_replace_cell_markdown(str(doc), 1, 1, 1, "**Label:** new text", write_mode="file")
+    after = table_of(doc)
+    cell = after.findall(W("tr"))[0].findall(W("tc"))[0]
+    assert sizes(cell) == {"17"}
+    for run in cell.iter(W("r")):
+        rpr = run.find(W("rPr"))
+        assert rpr.find(W("rFonts")).get(W("ascii")) == FONT
+        assert rpr.find(W("color")).get(W("val")) == COLOR
+        assert rpr.find(W("szCs")).get(W("val")) == "17"
+    assert len(list(cell.iter(W("b")))) == 1  # the bold the markdown asked for is kept
+    # Every other row, and every other cell of row 1, is byte-identical (8.5pt untouched).
+    assert ET.tostring(after.findall(W("tr"))[1]) == ET.tostring(before.findall(W("tr"))[1])
+    assert ET.tostring(after.findall(W("tr"))[0].findall(W("tc"))[1]) == ET.tostring(
+        before.findall(W("tr"))[0].findall(W("tc"))[1]
+    )
+
+
+def test_inherit_format_none_keeps_the_style_font(doc):
+    tables.execute_replace_cell_markdown(
+        str(doc), 1, 1, 1, "plain", write_mode="file", inherit_format="none"
+    )
+    assert sizes(cell_of(doc)) == {None}
+
+
+def test_a_run_property_set_by_the_markdown_is_not_overridden():
+    font = tables._inherited_cell_font(
+        ET.fromstring(
+            f'<w:tc xmlns:w="{projection.W_NS}"><w:p><w:r><w:rPr><w:sz w:val="17"/></w:rPr><w:t>x</w:t></w:r></w:p></w:tc>'
+        )
+    )
+    run = ET.fromstring(
+        f'<w:p xmlns:w="{projection.W_NS}"><w:r><w:rPr><w:sz w:val="30"/></w:rPr><w:t>big</w:t></w:r></w:p>'
+    )
+    tables._apply_inherited_font([run], font)
+    assert run.find(f"{W('r')}/{W('rPr')}/{W('sz')}").get(W("val")) == "30"
+
+
+@pytest.mark.parametrize(
+    "xml, want",
+    [
+        # a hyperlink first run is looked through
+        ('<w:p><w:hyperlink><w:r><w:rPr><w:sz w:val="17"/></w:rPr><w:t>a</w:t></w:r></w:hyperlink></w:p>', {"size": 8.5}),
+        # an empty first paragraph falls back to the paragraph mark
+        ('<w:p><w:pPr><w:rPr><w:sz w:val="18"/></w:rPr></w:pPr></w:p>', {"size": 9.0}),
+        # a font set only by the style supplies nothing to inherit
+        ('<w:p><w:r><w:t>a</w:t></w:r></w:p>', None),
+        # name and colour are carried; "auto" is not
+        (
+            '<w:p><w:r><w:rPr><w:rFonts w:ascii="Calibri"/><w:color w:val="auto"/></w:rPr><w:t>a</w:t></w:r></w:p>',
+            {"name": "Calibri"},
+        ),
+    ],
+)
+def test_first_run_definition(xml, want):
+    tc = ET.fromstring(f'<w:tc xmlns:w="{projection.W_NS}">{xml}</w:tc>')
+    font = tables._inherited_cell_font(tc)
+    assert (font["wire"] if font else None) == want
+
+
+def test_invalid_inherit_format_is_refused(doc):
+    with pytest.raises(VerifyError) as exc:
+        tables.execute_replace_cell_markdown(str(doc), 1, 1, 1, "x", write_mode="file", inherit_format="all")
+    assert exc.value.envelope.error_code == ErrorCode.INVALID_INPUT
+
+
+# ---- 3. merge --------------------------------------------------------------
+
+
+def test_merge_keeps_first_paragraph_properties_and_both_run_formats(doc):
+    props = ET.tostring(add_second_paragraph(doc))
+    other_before = ET.tostring(cell_of(doc, 1, 2))
+    paragraph_merge.execute(
+        str(doc), 1, 1, 1, 1, expected_text=["R1C1", "second"], separator=" ", write_mode="file"
+    )
+    cell = cell_of(doc)
+    assert len(cell.findall(W("p"))) == 1
+    assert ET.tostring(cell.find(f"{W('p')}/{W('pPr')}")) == props
+    assert "".join(n.text or "" for n in cell.iter(W("t"))) == "R1C1 second"
+    assert len(list(cell.iter(W("b")))) == 1
+    assert sizes(cell) == {"17"}  # no run changed size
+    assert ET.tostring(cell_of(doc, 1, 2)) == other_before
+
+
+def test_merge_keeps_a_hyperlink_target_and_text(doc):
+    add_second_paragraph(doc, text="proof", bold=False, link=True)
+    paragraph_merge.execute(str(doc), 1, 1, 1, 1, separator=" ", write_mode="file")
+    cell = cell_of(doc)
+    links = list(cell.iter(W("hyperlink")))
+    assert len(links) == 1
+    assert paragraph_merge._hyperlinks(cell, paragraph_merge._load_rels(doc)) == [
+        ("https://example.test/proof", None, "proof")
+    ]
+
+
+def test_merge_of_a_cells_last_paragraph_refuses_without_mutation(doc):
+    before = doc.read_bytes()
+    with pytest.raises(VerifyError) as exc:
+        paragraph_merge.execute(str(doc), 1, 1, 1, 1, write_mode="file")
+    assert exc.value.envelope.error_code == ErrorCode.STRUCTURAL_BOUNDARY
+    assert doc.read_bytes() == before
+
+
+def test_merge_refuses_a_text_mismatch_and_protected_structure(doc):
+    add_second_paragraph(doc)
+    before = doc.read_bytes()
+    with pytest.raises(VerifyError) as exc:
+        paragraph_merge.execute(str(doc), 1, 1, 1, 1, expected_text=["R1C1", "WRONG"], write_mode="file")
+    assert exc.value.envelope.error_code == ErrorCode.CELL_TEXT_MISMATCH
+    root, _ = mutations._load_document(doc)
+    cell = tables._find_table_element(root, 1).findall(W("tr"))[0].findall(W("tc"))[0]
+    ET.SubElement(cell.find(W("p")), W("bookmarkStart"), {W("id"): "9", W("name"): "keep"})
+    rewrite(doc, root)
+    before = doc.read_bytes()
+    with pytest.raises(VerifyError) as exc:
+        paragraph_merge.execute(str(doc), 1, 1, 1, 1, write_mode="file")
+    assert exc.value.envelope.error_code == ErrorCode.STRUCTURAL_BOUNDARY
+    assert doc.read_bytes() == before
+
+
+def test_tracked_merge_is_refused_in_both_modes(doc):
+    add_second_paragraph(doc)
+    before = doc.read_bytes()
+    for mode in ("file", "auto"):
+        with pytest.raises(VerifyError) as exc:
+            paragraph_merge.execute(str(doc), 1, 1, 1, 1, track_changes=True, write_mode=mode)
+        assert exc.value.envelope.error_code == ErrorCode.INVALID_INPUT
+    assert doc.read_bytes() == before
+
+
+# ---- 4. structural paragraph anchors ---------------------------------------
+
+
+def body_after_table(path):
+    root, _ = mutations._load_document(path)
+    body = mutations._find_body(root)
+    table = tables._find_table_element(root, 1)
+    children = list(body)
+    return children, children.index(table)
+
+
+def test_paragraph_after_table_and_fill_empty(doc):
+    children_before, at = body_after_table(doc)
+    result = paragraph_insert.execute_insert_paragraphs(
+        str(doc), {"after_table_id": 1}, [{"text": "Caption"}], 1, write_mode="file"
+    )
+    assert result["applied"]
+    children, at = body_after_table(doc)
+    assert len(children) == len(children_before) + 1
+    assert "".join(children[at + 1].itertext()) == "Caption"
+    assert "".join(children[at + 2].itertext()) == "".join(children_before[at + 1].itertext())
+
+    # Make the paragraph after the table empty, then fill it: the paragraph is kept, not replaced.
+    root, _ = mutations._load_document(doc)
+    body = mutations._find_body(root)
+    target = list(body)[at + 1]
+    for child in list(target):
+        if child.tag != W("pPr"):
+            target.remove(child)
+    ppr = target.find(W("pPr"))
+    if ppr is None:
+        ppr = ET.Element(W("pPr"))
+        target.insert(0, ppr)
+    ET.SubElement(ppr, W("jc"), {W("val"): "center"})
+    props = ET.tostring(ppr)
+    count = len(list(body))
+    rewrite(doc, root)
+    paragraph_insert.execute_insert_paragraphs(
+        str(doc), {"empty_paragraph_after_table_id": 1}, [{"text": "Filled"}, {"text": "Extra"}], 1,
+        write_mode="file", allow_concurrent_editor=True,
+    )
+    children, at = body_after_table(doc)
+    assert len(children) == count + 1  # one paragraph filled, one inserted
+    assert [("".join(p.itertext())) for p in children[at + 1 : at + 3]] == ["Filled", "Extra"]
+    assert ET.tostring(children[at + 1].find(W("pPr"))) == props  # the paragraph's own properties survive
+
+
+@pytest.mark.parametrize("problem", ["text", "bookmark", "hyperlink", "tab"])
+def test_fill_refuses_a_paragraph_that_is_not_empty(doc, problem):
+    paragraph_insert.execute_insert_paragraphs(
+        str(doc), {"after_table_id": 1}, [{"text": "Caption"}], 1, write_mode="file"
+    )
+    root, _ = mutations._load_document(doc)
+    body = mutations._find_body(root)
+    children = list(body)
+    target = children[children.index(tables._find_table_element(root, 1)) + 1]
+    for child in list(target):
+        target.remove(child)
+    if problem == "text":
+        ET.SubElement(ET.SubElement(target, W("r")), W("t")).text = "kept"
+    elif problem == "bookmark":
+        ET.SubElement(target, W("bookmarkStart"), {W("id"): "7", W("name"): "b"})
+    elif problem == "hyperlink":
+        ET.SubElement(target, W("hyperlink"), {W("anchor"): "x"})
+    else:
+        ET.SubElement(ET.SubElement(target, W("r")), W("tab"))
+    rewrite(doc, root)
+    before = doc.read_bytes()
+    with pytest.raises(VerifyError) as exc:
+        paragraph_insert.execute_insert_paragraphs(
+            str(doc), {"empty_paragraph_after_table_id": 1}, [{"text": "Nope"}], 1,
+            write_mode="file", allow_concurrent_editor=True,
+        )
+    assert exc.value.envelope.error_code == ErrorCode.STRUCTURAL_BOUNDARY
+    assert doc.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "anchor, position, message",
+    [
+        ({"after_table_id": 1, "empty_paragraph_after_table_id": 1}, "after", "exactly one"),
+        ({"after_table_id": 0}, "after", "positive"),
+        ({"after_table_id": True}, "after", "positive"),
+        ({"before_table": 1}, "after", "exactly one"),
+        ({"after_table_id": 1}, "before", "after"),
+    ],
+)
+def test_structural_anchor_validation(anchor, position, message):
+    with pytest.raises(VerifyError) as exc:
+        paragraph_insert.validate_insert_request(anchor, position, [{"text": "x"}], 1)
+    assert exc.value.envelope.error_code == ErrorCode.INVALID_INPUT
+    assert message in exc.value.envelope.message
+
+
+def test_missing_table_is_table_not_found(doc):
+    with pytest.raises(VerifyError) as exc:
+        paragraph_insert.execute_insert_paragraphs(
+            str(doc), {"after_table_id": 99}, [{"text": "x"}], 1, write_mode="file"
+        )
+    assert exc.value.envelope.error_code == ErrorCode.TABLE_NOT_FOUND
+
+
+# ---- 5. per-edit row scope in a batch ---------------------------------------
+
+
+def test_batch_forwards_each_row_anchor_and_chains_revisions(monkeypatch, tmp_path):
+    from verified_docx_mcp import text_edit
+    from verified_docx_mcp.live import write_mode
+
+    pane = SimpleNamespace(
+        document_name="batch.docx",
+        hello=SimpleNamespace(capabilities={"replacement_formatting", "comment_loss_guard", "row_scope"}),
+        request_threadsafe=lambda *args, **kwargs: {"bodySha256": "a" * 64},
+    )
+    monkeypatch.setattr(write_mode, "live_session_for", lambda path: pane)
+    calls = []
+
+    def apply(session, **kwargs):
+        calls.append(kwargs)
+        return {"post": ("b" if len(calls) == 1 else "c") * 64, "match_count": 1, "matches": []}
+
+    monkeypatch.setattr(text_edit, "_live_replace_once", apply)
+    edits = [
+        {"find": "same", "replace": "one", "expected_matches": 1, "within_row_containing": "First row"},
+        {"find": "same", "replace": "two", "expected_matches": 1, "within_row_containing": "Second row"},
+    ]
+    result = text_edit.execute_replace_text_batch_live(str(tmp_path / "batch.docx"), edits, "live:sha256:" + "a" * 64)
+    assert result["batch_status"] == "complete"
+    assert [c["within_row_containing"] for c in calls] == ["First row", "Second row"]
+    assert [c["pre_hash"] for c in calls] == ["a" * 64, "b" * 64]
+
+
+def test_batch_row_scope_needs_the_pane_capability_and_text(monkeypatch, tmp_path):
+    from verified_docx_mcp import text_edit
+    from verified_docx_mcp.live import write_mode
+
+    pane = SimpleNamespace(
+        document_name="batch.docx",
+        hello=SimpleNamespace(capabilities={"replacement_formatting"}),  # no row_scope
+        request_threadsafe=lambda *args, **kwargs: {"bodySha256": "a" * 64},
+    )
+    monkeypatch.setattr(write_mode, "live_session_for", lambda path: pane)
+    scoped = [{"find": "x", "replace": "y", "expected_matches": 1, "within_row_containing": "Row"}]
+    with pytest.raises(VerifyError) as exc:
+        text_edit.execute_replace_text_batch_live(str(tmp_path / "batch.docx"), scoped, "live:sha256:" + "a" * 64)
+    assert exc.value.envelope.error_code == ErrorCode.LIVE_CAPABILITY_MISSING
+    for bad in ("", "  ", 3):
+        edits = [{"find": "x", "replace": "y", "expected_matches": 1, "within_row_containing": bad}]
+        with pytest.raises(VerifyError) as exc:
+            text_edit._validate_batch_edits(edits)
+        assert exc.value.envelope.error_code == ErrorCode.INVALID_INPUT

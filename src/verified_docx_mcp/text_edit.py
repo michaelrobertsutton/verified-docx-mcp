@@ -1104,7 +1104,7 @@ def _validate_batch_edits(edits: Any) -> list[dict[str, Any]]:
                 ErrorCode.INVALID_INPUT,
                 f"edits[{i}]: allow_comment_loss is not accepted in a batch; use allow_comment_loss_ids",
             )
-        unknown = set(edit) - {"find", "replace", "expected_matches", "allow_comment_loss_ids"}
+        unknown = set(edit) - {"find", "replace", "expected_matches", "allow_comment_loss_ids", "within_row_containing"}
         if unknown:
             raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}]: unknown key(s) {sorted(unknown)}")
         find, replace, expected = edit.get("find"), edit.get("replace"), edit.get("expected_matches")
@@ -1120,7 +1120,11 @@ def _validate_batch_edits(edits: Any) -> list[dict[str, Any]]:
             raise _make_error(
                 ErrorCode.INVALID_INPUT, f"edits[{i}]: {exc.envelope.message}", exc.envelope.diagnostics
             ) from exc
-        out.append({"find": find, "replace": replace, "expected_matches": expected, "allow_comment_loss_ids": ids})
+        row_scope = edit.get("within_row_containing")
+        if row_scope is not None and (not isinstance(row_scope, str) or not row_scope.strip()):
+            raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}].within_row_containing must be non-empty text")
+        out.append({"find": find, "replace": replace, "expected_matches": expected,
+                    "allow_comment_loss_ids": ids, "within_row_containing": row_scope})
     return out
 
 
@@ -1167,7 +1171,7 @@ def execute_replace_text_batch_live(
     document_name = session.document_name
     _require_live_replace_capabilities(
         session,
-        within_row_containing=None,
+        within_row_containing=next((e["within_row_containing"] for e in checked if e["within_row_containing"]), None),
         allow_comment_loss_ids=[] if any(e["allow_comment_loss_ids"] is not None for e in checked) else None,
     )
 
@@ -1229,6 +1233,7 @@ def execute_replace_text_batch_live(
                 pre_hash=current,
                 track_changes=track_changes,
                 allow_comment_loss_ids=edit["allow_comment_loss_ids"],
+                within_row_containing=edit["within_row_containing"],
                 inherit_format=inherit_format,
             )
         except VerifyError as exc:
@@ -2313,6 +2318,14 @@ def execute_live_save(path: str) -> dict[str, Any]:
     ``file_revision``, so a caller that wants to keep working against the
     file-mode revision contract after a live session has one to pass as
     the next file-mode call's ``revision_before``.
+
+    Issue #107: saving persists, it does not read or change the body, so in shared-bridge
+    mode it needs no body baseline (a save no longer fails LIVE_STALE because someone is
+    typing), does not acknowledge the caller's earlier read, and does not stale other
+    clients. It still honours the document lease and section locks. The follow-up describe
+    and the disk token are read at separate instants, so ``revision_after`` and
+    ``file_revision`` are NOT proof that the saved bytes are that body; it also does not
+    settle an uncertain write from an earlier call.
 
     Structural verification (tables, whole-section rewrites -- rungs 3/4,
     which never go live per the plan) against the now-saved file is the

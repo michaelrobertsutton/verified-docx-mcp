@@ -435,6 +435,13 @@ channel:
   in an earlier paragraph, and `insertBreak` rejects `"End"`. The pane
   therefore inserts the empty paragraphs, syncs, writes into the loaded
   paragraph items, and breaks with `"After"`.
+- **Font (issue #107)**: by default the cell's first-run font name, size and
+  colour are read (`cell_get` with `include_ooxml`, capability
+  `cell_font_inheritance_v1`), sent with `cell_set` as `inherit_font`, applied
+  to the cell and read back (`VERIFICATION_FAILED` on a mismatch). A pane without
+  the capability is refused with `LIVE_CAPABILITY_MISSING`; pass
+  `inherit_format="none"` to accept the style's font. Word's API cannot set the
+  complex-script size, so live mode carries name, size and colour only.
 - **Compare-and-set**: `cell_set` carries the text `cell_get` just read;
   the pane refuses (`LIVE_OP_FAILED`) if the cell changed in between, so
   a co-author typing in the same cell is not overwritten.
@@ -591,6 +598,17 @@ pane's `paragraph_insert` op and requires the `paragraph_insert` capability
   `MATCH_COUNT_MISMATCH`, refused before any write). It must be in a top-level
   body paragraph, not a table cell (`STRUCTURAL_BOUNDARY`). Under section locks
   only `position="after"` is allowed.
+- **Structural anchors (issue #107):** `anchor` may instead be
+  `{"after_table_id": N}` (after top-level table N) or
+  `{"empty_paragraph_after_table_id": N}` (fill the empty body paragraph directly
+  after it, keeping its own style unless one is named). Both need
+  `position="after"`, `expected_matches=1` and the pane's
+  `paragraph_positions_v1` capability. "Empty" is one list
+  (`paragraph_insert.EMPTY_PARAGRAPH_FORBIDDEN_TAGS`: text, fields, bookmarks,
+  tabs, breaks, hyperlinks, drawings, comment anchors, tracked changes, section
+  breaks) that the server sends and the pane applies, so both modes refuse the
+  same paragraphs; the section guard covers the destination itself. See
+  [`docs/acceptance/107-cell-editing.md`](acceptance/107-cell-editing.md).
 - **Paragraphs:** each `{text, style, color}` is one paragraph. `style` is a
   paragraph style name; it is resolved before anything is written
   (`STYLE_NOT_FOUND` / `UNSUPPORTED_STYLE_TYPE`). Omitted `style` is written as
