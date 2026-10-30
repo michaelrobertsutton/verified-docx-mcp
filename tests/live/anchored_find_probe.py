@@ -16,7 +16,8 @@ Checks:
   (c) an approved run replacing a ~600-character paragraph by ellipsis;
   (d) a stale paragraph hash (PARA_HASH_MISMATCH) and a stale revision (LIVE_STALE) refused;
   (e) an anchored format_text and an anchored delete_paragraph;
-  (f) a 2-edit replace_text_batch whose second, anchored edit targets the first edit's output.
+  (f) a 2-edit replace_text_batch whose second, anchored edit targets the first edit's output;
+  (g) a 12-comment live add_anchored_comment_batch.
 (b) also replaces a > 230-character paragraph by para_ref in plain live mode. expected_length
 counts characters of the normalized span (straight quotes, whitespace runs -> one space).
 """
@@ -27,7 +28,7 @@ import json
 import sys
 from pathlib import Path
 
-from verified_docx_mcp import locate, mutations, server, text_edit
+from verified_docx_mcp import comment_batch, locate, mutations, server, text_edit
 from verified_docx_mcp.errors import VerifyError
 from verified_docx_mcp.live import approved_changes as runs
 from verified_docx_mcp.live import bridge, open_pane_live, paragraphs_live, reads_live
@@ -67,6 +68,8 @@ BATCH_1 = "Batch paragraph rewritten by edit one, " + "then edited again by the 
 APPROVED = "Skyward will operate the help desk " + "with tiered escalation and measured response times, " * 11 + \
     "reported monthly to the program office."
 
+REVIEW = [f"Review target {n}: Skyward staffs requirement {n} with a named lead." for n in range(1, 13)]
+
 
 def nlen(text: str) -> int:
     """What expected_length counts: characters of the normalized span."""
@@ -74,7 +77,7 @@ def nlen(text: str) -> int:
 
 
 # 0. Known body, written in file mode before Word opens the document.
-body = f"# Anchored\n\n{DECOY}\n\n{LONG}\n\n{PARA}\n\n{PARA_LONG}\n\n{DELETE_ME}\n\n{FORMAT_ME}\n\n{BATCH}\n\n# Approved\n\n{APPROVED}\n\nClosing paragraph."
+body = f"# Anchored\n\n{DECOY}\n\n{LONG}\n\n{PARA}\n\n{PARA_LONG}\n\n{DELETE_ME}\n\n{FORMAT_ME}\n\n{BATCH}\n\n" + "\n\n".join(REVIEW) + f"\n\n# Approved\n\n{APPROVED}\n\nClosing paragraph."
 mutations.execute_replace_body_markdown(path, body, allow_concurrent_editor=True)
 registry = bridge.start_in_background()
 opened = open_pane_live.execute_open_pane(path, timeout_s=90)
@@ -153,6 +156,14 @@ batch = text_edit.execute_replace_text_batch_live(path, [
 ], revision())
 check("(f) batch: an anchored edit on the previous edit's output", batch["batch_status"] == "complete"
       and "Batch paragraph final." in live_lines(), results=batch["results"])
+
+# (g) 12 review comments in one live batch.
+comments = [{"quote": f"Review target {n}: Skyward staffs", "content": f"Probe finding {n}: name the lead."}
+            for n in range(1, 13)]
+review = comment_batch.execute_add_anchored_comment_batch(path, comments, write_mode="live")
+check("(g) 12-comment live batch", review["batch_status"] == "complete" and review["applied_count"] == 12
+      and len({r.get("comment_id") for r in review["results"]}) == 12,
+      batch_status=review["batch_status"], applied_count=review["applied_count"])
 
 # (c) approved run: a ~600-character ellipsis replacement.
 ops = [{"op": "replace_text", "section": "approved",

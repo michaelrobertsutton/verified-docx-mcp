@@ -220,3 +220,18 @@ def test_a_pre_write_refusal_does_not_stale_other_clients(code):
     with pytest.raises(LiveOpFailed):
         call(a, "replace", {"prefix": "x" * 12, "suffix": "y" * 12, "expected_text_sha256": "0" * 64})
     call(b, "replace", {"find": "z", "expected_matches": 1, "replace": "w"})  # not stale
+
+
+def test_batch_row_scope_is_refused_with_an_anchored_or_para_ref_target():
+    """#107's within_row_containing scopes a plain find only; the merge with #113 keeps that."""
+    anchored = {"find": f"Skyward will deliver th{E}on the first day.", "expected_length": 60, "replace": "y",
+                "within_row_containing": "Row"}
+    para = {"para_ref": "p2", "expected_sha256": "a" * 64, "replace": "y", "within_row_containing": "Row"}
+    for edit in (anchored, para):
+        with pytest.raises(VerifyError) as exc:
+            text_edit._validate_batch_edits([edit])
+        assert exc.value.envelope.error_code.value == "INVALID_INPUT"
+        assert "within_row_containing" in exc.value.envelope.message
+    plain = text_edit._validate_batch_edits(
+        [{"find": "x", "replace": "y", "expected_matches": 1, "within_row_containing": "Row"}])
+    assert plain[0]["within_row_containing"] == "Row" and plain[0]["kind"] == "plain"
