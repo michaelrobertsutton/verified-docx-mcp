@@ -47,8 +47,7 @@ _SEPARATOR_CELL = re.compile(r"^:?-+:?$")
 
 def _split_pipe_row(line: str) -> list[str]:
     line = line.strip()
-    if line.startswith("|"):
-        line = line[1:]
+    line = line.removeprefix("|")
     if line.endswith("|") and not line.endswith("\\|"):
         line = line[:-1]
     cells: list[str] = []
