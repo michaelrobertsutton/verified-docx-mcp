@@ -369,7 +369,41 @@ def read_source(path: str, source: str, part: str = DEFAULT_PART, *, observe: bo
             local_path.unlink(missing_ok=True)
 
 
-def live_revision(path: str) -> dict[str, Any]:
+@dataclass
+class BodyDigests:
+    """Digests computed server-side from ONE ``body_ooxml`` export."""
+
+    body_sha256: str
+    sections: list[list[str]]  # [[section_key, sha12], ...]
+    content_sections: list[list[str]]  # [[section_key, content_sha12], ...]; [] unless asked
+    preamble_content_sha12: str | None
+
+
+def body_digests_from_ooxml(session: Any, document_name: str, *, content: bool) -> BodyDigests:
+    """Take exactly one ``body_ooxml`` export through *session* (so its observe
+    semantics are the caller's) and compute every digest from that snapshot:
+    ``sha12`` per heading section and, with *content*, ``content_sha12`` plus
+    the preamble's (issue #117, ``projection.section_content_items``). The
+    export is discarded."""
+    from .. import projection
+
+    reply = _fetch_body_ooxml(session)
+    with tempfile.TemporaryDirectory(prefix="verified-docx-live-rev-") as tmp:
+        temp_docx = Path(tmp) / document_name
+        flat_opc_to_docx(reply["ooxml"], temp_docx)
+        sections, preamble = projection.find_sections_and_preamble(
+            temp_docx, digests=True, ignore_trailing_empty=True, content_digests=content
+        )
+    headings = [sec for sec in sections if sec["kind"] == "heading"]
+    return BodyDigests(
+        body_sha256=reply["bodySha256"],
+        sections=[[sec["section_key"], sec["sha12"]] for sec in headings],
+        content_sections=[[sec["section_key"], sec["content_sha12"]] for sec in headings] if content else [],
+        preamble_content_sha12=preamble,
+    )
+
+
+def live_revision(path: str, content_digests: bool = False) -> dict[str, Any]:
     """The live body's current revision token and per-section digests, without
     reading the body into the response (issue #110).
 
@@ -378,13 +412,17 @@ def live_revision(path: str) -> dict[str, Any]:
     section-digested server-side, then discarded -- correct but not cheap, so
     the reply says ``via: "body_ooxml_fallback"``.
 
+    *content_digests* (issue #117) takes exactly one ``body_ooxml`` export
+    instead (never ``body_hash``) and computes ``revision``, ``sections`` and
+    the new ``content_sections`` / ``preamble_content_sha12`` from that one
+    snapshot (``via: "body_ooxml"``).
+
     Like ``read_document(source="live")`` this goes through the registry
     session (observe=True), so in shared-bridge mode it re-arms the caller's
-    write baseline. A non-observing view (``write_mode.live_session_for``)
-    never does, which is how an error path can look at the body without
-    re-arming the client it just refused.
+    write baseline -- with or without *content_digests*. A non-observing view
+    (``write_mode.live_session_for``) never does, which is how an error path
+    can look at the body without re-arming the client it just refused.
     """
-    from .. import projection
     from .comments_live import _request
 
     resolved = paths.resolve_allowed_docx_path(path, must_exist=False)
@@ -406,6 +444,21 @@ def live_revision(path: str) -> dict[str, Any]:
         )
     write_mode._check_session_identity(path, session)
 
+    if content_digests:
+        write_mode.require_capability(
+            session, BODY_OOXML_CAPABILITY, feature_description="live_revision(content_digests=true)"
+        )
+        computed = body_digests_from_ooxml(session, document_name, content=True)
+        return {
+            "revision": f"{LIVE_REVISION_PREFIX}{computed.body_sha256}",
+            "body_sha12": computed.body_sha256[:12],
+            "sections": computed.sections,
+            "content_sections": computed.content_sections,
+            "preamble_content_sha12": computed.preamble_content_sha12,
+            "observed_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+            "via": "body_ooxml",
+        }
+
     if BODY_HASH_CAPABILITY in session.hello.capabilities:
         reply = _request(session, "body_hash", {})
         body_sha = reply.get("bodySha256")
@@ -423,16 +476,9 @@ def live_revision(path: str) -> dict[str, Any]:
         via = "body_hash"
     else:
         write_mode.require_capability(session, BODY_OOXML_CAPABILITY, feature_description="live_revision")
-        reply = _fetch_body_ooxml(session)
-        body_sha = reply["bodySha256"]
-        with tempfile.TemporaryDirectory(prefix="verified-docx-live-rev-") as tmp:
-            temp_docx = Path(tmp) / document_name
-            flat_opc_to_docx(reply["ooxml"], temp_docx)
-            digests = [
-                [sec["section_key"], sec["sha12"]]
-                for sec in projection.find_sections_impl(temp_docx, digests=True, ignore_trailing_empty=True)
-                if sec["kind"] == "heading"
-            ]
+        computed = body_digests_from_ooxml(session, document_name, content=False)
+        body_sha = computed.body_sha256
+        digests = computed.sections
         via = "body_ooxml_fallback"
 
     return {
