@@ -128,6 +128,7 @@ class ErrorCode(Enum):
     LIVE_DISCONNECTED = "LIVE_DISCONNECTED"  # the pane's WebSocket closed mid-request, or a reply never arrived within the op timeout (live/session.py LiveDisconnected)
     HOST_SHAPE_READ_FAILED = "HOST_SHAPE_READ_FAILED"
     MIXED_FORMATTING = "MIXED_FORMATTING"
+    FORMAT_DRIFT = "FORMAT_DRIFT"  # issue #108: partial replacement_segments were resolved against the first replaced run's font, and the pane re-read that font immediately before writing and found it changed; nothing was written. Re-run the call (or re-prepare an approved run) to resolve against the current formatting
     WOULD_DELETE_COMMENTS = "WOULD_DELETE_COMMENTS"
     COMMENT_ID_STALE = "COMMENT_ID_STALE"
     LIVE_STALE = "LIVE_STALE"  # the pane's body hash before the op (result["pre"]) did not match a caller-supplied expected_body_sha256 (live/session.py LiveStale)

@@ -11,6 +11,7 @@ import asyncio
 import copy
 import json
 import os
+import re
 import socket
 import socketserver
 import stat
@@ -42,6 +43,7 @@ READ_OPS = frozenset(
         "autoopen_get",
         "sections_list",
         "execution_snapshot",
+        "replacement_font",
     }
 )
 # Writes that persist but neither read nor change the body (issue #107): they stay writes for
@@ -73,8 +75,26 @@ PRE_MUTATION_REFUSALS = frozenset(
         # every one of which runs before its op writes anything).
         "AMBIGUOUS_SPAN",
         "INVALID_INPUT",
+        # issue #108: the count gate, however the pane spells it (paragraph_insert uses the
+        # upper-case names), and the mutation-boundary formatting drift check.
+        "ZERO_MATCH",
+        "MATCH_COUNT_MISMATCH",
+        "FORMAT_DRIFT",
     }
 )
+# issue #108: panes before #108 report the replace/format/comment_add count gate as a bare
+# LIVE_OP_FAILED carrying exactly this message (text_edit already classifies it as a refusal),
+# so the broker must too -- otherwise a batch's refused edit stales its own client and every
+# other client, and the batch's revision_after no longer re-arms the next write.
+_COUNT_GATE = re.compile(r"expected \d+ match\(es\) for .*, found \d+", re.DOTALL)
+
+
+def refused_before_mutation(exc: LiveOpFailed) -> bool:
+    """True only for a pane refusal proven to be raised before any write."""
+    if exc.code in PRE_MUTATION_REFUSALS:
+        return True
+    return exc.code == "LIVE_OP_FAILED" and bool(_COUNT_GATE.fullmatch(exc.message or ""))
+
 MAX_FRAME = 72 * 2**20  # body_ooxml can return 48 MiB, with JSON escaping
 CLIENT_TTL = 300.0
 HEARTBEAT_S = 30.0
@@ -370,7 +390,7 @@ class Broker:
             except LiveOpFailed as exc:
                 # Only a refusal the pane raises before touching the document is safe to
                 # ignore; anything else (timeout, verification failure) may have applied.
-                if exc.code in PRE_MUTATION_REFUSALS:
+                if refused_before_mutation(exc):
                     mutated = False
                 raise
             finally:

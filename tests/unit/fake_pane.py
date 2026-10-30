@@ -71,6 +71,15 @@ SHAPE_GUARDED_OPS = frozenset({
 })
 
 
+# Issue #108: the effective font every character has unless a test overrides a span
+# (FakeDocument.fonts). Mirrors the ten FONT_FIELDS the real pane reports.
+DEFAULT_FONT: dict[str, Any] = {
+    "bold": False, "italic": False, "underline": "None", "strikeThrough": False,
+    "doubleStrikeThrough": False, "subscript": False, "superscript": False,
+    "color": "#000000", "name": "Calibri", "size": 11,
+}
+
+
 class OpRefused(Exception):
     """Raised by a `FakeDocument` op handler to make `FakePane` reply
     `ok=false` with this code/message, instead of a raised exception
@@ -161,6 +170,14 @@ class FakeDocument:
     def __init__(self, text: str = "", *, author_name: str = "Fake Pane") -> None:
         self.text = text
         self.author_name = author_name
+        # Issue #108: a minimal run-format model -- (substring, font) pairs; every character
+        # inside an occurrence of substring has that effective font, every other character
+        # DEFAULT_FONT. replacement_font and replace's expected_first_font read it; a replace
+        # with replacement_segments records each segment's format on its inserted text.
+        self.fonts: list[tuple[str, dict[str, Any]]] = []
+        # Called right before replace's mutation-boundary font check (lets a test reformat
+        # the target between the server's lookup and the write).
+        self.before_replace: Any = None
         self.comments: list[FakeComment] = []
         self.change_tracking_mode = "Off"
         self.saved = True
@@ -763,6 +780,29 @@ class FakeDocument:
             )
         return results
 
+    def font_at(self, index: int) -> dict[str, Any]:
+        """The effective font of the character at *index* (issue #108)."""
+        for needle, font in reversed(self.fonts):
+            start = self.text.find(needle)
+            while needle and start >= 0:
+                if start <= index < start + len(needle):
+                    return {**DEFAULT_FONT, **font}
+                start = self.text.find(needle, start + 1)
+        return dict(DEFAULT_FONT)
+
+    def replacement_font(self, find: str, expected_matches: int, *, row_anchor: str | None = None) -> dict[str, Any]:
+        """Read-only (issue #108): the first run's effective font of every match."""
+        positions = self._scoped_positions(find, row_anchor)
+        if len(positions) != expected_matches:
+            raise OpRefused(
+                "zero_match" if not positions else "match_count_mismatch",
+                f"expected {expected_matches} match(es) for {find!r}, found {len(positions)}",
+            )
+        fonts = [self.font_at(start) for start, _ in positions]
+        if any(font != fonts[0] for font in fonts):
+            raise OpRefused("INVALID_INPUT", "matches differ in formatting; specify every field")
+        return {"font": fonts[0], "match_count": len(positions)}
+
     def replace(
         self,
         find: str,
@@ -774,6 +814,8 @@ class FakeDocument:
         expected_body_sha256: str | None = None,
         allow_comment_loss_ids: list[dict[str, Any]] | None = None,
         anchor: dict[str, Any] | None = None,
+        replacement_segments: list[dict[str, Any]] | None = None,
+        expected_first_font: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         pre = self.sha256()
         # Issue #82: the real pane refuses a stale caller before touching anything.
@@ -789,6 +831,13 @@ class FakeDocument:
                 "LIVE_OP_FAILED",
                 f"expected {expected_matches} match(es) for {find!r}, found {len(positions)}",
             )
+        if self.before_replace is not None:
+            self.before_replace(self)
+        # Issue #108: the mutation-boundary check against the baseline partial segments used.
+        if expected_first_font is not None and any(
+            self.font_at(start) != expected_first_font for start, _ in positions
+        ):
+            raise OpRefused("FORMAT_DRIFT", "the first replaced run's formatting changed; nothing was written")
         if self.shapes:
             touched: list[str] = []
             offset = 0
@@ -821,10 +870,18 @@ class FakeDocument:
             self.change_tracking_mode = "TrackAll"
         try:
             matches_result = [{"before": find, "after": replace} for _ in positions]
+            if replacement_segments is not None:
+                for match in matches_result:
+                    match["segments"] = [
+                        {"text": seg["text"], "format": dict(seg["format"]), "hyperlink": seg.get("hyperlink")}
+                        for seg in replacement_segments
+                    ]
             new_text = self.text
             for start, end in reversed(positions):
                 new_text = new_text[:start] + replace + new_text[end:]
             self.text = new_text
+            if replacement_segments is not None:
+                self.fonts.extend((seg["text"], dict(seg["format"])) for seg in replacement_segments)
         finally:
             self.change_tracking_mode = previous_mode
         result = {
@@ -1228,6 +1285,13 @@ class FakePane:
                 expected_body_sha256=payload.get("expectedBodySha256"),
                 allow_comment_loss_ids=payload.get("allow_comment_loss_ids"),
                 anchor=anchor,
+                replacement_segments=payload.get("replacement_segments"),
+                expected_first_font=payload.get("expected_first_font"),
+            )
+        if op == "replacement_font":
+            self.op_payloads.setdefault(op, []).append(dict(payload))
+            return doc.replacement_font(
+                payload["find"], int(payload["expected_matches"]), row_anchor=payload.get("rowAnchor")
             )
         if op == "format":
             return doc.format(

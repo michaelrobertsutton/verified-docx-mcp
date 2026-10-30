@@ -1051,3 +1051,290 @@ def test_save_needs_the_shared_queue_capability_like_any_write(setup_broker):
     with pytest.raises(LiveOpFailed, match="LIVE_CAPABILITY_MISSING"):
         call(a, "save")
     assert all(op != "save" for op, _ in pane.calls)
+
+
+# -- issue #108: cheap re-sync after partial / unknown batches -------------------------------
+
+
+class DocPane:
+    """A broker-registered pane over a real FakeDocument, so text_edit's batch and single
+    replace run end to end through the broker's stale/lock/unknown barriers."""
+
+    document_name = "Proposal.docx"
+    document_url = "/x/Proposal.docx"
+    connected_since = 1.0
+    body_hash_state = "sampled"
+    body_hash_sampled_monotonic = time.monotonic()
+    heartbeat_count = 0
+    hash_sample_count = 0
+    hello = HelloMessage(
+        document_url, "Word", "Mac", {}, "initial",
+        frozenset({"shared_queue", "section_locks", "body_hash_v1", "replacement_formatting",
+                   "comment_loss_guard", "formatted_replacements_v1", "partial_font_segments_v1"}),
+        "pane-1",
+    )
+
+    def __init__(self, text):
+        from fake_pane import FakeDocument
+
+        self.doc = FakeDocument(text=text)
+        self.calls = []
+        self.fail_after_apply = False  # apply the replace, then report VERIFICATION_FAILED
+
+    @property
+    def last_body_sha256(self):
+        return self.doc.sha256()
+
+    def heartbeat_age(self):
+        return 0
+
+    def request_threadsafe(self, op, payload=None, **kwargs):
+        from fake_pane import OpRefused
+
+        payload = payload or {}
+        self.calls.append((op, dict(payload)))
+        if op in {"describe", "body_hash"}:
+            return {"bodySha256": self.doc.sha256(), "sections": []}
+        if op == "sections_list":
+            return {"bodySha256": self.doc.sha256(), "sections": [
+                {"section_key": "scope-1", "slug": "scope", "heading_text": "Scope", "level": 1,
+                 "slug_unique": True, "sectionSha256": "s"}]}
+        if op == "replacement_font":
+            try:
+                return self.doc.replacement_font(payload["find"], int(payload["expected_matches"]))
+            except OpRefused as exc:
+                raise LiveOpFailed(exc.code, exc.message) from None
+        if op != "replace":
+            raise AssertionError(op)
+        if payload.get("forbiddenSections"):
+            raise LiveOpFailed("LOCKED_BY_OTHER_CLIENT", "target lies in another client's locked section")
+        try:
+            result = self.doc.replace(
+                payload["find"], int(payload["expected_matches"]), payload["replace"],
+                expected_body_sha256=payload.get("expectedBodySha256"),
+                replacement_segments=payload.get("replacement_segments"),
+                expected_first_font=payload.get("expected_first_font"),
+            )
+        except OpRefused as exc:
+            raise LiveOpFailed(exc.code, exc.message) from None
+        if self.fail_after_apply:
+            raise LiveOpFailed("VERIFICATION_FAILED", "Replacement may have applied")
+        return result
+
+
+_DOC = {"path": ""}
+
+
+@pytest.fixture
+def doc_broker(monkeypatch, tmp_path):
+    """(pane, broker, a, b, use): use(client_id) routes every tool call through that client."""
+    from verified_docx_mcp.live import bridge, write_mode
+
+    monkeypatch.setenv("VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS", str(tmp_path))
+    monkeypatch.setitem(_DOC, "path", str(tmp_path / "Proposal.docx"))
+
+    pane = DocPane("alpha beta gamma delta epsilon")
+    broker = shared.Broker(SimpleNamespace(
+        get=lambda name: pane if name == pane.document_name else None, list=lambda: [pane], collisions=list))
+    current = {}
+
+    def use(client_id):
+        client = SimpleNamespace(
+            rpc=lambda action, **kw: broker.dispatch({"action": action, "client_id": client_id, **kw}))
+        current["remote"] = shared.RemoteSession(client, broker.snapshot(pane))
+
+    monkeypatch.setattr(bridge, "current_registry", lambda: SimpleNamespace(
+        get=lambda name: current["remote"], collisions=list))
+    monkeypatch.setattr(write_mode, "_check_session_identity", lambda path, session: None)
+    monkeypatch.setattr(write_mode, "_document_name", lambda path: "Proposal.docx")
+    a = broker.dispatch({"action": "attach"})["client_id"]
+    b = broker.dispatch({"action": "attach"})["client_id"]
+    return pane, broker, a, b, use
+
+
+def _revision():
+    from verified_docx_mcp.live import reads_live
+
+    return reads_live.live_revision(_DOC["path"])["revision"]
+
+
+def _batch(edits, revision_before):
+    from verified_docx_mcp import text_edit
+
+    return text_edit.execute_replace_text_batch_live(
+        _DOC["path"], [{"find": f, "replace": r, "expected_matches": 1} for f, r in edits], revision_before)
+
+
+def _replace(find, replace, revision_before):
+    from verified_docx_mcp import text_edit
+
+    return text_edit.execute_replace_text_live(_DOC["path"], find, replace, 1, revision_before=revision_before)
+
+
+def _reads(pane):
+    return sum(op in {"body_hash", "body_ooxml"} for op, _ in pane.calls)
+
+
+def _code(exc_info):
+    return exc_info.value.envelope.error_code.value
+
+
+def test_partial_batch_revision_after_is_accepted_without_a_body_read(doc_broker):
+    from verified_docx_mcp.errors import VerifyError
+
+    pane, _, a, b, use = doc_broker
+    use(b)
+    _revision()
+    use(a)
+    start = _revision()
+    report = _batch([("alpha", "A"), ("missing", "X"), ("gamma", "G")], start)
+    assert report["batch_status"] == "partial"
+    assert [r["status"] for r in report["results"]] == ["applied", "refused_before_write", "not_attempted"]
+    reads = _reads(pane)
+    result = _replace("gamma", "G", report["revision_after"])
+    assert result["revision_after"] == f"live:sha256:{pane.doc.sha256()}"
+    assert _reads(pane) == reads  # the batch's own revision_after was proof enough
+    assert pane.doc.text == "A beta G delta epsilon"
+    # ... and the other client is still stale: it never saw A's writes.
+    use(b)
+    with pytest.raises(VerifyError) as exc:
+        _replace("delta", "D", result["revision_after"])
+    assert _code(exc) == "LIVE_STALE"
+    assert pane.doc.text == "A beta G delta epsilon"
+
+
+def test_pane_match_count_refusal_codes_never_stale_anyone(setup_broker):
+    """A count-gate refusal is pre-mutation whether the pane names it (zero_match /
+    match_count_mismatch) or, like older panes, sends LIVE_OP_FAILED with the gate's message."""
+    pane, _, a, b, call = setup_broker
+    call(a)
+    call(b)
+    original = pane.request_threadsafe
+    for code, message in [("zero_match", "x"), ("match_count_mismatch", "x"),
+                          ("LIVE_OP_FAILED", 'expected 1 match(es) for "missing", found 0'),
+                          ("LIVE_OP_FAILED", 'expected 1 match(es) for "a", found 2')]:
+        def refuse(op, payload=None, _code=code, _message=message, **kwargs):
+            if op == "replace":
+                raise LiveOpFailed(_code, _message)
+            return original(op, payload, **kwargs)
+
+        pane.request_threadsafe = refuse
+        with pytest.raises(LiveOpFailed):
+            call(a, "replace")
+        pane.request_threadsafe = original
+        call(b, "replace")  # b was not staled by a's refused write
+        call(a)
+        call(b)
+
+
+def test_unrecognised_live_op_failed_still_stales_other_clients(setup_broker):
+    pane, _, a, b, call = setup_broker
+    call(a)
+    call(b)
+    original = pane.request_threadsafe
+
+    def boom(op, payload=None, **kwargs):
+        if op == "replace":
+            raise LiveOpFailed("LIVE_OP_FAILED", "GeneralException after insertText")
+        return original(op, payload, **kwargs)
+
+    pane.request_threadsafe = boom
+    with pytest.raises(LiveOpFailed):
+        call(a, "replace")
+    pane.request_threadsafe = original
+    with pytest.raises(LiveOpFailed, match="LIVE_STALE"):
+        call(b, "replace")
+
+
+def test_unknown_batch_outcome_refuses_until_live_revision(doc_broker):
+    from verified_docx_mcp.errors import VerifyError
+    from verified_docx_mcp.live import bridge
+
+    pane, _, a, _, use = doc_broker
+    use(a)
+    start = _revision()
+    pane.fail_after_apply = True
+    report = _batch([("alpha", "A"), ("gamma", "G")], start)
+    pane.fail_after_apply = False
+    assert report["batch_status"] == "unknown"
+    assert report["revision_after"] is None
+    # Not even the true current hash re-arms a write: only an observed read does.
+    with pytest.raises(VerifyError) as exc:
+        _replace("gamma", "G", f"live:sha256:{pane.doc.sha256()}")
+    assert _code(exc) == "LIVE_STALE"
+    # A non-observing lookup (live_status / an error path's status view) never re-arms.
+    bridge.current_registry().get("Proposal.docx").status_view().request_threadsafe("body_hash")
+    with pytest.raises(VerifyError) as exc:
+        _replace("gamma", "G", f"live:sha256:{pane.doc.sha256()}")
+    assert _code(exc) == "LIVE_STALE"
+    assert pane.doc.text == "A beta gamma delta epsilon"
+    revision = _revision()  # live_revision: one body_hash, no body
+    _replace("gamma", "G", revision)
+    assert pane.doc.text == "A beta G delta epsilon"
+
+
+def test_resync_keeps_lease_and_section_lock_barriers(doc_broker):
+    from verified_docx_mcp.errors import VerifyError
+
+    pane, broker, a, b, use = doc_broker
+    use(a)
+    start = _revision()
+    report = _batch([("alpha", "A"), ("missing", "X")], start)
+    assert report["batch_status"] == "partial"
+    target = {"client_id": b, "document_name": pane.document_name, "document_url": pane.document_url,
+              "connected_since": pane.connected_since}
+    broker.dispatch({"action": "lock", **target})
+    with pytest.raises(VerifyError) as exc:
+        _replace("gamma", "G", report["revision_after"])
+    assert _code(exc) == "LOCKED_BY_OTHER_CLIENT"
+    broker.dispatch({"action": "unlock", **target})
+    broker.dispatch({"action": "section_lock", "sections": ["scope-1"], **target})
+    with pytest.raises(VerifyError) as exc:
+        _replace("gamma", "G", report["revision_after"])
+    assert _code(exc) == "LOCKED_BY_OTHER_CLIENT"
+    assert pane.doc.text == "A beta gamma delta epsilon"
+
+
+def test_partial_segment_font_lookup_never_rearms_a_stale_client(doc_broker):
+    """#108: replace_text's replacement_font lookup is read-only and non-observing, so a
+    client staled by another client's write is still refused, and nothing is written."""
+    from verified_docx_mcp import text_edit
+    from verified_docx_mcp.errors import VerifyError
+
+    pane, _, a, b, use = doc_broker
+    use(b)
+    stale = _revision()
+    use(a)
+    _replace("alpha", "A", _revision())
+    use(b)
+    with pytest.raises(VerifyError) as exc:
+        text_edit.execute_replace_text_live(
+            _DOC["path"], "gamma", "G", 1, revision_before=f"live:sha256:{pane.doc.sha256()}",
+            replacement_segments=[{"text": "G", "format": {"bold": True}}])
+    assert _code(exc) == "LIVE_STALE"
+    assert [op for op, _ in pane.calls].count("replacement_font") == 1
+    assert pane.doc.text == "A beta gamma delta epsilon"
+    assert stale != f"live:sha256:{pane.doc.sha256()}"
+    _revision()  # an explicit read re-arms; the partial segment then resolves and lands
+    text_edit.execute_replace_text_live(
+        _DOC["path"], "gamma", "G", 1, revision_before=f"live:sha256:{pane.doc.sha256()}",
+        replacement_segments=[{"text": "G", "format": {"bold": True}}])
+    assert pane.doc.text == "A beta G delta epsilon"
+
+
+def test_format_drift_refusal_does_not_stale_other_clients(setup_broker):
+    pane, _, a, b, call = setup_broker
+    call(a)
+    call(b)
+    original = pane.request_threadsafe
+
+    def drift(op, payload=None, **kwargs):
+        if op == "replace":
+            raise LiveOpFailed("FORMAT_DRIFT", "first run changed")
+        return original(op, payload, **kwargs)
+
+    pane.request_threadsafe = drift
+    with pytest.raises(LiveOpFailed, match="FORMAT_DRIFT"):
+        call(a, "replace")
+    pane.request_threadsafe = original
+    call(b, "replace")
