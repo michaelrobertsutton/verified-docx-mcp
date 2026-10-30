@@ -2856,7 +2856,8 @@ def add_anchored_comment_batch(
     to that section, so the quote may repeat elsewhere (SECTION_NOT_FOUND if the key
     is unknown). All-or-nothing: if an item fails, nothing is saved: earlier items
     report "not_persisted", the failing one its code, the rest "not_attempted",
-    batch_status "none_applied"; a failed save makes every item "not_persisted".
+    batch_status "none_applied"; a failed save makes every item "not_persisted" (or
+    "unknown", batch_status "unknown", when the save may have landed).
 
     Returns {applied (true only for "complete"), batch_status ("complete" | "partial"
     | "none_applied" | "unknown"), applied_count, item_count, revision_before,

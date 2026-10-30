@@ -312,9 +312,18 @@ def resolve_input_text_file(path: str, *, param: str = "markdown_file") -> Path:
     """
     if not isinstance(path, str) or not path.strip():
         raise _make_error(ErrorCode.INVALID_INPUT, f"{param} must not be empty")
-    resolved = resolve_allowed_docx_path(path, escape_code=ErrorCode.DOCX_PATH_ESCAPE)
+    # Containment before existence: a path outside the roots is DOCX_PATH_ESCAPE whether or not it
+    # exists, so the answer never reveals which files exist there.
+    try:
+        resolved = resolve_allowed_docx_path(path, must_exist=False, escape_code=ErrorCode.DOCX_PATH_ESCAPE)
+    except (OSError, RuntimeError) as exc:  # a symlink loop or unreadable directory while resolving
+        raise _make_error(ErrorCode.INVALID_INPUT, f"Could not resolve {param}: {exc}", {param: path}) from exc
     details = {param: path, "resolved_path": str(resolved)}
-    if not resolved.is_file():
+    try:
+        is_file = resolved.is_file()
+    except OSError:
+        is_file = False
+    if not is_file:
         raise _make_error(ErrorCode.INVALID_INPUT, f"{param} is not a regular file: {path!r}", details)
     if resolved.suffix.lower() not in _INPUT_TEXT_SUFFIXES:
         raise _make_error(

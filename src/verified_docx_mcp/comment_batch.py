@@ -59,7 +59,9 @@ def validate_comments(comments_arg: Any) -> list[dict[str, Any]]:
         if unknown:
             raise _make_error(ErrorCode.INVALID_INPUT, f"comments[{i}]: unknown key(s) {sorted(unknown)}")
         quote, content = item.get("quote"), item.get("content")
-        expected, section_key = item.get("expected_matches", 1), item.get("section_key")
+        expected, section_key = item.get("expected_matches"), item.get("section_key")
+        if expected is None:  # optional, default 1 (an explicit null included)
+            expected = 1
         if not isinstance(quote, str) or not quote:
             raise _make_error(ErrorCode.INVALID_INPUT, f"comments[{i}].quote must be a non-empty string")
         if not isinstance(content, str) or not content:
@@ -303,6 +305,12 @@ def _live_batch(
                  "message": exc.envelope.message}
             )
             continue
+        except Exception as exc:  # noqa: BLE001 - a read/parse failure before dispatch: nothing was sent
+            results.append(
+                {"index": i, "status": "refused_before_write", "code": ErrorCode.LIVE_OP_FAILED.value,
+                 "message": f"could not check the item's section: {type(exc).__name__}: {exc}"}
+            )
+            continue
         try:
             reply = _send_comment_add(session, item, current)
         except VerifyError as exc:
@@ -318,6 +326,12 @@ def _live_batch(
             results.append({"index": i, "status": "unknown", "code": ErrorCode.LIVE_OP_FAILED.value, "message": str(exc)})
             continue
         current = reply.get("post") or current
+        if not reply.get("comment_id"):
+            # The pane answered without an id: the comment probably landed, but it cannot be named.
+            unknown = True
+            results.append({"index": i, "status": "unknown", "code": ErrorCode.LIVE_OP_FAILED.value,
+                            "message": "the pane's comment_add reply carried no comment_id"})
+            continue
         handle = f"{comments_live._LIVE_HANDLE_PREFIX}{reply['comment_id']}"
         results.append(
             {
@@ -468,8 +482,9 @@ def _file_batch(
                 r.pop("comment_id", None)
                 r.pop("comment_ids", None)
         # Every item carries the cause, so a caller reading one row sees it.
-        results[0]["code"] = save_error.envelope.error_code.value
-        results[0]["message"] = save_error.envelope.message
+        for r in results:
+            r["code"] = save_error.envelope.error_code.value
+            r["message"] = save_error.envelope.message
         return _finish(
             str(resolved), mode="file", items=items, results=results,
             batch_status="unknown" if landed else "none_applied",

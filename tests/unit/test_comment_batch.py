@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -76,6 +77,8 @@ class RegistrationTests(unittest.TestCase):
                     comment_batch.validate_comments(value)
                 self.assertEqual(code_of(ctx.exception), ErrorCode.INVALID_INPUT)
         self.assertEqual(len(comment_batch.validate_comments(items(1) * 50)), 50)
+        explicit_null = comment_batch.validate_comments([{"quote": "q", "content": "c", "expected_matches": None}])
+        self.assertEqual(explicit_null[0]["expected_matches"], 1)
 
 
 class _FileCase(unittest.TestCase):
@@ -266,6 +269,23 @@ class LiveBatchTests(LiveCommentsTestCase):
         )
         self.assertEqual(result["results"][3]["code"], "ZERO_MATCH")
         self.assertEqual(len(pane.document.comments), 3)
+
+    async def test_reply_without_comment_id_is_unknown_and_still_audited(self):
+        await self.connect_pane(document=self.doc())
+        real = comment_batch._send_comment_add
+        calls = []
+
+        def flaky(session, item, current):
+            calls.append(item)
+            reply = real(session, item, current)
+            return {k: v for k, v in reply.items() if k != "comment_id"} if len(calls) == 2 else reply
+
+        with unittest.mock.patch.object(comment_batch, "_send_comment_add", flaky):
+            result = await self.batch(items(4))
+        self.assertEqual(result["batch_status"], "unknown")
+        self.assertEqual([r["status"] for r in result["results"]],
+                         ["applied", "unknown", "not_attempted", "not_attempted"])
+        self.assertIn("evidence_ref", result)
 
     async def test_first_item_refused_is_none_applied(self):
         pane = await self.connect_pane(document=self.doc())

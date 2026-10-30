@@ -143,6 +143,16 @@ class MarkdownFileInputTests(_Base):
             outside.write_text("x")
             self.assertEqual(self.err(self.call, markdown_file=str(outside)), ErrorCode.DOCX_PATH_ESCAPE)
 
+    def test_missing_outside_roots_is_path_escape_too(self):
+        # Containment is checked before existence, so the code never says what exists outside.
+        with tempfile.TemporaryDirectory() as other:
+            missing = Path(other).resolve() / "nope.md"
+            self.assertEqual(self.err(self.call, markdown_file=str(missing)), ErrorCode.DOCX_PATH_ESCAPE)
+
+    def test_file_used_as_a_directory_is_invalid_input(self):
+        (self.root / "a.md").write_text("x")
+        self.assertEqual(self.err(self.call, markdown_file=str(self.root / "a.md" / "x.md")), ErrorCode.INVALID_INPUT)
+
     def test_symlink_to_outside_roots_is_refused(self):
         with tempfile.TemporaryDirectory() as other:
             secret = Path(other).resolve() / "secret.md"
