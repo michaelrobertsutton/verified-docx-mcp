@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Trimmed read payloads (#111):
-  - `list_open_items` gains `fields="summary"` (columnar, ~590 tokens for 27 comments), `section_key`/`within_text` scoping and `include_correlation`. Its default `full` shape drops constant or derivable fields (`modified_time`, `scope`, live `w_id`/`quoted_text`, `reply_count`, empty `replies`, null top-level keys) and is 40% smaller.
+  - `list_open_items` gains `fields="summary"` (columnar, ~590 tokens for 27 comments), `section_key`/`within_text` scoping and `include_correlation`. Its default `full` shape drops constant or derivable fields (`modified_time`, `scope`, live `w_id`/`quoted_text`, `reply_count`, empty `replies`, null top-level keys) and is 39.9% smaller on the 27-comment fixture.
   - `list_tables` reports `header_row` and `anchor_section_key`.
   - `list_styles` gains `type`/`name_contains` filters; `STYLE_NOT_FOUND` lists near matches instead of every style.
   - `live_status(path, verbose)` and `lock_status(verbose)` are compact by default.
