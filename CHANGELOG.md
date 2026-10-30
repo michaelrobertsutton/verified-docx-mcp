@@ -5,7 +5,7 @@
 - Token efficiency remainder (#108). Default changes, for the next minor release (0.2.0):
   - `get_table` is compact by default: `rows` is a grid of cell text, and `merged` lists only merged cells. Live merges give `merged: null` with the warning `live_merge_metadata_unavailable`. `compact=false` restores the per-cell shape.
   - `read_document(section_key="<heading>-n")` reads one heading section in text, markdown or runs, in file and live mode.
-  - Live `replacement_segments` may name only the fields that change; the rest inherit from the first replaced run. This needs pane v69 (`partial_font_segments_v1`). Approved runs bind the resolved fonts and their baseline in the manifest. The pane refuses with `FORMAT_DRIFT` if the run was reformatted since.
+  - Live `replacement_segments` may name only the fields that change; the rest inherit from the first replaced run. This needs pane v69b (`partial_font_segments_v1`). Approved runs bind the resolved fonts and their baseline in the manifest. The pane refuses with `FORMAT_DRIFT` if the run was reformatted since.
   - Re-sync: a refused edit inside a batch (zero matches or a count mismatch) no longer stales the client, so the batch's `revision_after` re-arms the next write without a body read.
   - Tool descriptions are trimmed to the call contract. History and extended contracts move to `docs/tool-contracts.md`.
   - The issue's session (20 cell edits plus 3 table reads) returns 65% fewer response tokens; see `docs/acceptance/108-token-efficiency.md`.

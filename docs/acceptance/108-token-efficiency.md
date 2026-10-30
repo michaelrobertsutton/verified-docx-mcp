@@ -81,3 +81,24 @@ The fix: the broker now treats the pane's count gate (zero matches or a count mi
 Live `replace_text` with partial segments on an anchored or `para_ref` target looks up the font of
 the resolved span. A span over 230 characters with partial segments is refused (`INVALID_INPUT`),
 because Word cannot search for its first run; full segments still work. Both cases are unit-tested.
+
+## Review
+
+An independent opus review of the code confirmed the re-sync classification. The count-gate
+message is only ever raised before a write, in current and older panes. `FORMAT_DRIFT` is thrown
+before any insert. It found four defects, all fixed and tested:
+
+1. **High:** partial segments with a text-box or `all` scope sampled the first run with
+   `Range.search` inside shape text. That call hangs Word for Mac. Partial segments are now
+   body-only: the server refuses them with `INVALID_INPUT` before sending anything, and the pane's
+   `replacement_font` and drift paths refuse a non-body scope.
+2. **Low:** a short `para_ref` or anchored target containing a soft line break looked up its font
+   with a raw `find` and was refused with `ZERO_MATCH`. The lookup now names the target the same
+   way the write does (anchored form).
+3. **Low:** a heading titled "Textbox" collides with the first text box's key `textbox-1`. A read
+   by that key is now refused with `INVALID_INPUT` and gives the heading's paragraph range,
+   instead of silently reading the text box.
+4. **Trivial:** a font baseline missing a field is rejected even when it carries an extra key.
+
+The pane fix ships as `?v=69b`. The real-Word run above used `?v=69`; v69b only adds the
+non-body refusal.
