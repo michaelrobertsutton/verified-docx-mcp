@@ -991,6 +991,7 @@ def _live_replace_once(
     replacement_segments: list[dict[str, Any]] | None = None,
     scope: str = "body",
     scope_info: dict[str, Any] | None = None,
+    expected_first_font: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Send ONE pane ``replace`` guarded by ``expectedBodySha256=pre_hash`` and verify it.
 
@@ -1011,6 +1012,8 @@ def _live_replace_once(
     }
     if replacement_segments is not None:
         payload["replacement_segments"] = replacement_segments
+    if expected_first_font is not None:
+        payload["expected_first_font"] = expected_first_font
     if allow_comment_loss_ids is not None:
         payload["allow_comment_loss_ids"] = allow_comment_loss_ids
     payload["scope"] = scope
@@ -1153,11 +1156,23 @@ def execute_replace_text_live(
             ErrorCode.INVALID_INPUT, "allow_comment_loss and allow_comment_loss_ids are mutually exclusive"
         )
 
-    from .formatted_text import validate_segments
-    replacement_segments = validate_segments(replacement_segments, replace)
+    from .formatted_text import PARTIAL_CAPABILITY, is_partial, validate_segments
+    replacement_segments = validate_segments(replacement_segments, replace, partial=True)
+    partial = is_partial(replacement_segments)
     session = live_write_mode.live_session_for(path)
     if replacement_segments is not None:
         live_write_mode.require_capability(session, "formatted_replacements_v1", feature_description="explicit formatted replacements")
+    if partial:
+        if scope != "body":
+            # Sampling the first run uses Range.search, which hangs Word for Mac inside shape text.
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                "partial replacement_segments work in the document body only; in a text box give every font field",
+                {"scope": scope},
+            )
+        live_write_mode.require_capability(
+            session, PARTIAL_CAPABILITY, feature_description="partial replacement_segments formats (inherited fields)"
+        )
     document_name = session.document_name
     _require_live_replace_capabilities(
         session, within_row_containing=within_row_containing, allow_comment_loss_ids=allow_comment_loss_ids
@@ -1178,6 +1193,29 @@ def execute_replace_text_live(
     except LiveDisconnected as exc:
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
 
+    expected_first_font = None
+    if partial:
+        # issue #108: inherit unspecified fields from the first replaced run. The lookup is
+        # read-only and goes through this tool's non-observing session, so it never re-arms
+        # the caller's write baseline; the pane re-checks the baseline at the write.
+        from .formatted_text import request_replacement_font, resolve_segments
+        if target is not None and locate_mod.utf16_len(target["text"]) > locate_mod.PANE_SEARCH_MAX:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"partial replacement_segments need the target's first run, which Word cannot search for in a "
+                f"span over {locate_mod.PANE_SEARCH_MAX} characters; give every font field explicitly",
+            )
+        font_target: dict[str, Any] = {
+            "find": target["text"] if target else find,
+            "expected_matches": 1 if target else expected_matches,
+            "scope": scope,
+        }
+        _apply_pane_target(font_target, target)  # a target with a line break goes in anchored form
+        if within_row_containing:
+            font_target["rowAnchor"] = within_row_containing
+        expected_first_font = request_replacement_font(session, font_target)
+        replacement_segments = resolve_segments(replacement_segments, expected_first_font, replace)
+
     try:
         result = _live_replace_once(
             session,
@@ -1194,6 +1232,7 @@ def execute_replace_text_live(
             replacement_segments=replacement_segments,
             scope=scope,
             scope_info=scope_info,
+            expected_first_font=expected_first_font,
         )
     except VerifyError as exc:
         if exc.envelope.error_code == ErrorCode.LIVE_STALE_AFTER_WRITE:
@@ -1258,11 +1297,12 @@ _BATCH_REFUSED_CODES = frozenset(
         ErrorCode.INVALID_INPUT,
         ErrorCode.AMBIGUOUS_SPAN,
         ErrorCode.PARA_HASH_MISMATCH,
+        ErrorCode.FORMAT_DRIFT,  # issue #108: the pane's mutation-boundary formatting check
     }
 )
 _BATCH_REFUSED_PANE_CODES = frozenset(
     {"LOCK_SCOPE_UNRESOLVED", "WOULD_DELETE_COMMENTS", "ANCHORED_SHAPES", "zero_match", "match_count_mismatch", "stale",
-     "AMBIGUOUS_SPAN"}
+     "AMBIGUOUS_SPAN", "FORMAT_DRIFT"}
 )
 _BATCH_EDIT_KEYS = frozenset(
     {"find", "replace", "expected_matches", "allow_comment_loss_ids", "within_row_containing",
@@ -1693,7 +1733,7 @@ def execute_replace_text(
             ErrorCode.INVALID_INPUT, "allow_comment_loss and allow_comment_loss_ids are mutually exclusive"
         )
     from .formatted_text import validate_segments
-    replacement_segments = validate_segments(replacement_segments, replace)
+    replacement_segments = validate_segments(replacement_segments, replace, partial=True)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if replacement_segments is not None and mode != "live":
         raise _make_error(ErrorCode.LIVE_UNAVAILABLE, "Explicit segments require live Word")

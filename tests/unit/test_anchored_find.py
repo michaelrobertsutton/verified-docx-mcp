@@ -311,4 +311,6 @@ def test_pane_anchored_find_harness_and_hash_parity():
 def test_pane_reports_anchored_find_v1_and_cache_buster_moved():
     js = (REPO / "addin/taskpane.js").read_text()
     assert '"anchored_find_v1"' in js.split("const PANE_CAPABILITIES = ", 1)[1].split(";", 1)[0]
-    assert 'taskpane.js?v=68b"' in (REPO / "addin/taskpane.html").read_text()
+    import re
+    version = re.search(r'taskpane\.js\?v=(\d+)', (REPO / "addin/taskpane.html").read_text())
+    assert version and int(version.group(1)) >= 68  # anchored_find_v1 shipped in pane v68

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Token efficiency remainder (#108). Default changes, for the next minor release (0.2.0):
+  - `get_table` is compact by default: `rows` is a grid of cell text, and `merged` lists only merged cells. Live merges give `merged: null` with the warning `live_merge_metadata_unavailable`. `compact=false` restores the per-cell shape.
+  - `read_document(section_key="<heading>-n")` reads one heading section in text, markdown or runs, in file and live mode.
+  - Live `replacement_segments` may name only the fields that change; the rest inherit from the first replaced run. This needs pane v69b (`partial_font_segments_v1`). Approved runs bind the resolved fonts and their baseline in the manifest. The pane refuses with `FORMAT_DRIFT` if the run was reformatted since.
+  - Re-sync: a refused edit inside a batch (zero matches or a count mismatch) no longer stales the client, so the batch's `revision_after` re-arms the next write without a body read.
+  - Tool descriptions are trimmed to the call contract. History and extended contracts move to `docs/tool-contracts.md`.
+  - The issue's session (20 cell edits plus 3 table reads) returns 65% fewer response tokens; see `docs/acceptance/108-token-efficiency.md`.
 - Cheaper write inputs (#113 part B):
   - `replace_range_markdown`, `replace_body_markdown`, `append_markdown`, `replace_cell_markdown` and `insert_table` take `markdown_file` (a `.md`/`.txt` path under the allowed roots, UTF-8, at most 2 MB) instead of inline markdown. The response reports `markdown_sha256` and `markdown_chars`; a path outside the roots is `DOCX_PATH_ESCAPE`. Approved runs read the file once at prepare, so the digest binds its content.
   - New `add_anchored_comment_batch`: 1-50 comments in one call, file mode all-or-nothing with one save, live mode stop-at-first-failure with per-item status. One audit record per call.

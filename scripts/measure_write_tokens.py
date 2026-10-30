@@ -84,5 +84,26 @@ async def main() -> None:
             {"path": fresh(), "find": "this text is not in the document", "replace": "x", "expected_matches": 1, "write_mode": "file"},
         )
 
+        # #108: compact get_table and heading-section reads (read-only; fixtures live in the repo).
+        fixtures = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
+        for fixture in ("tables-merged.docx", "approved-changes.docx"):
+            for compact in (False, True):
+                await measure(
+                    f"get_table {fixture}, {'compact' if compact else 'detailed'}",
+                    "get_table",
+                    {"path": str(shutil.copy(fixtures / fixture, TMP / fixture)), "table_id": 1, "source": "file", "compact": compact},
+                )
+        await measure("read_document, whole body (text)", "read_document", {"path": fresh(), "format": "text", "source": "file"})
+        await measure(
+            "read_document, heading section (text)",
+            "read_document",
+            {"path": fresh(), "format": "text", "section_key": "section-007-1", "source": "file"},
+        )
+        await measure(
+            "read_document, heading section (markdown)",
+            "read_document",
+            {"path": fresh(), "format": "markdown", "section_key": "section-007-1", "source": "file"},
+        )
+
 
 asyncio.run(main())

@@ -263,3 +263,87 @@ class FindSectionsSizeAndDigestTests(RangedReadTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HeadingSectionReadTests(RangedReadTestCase):
+    def _sections(self):
+        return [s for s in projection.find_sections_impl(self.sections) if s["kind"] == "heading"]
+
+    def test_heading_read_equals_the_range_read_in_every_format(self):
+        for sec in self._sections():
+            for fmt in ("text", "markdown", "runs"):
+                by_key = self.read(self.sections, format=fmt, section_key=sec["section_key"])
+                by_range = self.read(
+                    self.sections, format=fmt, start_para_ref=sec["start_para_ref"], end_para_ref=sec["end_para_ref"]
+                )
+                self.assertEqual(by_key[fmt], by_range[fmt], (sec["section_key"], fmt))
+                self.assertEqual(by_key["section_key"], sec["section_key"])
+                self.assertEqual(by_key["start_para_ref"], sec["start_para_ref"])
+                self.assertEqual(by_key["end_para_ref"], sec["end_para_ref"])
+
+    def test_last_section_runs_to_the_end_of_the_body(self):
+        sec = self._sections()[-1]
+        result = self.read(self.sections, format="text", section_key=sec["section_key"])
+        self.assertEqual(result["text"], "Next Steps\nNext steps text.")
+        whole = self.read(self.sections, format="text")
+        self.assertTrue(whole["text"].endswith(result["text"]))
+
+    def test_original_para_refs_are_kept(self):
+        result = self.read(self.sections, format="runs", section_key="next-steps-1")
+        refs = {r["para_ref"] for r in result["runs"] if "para_ref" in r}
+        self.assertEqual(refs, {"p4", "p5"})
+
+    def test_unknown_key_lists_heading_and_textbox_keys(self):
+        with self.assertRaises(VerifyError) as ctx:
+            self.read(self.sections, format="text", section_key="nope-1")
+        env = ctx.exception.envelope
+        self.assertEqual(env.error_code, ErrorCode.INVALID_INPUT)
+        self.assertIn("next-steps-1", env.diagnostics["available_heading_keys"])
+        self.assertEqual(env.diagnostics["available_textbox_keys"], [])
+
+    def test_textbox_key_still_reads_the_textbox(self):
+        box = Path(self._tmp.name) / "textbox.docx"
+        shutil.copyfile(FIXTURES / "textbox.docx", box)
+        result = self.read(box, format="text", section_key="textbox-1")
+        self.assertIn("Text inside the text box.", result["text"])
+        self.assertNotIn("start_para_ref", result)
+
+    def test_heading_titled_textbox_colliding_with_a_textbox_key_is_refused(self):
+        # slug("Textbox") + "-1" is also the first text box's key: refuse rather than guess.
+        box = Path(self._tmp.name) / "textbox.docx"
+        shutil.copyfile(FIXTURES / "textbox.docx", box)
+        from verified_docx_mcp import text_edit
+        text_edit.execute_replace_text(str(box), "Body text before the text box.", "Textbox", 1, write_mode="file")
+        text_edit.execute_apply_style(str(box), "Textbox", "Heading1", 1)
+        keys = [(s["section_key"], s["kind"]) for s in projection.find_sections_impl(box)]
+        self.assertIn(("textbox-1", "heading"), keys)
+        self.assertIn(("textbox-1", "textbox"), keys)
+        with self.assertRaises(VerifyError) as ctx:
+            self.read(box, format="text", section_key="textbox-1")
+        env = ctx.exception.envelope
+        self.assertEqual(env.error_code, ErrorCode.INVALID_INPUT)
+        self.assertEqual(env.diagnostics["start_para_ref"], "p0")
+
+    def test_heading_key_with_a_range_is_invalid_input(self):
+        with self.assertRaises(VerifyError) as ctx:
+            self.read(self.sections, format="text", section_key="next-steps-1", start_para_ref="p0", end_para_ref="p1")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    def test_to_file_writes_only_the_section(self):
+        out = Path(self._tmp.name) / "section.txt"
+        result = self.read(self.sections, format="text", section_key="next-steps-1", to_file=str(out))
+        self.assertEqual(out.read_text(encoding="utf-8"), "Next Steps\nNext steps text.")
+        self.assertEqual(result["section_key"], "next-steps-1")
+        self.assertEqual((result["start_para_ref"], result["end_para_ref"]), ("p4", "p5"))
+        self.assertNotIn("text", result)
+
+    def test_section_with_a_table_matches_the_range_read(self):
+        sections = [s for s in projection.find_sections_impl(self.tables) if s["kind"] == "heading"]
+        if not sections:
+            self.skipTest("fixture has no headings")
+        sec = sections[0]
+        by_key = self.read(self.tables, format="markdown", section_key=sec["section_key"])
+        by_range = self.read(
+            self.tables, format="markdown", start_para_ref=sec["start_para_ref"], end_para_ref=sec["end_para_ref"]
+        )
+        self.assertEqual(by_key["markdown"], by_range["markdown"])
