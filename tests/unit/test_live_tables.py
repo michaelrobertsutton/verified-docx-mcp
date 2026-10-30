@@ -378,7 +378,7 @@ class GetTableLiveTests(_TableCase):
         self.assertEqual(result["rows"][1][0], {"row_index": 2, "cell_index": 1, "grid_span": 1, "v_merge": "none", "text": "R2C1"})
 
     async def test_compact_live_read_is_text_rows(self) -> None:
-        await self.connect_pane(_doc())
+        await self.connect_pane(_two_by_two())
         result = await self.get(1)
         self.assertEqual(result["rows"], [["R1C1", "R1C2"], ["R2C1", "R2C2"]])
         self.assertEqual(result["merged"], [])
@@ -386,7 +386,7 @@ class GetTableLiveTests(_TableCase):
         self.assertNotIn("live_merge_metadata_unavailable", result.get("warnings", []))
 
     async def test_compact_live_merged_table_flags_unavailable_metadata(self) -> None:
-        doc = _doc()
+        doc = _two_by_two()
         doc.merged_tables = {0}
         await self.connect_pane(doc)
         result = await self.get(1)
