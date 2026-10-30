@@ -32,9 +32,9 @@ TMP = Path(tempfile.mkdtemp(prefix="measure-inputs-"))
 os.environ["VERIFIED_DOCX_MCP_ALLOWED_FILE_ROOTS"] = str(TMP)
 os.environ["XDG_STATE_HOME"] = str(TMP / "state")
 
-from fastmcp import Client  # noqa: E402
+from fastmcp import Client
 
-from verified_docx_mcp import mutations, server  # noqa: E402
+from verified_docx_mcp import mutations, server
 
 REPO = Path(__file__).resolve().parents[1]
 FIXTURE = REPO / "tests" / "fixtures" / "sections.docx"
