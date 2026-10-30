@@ -4,15 +4,26 @@ import {DOMParser,EMPTY} from './shape_dom.mjs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
-export function fixture(path, initial='Heading. plain sentence', commented=true) {
+export function fixture(path, initial='Heading. plain sentence', commented=true, paragraphApi=false) {
   const state={paragraphXml:EMPTY,text:initial, chars:Array.from(initial,(_,i)=>({bold:i<8,italic:false,
     underline:'None',strikeThrough:false,color:'#000000',name:'Calibri',size:11,doubleStrikeThrough:false,subscript:false,superscript:false})),comments:[],queue:[]};
+  const searchIn=(lo,hi,find)=>{const items=[];const text=state.text.slice(lo,hi);
+    for(let i=text.indexOf(find);i>=0;i=text.indexOf(find,i+find.length))items.push(ranges(lo+i,lo+i+find.length));
+    return {items,load(){}};};
+  const paragraphsOf=(start,end)=>{const out=[];let lo=0;
+    for(const line of state.text.split('\n')){const pLo=lo,hi=lo+line.length;
+      const hit=start===end?(lo<=start&&start<=hi&&!out.length):(start<Math.max(hi,lo+1)&&end>lo);
+      if(hit)out.push({text:line,getOoxml:()=>({value:state.paragraphXml}),search:(find)=>searchIn(pLo,hi,find)});
+      lo=hi+1;}
+    return out.length?out:[{text:state.text,getOoxml:()=>({value:state.paragraphXml}),search:(find)=>searchIn(0,state.text.length,find)}];};
   const ranges=(start,end)=>{
     const font={load() {},reset() {state.queue.push(()=>state.chars.slice(start,end).forEach(c=>Object.assign(c,{bold:false,italic:false,underline:"None"})));}};
     for(const key of ['bold','italic','underline','strikeThrough','color','name','size','doubleStrikeThrough','subscript','superscript'])
       Object.defineProperty(font,key,{get(){const vals=state.chars.slice(start,end).map(c=>c[key]);return vals.every(v=>v===vals[0])?vals[0]:null;},set(v){state.queue.push(()=>state.chars.slice(start,end).forEach(c=>c[key]=v));}});
     const range={load(){},font,getOoxml:()=>({value:state.paragraphXml}),get text(){return state.text.slice(start,end);},
-      paragraphs:{items:[{text:state.text,getOoxml:()=>({value:state.paragraphXml})}],load(){}},getTrackedChanges:()=>({items:[],load(){}}),
+      // Paragraphs are the "\n"-separated lines of state.text (issue #113 multi-paragraph model).
+      paragraphs:{get items(){return paragraphsOf(start,end);},load(){},...(paragraphApi?{getFirst(){return paragraphsOf(start,end)[0];}}:{})},getTrackedChanges:()=>({items:[],load(){}}),
+      expandTo(other){return ranges(start,other.end);},
       getComments:()=>({get items(){return state.comments;},load(){}}),
       compareLocationWith(other){return {value:end<=other.start?'Before':start>=other.end?'After':'Overlaps'};},
       start,end,

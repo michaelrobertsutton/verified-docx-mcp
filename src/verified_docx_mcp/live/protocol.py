@@ -98,6 +98,27 @@ pane must honor.
                      post -- pre/post are ``body.text`` SHA-256 read
                      before and after the whole op).
 
+                     Anchored form (issue #113, capability
+                     "anchored_find_v1"; also on ``format``): instead of
+                     ``find``, the payload carries ``prefix`` and
+                     ``suffix`` (literal document text, each <= 230
+                     characters) and ``expected_text_sha256`` (sha256 hex
+                     of the span's text normalized as
+                     ``locate.normalize_span_text``), with
+                     ``expected_matches: 1``. The pane searches the prefix,
+                     searches the suffix inside each prefix match's own
+                     paragraph, pairs each prefix with the nearest suffix
+                     after it, ``prefix.expandTo(suffix)``, and keeps the
+                     spans whose normalized text hashes to the expected
+                     value. Exactly one, or a refusal before any write:
+                     ``zero_match`` / ``AMBIGUOUS_SPAN`` / ``INVALID_INPUT``
+                     (malformed, or combined with ``find``, ``rowAnchor``
+                     or a text-box scope). The hash is re-checked right
+                     before the write's own sync (``LIVE_STALE`` if it
+                     moved). The server sends this form only for a resolved
+                     span longer than 230 characters; shorter spans go as a
+                     plain ``find`` with ``expected_matches: 1``.
+
   format          -- ``FormatPayload`` (find, expected_matches, bold,
                      italic, underline, strike, color, track_changes,
                      rowAnchor). rowAnchor is the same row-scoping/

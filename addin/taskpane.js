@@ -386,7 +386,9 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["table_rows_v1", "table_copy_v1", "heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1", "compact_evidence_v1"];
+// issue #113: "anchored_find_v1" = replace/format accept {prefix, suffix, expected_text_sha256}
+// instead of `find` (a span longer than one Word search), re-checking the hash before the write.
+const PANE_CAPABILITIES = ["anchored_find_v1","table_rows_v1", "table_copy_v1", "heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1", "compact_evidence_v1"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -1213,7 +1215,99 @@ async function resolveRowCells(context, rowAnchorText) {
   return rowCells.items;
 }
 
+// issue #113 (anchored_find_v1): a span longer than one Word search (255
+// characters) is located by a literal prefix and suffix plus the sha256 of the
+// span's normalized text. normalizeSpanText must stay identical to the server's
+// locate.normalize_span_text: curly -> straight quotes, NBSP-class spaces and
+// whitespace runs -> one space (Python's \s set, spelled out), soft hyphens removed.
+const ANCHOR_MAX_CHARS = 230;
+const ANCHOR_CANDIDATE_LIMIT = 50;
+// A hoisted twin of charClass below (that const is not initialized yet at this point in the file).
+function spanCharClass(codes) {
+  return new RegExp(`[${codes.map((c) => String.fromCharCode(c)).join("")}]`, "g");
+}
+const SPAN_SINGLE_QUOTES = spanCharClass([0x2018, 0x2019, 0x201a, 0x201b, 0x2032, 0x2035]);
+const SPAN_DOUBLE_QUOTES = spanCharClass([0x201c, 0x201d, 0x201e, 0x201f, 0x2033, 0x2036, 0x00ab, 0x00bb]);
+const SPAN_SPACES = spanCharClass([0x00a0, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008,
+  0x2009, 0x200a, 0x202f, 0x205f, 0x3000]);
+const SPAN_WHITESPACE_RUN = new RegExp(`[${[0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x85, 0xa0,
+  0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029,
+  0x202f, 0x205f, 0x3000].map(c => String.fromCharCode(c)).join("")}]+`, "g");
+
+function normalizeSpanText(text) {
+  return String(text || "")
+    .replace(SPAN_SINGLE_QUOTES, "'")
+    .replace(SPAN_DOUBLE_QUOTES, '"')
+    .replace(SPAN_SPACES, " ")
+    .replace(SPAN_WHITESPACE_RUN, " ")
+    .replace(SOFT_HYPHEN, "");
+}
+
+async function spanHash(text) {
+  return sha256Hex(normalizeSpanText(text));
+}
+
+function isAnchored(payload) {
+  return payload.prefix !== undefined || payload.suffix !== undefined || payload.expected_text_sha256 !== undefined;
+}
+
+// Each prefix match pairs with the nearest suffix match after it in the SAME
+// paragraph (the suffix is searched inside the prefix's own paragraph, so a
+// span never crosses a paragraph or cell); prefix.expandTo(suffix) is kept
+// only when its normalized text hashes to expected_text_sha256. Exactly one
+// such span, or a refusal: zero_match / AMBIGUOUS_SPAN. Nothing is written here.
+async function anchoredSpans(context, source, payload) {
+  const {prefix, suffix, expected_text_sha256: want} = payload;
+  if (typeof prefix !== "string" || typeof suffix !== "string" || !prefix || !suffix ||
+      prefix.length > ANCHOR_MAX_CHARS || suffix.length > ANCHOR_MAX_CHARS ||
+      typeof want !== "string" || !/^[0-9a-f]{64}$/.test(want) || (payload.find !== undefined && payload.find !== null))
+    throw refusalError("Anchored find needs prefix and suffix (each 1..230 characters), expected_text_sha256 and no find", "INVALID_INPUT");
+  if (payload.rowAnchor != null || (payload.scope && payload.scope !== "body"))
+    throw refusalError("Anchored find works on the document body only", "INVALID_INPUT");
+  const options = {matchCase: true, matchWholeWord: false};
+  const starts = source.search(prefix, options);
+  starts.load("items");
+  await context.sync();
+  const prefixes = starts.items.slice(0, ANCHOR_CANDIDATE_LIMIT);
+  const suffixLists = prefixes.map(r => r.paragraphs.getFirst().search(suffix, options));
+  suffixLists.forEach(list => list.load("items"));
+  await context.sync();
+  const relations = prefixes.map((p, i) => suffixLists[i].items.map(s => p.compareLocationWith(s)));
+  await context.sync();
+  const spans = [];
+  prefixes.forEach((p, i) => {
+    const k = relations[i].findIndex(r => r.value === "Before" || r.value === "AdjacentBefore");
+    if (k >= 0) spans.push(p.expandTo(suffixLists[i].items[k]));
+  });
+  spans.forEach(s => s.load("text"));
+  await context.sync();
+  const hashes = await Promise.all(spans.map(s => spanHash(s.text)));
+  const hits = spans.filter((_, i) => hashes[i] === want);
+  if (hits.length === 0)
+    throw refusalError(`no prefix-suffix span matches expected_text_sha256 (${spans.length} candidate(s), found 0)`, "zero_match");
+  if (hits.length > 1)
+    throw refusalError(`${hits.length} prefix-suffix spans match expected_text_sha256; nothing was written`, "AMBIGUOUS_SPAN");
+  return hits;
+}
+
+// The hash re-check at the mutation boundary: called right before the write's own sync.
+async function requireAnchoredText(context, ranges, payload) {
+  if (!isAnchored(payload)) return;
+  ranges.forEach(r => r.load("text"));
+  await context.sync();
+  const hashes = await Promise.all(ranges.map(r => spanHash(r.text)));
+  if (hashes.some(h => h !== payload.expected_text_sha256))
+    throw refusalError("Anchored target changed during preflight; nothing was written", "LIVE_STALE");
+}
+
 async function searchScoped(context, payload) {
+  if (isAnchored(payload)) {
+    const source = payload.executionTargetSection ? await targetSectionRange(context, payload) : context.document.body;
+    const hits = await executionTargetRanges(context, payload, await anchoredSpans(context, source, payload));
+    // Downstream checks (boundary, preflight text compare, read-back) work on the verified text.
+    if (hits.length === 1) payload.find = hits[0].text;
+    return hits;
+  }
   if (payload.scope && payload.scope !== "body") {
     if (payload.rowAnchor) throw refusalError("Row scope cannot be combined with text-box scopes", "INVALID_INPUT");
     const resolved = await resolveScopes(context, payload.scope, true);
@@ -1446,6 +1540,7 @@ async function opReplace(payload) {
     await context.sync();
     if (matchItems.some(range => range.text !== payload.find))
       throw refusalError("Replacement target changed during preflight", "LIVE_STALE");
+    await requireAnchoredText(context, matchItems, payload);
     const matches = matchItems.map((range) => ({ before: range.text, after: payload.replace }));
     try {
       if (previousMode !== null) context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
@@ -1557,6 +1652,7 @@ async function opFormat(payload) {
       await guardRevisions(context, matchItems);
       await guardComments(context, matchItems, false, await scopeShapeBodies(context, payload.scope));
     }
+    await requireAnchoredText(context, matchItems, payload);
 
     let previousMode = null;
     if (payload.track_changes) {
