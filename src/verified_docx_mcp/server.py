@@ -1144,12 +1144,21 @@ def _read_document_from(
     if section_key is not None:
         # A textbox-<n> key reads that text box's own scope.
         scoped = projection.project_textbox_scope(local_path, part, section_key)
-        if scoped is not None:
-            return render(scoped, [])
         # Otherwise a heading section_key: read that section's paragraph range
         # exactly as find_sections reports it (original para refs / table ids kept).
         sections = projection.find_sections_impl(local_path, part, ignore_trailing_empty=live)
         heading = next((s for s in sections if s["kind"] == "heading" and s["section_key"] == section_key), None)
+        if scoped is not None and heading is not None:
+            # A heading titled "Textbox" slugs to the same key as the first text box.
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"section_key {section_key!r} names both a heading section and a text box; read the heading "
+                "with start_para_ref/end_para_ref from find_sections instead.",
+                {"section_key": section_key, "part": part, "start_para_ref": heading["start_para_ref"],
+                 "end_para_ref": heading["end_para_ref"]},
+            )
+        if scoped is not None:
+            return render(scoped, [])
         if heading is None:
             raise _make_error(
                 ErrorCode.INVALID_INPUT,

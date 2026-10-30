@@ -731,9 +731,11 @@ class FakeDocument:
         from xml.sax.saxutils import escape
 
         w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        def run(line: str) -> str:  # a "\v" (soft line break) becomes <w:br/>, as Word writes it
+            return '<w:br/>'.join(f'<w:t xml:space="preserve">{escape(part)}</w:t>' for part in line.split("\v"))
+
         paragraphs = "".join(
-            f'<w:p><w:r><w:t xml:space="preserve">{escape(line)}</w:t></w:r></w:p>' if line else "<w:p/>"
-            for line in self.text.split("\n")
+            f"<w:p><w:r>{run(line)}</w:r></w:p>" if line else "<w:p/>" for line in self.text.split("\n")
         )
         document = f'<w:document xmlns:w="{w}"><w:body>{paragraphs}</w:body></w:document>'
         ns = "http://schemas.microsoft.com/office/2006/xmlPackage"
@@ -1290,9 +1292,11 @@ class FakePane:
             )
         if op == "replacement_font":
             self.op_payloads.setdefault(op, []).append(dict(payload))
-            return doc.replacement_font(
-                payload["find"], int(payload["expected_matches"]), row_anchor=payload.get("rowAnchor")
-            )
+            find = payload.get("find")
+            if find is None:  # anchored form (#113): the real pane's searchScoped resolves it first
+                (start, end), = doc.anchored_positions(payload)
+                find = doc.text[start:end]
+            return doc.replacement_font(find, int(payload["expected_matches"]), row_anchor=payload.get("rowAnchor"))
         if op == "format":
             return doc.format(
                 payload.get("find", ""),

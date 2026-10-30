@@ -1163,6 +1163,13 @@ def execute_replace_text_live(
     if replacement_segments is not None:
         live_write_mode.require_capability(session, "formatted_replacements_v1", feature_description="explicit formatted replacements")
     if partial:
+        if scope != "body":
+            # Sampling the first run uses Range.search, which hangs Word for Mac inside shape text.
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                "partial replacement_segments work in the document body only; in a text box give every font field",
+                {"scope": scope},
+            )
         live_write_mode.require_capability(
             session, PARTIAL_CAPABILITY, feature_description="partial replacement_segments formats (inherited fields)"
         )
@@ -1203,6 +1210,7 @@ def execute_replace_text_live(
             "expected_matches": 1 if target else expected_matches,
             "scope": scope,
         }
+        _apply_pane_target(font_target, target)  # a target with a line break goes in anchored form
         if within_row_containing:
             font_target["rowAnchor"] = within_row_containing
         expected_first_font = request_replacement_font(session, font_target)

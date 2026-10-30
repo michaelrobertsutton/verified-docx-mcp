@@ -92,7 +92,7 @@ def normalize_baseline(font: Any) -> dict[str, Any]:
     """The pane's reported first-run font, as a baseline: the ten fields, colour upper-cased.
     A field the pane could not report (Word answers null/"" for a mixed range) stays as
     reported; resolution refuses to inherit it."""
-    if not isinstance(font, dict) or set(font) < FIELDS:
+    if not isinstance(font, dict) or not FIELDS <= set(font):
         raise _make_error(ErrorCode.LIVE_OP_FAILED, 'The pane returned a malformed replacement_font reply',
                           {'stage': 'replacement_font_reply'})
     out = {k: font[k] for k in sorted(FIELDS)}

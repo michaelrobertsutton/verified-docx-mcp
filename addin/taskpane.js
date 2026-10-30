@@ -1529,6 +1529,9 @@ function expectedFirstFont(payload) {
 }
 
 async function opReplacementFont(payload) {
+  // Range.search inside shape text hangs Word for Mac; partial segments are body-only.
+  if (payload.scope && payload.scope !== "body")
+    throw refusalError("partial replacement_segments work in the document body only", "INVALID_INPUT");
   return measuredWordRun(async (context) => {
     const matchItems = await searchScoped(context, payload);
     if (matchItems.length !== payload.expected_matches)
@@ -1548,6 +1551,8 @@ async function opReplace(payload) {
   const expectedMatches = payload.expected_matches;
   const segments = explicitSegments(payload);
   const expectedFont = expectedFirstFont(payload);
+  if (expectedFont && payload.scope && payload.scope !== "body")
+    throw refusalError("partial replacement_segments work in the document body only", "INVALID_INPUT");
   return measuredWordRun(async (context) => {
     if (!payload.executionSections) await requireFreshBody(context, payload.expectedBodySha256);
     await requireFreshScope(context, payload);

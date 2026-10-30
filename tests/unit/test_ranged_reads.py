@@ -308,6 +308,22 @@ class HeadingSectionReadTests(RangedReadTestCase):
         self.assertIn("Text inside the text box.", result["text"])
         self.assertNotIn("start_para_ref", result)
 
+    def test_heading_titled_textbox_colliding_with_a_textbox_key_is_refused(self):
+        # slug("Textbox") + "-1" is also the first text box's key: refuse rather than guess.
+        box = Path(self._tmp.name) / "textbox.docx"
+        shutil.copyfile(FIXTURES / "textbox.docx", box)
+        from verified_docx_mcp import text_edit
+        text_edit.execute_replace_text(str(box), "Body text before the text box.", "Textbox", 1, write_mode="file")
+        text_edit.execute_apply_style(str(box), "Textbox", "Heading1", 1)
+        keys = [(s["section_key"], s["kind"]) for s in projection.find_sections_impl(box)]
+        self.assertIn(("textbox-1", "heading"), keys)
+        self.assertIn(("textbox-1", "textbox"), keys)
+        with self.assertRaises(VerifyError) as ctx:
+            self.read(box, format="text", section_key="textbox-1")
+        env = ctx.exception.envelope
+        self.assertEqual(env.error_code, ErrorCode.INVALID_INPUT)
+        self.assertEqual(env.diagnostics["start_para_ref"], "p0")
+
     def test_heading_key_with_a_range_is_invalid_input(self):
         with self.assertRaises(VerifyError) as ctx:
             self.read(self.sections, format="text", section_key="next-steps-1", start_para_ref="p0", end_para_ref="p1")

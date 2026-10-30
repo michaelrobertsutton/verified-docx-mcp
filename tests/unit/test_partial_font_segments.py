@@ -141,6 +141,30 @@ class PartialLiveTests(LiveWriteBridgeTestCase):
         self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
         self.assertFalse([op for op, _ in sent if op in {"replacement_font", "replace"}])
 
+    async def test_partial_segments_outside_the_body_refuse_before_anything_is_sent(self):
+        # Sampling the first run uses Range.search, which hangs Word for Mac in shape text.
+        doc, _, sent = await self.connect()
+        with self.assertRaises(VerifyError) as ctx:
+            await self.replace("gamma", "G", [{"text": "G", "format": {"bold": True}}], scope="all")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        self.assertFalse([op for op, _ in sent if op in {"replacement_font", "replace"}])
+        self.assertEqual(doc.text, "alpha beta gamma delta")
+
+    async def test_para_ref_target_with_a_soft_break_looks_up_its_font_in_anchored_form(self):
+        para = "Soft break target, first line\vsecond line of the same paragraph."
+        doc, _, sent = await self.connect(text=f"Intro.\n{para}\nOutro.",
+                                          caps=[*CAPS, "body_ooxml", "anchored_find_v1"], body_ooxml_from_text=True)
+        from verified_docx_mcp import locate
+        result = await asyncio.to_thread(
+            text_edit.execute_replace_text, str(self.target), None, "Replaced.", None, para_ref="p1",
+            expected_sha256=locate.span_sha256(para), write_mode="live",
+            replacement_segments=[{"text": "Replaced.", "format": {"bold": True}}])
+        self.assertTrue(result["applied"])
+        lookup = next(p for op, p in sent if op == "replacement_font")
+        self.assertNotIn("find", lookup)
+        self.assertEqual(lookup["expected_matches"], 1)
+        self.assertEqual(doc.text, "Intro.\nReplaced.\nOutro.")
+
     async def test_full_segments_need_no_lookup_and_no_new_capability(self):
         doc, _, sent = await self.connect(caps=["formatted_replacements_v1"])
         await self.replace("gamma", "G", [{"text": "G", "format": dict(DEFAULT_FONT, bold=True)}])
