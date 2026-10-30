@@ -69,6 +69,9 @@ class Scenario:
     baseline: str = ""  # the variant the others are compared with (default: the first)
     prepare: Callable[[], Workspace] = Workspace  # builds each variant's fresh workspace
     notes: list[str] = field(default_factory=list)
+    # False: the calls are only sized, not sent (live mode needs Word; the new-API live calls are
+    # exercised by the fake-pane unit tests and the real-Word probe instead).
+    execute: bool = True
 
 
 SCENARIOS: list[Callable[[], Scenario]] = []
@@ -149,7 +152,138 @@ def markdown_section_write() -> Scenario:
     )
 
 
-# Part A hook: add ellipsis/anchored-find scenarios here (or anywhere above) with @scenario.
+def _old_paragraph(n: int) -> str:
+    """A ~460-character proposal paragraph (the issue's example is 412), unique per n."""
+    return (
+        f"For requirement {n}, Skyward will meet it through a dedicated delivery lead who owns the schedule, the "
+        "risk register and the weekly status report to the contracting officer's representative. The lead "
+        "coordinates the engineering, test and security staff, escalates blocking issues within one business "
+        "day, and confirms each milestone against the performance work statement before the government "
+        f"accepts it, so that requirement {n} is delivered on time and verified by 2027."
+    )
+
+
+def _new_paragraph(n: int) -> str:
+    """The rewrite: every sentence changes, about the same length (the model types all of it in both APIs)."""
+    return (
+        f"Requirement {n} is owned end to end by a named Skyward delivery manager, who keeps the integrated "
+        "schedule and risk register current and briefs the COR every Tuesday. That manager directs the "
+        "engineering, test and cyber staff, raises any blocker to the program manager within four working "
+        "hours, and walks each milestone through the PWS acceptance checklist with the government before "
+        f"sign-off, so requirement {n} lands on schedule with evidence on file by mid-2027."
+    )
+
+
+OLD_PARAGRAPHS = [_old_paragraph(n) for n in range(1, 11)]
+NEW_PARAGRAPHS = [_new_paragraph(n) for n in range(1, 11)]
+ANCHOR = 24  # prefix/suffix characters an anchored find carries (the minimum is 12)
+
+
+def _anchored(text: str) -> str:
+    return f"{text[:ANCHOR]}…{text[-ANCHOR:]}"
+
+
+@scenario
+def rewrite_and_review_session() -> Scenario:
+    """The issue's acceptance session: 10 paragraph rewrites then 12 review comments."""
+
+    def prepared() -> Workspace:
+        ws = Workspace()
+        mutations.execute_replace_body_markdown(ws.docx, "\n\n".join(OLD_PARAGRAPHS + PARAGRAPHS), force=True)
+        return ws
+
+    def today(ws: Workspace) -> list[Call]:
+        rewrites = [
+            ("replace_text", {"path": ws.docx, "find": old, "replace": new, "expected_matches": 1, "write_mode": "file"})
+            for old, new in zip(OLD_PARAGRAPHS, NEW_PARAGRAPHS, strict=True)
+        ]
+        comments = [
+            ("add_anchored_comment", {"path": ws.docx, "quote": q, "text": c, "expected_matches": 1, "write_mode": "file"})
+            for q, c in zip(QUOTES, FINDINGS, strict=True)
+        ]
+        return rewrites + comments
+
+    def new_api(ws: Workspace) -> list[Call]:
+        rewrites = [
+            ("replace_text", {"path": ws.docx, "find": _anchored(old), "expected_length": len(old), "replace": new,
+                              "write_mode": "file"})
+            for old, new in zip(OLD_PARAGRAPHS, NEW_PARAGRAPHS, strict=True)
+        ]
+        batch = (
+            "add_anchored_comment_batch",
+            {"path": ws.docx, "write_mode": "file",
+             "comments": [{"quote": q, "content": c} for q, c in zip(QUOTES, FINDINGS, strict=True)]},
+        )
+        return [*rewrites, batch]
+
+    return Scenario(
+        f"session: 10 paragraph rewrites ({len(OLD_PARAGRAPHS[0])} chars) + 12 review comments, file mode",
+        {"today: full find + 12 comment calls": today, "#113: anchored find + comment batch": new_api},
+        prepare=prepared,
+        notes=["file mode has no 230-char find cap, so 'today' is one call per rewrite (the cheapest old form)"],
+    )
+
+
+LIVE_FIND_CAP = 230  # today's live replace_text find limit (Word search() caps needles at 255)
+REVISION = "live:sha256:" + "0" * 64  # the shape of the token every live write passes
+
+
+def _chunks(text: str, cap: int = LIVE_FIND_CAP) -> list[str]:
+    """Split *text* into consecutive pieces of at most *cap* characters at sentence, then
+    clause, then word boundaries: how a caller chunks a long live rewrite today."""
+    out: list[str] = []
+    rest = text
+    while len(rest) > cap:
+        head = rest[:cap]
+        cut = max(head.rfind(". "), head.rfind(", "), head.rfind(" "))
+        out.append(rest[: cut + 1])
+        rest = rest[cut + 1 :]
+    return [*out, rest]
+
+
+@scenario
+def rewrite_and_review_session_live() -> Scenario:
+    """The same session in live mode, where today's 230-character find cap splits each rewrite."""
+    doc = "/Users/me/Proposals/Volume II Technical.docx"
+
+    def today(_ws: Workspace) -> list[Call]:
+        calls: list[Call] = []
+        for old, new in zip(OLD_PARAGRAPHS, NEW_PARAGRAPHS, strict=True):
+            olds = _chunks(old)
+            # The new text is split into as many consecutive pieces (one per old piece).
+            step = -(-len(new) // len(olds))
+            news = [new[i * step : (i + 1) * step] for i in range(len(olds))]
+            calls += [
+                ("replace_text", {"path": doc, "find": o, "replace": r, "expected_matches": 1, "write_mode": "live",
+                                  "revision_before": REVISION})
+                for o, r in zip(olds, news, strict=True)
+            ]
+        calls += [
+            ("add_anchored_comment", {"path": doc, "quote": q, "text": c, "expected_matches": 1, "write_mode": "live"})
+            for q, c in zip(QUOTES, FINDINGS, strict=True)
+        ]
+        return calls
+
+    def new_api(_ws: Workspace) -> list[Call]:
+        rewrites = [
+            ("replace_text", {"path": doc, "find": _anchored(old), "expected_length": len(old), "replace": new,
+                              "write_mode": "live", "revision_before": REVISION})
+            for old, new in zip(OLD_PARAGRAPHS, NEW_PARAGRAPHS, strict=True)
+        ]
+        batch = (
+            "add_anchored_comment_batch",
+            {"path": doc, "write_mode": "live",
+             "comments": [{"quote": q, "content": c} for q, c in zip(QUOTES, FINDINGS, strict=True)]},
+        )
+        return [*rewrites, batch]
+
+    return Scenario(
+        "session: 10 paragraph rewrites + 12 review comments, live mode (sized, not sent)",
+        {"today: 230-char chunks + 12 comment calls": today, "#113: anchored find + comment batch": new_api},
+        execute=False,
+        notes=[f"each {len(OLD_PARAGRAPHS[0])}-char rewrite is {len(_chunks(OLD_PARAGRAPHS[0]))} live calls today",
+               "a typical real path; revision_before on every replace_text, as live writes pass it"],
+    )
 
 
 # --- runner ---------------------------------------------------------------------------------
@@ -160,13 +294,13 @@ def arg_chars(args: dict) -> int:
 
 
 async def run_variant(
-    client: Client, builder: Callable[[Workspace], list[Call]], prepare: Callable[[], Workspace]
+    client: Client, builder: Callable[[Workspace], list[Call]], prepare: Callable[[], Workspace], execute: bool = True
 ) -> tuple[int, int, int]:
     calls = builder(prepare())
     chars = 0
     for tool, args in calls:
-        result = await client.call_tool(tool, args, raise_on_error=False)
-        if result.is_error:
+        result = await client.call_tool(tool, args, raise_on_error=False) if execute else None
+        if result is not None and result.is_error:
             text = "".join(getattr(block, "text", "") for block in result.content)
             raise SystemExit(f"{tool} failed: {text[:300]}")
         chars += arg_chars(args)
@@ -179,7 +313,9 @@ async def main() -> None:
         for factory in SCENARIOS:
             sc = factory()
             baseline = sc.baseline or next(iter(sc.variants))
-            measured = {label: await run_variant(client, builder, sc.prepare) for label, builder in sc.variants.items()}
+            measured = {
+                label: await run_variant(client, builder, sc.prepare, sc.execute) for label, builder in sc.variants.items()
+            }
             base_chars = measured[baseline][1]
             print(f"\n{sc.name}")
             for label, (calls, chars, tokens) in measured.items():
