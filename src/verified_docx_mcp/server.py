@@ -1732,13 +1732,9 @@ def append_markdown(
 @mcp.tool()
 def replace_text(
     path: str,
-    replace: str,
     find: str | None = None,
+    replace: str | None = None,
     expected_matches: int | None = None,
-    expected_length: int | None = None,
-    find_sha256: str | None = None,
-    para_ref: str | None = None,
-    expected_sha256: str | None = None,
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
@@ -1751,21 +1747,30 @@ def replace_text(
     scope: str = "body",
     allow_comment_loss_ids: list[dict[str, Any]] | None = None,
     verbose: bool = False,
+    *,
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
+    para_ref: str | None = None,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Replace every occurrence of `find` with `replace`, atomically.
+    """Replace every occurrence of `find` with `replace`, atomically. `replace` is required.
 
     Three ways to name the target (issue #113), exactly one per call:
       - plain `find` + `expected_matches` (required for a plain find).
       - anchored `find` = "<prefix>…<suffix>" (one U+2026 or "[...]"; prefix
-        and suffix >= 12 characters each) + `expected_length` (characters in
-        the whole span, +-2) and/or `find_sha256` (sha256 hex of the span with
-        straight quotes, whitespace runs collapsed to one space, soft hyphens
-        removed). Each prefix pairs with the nearest following suffix in the
+        and suffix >= 12 characters each) + `expected_length` and/or
+        `find_sha256`. Only these two make a find anchored: without them a
+        literal "…" is ordinary text in a plain find. The span is normalized
+        (straight quotes, whitespace runs -> one space, soft hyphens removed);
+        `expected_length` counts its characters (+-2) and `find_sha256` is the
+        sha256 hex of it (`locate.span_sha256`). Each prefix pairs with the nearest following suffix in the
         same paragraph; exactly one span must pass the check, else
         AMBIGUOUS_SPAN (up to 5 candidates) or ZERO_MATCH (candidate lengths).
         No retyping a long span; no 230-character live limit.
       - `para_ref` ("pN") + `expected_sha256` (same hash of that paragraph's
         text): replaces the whole paragraph's text; PARA_HASH_MISMATCH if it changed.
+        No read returns this hash yet: compute it as `locate.span_sha256` does
+        (a read-side paragraph hash is a follow-up).
     Live mode resolves anchored/para_ref targets on a read of the live body that
     never re-arms a stale caller; text-box scopes and within_row_containing take a
     plain find only there. Spans over 230 characters need the pane's
@@ -1936,6 +1941,8 @@ def replace_text(
                                            pane build predating this feature) -- reload the pane
     """
     try:
+        if replace is None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "replace is required (pass \"\" to delete the text)")
         return text_edit.execute_replace_text(
             path,
             find,

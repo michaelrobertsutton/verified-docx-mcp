@@ -115,9 +115,14 @@ pane must honor.
                      (malformed, or combined with ``find``, ``rowAnchor``
                      or a text-box scope). The hash is re-checked right
                      before the write's own sync (``LIVE_STALE`` if it
-                     moved). The server sends this form only for a resolved
-                     span longer than 230 characters; shorter spans go as a
-                     plain ``find`` with ``expected_matches: 1``.
+                     moved). The server sends this form for a resolved span
+                     longer than 230 UTF-16 units, or one of any length that
+                     holds a soft line break (one Word search cannot match
+                     it); every other span goes as a plain ``find`` with
+                     ``expected_matches: 1``. Before sending, the server
+                     replays this pairing over its own read of the body and
+                     refuses (AMBIGUOUS_SPAN) when the prefix occurs more than
+                     50 times, since the pane looks at the first 50 hits only.
 
   format          -- ``FormatPayload`` (find, expected_matches, bold,
                      italic, underline, strike, color, track_changes,
