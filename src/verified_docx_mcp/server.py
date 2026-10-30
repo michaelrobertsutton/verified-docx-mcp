@@ -49,7 +49,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from fastmcp import FastMCP
 
@@ -1411,18 +1411,33 @@ def list_page_sections(path: str, part: str = projection.DEFAULT_PART) -> dict[s
         _raise_tool_error(exc)
 
 
-def execute_list_styles(path: str) -> dict[str, Any]:
+def execute_list_styles(
+    path: str, type: str | None = None, name_contains: str | None = None
+) -> dict[str, Any]:
+    if type is not None and type not in projection.STYLE_TYPES:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"type must be one of {projection.STYLE_TYPES}, got {type!r}",
+            {"type": type},
+        )
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     local_path, is_temp = _read_local_copy(resolved)
     try:
-        return {"path": str(resolved), "styles": projection.list_styles_impl(local_path)}
+        styles = projection.list_styles_impl(local_path)
+        if type is not None or name_contains:
+            styles = projection.filter_styles(styles, style_type=type, name_contains=name_contains)
+        return {"path": str(resolved), "styles": styles}
     finally:
         if is_temp:
             local_path.unlink(missing_ok=True)
 
 
 @mcp.tool()
-def list_styles(path: str) -> dict[str, Any]:
+def list_styles(
+    path: str,
+    type: Literal["paragraph", "character", "table", "numbering"] | None = None,
+    name_contains: str | None = None,
+) -> dict[str, Any]:
     """Enumerate word/styles.xml's styles: ids, names, types, outline
     levels.
 
@@ -1434,6 +1449,8 @@ def list_styles(path: str) -> dict[str, Any]:
     targeting one.
 
     Returns path, styles (list of {style_id, name, type, outline_lvl}).
+    type narrows to one style type; name_contains keeps styles whose name
+    or style_id contains it (case-insensitive). Both default to no filter.
 
     Not gated by DOCX_LOCKED — see list_parts' docstring.
 
@@ -1442,7 +1459,7 @@ def list_styles(path: str) -> dict[str, Any]:
       SNAPSHOT_FAILED - the read-path snapshot could not be validated
     """
     try:
-        return execute_list_styles(path)
+        return execute_list_styles(path, type, name_contains)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -2229,18 +2246,50 @@ def live_save(path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
+def list_open_items(
+    path: str,
+    source: str = "auto",
+    fields: Literal["summary", "full"] = "full",
+    section_key: str | None = None,
+    within_text: str | None = None,
+    include_correlation: bool = False,
+) -> dict[str, Any]:
     """List every open comment and pending tracked change (w:ins/w:del) in
     a .docx.
 
+    fields (issue #111): "full" (default) is the whole record; "summary"
+    is columnar -- `counts`, `comment_columns` ["comment_id", "author",
+    "resolved", "anchor" (first 60 chars), "reply_count"] with `comments`
+    as a list of row lists, and `suggestion_columns` (file: suggestion_id,
+    kind, author, anchor; live: revision_id, type, author, anchor) with
+    `suggestions` as row lists (a trailing "scope_uncertain" column
+    appears only when scoping flagged a row) -- and keeps `complete`,
+    `scope`, `warnings` and `source`. Ids are complete. Use it for guard
+    reads and to pick ids. NOTE: JennyStack's comment loader expects the
+    "full" shape (objects under `comments`); do not feed it a summary.
+    In full, `reply_count` (== len(replies)) and an empty `replies` are
+    omitted.
+
+    section_key / within_text scope the result: a find_sections key (the
+    heading section), and/or a text span (must match exactly once, like
+    replace_text's find; both given = their intersection). `counts` then
+    adds `in_scope` next to the document-wide totals. File mode places a
+    comment by its anchored runs. Live mode only knows a comment's anchor
+    PARAGRAPH TEXT, so it matches that text against the live body (read
+    without re-arming your write baseline); an item whose text cannot be
+    placed, or that occurs both inside and outside the scope, is kept and
+    flagged `scope_uncertain: true`. An unknown section_key is
+    INVALID_INPUT listing the available keys.
+
     Returns `comments` (from word/comments.xml + commentsExtended.xml's
-    resolved flag; each with comment_id, content, resolved, reply_count,
-    replies, quoted_text, author, created_time, modified_time, scope --
-    the same shape the GoogleDocs-MCP server returns, "scope": "document"
-    always since a docx comment anchor is not tab-scoped) and
-    `pending_suggestions` (every w:ins/w:del, with suggestion_id, kind
-    ("insertion"|"deletion"), text, author, date, anchor_context -- the
-    owning paragraph's own live text).
+    resolved flag; each with comment_id, w_id, content, resolved,
+    replies (omitted when empty), quoted_text, author, created_time -- the
+    constant modified_time/scope of the GoogleDocs-MCP shape are not
+    sent) and `pending_suggestions` (every w:ins/w:del, with
+    suggestion_id, kind ("insertion"|"deletion"), text, author, date,
+    para_ref; the owning paragraph's own live text is sent ONCE per
+    paragraph in the top-level `anchor_contexts` {para_ref: text}, not
+    per suggestion).
 
     Comment replies are threaded (commentsExtended's w15:paraIdParent):
     `comments` lists ROOT comments only, each with reply_count ==
@@ -2269,12 +2318,14 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     In live mode: `source: "live"`; each comment's `comment_id` is a live
     handle `live:<Comment.id>` (Office.js's own id, unrelated to the OOXML
     durableId/w:id -- docs/live-mode.md's WP-1 finding; it does not
-    survive a Word restart), `w_id` is null, and each comment also carries
-    `anchor_text`/`author`/`created_time`/`resolved`/`replies` read
-    straight from the pane (including real reply threading, since the
-    pane sees it and file mode's own reply_count=0/replies=[] limit above
-    does not apply here). Resolved comments are filtered out the same way
-    file mode does, even though the pane reports them too.
+    survive a Word restart), and each comment carries
+    `anchor_text`/`anchor_paragraph_text`/`author`/`created_time`/
+    `resolved`/`replies` read straight from the pane (`session_epoch` is
+    sent once at the top level; there is no `w_id`/`quoted_text`, which
+    was always null / equal to `anchor_text`). Live mode already returns
+    the FULL reply threads, so get_comment_thread is only needed in file
+    mode. Resolved comments are filtered out the same way file mode does,
+    even though the pane reports them too.
 
     Issue #39 -- READ THESE BEFORE TELLING A USER A COMMENT DOES NOT EXIST.
     The live response leads with `counts` (`live_total`/`live_open`: the
@@ -2283,7 +2334,7 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     document body is read, so comments anchored in headers, footers or text
     boxes are NOT visible), `pane` (`instance_id`/`platform`/`host`/
     `observed_at`: WHICH pane answered and when it read), and `warnings`
-    (`scope_body_only`, `same_document_duplicate` when a second pane for
+    (`pane_collection_incomplete`, `same_document_duplicate` when a second pane for
     this document was connected, `file_has_unlisted_comments` when the saved
     file has open comments the pane did not report). `file_only_open_comments`
     lists those. All of it is advisory: a pane that returns a stale
@@ -2295,7 +2346,7 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
     `comments` list, or `counts` that disagree with the comments returned)
     raises LIVE_OP_FAILED rather than reporting an empty result.
 
-    The response
+    With include_correlation=true the response
     also carries a top-level `correlation` list: for each listed live
     comment, the best-matching file-mode comment_id (durableId, or a raw
     w:id fallback) from this same document's on-disk snapshot, matched by
@@ -2337,13 +2388,22 @@ def list_open_items(path: str, source: str = "auto") -> dict[str, Any]:
 
     Errors:
       INVALID_INPUT    - path does not exist or is outside the allowed
-                          roots, or source is not "auto"/"file"/"live"
+                          roots, source is not "auto"/"file"/"live", fields
+                          is not "summary"/"full", or section_key is unknown
+      ZERO_MATCH / MATCH_COUNT_MISMATCH - within_text did not match exactly once
       SNAPSHOT_FAILED  - the read-path snapshot could not be validated
       LIVE_UNAVAILABLE - source="live" requested but no connected pane
                           session for this document
     """
     try:
-        return comments_live.execute_list_open_items(path, source)
+        return comments_live.execute_list_open_items(
+            path,
+            source,
+            fields=fields,
+            section_key=section_key,
+            within_text=within_text,
+            include_correlation=include_correlation,
+        )
     except VerifyError as exc:
         _raise_tool_error(exc)
 

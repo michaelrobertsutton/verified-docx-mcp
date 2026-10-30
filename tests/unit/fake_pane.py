@@ -126,6 +126,9 @@ class FakeComment:
     anchor_text: str
     resolved: bool = False
     replies: list[FakeReply] = field(default_factory=list)
+    # Issue #111: the text of the paragraph holding the anchor (the pane's anchorParagraphText).
+    # None = not reported, like a pane that predates it.
+    anchor_paragraph_text: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +139,7 @@ class FakeComment:
             "resolved": self.resolved,
             "anchorText": self.anchor_text,
             "replies": [r.to_dict() for r in self.replies],
+            **({"anchorParagraphText": self.anchor_paragraph_text} if self.anchor_paragraph_text is not None else {}),
         }
 
 
@@ -1184,6 +1188,10 @@ class FakePane:
             return reply
         if op == "comment_add":
             return doc.comment_add(payload["find"], int(payload["expected_matches"]), payload["text"])
+        if op in ("comment_reply", "comment_resolve"):
+            # The real pane's checkCommentEpoch.
+            if payload.get("session_epoch") and doc.session_epoch and payload["session_epoch"] != doc.session_epoch:
+                raise OpRefused("COMMENT_ID_STALE", "Comment handle is from another pane epoch")
         if op == "comment_reply":
             return doc.comment_reply(payload["comment_id"], payload["text"])
         if op == "comment_resolve":

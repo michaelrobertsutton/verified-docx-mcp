@@ -29,23 +29,28 @@ way while file mode's own join has no separator at all.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import ssl
 import sys
 import tempfile
 import unittest
+import unittest.mock
+import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fake_pane import FakeComment, FakeDocument, FakePane
+from fake_pane import FakeComment, FakeDocument, FakePane, FakeReply, docx_to_flat_opc
 
 from verified_docx_mcp import comments, mutations, paths, server
 from verified_docx_mcp.errors import ErrorCode, VerifyError
 from verified_docx_mcp.live import bridge, comments_live
+from verified_docx_mcp.live.protocol import HelloMessage
+from verified_docx_mcp.live.session import LiveOpFailed
 
 FIXTURES = REPO / "tests" / "fixtures"
 MULTIPARA = FIXTURES / "comments" / "multipara-comment.docx"
@@ -164,22 +169,29 @@ class ListOpenItemsLiveCorrelationTests(LiveCommentsTestCase):
         ]
         return doc
 
+    async def _list_with_correlation(self):
+        return await self.call(
+            lambda: comments_live.execute_list_open_items_live(str(self.target), include_correlation=True)
+        )
+
     async def test_shape_and_exact_correlation_for_both_fixture_comments(self):
         doc = self._fixture_comments()
         await self.connect_pane(document=doc)
 
-        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        result = await self._list_with_correlation()
         self.assertEqual(result["source"], "live")
         self.assertEqual(len(result["comments"]), 2)
 
         by_id = {c["comment_id"]: c for c in result["comments"]}
         root = by_id["live:c-root"]
-        self.assertEqual(root["w_id"], None)
+        for gone in ("w_id", "quoted_text", "modified_time", "scope", "session_epoch"):
+            self.assertNotIn(gone, root)  # constant or duplicate fields are not sent (#111)
         self.assertEqual(root["content"], ROOT_CONTENT_LIVE)
         self.assertEqual(root["anchor_text"], ROOT_ANCHOR)
         self.assertEqual(root["author"], ROOT_AUTHOR)
         self.assertFalse(root["resolved"])
-        self.assertEqual(root["replies"], [])
+        self.assertNotIn("replies", root)  # empty list omitted (#111)
+        self.assertNotIn("reply_count", root)
 
         correlation_by_live_id = {e["live_comment_id"]: e for e in result["correlation"]}
         self.assertEqual(correlation_by_live_id["live:c-root"]["comment_id"], ROOT_DURABLE_ID)
@@ -192,7 +204,7 @@ class ListOpenItemsLiveCorrelationTests(LiveCommentsTestCase):
         doc.comments[1].resolved = True  # the single-paragraph one
         await self.connect_pane(document=doc)
 
-        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        result = await self._list_with_correlation()
         ids = {c["comment_id"] for c in result["comments"]}
         self.assertEqual(ids, {"live:c-root"})
         self.assertEqual({e["live_comment_id"] for e in result["correlation"]}, {"live:c-root"})
@@ -211,7 +223,7 @@ class ListOpenItemsLiveCorrelationTests(LiveCommentsTestCase):
         )
         await self.connect_pane(document=doc)
 
-        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        result = await self._list_with_correlation()
         correlation_by_live_id = {e["live_comment_id"]: e for e in result["correlation"]}
         entry = correlation_by_live_id["live:c-unrelated"]
         self.assertEqual(entry["confidence"], "none")
@@ -233,7 +245,7 @@ class ListOpenItemsLiveCorrelationTests(LiveCommentsTestCase):
         doc.comments[0].creation_date = "2026-09-16T18:06:00.000Z"  # the root comment's live-side date
         await self.connect_pane(document=doc)
 
-        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        result = await self._list_with_correlation()
         correlation_by_live_id = {e["live_comment_id"]: e for e in result["correlation"]}
         root = correlation_by_live_id["live:c-root"]
         self.assertEqual(root["confidence"], "exact")
@@ -251,7 +263,7 @@ class ListOpenItemsLiveCorrelationTests(LiveCommentsTestCase):
         doc = self._fixture_comments()
         await self.connect_pane(document=doc)
 
-        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        result = await self._list_with_correlation()
         self.assertTrue(result["correlation"], "expected at least one correlation entry")
         for entry in result["correlation"]:
             self.assertIs(entry["w_id_stable"], False)
@@ -264,13 +276,13 @@ class ListOpenItemsLiveCorrelationTests(LiveCommentsTestCase):
         await self.connect_pane(document=doc, instance_id="pane-A", platform="Mac")
 
         result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
-        self.assertEqual(list(result)[:4], ["counts", "scope", "pane", "warnings"])
+        self.assertEqual(list(result)[:4], ["counts", "scope", "pane", "path"])
         self.assertEqual(result["counts"], {"live_total": 2, "live_open": 1, "returned": 1})
         self.assertEqual(result["scope"], "body")
         self.assertEqual(result["pane"]["instance_id"], "pane-A")
         self.assertEqual(result["pane"]["platform"], "Mac")
         self.assertEqual(result["pane"]["observed_at"], "2026-10-01T12:00:00.000Z")
-        self.assertIn("scope_body_only", [w["code"] for w in result["warnings"]])
+        self.assertNotIn("scope_body_only", [w["code"] for w in result.get("warnings", [])])  # `scope` says it (#111)
         self.assertNotIn("pane_note", result)
 
     async def test_older_pane_without_counts_gets_computed_counts_and_note(self):
@@ -306,7 +318,7 @@ class ListOpenItemsLiveCorrelationTests(LiveCommentsTestCase):
         await self.connect_pane(document=doc)
 
         result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
-        self.assertIn("file_has_unlisted_comments", [w["code"] for w in result["warnings"]])
+        self.assertIn("file_has_unlisted_comments", [w["code"] for w in result.get("warnings", [])])
         self.assertEqual(
             [c["comment_id"] for c in result["file_only_open_comments"]], [ROOT_DURABLE_ID]
         )
@@ -318,7 +330,7 @@ class ListOpenItemsLiveCorrelationTests(LiveCommentsTestCase):
 
         result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
         self.assertEqual(result["pane"]["instance_id"], "pane-new")
-        dup = [w for w in result["warnings"] if w["code"] == "same_document_duplicate"]
+        dup = [w for w in result.get("warnings", []) if w["code"] == "same_document_duplicate"]
         self.assertEqual(len(dup), 1)
         self.assertEqual(dup[0]["displaced_instance_id"], "pane-old")
 
@@ -512,6 +524,37 @@ class ResolveCommentLiveTests(LiveCommentsTestCase):
         self.assertEqual(evidence["after"], "resolved")
         self.assertEqual(evidence["comment_id_resolved_via"], "live-handle")
         self.assertTrue(doc.comments[0].resolved)
+
+    async def test_listed_epoch_handle_resolves_and_replies(self):
+        """A real-Word probe for #117 found list_open_items' live:<epoch>:<id>
+        handle reached the pane as "<epoch>:<id>" and was refused; the listed
+        handle must work as-is for reply and resolve."""
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        doc.session_epoch = "ep9"
+        await self.connect_pane(document=doc)
+        await self.call(comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "x", 1)
+        listed = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        handle = listed["comments"][0]["comment_id"]
+        self.assertTrue(handle.startswith("live:ep9:"))
+
+        replied = await self.call(comments_live.execute_reply_to_comment_live, str(self.target), handle, "ok")
+        self.assertTrue(replied["applied"])
+        resolved = await self.call(comments_live.execute_resolve_comment_live, str(self.target), handle)
+        self.assertTrue(resolved["applied"])
+        self.assertTrue(doc.comments[0].resolved)
+
+    async def test_listed_handle_from_an_earlier_epoch_is_refused(self):
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        doc.session_epoch = "ep9"
+        await self.connect_pane(document=doc)
+        await self.call(comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "x", 1)
+        listed = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        stale = listed["comments"][0]["comment_id"].replace("live:ep9:", "live:ep8:")
+
+        with self.assertRaises(VerifyError) as ctx:
+            await self.call(comments_live.execute_resolve_comment_live, str(self.target), stale)
+        self.assertEqual(ctx.exception.envelope.error_code.value, "COMMENT_ID_STALE")
+        self.assertFalse(doc.comments[0].resolved)
 
     async def test_evidence_carries_live_sha256_revision_tokens(self):
         """issue #106 WP-6 real-pane finding: resolve evidence used to
@@ -832,7 +875,9 @@ class NoLocalFileLiveTests(LiveCommentsTestCase):
         doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
         await self.connect_pane(document=doc)
 
-        result = await self.call(comments_live.execute_list_open_items_live, str(self.target))
+        result = await self.call(
+            lambda: comments_live.execute_list_open_items_live(str(self.target), include_correlation=True)
+        )
         self.assertEqual(result["source"], "live")
         self.assertIsNone(result["pending_suggestions"])
         self.assertFalse(result["file_side_available"])
@@ -914,3 +959,340 @@ class TargetedVerifyTests(LiveCommentsTestCase):
         self.assertIn("close and reopen", reply["pane_note"])
         self.assertIn("close and reopen", resolve["pane_note"])
         self.assertTrue(doc.comments[0].resolved)
+
+
+# ---------------------------------------------------------------------------
+# Issue #111: list_open_items(source="live") fields/scoping/trim.
+# ---------------------------------------------------------------------------
+
+SECTIONS = FIXTURES / "sections.docx"
+PARA_OVERVIEW = "Some overview text."
+PARA_BACKGROUND = "Background text."
+PARA_NEXT = "Next steps text."
+
+
+def _flat_body(replace: dict[str, str] | None = None) -> str:
+    """Flat OPC of sections.docx's body, optionally with literal text replaced in its document.xml
+    (to make two paragraphs identical)."""
+    if not replace:
+        return docx_to_flat_opc(SECTIONS)
+    out = Path(tempfile.mkdtemp()) / "sections.docx"
+    with zipfile.ZipFile(SECTIONS) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            data = zin.read(info.filename)
+            if info.filename == "word/document.xml":
+                text = data.decode("utf-8")
+                for old, new in replace.items():
+                    assert old in text, old
+                    text = text.replace(old, new)
+                data = text.encode("utf-8")
+            zout.writestr(info.filename, data)
+    return docx_to_flat_opc(out)
+
+
+def _comment(cid: str, anchor: str, paragraph: str | None, *, content: str = "please check", replies: int = 0):
+    return FakeComment(
+        id=cid,
+        content=content,
+        author_name="Pat Reviewer",
+        creation_date="2026-10-01T12:00:00.000Z",
+        anchor_text=anchor,
+        anchor_paragraph_text=paragraph,
+        replies=[
+            FakeReply(id=f"{cid}-r{n}", content="agreed", author_name="Lee", creation_date="2026-10-01T13:00:00.000Z")
+            for n in range(replies)
+        ],
+    )
+
+
+def twenty_seven_comment_document() -> FakeDocument:
+    """A realistic review pass: 27 open comments, a few with replies, mixed anchor lengths."""
+    anchors = [
+        "Staffing plan", "Transition schedule", "the incumbent's key personnel retention rate",
+        "Quality control", "Phase II option", "past performance reference 3",
+        "Skyward will deliver the first increment within 30 days of award and every 30 days after that",
+    ]
+    doc = FakeDocument(text="", author_name="Pat Reviewer")
+    doc.session_epoch = "ep7a1c"
+    for n in range(1, 28):
+        anchor = anchors[n % len(anchors)]
+        doc.comments.append(
+            _comment(
+                f"c{n}",
+                anchor,
+                f"{anchor} is described in this paragraph of the technical volume, section {n}.",
+                content=f"Comment {n}: please tighten this language and cite the source for the figure quoted here.",
+                replies=1 if n % 9 == 0 else 0,
+            )
+        )
+    return doc
+
+
+class ListOpenItemsLiveTrimTests(LiveCommentsTestCase):
+    fixture_name = "sections.docx"
+
+    def _document(self) -> FakeDocument:
+        doc = FakeDocument(text="", author_name="Pat Reviewer")
+        doc.session_epoch = "ep1"
+        doc.comments = [
+            _comment("c-ov", "overview", PARA_OVERVIEW, content="overview note", replies=1),
+            _comment("c-bg", "Background", PARA_BACKGROUND, content="background note"),
+            _comment("c-nx", "steps", PARA_NEXT, content="next note"),
+        ]
+        return doc
+
+    async def _list(self, **kwargs):
+        return await self.call(
+            lambda: comments_live.execute_list_open_items_live(str(self.target), **kwargs)
+        )
+
+    async def test_full_drops_constant_and_duplicate_fields(self):
+        await self.connect_pane(document=self._document(), body_ooxml=_flat_body())
+        result = await self._list()
+        self.assertEqual(result["session_epoch"], "ep1")  # once, at the top level
+        self.assertEqual(result["scope"], "body")
+        self.assertNotIn("scope_body_only", [w["code"] for w in result.get("warnings", [])])
+        self.assertNotIn("correlation", result)
+        for comment in result["comments"]:
+            for gone in ("quoted_text", "w_id", "modified_time", "scope", "session_epoch", "reply_count"):
+                self.assertNotIn(gone, comment)
+            for kept in ("comment_id", "content", "resolved", "anchor_text",
+                         "anchor_paragraph_text", "author", "created_time"):
+                self.assertIn(kept, comment)
+        by_id = {c["comment_id"]: c for c in result["comments"]}
+        self.assertEqual(len(by_id["live:ep1:c-ov"]["replies"]), 1)  # only threads with replies carry the key
+        self.assertNotIn("replies", by_id["live:ep1:c-bg"])
+
+    async def test_include_correlation_restores_the_correlation_list(self):
+        await self.connect_pane(document=self._document(), body_ooxml=_flat_body())
+        result = await self._list(include_correlation=True)
+        self.assertEqual(len(result["correlation"]), 3)
+
+    async def test_summary_shape_and_kept_completeness_fields(self):
+        doc = self._document()
+        doc.ooxml = {"available": True, "total_threads": 4, "open_threads": 4, "ids": []}
+        await self.connect_pane(document=doc, body_ooxml=_flat_body())
+        result = await self._list(fields="summary")
+        self.assertEqual(result["comment_columns"], ["comment_id", "author", "resolved", "anchor", "reply_count"])
+        self.assertEqual(result["comments"][0][4], 1)
+        self.assertNotIn("suggestion_columns", result)
+        self.assertIsNone(result["suggestions"])  # fake pane has no live revisions
+        for key in ("complete", "scope", "warnings", "source", "counts"):
+            self.assertIn(key, result)
+        self.assertEqual(result["source"], "live")
+        self.assertIs(result["complete"], False)  # ooxml says 4 open, the pane reported 3
+        self.assertIn("pane_collection_incomplete", [w["code"] for w in result.get("warnings", [])])
+        self.assertNotIn("correlation", result)
+
+    async def test_summary_anchor_is_clipped_to_60_chars(self):
+        doc = self._document()
+        doc.comments[0].anchor_text = "x" * 200
+        await self.connect_pane(document=doc, body_ooxml=_flat_body())
+        result = await self._list(fields="summary")
+        self.assertEqual(result["comments"][0][3], "x" * 60)
+
+    async def test_unknown_fields_value_refused(self):
+        await self.connect_pane(document=self._document(), body_ooxml=_flat_body())
+        with self.assertRaises(VerifyError) as ctx:
+            await self._list(fields="brief")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+
+    async def test_section_key_scopes_live_comments_without_correlating_ids(self):
+        pane = await self.connect_pane(document=self._document(), body_ooxml=_flat_body())
+        result = await self._list(section_key="background-1")
+        self.assertEqual([c["comment_id"] for c in result["comments"]], ["live:ep1:c-bg"])
+        self.assertNotIn("scope_uncertain", result["comments"][0])
+        self.assertEqual(result["counts"]["live_open"], 3)
+        self.assertEqual(result["counts"]["returned"], 1)
+        self.assertEqual(result["counts"]["open_comments"], 3)
+        self.assertEqual(result["counts"]["in_scope"]["comments"], 1)
+        self.assertEqual(pane.body_ooxml_requests, 1)
+
+    async def test_within_text_scopes_live_comments(self):
+        await self.connect_pane(document=self._document(), body_ooxml=_flat_body())
+        result = await self._list(within_text="Next steps text")
+        self.assertEqual([c["comment_id"] for c in result["comments"]], ["live:ep1:c-nx"])
+
+    async def test_unscoped_call_never_reads_the_body(self):
+        pane = await self.connect_pane(document=self._document(), body_ooxml=_flat_body())
+        await self._list()
+        await self._list(fields="summary")
+        self.assertEqual(pane.body_ooxml_requests, 0)
+
+    async def test_unknown_section_key_lists_available_keys(self):
+        await self.connect_pane(document=self._document(), body_ooxml=_flat_body())
+        with self.assertRaises(VerifyError) as ctx:
+            await self._list(section_key="nope")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        self.assertEqual(
+            ctx.exception.envelope.diagnostics["available_section_keys"],
+            ["overview-1", "background-1", "next-steps-1"],
+        )
+
+    async def test_scoping_needs_a_pane_that_can_read_the_body(self):
+        await self.connect_pane(
+            document=self._document(),
+            body_ooxml=_flat_body(),
+            capabilities=["comment_counts"],
+        )
+        with self.assertRaises(VerifyError) as ctx:
+            await self._list(section_key="background-1")
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.LIVE_CAPABILITY_MISSING)
+
+    async def test_identical_paragraphs_straddling_the_scope_are_flagged_uncertain(self):
+        # Next Steps' paragraph now reads exactly like Background's.
+        body = _flat_body({PARA_NEXT: PARA_BACKGROUND})
+        doc = self._document()
+        doc.comments[2].anchor_paragraph_text = PARA_BACKGROUND
+        await self.connect_pane(document=doc, body_ooxml=body)
+        result = await self._list(section_key="background-1")
+        by_id = {c["comment_id"]: c for c in result["comments"]}
+        self.assertEqual(set(by_id), {"live:ep1:c-bg", "live:ep1:c-nx"})
+        self.assertTrue(by_id["live:ep1:c-bg"]["scope_uncertain"])
+        self.assertTrue(by_id["live:ep1:c-nx"]["scope_uncertain"])
+        summary = await self._list(section_key="background-1", fields="summary")
+        self.assertEqual(summary["comment_columns"][-1], "scope_uncertain")
+        self.assertTrue(all(c[-1] for c in summary["comments"]))
+
+    async def test_comment_with_no_paragraph_text_is_kept_and_flagged(self):
+        doc = self._document()
+        doc.comments[1].anchor_paragraph_text = None  # an older pane / unreadable anchor
+        await self.connect_pane(document=doc, body_ooxml=_flat_body())
+        result = await self._list(section_key="next-steps-1")
+        by_id = {c["comment_id"]: c for c in result["comments"]}
+        self.assertEqual(set(by_id), {"live:ep1:c-bg", "live:ep1:c-nx"})
+        self.assertTrue(by_id["live:ep1:c-bg"]["scope_uncertain"])
+        self.assertNotIn("scope_uncertain", by_id["live:ep1:c-nx"])
+
+    async def test_scoped_list_does_not_rearm_a_stale_shared_bridge_client(self):
+        """live_session_for hands back a non-observing view: the body read made for scoping must not
+        acknowledge another client's write (see test_shared_bridge.py for the broker-level pattern)."""
+        from types import SimpleNamespace
+
+        from verified_docx_mcp.live import shared, write_mode
+
+        target = self.target
+
+        class Pane:
+            document_name = target.name
+            document_url = str(target)
+            connected_since = 1.0
+            last_body_sha256 = "initial"
+            heartbeat_count = hash_sample_count = 0
+            body_hash_state = "sampled"
+            body_hash_sampled_monotonic = 0.0
+            hello = HelloMessage(
+                str(target), "Word", "Mac", {}, "initial",
+                frozenset({"shared_queue", "body_ooxml", "comment_counts"}), "pane-1",
+            )
+
+            def __init__(self):
+                self.calls: list[str] = []
+
+            def heartbeat_age(self):
+                return 0
+
+            def request_threadsafe(self, op, payload=None, **kwargs):
+                self.calls.append(op)
+                if op == "comments_list":
+                    return {
+                        "comments": [_comment("c-bg", "Background", PARA_BACKGROUND).to_dict()],
+                        "counts": {"total": 1, "open": 1}, "scope": "body", "observed_at": "t",
+                        "session_epoch": "ep1",
+                    }
+                if op == "body_ooxml":
+                    return {"ooxml": _flat_body(), "bodySha256": "initial"}
+                if op == "describe":
+                    return {"session_epoch": "ep1", "bodySha256": self.last_body_sha256}
+                if op in shared.READ_OPS:
+                    return {"bodySha256": "initial"}
+                self.last_body_sha256 = "changed"
+                return {"pre": "initial", "post": "changed"}
+
+        pane = Pane()
+        registry = SimpleNamespace(
+            get=lambda name: pane if name == pane.document_name else None, list=lambda: [pane], collisions=list
+        )
+        broker = shared.Broker(registry)
+        a = broker.dispatch({"action": "attach"})["client_id"]
+        b = broker.dispatch({"action": "attach"})["client_id"]
+
+        def call(client, op, **kw):
+            return broker.dispatch(
+                {"action": "request", "client_id": client, "document_name": pane.document_name,
+                 "document_url": pane.document_url, "connected_since": pane.connected_since, "op": op, **kw}
+            )
+
+        call(a, "describe")
+        call(b, "describe")
+        call(a, "replace")  # A writes: B's baseline is now stale
+
+        client = SimpleNamespace(rpc=lambda action, **kw: broker.dispatch({"action": action, "client_id": b, **kw}))
+        remote = shared.RemoteSession(client, broker.snapshot(pane))
+        with (
+            unittest.mock.patch.object(
+                bridge, "current_registry", lambda: SimpleNamespace(get=lambda n: remote, collisions=list)
+            ),
+            unittest.mock.patch.object(write_mode, "_check_session_identity", lambda path, session: None),
+        ):
+            result = await self._list(section_key="background-1", fields="summary")
+        self.assertEqual([c[0] for c in result["comments"]], ["live:ep1:c-bg"])
+        self.assertIn("body_ooxml", pane.calls)
+        with self.assertRaises(LiveOpFailed) as ctx:
+            call(b, "replace")  # still stale: the scoped list did not re-arm it
+        self.assertIn("LIVE_STALE", str(ctx.exception))
+
+
+class ListOpenItemsLivePayloadSizeTests(LiveCommentsTestCase):
+    """Issue #111 acceptance numbers on the 27-comment fixture (chars/4 ~ tokens)."""
+
+    fixture_name = "sections.docx"
+
+    @staticmethod
+    def _size(value) -> int:
+        return len(json.dumps(value, separators=(",", ":")))
+
+    async def _old_shape_size(self, doc: FakeDocument) -> int:
+        """The pre-#111 full response: per-comment constants/duplicates, per-comment epoch, the
+        correlation list and the scope_body_only warning."""
+        result = await self.call(
+            lambda: comments_live.execute_list_open_items_live(str(self.target), include_correlation=True)
+        )
+        old = {"pending_suggestions_source": None, "file_only_open_comments": [], **result}  # keys now omitted
+        old["comments"] = [
+            comments_live._live_comment_record({**c.to_dict(), "session_epoch": doc.session_epoch})
+            for c in doc.comments
+        ]
+        old["warnings"] = [
+            *result.get("warnings", []),
+            {
+                "code": "scope_body_only",
+                "message": "only comments in the main document body are visible to the pane; comments "
+                "anchored in headers, footers or text boxes are not listed",
+            },
+        ]
+        return self._size(old)
+
+    async def test_summary_and_full_are_much_smaller_than_the_old_full_shape(self):
+        """Measured on the 27-comment fixture above (compact JSON chars; ~chars/4 tokens):
+        old full 19099, new full 11482 (60.1% of old: 23 chars over the 60% target), columnar
+        summary 2351 (under 2400). Closing the last 23 chars of full would mean dropping
+        information. What remains in full's comments array (~10997): anchor_paragraph_text 3451,
+        content 2718, anchor_text 1354, created_time 1134, comment_id 828, author 648, resolved 459,
+        replies 350; summary rows ~1997 (anchor 844, comment_id 477, author 405, resolved 162,
+        reply_count 54). Summary omits `pane` and `path`; both modes omit null/empty top-level keys."""
+        doc = twenty_seven_comment_document()
+        await self.connect_pane(document=doc)
+        summary = await self.call(
+            lambda: comments_live.execute_list_open_items_live(str(self.target), fields="summary")
+        )
+        full = await self.call(lambda: comments_live.execute_list_open_items_live(str(self.target)))
+        old = await self._old_shape_size(doc)
+        self.assertEqual(len(summary["comments"]), 27)
+        print(f"\n#111 sizes (chars): old full={old} new full={self._size(full)} summary={self._size(summary)}")
+        self.assertLessEqual(self._size(full), old * 0.605)
+        self.assertLess(self._size(summary), 2400)
+        for gone in ("pane", "path", "warnings", "file_only_open_comments", "suggestion_columns"):
+            self.assertNotIn(gone, summary)
+        for kept in ("pane", "path"):
+            self.assertIn(kept, full)

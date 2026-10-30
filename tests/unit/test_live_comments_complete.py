@@ -57,7 +57,7 @@ class CompleteFlagTests(LiveCommentsTestCase):
         result = await self._list()
         self.assertIs(result["complete"], True)
         self.assertEqual(result["counts"], {"live_total": 2, "live_open": 2, "returned": 2, "ooxml_open": 2})
-        self.assertNotIn("pane_collection_incomplete", [w["code"] for w in result["warnings"]])
+        self.assertNotIn("pane_collection_incomplete", [w["code"] for w in result.get("warnings", [])])
         self.assertEqual(len(pane.comments_list_payloads), 1)  # no retry when nothing is wrong
 
     async def test_fewer_ooxml_threads_than_listed_is_still_complete(self) -> None:
@@ -75,7 +75,7 @@ class CompleteFlagTests(LiveCommentsTestCase):
         self.assertIs(result["complete"], False)
         self.assertEqual(result["counts"]["ooxml_open"], 3)
         self.assertEqual(result["counts"]["live_open"], 2)
-        warning = next(w for w in result["warnings"] if w["code"] == "pane_collection_incomplete")
+        warning = next(w for w in result.get("warnings", []) if w["code"] == "pane_collection_incomplete")
         self.assertIn("2", warning["message"])
         self.assertIn("3", warning["message"])
         self.assertEqual(warning["missing_comment_ids"], ["9"])
@@ -91,7 +91,7 @@ class CompleteFlagTests(LiveCommentsTestCase):
         result = await self._list()
         self.assertIs(result["complete"], True)
         self.assertEqual(len(pane.comments_list_payloads), 2)
-        self.assertNotIn("pane_collection_incomplete", [w["code"] for w in result["warnings"]])
+        self.assertNotIn("pane_collection_incomplete", [w["code"] for w in result.get("warnings", [])])
 
     async def test_uncorrelated_id_spaces_leave_missing_ids_unknown(self) -> None:
         doc = _doc("guid-a")
@@ -109,7 +109,7 @@ class CompleteFlagTests(LiveCommentsTestCase):
 
         result = await self._list()
         self.assertIs(result["complete"], False)
-        warning = next(w for w in result["warnings"] if w["code"] == "pane_collection_incomplete")
+        warning = next(w for w in result.get("warnings", []) if w["code"] == "pane_collection_incomplete")
         self.assertEqual(warning["missing_comment_ids"], ["4", "5"])
 
     async def test_complete_null_for_a_pane_without_the_crosscheck(self) -> None:
@@ -118,7 +118,7 @@ class CompleteFlagTests(LiveCommentsTestCase):
         result = await self._list()
         self.assertIsNone(result["complete"])
         self.assertNotIn("ooxml_open", result["counts"])
-        self.assertNotIn("pane_collection_incomplete", [w["code"] for w in result["warnings"]])
+        self.assertNotIn("pane_collection_incomplete", [w["code"] for w in result.get("warnings", [])])
         self.assertEqual(len(pane.comments_list_payloads), 1)
 
     async def test_complete_null_when_the_pane_could_not_read_the_comments_parts(self) -> None:
@@ -136,10 +136,13 @@ class CompleteFlagTests(LiveCommentsTestCase):
         await self.connect_pane(document=doc)
 
         result = await self._list()
-        self.assertEqual(list(result)[:4], ["counts", "scope", "pane", "warnings"])
-        for key in ("path", "source", "session_epoch", "comments", "pending_suggestions", "correlation",
-                    "file_side_available", "file_only_open_comments", "revision_coverage"):
+        self.assertEqual(list(result)[:4], ["counts", "scope", "pane", "path"])
+        for key in ("path", "source", "comments", "pending_suggestions", "file_side_available", "revision_coverage"):
             self.assertIn(key, result)
+        # null / empty top-level keys are omitted (#111): no epoch on this pane, nothing file-only
+        for key in ("session_epoch", "file_only_open_comments", "warnings", "pending_suggestions_source"):
+            self.assertNotIn(key, result)
+        self.assertNotIn("correlation", result)  # opt-in since #111
         self.assertEqual([c["comment_id"] for c in result["comments"]], ["live:1"])
         self.assertEqual(result["scope"], "body")
 
