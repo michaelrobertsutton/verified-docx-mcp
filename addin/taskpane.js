@@ -3659,6 +3659,11 @@ async function opCellParagraphMerge(payload) {
     await (await sectionGuard(context,payload)).check(()=>[range]);
     await guardComments(context,[range],false);await guardRevisions(context,[range]);
     await guardAnchoredParagraphs(context,[range]);await requireFreshBody(context,pre);
+    // Word's own tracking mode applies to insertOoxml even when track_changes is false, which would
+    // record the merge as a tracked change: a mode this op declares unsupported. Refuse, don't switch.
+    context.document.load('changeTrackingMode');await context.sync();
+    if (context.document.changeTrackingMode !== Word.ChangeTrackingMode.off)
+      throw refusalError('Track Changes is on in Word; turn it off to merge paragraphs (tracked merges are not supported)','TRACKED_CHANGES_PRESENT');
     range.insertOoxml(payload.ooxml,'Replace');await context.sync();
     const after=await readCellParagraphs(context,cell);
     if(after.length !== before.length-1)

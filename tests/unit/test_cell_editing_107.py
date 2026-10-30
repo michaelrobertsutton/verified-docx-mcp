@@ -255,6 +255,60 @@ def test_merge_refuses_a_text_mismatch_and_protected_structure(doc):
     assert doc.read_bytes() == before
 
 
+@pytest.mark.parametrize("markup", ["ins", "pPrChange", "del"])
+def test_merge_refuses_any_revision_markup_even_the_configured_authors(doc, markup, monkeypatch):
+    monkeypatch.setenv("VERIFIED_DOCX_MCP_AUTHOR", "Sutton")
+    add_second_paragraph(doc)
+    root, _ = mutations._load_document(doc)
+    cell = tables._find_table_element(root, 1).findall(W("tr"))[0].findall(W("tc"))[0]
+    second = cell.findall(W("p"))[1]
+    attrs = {W("id"): "41", W("author"): "Sutton", W("date"): "2026-10-29T00:00:00Z"}
+    if markup == "pPrChange":
+        ET.SubElement(second.find(W("pPr")), W("pPrChange"), attrs).append(ET.Element(W("pPr")))
+    else:
+        run = second.find(W("r"))
+        second.remove(run)
+        ET.SubElement(second, W(markup), attrs).append(run)
+    rewrite(doc, root)
+    before = doc.read_bytes()
+    with pytest.raises(VerifyError) as exc:
+        paragraph_merge.execute(str(doc), 1, 1, 1, 1, write_mode="file", allow_concurrent_editor=True)
+    assert exc.value.envelope.error_code == ErrorCode.TRACKED_CHANGES_PRESENT
+    assert doc.read_bytes() == before
+
+
+def test_a_hyperlink_in_a_paragraph_outside_the_merged_pair_does_not_fail_verification(doc):
+    add_second_paragraph(doc, text="second", bold=False)
+    root, _ = mutations._load_document(doc)
+    cell = tables._find_table_element(root, 1).findall(W("tr"))[0].findall(W("tc"))[0]
+    third = copy.deepcopy(cell.find(W("p")))
+    run = third.find(W("r"))
+    run.find(W("t")).text = "outside"
+    third.remove(run)
+    ET.SubElement(third, W("hyperlink"), {W("anchor"): "elsewhere"}).append(run)
+    cell.append(third)
+    rewrite(doc, root)
+    paragraph_merge.execute(str(doc), 1, 1, 1, 1, separator=" ", write_mode="file")
+    cell = cell_of(doc)
+    assert [ts.paragraph_text(p) for p in cell.findall(W("p"))] == ["R1C1 second", "outside"]
+    assert len(list(cell.iter(W("hyperlink")))) == 1
+
+
+def test_a_fill_that_keeps_the_paragraphs_style_does_not_fail_the_live_style_check():
+    from verified_docx_mcp.live import paragraphs_live
+
+    specs = [{"text": "Filled", "style": None, "color": None}]
+    inserted = [{"text": "Filled", "style": "Heading 2", "style_builtin": "", "color": "",
+                 "requested_style": {"kind": "builtin", "value": "Normal"}}]
+    assert paragraphs_live._spec_problems(specs, inserted)  # an ordinary insert would read Normal
+    assert paragraphs_live._spec_problems(specs, inserted, keeps_first_style=True) == []
+    # a named style, or a colour, is still checked on the filled paragraph
+    named = [{"text": "Filled", "style": "Heading 2", "color": None}]
+    assert paragraphs_live._spec_problems(named, [{**inserted[0], "requested_style": {"kind": "name", "value": "Body"}, "style": "Body"}], keeps_first_style=True)
+    coloured = [{"text": "Filled", "style": None, "color": "7030A0"}]
+    assert paragraphs_live._spec_problems(coloured, inserted, keeps_first_style=True)
+
+
 def test_tracked_merge_is_refused_in_both_modes(doc):
     add_second_paragraph(doc)
     before = doc.read_bytes()

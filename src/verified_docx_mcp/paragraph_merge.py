@@ -39,6 +39,17 @@ _PROTECTED_TAGS = (
 )
 
 
+_REVISION_TAGS = frozenset(
+    {"ins", "del", "moveFrom", "moveTo", "moveFromRangeStart", "moveFromRangeEnd", "moveToRangeStart",
+     "moveToRangeEnd", "cellIns", "cellDel", "cellMerge"}
+)
+
+
+def _is_revision(node: Any) -> bool:
+    name = node.tag.rsplit("}", 1)[-1]
+    return name in _REVISION_TAGS or name.endswith("Change")
+
+
 def _load_rels(docx_path: Path) -> dict[str, str]:
     with zipfile.ZipFile(docx_path) as archive:
         try:
@@ -101,6 +112,16 @@ def prepare(root, rels, table_id, row_index, cell_index, paragraph_index, expect
             ErrorCode.CELL_TEXT_MISMATCH, "Paragraph texts differ from expected_text", {"actual": texts}
         )
     mutations._check_hazards_or_raise(mutations._scan_range_hazards([first, second]), False, resolve_author_name())
+    # No own-author exemption here: removing the second paragraph's pPr would drop its revision
+    # history, including property revisions (pPrChange/rPrChange) the hazard scan does not see.
+    revisions = sorted(
+        {n.tag.rsplit("}", 1)[-1] for p in (first, second) for n in p.iter() if _is_revision(n)}
+    )
+    if revisions:
+        raise _make_error(
+            ErrorCode.TRACKED_CHANGES_PRESENT,
+            f"Paragraphs hold revision markup ({', '.join(revisions)}); accept or reject it first",
+        )
     found = sorted({n.tag.rsplit("}", 1)[-1] for p in (first, second) for n in p.iter()} & set(_PROTECTED_TAGS))
     if found:
         raise _make_error(
@@ -114,7 +135,9 @@ def prepare(root, rels, table_id, row_index, cell_index, paragraph_index, expect
             if p is not second
         ],
         "first_ppr": _ppr_signature(first),
-        "links": _hyperlinks(first, rels) + _hyperlinks(second, rels),
+        # The WHOLE cell, in document order: check() compares the whole cell after the merge, and
+        # a merge keeps the pair adjacent, so the order is unchanged.
+        "links": _hyperlinks(cell, rels),
         "others": _other_cells(table, row_index, cell_index),
     }
     if separator:

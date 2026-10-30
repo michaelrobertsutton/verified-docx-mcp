@@ -163,14 +163,23 @@ def delete_table(path: str, table_id: int, expected_text: str, revision_before: 
     return evidence
 
 
-def _spec_problems(specs: list[dict[str, Any]], inserted: list[dict[str, Any]]) -> list[str]:
-    """Independent check of the pane's read-back against what was asked."""
+def _spec_problems(specs: list[dict[str, Any]], inserted: list[dict[str, Any]],
+                   *, keeps_first_style: bool = False) -> list[str]:
+    """Independent check of the pane's read-back against what was asked.
+
+    ``keeps_first_style``: the first paragraph filled an existing empty paragraph and no style
+    was named, so it keeps that paragraph's own style (issue #107) -- there is nothing to compare
+    its style against."""
     problems: list[str] = []
     if len(inserted) != len(specs):
         return [f"pane reported {len(inserted)} inserted paragraph(s), expected {len(specs)}"]
     for i, (spec, got) in enumerate(zip(specs, inserted, strict=True), start=1):
         if got.get("text") != spec["text"]:
             problems.append(f"paragraph {i} text {got.get('text')!r} != {spec['text']!r}")
+        if i == 1 and keeps_first_style and not spec.get("style"):
+            if spec.get("color") and str(got.get("color") or "").lstrip("#").upper() != spec["color"]:
+                problems.append(f"paragraph {i} color {got.get('color')!r} != #{spec['color']}")
+            continue
         requested = got.get("requested_style") or {}
         if requested.get("kind") == "name":
             if got.get("style") != spec.get("style"):
@@ -219,7 +228,9 @@ def insert_paragraphs(path: str, anchor: str | dict[str, Any], position: str, pa
                 pre_body_sha256=pre, post_body_sha256=None, reason=exc.envelope.message)
         raise
     inserted = result.get("inserted") or []
-    problems = _spec_problems(paragraphs, inserted)
+    problems = _spec_problems(
+        paragraphs, inserted, keeps_first_style=structural and "empty_paragraph_after_table_id" in anchor
+    )
     if not result.get("applied") or result.get("post") == pre:
         problems.append("the pane did not report a changed body")
     if problems:
