@@ -98,12 +98,13 @@ from __future__ import annotations
 
 import dataclasses
 import difflib
+import hashlib
 import re
 import unicodedata
 from collections.abc import Callable
 from typing import Any
 
-from .errors import ErrorCode, _make_error
+from .errors import ErrorCode, VerifyError, _make_error
 from .projection import FieldEvent, Projection, RunEvent
 
 # ---------------------------------------------------------------------------
@@ -430,6 +431,9 @@ class LocateResult:
     rung: str
     match_count: int
     warnings: list[str]  # "crosses_comment_range" / "crosses_revision" / "touches_field_result"
+    # Anchored find only (issue #113): where the prefix match ends and the
+    # suffix match begins, in the same offsets as ``spans``.
+    anchors: tuple[int, int] | None = None
 
 
 def locate(
@@ -571,4 +575,556 @@ def locate(
         ErrorCode.ZERO_MATCH,
         "needle not found after full normalization ladder",
         {"ladder_report": ladder_report, "near_miss": near_miss},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Anchored ("ellipsis") find and paragraph targets -- issue #113.
+#
+# A long span is named by its first and last words: "<prefix>…<suffix>" (or
+# "[...]" as the delimiter). The prefix and suffix are located on the full
+# normalization ladder, each prefix pairs with the nearest suffix that
+# follows it, and the caller's expected_length (+-2 characters of the
+# ladder-normalized span) or find_sha256 (of that same normalized span) must
+# pick out exactly one pair, so a span the caller did not mean can never
+# match silently. A find is anchored only when expected_length or
+# find_sha256 is passed: without them a literal "…" (Word's AutoCorrect
+# produces one) is ordinary text in a plain find.
+# ---------------------------------------------------------------------------
+
+ELLIPSIS = "…"
+ELLIPSIS_ASCII = "[...]"
+ANCHOR_MIN_CHARS = 12
+ANCHORED_LENGTH_TOLERANCE = 2
+ANCHORED_CANDIDATE_LIMIT = 50
+RUNG_ANCHORED = "anchored"
+# Word's Office.js body.search() rejects needles over 255 characters; the
+# server keeps every live search needle at or under this.
+PANE_SEARCH_MAX = 230
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def normalize_span_text(text: str) -> str:
+    """*text* with the whole match ladder applied (curly -> straight quotes,
+    NBSP and whitespace runs -> one space, soft hyphens removed). This is
+    the text ``find_sha256`` / ``expected_sha256`` hash, and the pane's
+    ``normalizeSpanText`` (addin/taskpane.js) must stay identical to it."""
+    collapsed, _ = _norm_whitespace(text.translate(_QUOTE_MAP))
+    stripped, _ = _norm_softhyphen(collapsed)
+    return stripped
+
+
+def span_sha256(text: str) -> str:
+    """sha256 hex of ``normalize_span_text(text)`` (UTF-8)."""
+    return hashlib.sha256(normalize_span_text(text).encode("utf-8")).hexdigest()
+
+
+def split_anchored(find: str) -> tuple[str, str] | None:
+    """``(prefix, suffix)`` for an anchored *find*, ``None`` for a plain one.
+
+    Exactly one delimiter (``…`` or ``[...]``) makes a find anchored; more
+    than one, or a prefix/suffix under 12 characters after normalization,
+    is INVALID_INPUT. There is no escape for a literal ellipsis.
+    """
+    count = find.count(ELLIPSIS) + find.count(ELLIPSIS_ASCII)
+    if count == 0:
+        return None
+    if count > 1:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "an anchored find takes exactly one '…' or '[...]' between its prefix and suffix; "
+            f"found {count}. A literal ellipsis cannot be matched by an anchored find.",
+            {"delimiters": count},
+        )
+    delimiter = ELLIPSIS if ELLIPSIS in find else ELLIPSIS_ASCII
+    prefix, suffix = find.split(delimiter)
+    for name, part in (("prefix", prefix), ("suffix", suffix)):
+        if len(normalize_span_text(part).strip()) < ANCHOR_MIN_CHARS:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"the anchored find's {name} must be at least {ANCHOR_MIN_CHARS} characters; got {part!r}",
+                {name: part},
+            )
+    return prefix, suffix
+
+
+def check_anchored_args(expected_length: Any, find_sha256: Any) -> str | None:
+    """Validate an anchored find's check arguments; returns the lowercased digest."""
+    if expected_length is None and find_sha256 is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "an anchored find ('<prefix>…<suffix>') requires expected_length (characters in the "
+            "normalized span, +-2) or find_sha256 (sha256 of the normalized span), or both",
+        )
+    if expected_length is not None and (
+        isinstance(expected_length, bool) or not isinstance(expected_length, int) or expected_length < 1
+    ):
+        raise _make_error(ErrorCode.INVALID_INPUT, f"expected_length must be a positive integer; got {expected_length!r}")
+    if find_sha256 is None:
+        return None
+    digest = find_sha256.lower() if isinstance(find_sha256, str) else None
+    if digest is None or not _SHA256_RE.fullmatch(digest):
+        raise _make_error(ErrorCode.INVALID_INPUT, "find_sha256 must be 64 hex characters")
+    return digest
+
+
+@dataclasses.dataclass(frozen=True)
+class AnchoredSpan:
+    """One prefix->suffix pairing, in original-text offsets: the span
+    ``[start, end)``, where its prefix match ends and its suffix match begins."""
+
+    start: int
+    end: int
+    prefix_end: int
+    suffix_start: int
+
+
+def _ladder_map(text: str) -> tuple[str, list[int]]:
+    quoted = text.translate(_QUOTE_MAP)
+    collapsed, ws_pos = _norm_whitespace(quoted)
+    stripped, sh_pos = _norm_softhyphen(collapsed)
+    return stripped, _compose_orig_pos(sh_pos, ws_pos)
+
+
+def anchored_pairs(text: str, prefix: str, suffix: str) -> tuple[list[AnchoredSpan], int, int]:
+    """Every prefix match in *text* paired with the nearest suffix match that
+    starts at or after the prefix's end, both located on the fully
+    normalized ladder. Returns ``(pairs, prefix_count, suffix_count)``;
+    identical spans are listed once. Never capped: every pair feeds the
+    uniqueness decision (only the diagnostics list is cut to five)."""
+    norm, orig = _ladder_map(text)
+    np_, _ = _ladder_map(prefix)
+    ns, _ = _ladder_map(suffix)
+    prefix_count = 0
+    suffix_count = len(_find_all(ns, norm)) if ns else 0
+    pairs: list[AnchoredSpan] = []
+    seen: set[tuple[int, int]] = set()
+    i = norm.find(np_) if np_ else -1
+    while i != -1:
+        prefix_count += 1
+        j = norm.find(ns, i + len(np_)) if ns else -1
+        if j != -1:
+            span = AnchoredSpan(orig[i], orig[j + len(ns)], orig[i + len(np_)], orig[j])
+            if (span.start, span.end) not in seen:
+                seen.add((span.start, span.end))
+                pairs.append(span)
+        i = norm.find(np_, i + 1)
+    return pairs, prefix_count, suffix_count
+
+
+def _span_context(text: str, start: int, end: int) -> str:
+    """The span's first and last words with a little surrounding text, so two
+    candidates that share a prefix still read differently."""
+    head = text[max(0, start - 10) : min(end, start + 30)]
+    tail = text[max(start + 30, end - 30) : end + 10]
+    joined = head if not tail else f"{head}…{tail}"
+    return joined.replace("\n", " ")
+
+
+def normalized_length(text: str) -> int:
+    """What ``expected_length`` counts: characters of ``normalize_span_text(text)``."""
+    return len(normalize_span_text(text))
+
+
+def _anchored_diag(text: str, spans: list[AnchoredSpan]) -> list[dict[str, Any]]:
+    return [
+        {"start": s.start, "end": s.end, "length": normalized_length(text[s.start : s.end]),
+         "context": _span_context(text, s.start, s.end)}
+        for s in spans[:_MATCH_DIAGNOSTIC_MAX]
+    ]
+
+
+def _passes(text: str, span: AnchoredSpan, expected_length: int | None, digest: str | None) -> bool:
+    if expected_length is not None and abs(
+        normalized_length(text[span.start : span.end]) - expected_length
+    ) > ANCHORED_LENGTH_TOLERANCE:
+        return False
+    return digest is None or span_sha256(text[span.start : span.end]) == digest
+
+
+def _rank(candidates: list[Any], expected_length: int | None, length_of: Callable[[Any], int]) -> list[Any]:
+    if expected_length is None:
+        return candidates
+    return sorted(candidates, key=lambda c: abs(length_of(c) - expected_length))
+
+
+def _no_anchored_match(
+    text: str,
+    prefix: str,
+    suffix: str,
+    candidates: list[AnchoredSpan],
+    counts: tuple[int, int],
+    expected_length: int | None,
+) -> VerifyError:
+    diagnostics: dict[str, Any] = {
+        "prefix_matches": counts[0],
+        "suffix_matches": counts[1],
+        "candidates": _anchored_diag(
+            text, _rank(candidates, expected_length, lambda s: normalized_length(text[s.start : s.end]))
+        ),
+        "total_candidates": len(candidates),
+    }
+    if expected_length is not None:
+        diagnostics["expected_length"] = expected_length
+    if counts[0] == 0 or counts[1] == 0:
+        norm, _ = _ladder_map(text)
+        missing = prefix if counts[0] == 0 else suffix
+        diagnostics["near_miss"] = _near_miss_scan(normalize_span_text(missing), norm)
+    if not candidates:
+        message = "no prefix -> suffix span found for the anchored find"
+    else:
+        message = (
+            f"none of the {len(candidates)} prefix -> suffix span(s) has the expected length/sha256; "
+            "the candidates' lengths are in diagnostics"
+        )
+    return _make_error(ErrorCode.ZERO_MATCH, message, diagnostics)
+
+
+def locate_anchored(
+    find: str,
+    proj: Projection,
+    *,
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
+    span_filter: Callable[[int, int], bool] | None = None,
+) -> LocateResult:
+    """Resolve an anchored *find* (``"<prefix>…<suffix>"``) to one full span.
+
+    Raises INVALID_INPUT (not anchored, bad delimiter count, a prefix/suffix
+    under 12 characters, neither expected_length nor find_sha256),
+    STRUCTURAL_BOUNDARY (a span that crosses a paragraph, table cell or
+    text-box boundary passes the check, or every candidate crosses one),
+    AMBIGUOUS_SPAN (more than one span passes, counting crossing ones; up to
+    five ``{start, end, length, context}`` plus ``total``) or ZERO_MATCH (no
+    span passes; the nearest candidates' normalized lengths are in
+    diagnostics). *expected_length* counts characters of the normalized span.
+    *span_filter* applies to each candidate before the check, as in locate().
+    """
+    parts = require_anchored(find)
+    digest = check_anchored_args(expected_length, find_sha256)
+    prefix, suffix = parts
+    text = proj.text
+    pairs, prefix_count, suffix_count = anchored_pairs(text, prefix, suffix)
+    if span_filter is not None:
+        pairs = [p for p in pairs if span_filter(p.start, p.end)]
+    inside: list[AnchoredSpan] = []
+    crossing: list[tuple[AnchoredSpan, set[str]]] = []
+    for pair in pairs:
+        kinds = _boundary_kinds(proj, pair.start, pair.end)
+        if kinds:
+            crossing.append((pair, kinds))
+        else:
+            inside.append(pair)
+    passing = [p for p in inside if _passes(text, p, expected_length, digest)]
+    crossing_passing = [(p, k) for p, k in crossing if _passes(text, p, expected_length, digest)]
+    # A crossing span that passes the check is never silently passed over for an inside one.
+    if len(passing) + len(crossing_passing) > 1:
+        every = sorted(passing + [p for p, _k in crossing_passing], key=lambda p: p.start)
+        raise _make_error(
+            ErrorCode.AMBIGUOUS_SPAN,
+            f"the anchored find matches {len(every)} spans; lengthen the prefix or suffix, or pass find_sha256",
+            {"candidates": _anchored_diag(text, every), "total": len(every),
+             "crossing_boundaries": len(crossing_passing)},
+        )
+    if not passing:
+        reported = crossing_passing or (crossing if not inside else [])
+        if reported:
+            kinds_union = sorted(set().union(*(k for _p, k in reported)))
+            raise _make_error(
+                ErrorCode.STRUCTURAL_BOUNDARY,
+                f"the anchored span crosses a structural boundary: {kinds_union}",
+                {
+                    "rung": RUNG_ANCHORED,
+                    "candidates": _anchored_diag(text, [p for p, _k in reported]),
+                    "boundary_kinds": kinds_union,
+                },
+            )
+        raise _no_anchored_match(text, prefix, suffix, inside, (prefix_count, suffix_count), expected_length)
+
+    span = passing[0]
+    return LocateResult(
+        spans=[(span.start, span.end)],
+        rung=RUNG_ANCHORED,
+        match_count=1,
+        warnings=_span_warnings(proj, span.start, span.end),
+        anchors=(span.prefix_end, span.suffix_start),
+    )
+
+
+def _span_warnings(proj: Projection, start: int, end: int) -> list[str]:
+    warnings: set[str] = set()
+    if _crosses_comment_range(proj, start, end):
+        warnings.add("crosses_comment_range")
+    if _crosses_revision(proj, start, end):
+        warnings.add("crosses_revision")
+    if _touches_field_result(proj, start, end, _field_spans(proj)):
+        warnings.add(WARNING_TOUCHES_FIELD_RESULT)
+    return sorted(warnings)
+
+
+def anchored_requested(expected_length: Any, find_sha256: Any) -> bool:
+    """Whether a find is anchored: only expected_length or find_sha256 makes it so."""
+    return expected_length is not None or find_sha256 is not None
+
+
+def require_anchored(find: str) -> tuple[str, str]:
+    """``split_anchored`` for a find the caller marked anchored: no delimiter is INVALID_INPUT."""
+    parts = split_anchored(find)
+    if parts is None:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "expected_length/find_sha256 make find anchored, but it has no '…' or '[...]' between a "
+            "prefix and a suffix; for a plain find pass expected_matches instead",
+        )
+    return parts
+
+
+def check_plain_find_args(expected_matches: Any, expected_length: Any, find_sha256: Any) -> None:
+    """A plain (non-anchored) find: expected_matches required, no anchored-only arguments."""
+    if anchored_requested(expected_length, find_sha256):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "expected_length and find_sha256 apply only to an anchored find ('<prefix>…<suffix>')",
+        )
+    if expected_matches is None:
+        raise _make_error(ErrorCode.INVALID_INPUT, "expected_matches is required for a plain find (D4)")
+
+
+def check_anchored_expected_matches(expected_matches: Any) -> None:
+    if expected_matches not in (None, 1) or isinstance(expected_matches, bool):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "an anchored find always names exactly one span; omit expected_matches (or pass 1)",
+        )
+
+
+def locate_find(
+    find: str,
+    proj: Projection,
+    expected_matches: int | None,
+    *,
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
+    span_filter: Callable[[int, int], bool] | None = None,
+) -> LocateResult:
+    """``locate`` for a plain *find*, ``locate_anchored`` for an anchored one.
+
+    A find is anchored only when expected_length or find_sha256 is passed
+    (``anchored_requested``); it then needs one ``…``/``[...]`` delimiter and
+    accepts *expected_matches* only as 1. Otherwise it is plain, a literal
+    ``…`` included, and requires *expected_matches*.
+    """
+    if not find:
+        raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty")
+    if anchored_requested(expected_length, find_sha256):
+        check_anchored_expected_matches(expected_matches)
+        return locate_anchored(
+            find, proj, expected_length=expected_length, find_sha256=find_sha256, span_filter=span_filter
+        )
+    check_plain_find_args(expected_matches, expected_length, find_sha256)
+    assert expected_matches is not None
+    return locate(find, proj, expected_matches, span_filter=span_filter)
+
+
+def paragraph_spans(proj: Projection) -> dict[str, tuple[int, int]]:
+    """``para_ref -> [start, end)`` of each non-empty paragraph's own text in
+    ``proj.text`` (the paragraph-separator newline excluded)."""
+    spans: dict[str, tuple[int, int]] = {}
+    for s, e, para_ref, run_ref in proj.offset_map:
+        if run_ref.endswith("/break"):
+            continue
+        spans[para_ref] = (spans[para_ref][0], e) if para_ref in spans else (s, e)
+    return spans
+
+
+def locate_paragraph(proj: Projection, para_ref: str, expected_sha256: str) -> LocateResult:
+    """The whole text of paragraph *para_ref* (``pN``, as find_sections and
+    the runs/markdown reads report it), verified against *expected_sha256*:
+    the sha256 of the paragraph's normalized text (``span_sha256``).
+
+    INVALID_INPUT for a malformed/out-of-range ref, a malformed hash or an
+    empty paragraph; PARA_HASH_MISMATCH when the paragraph's text changed.
+    """
+    from .projection import para_index
+
+    digest = expected_sha256.lower() if isinstance(expected_sha256, str) else None
+    if digest is None or not _SHA256_RE.fullmatch(digest):
+        raise _make_error(ErrorCode.INVALID_INPUT, "expected_sha256 must be 64 hex characters")
+    try:
+        index = para_index(para_ref) if isinstance(para_ref, str) else -1
+    except ValueError:
+        index = -1
+    if not 0 <= index < len(proj.paragraphs):
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"para_ref must name a paragraph p0..p{max(len(proj.paragraphs) - 1, 0)}; got {para_ref!r}",
+            {"para_ref": para_ref, "paragraph_count": len(proj.paragraphs)},
+        )
+    bounds = paragraph_spans(proj).get(proj.paragraphs[index].para_ref)
+    if bounds is None:
+        raise _make_error(ErrorCode.INVALID_INPUT, f"paragraph {para_ref} is empty; there is no text to replace")
+    start, end = bounds
+    text = proj.text[start:end]
+    if span_sha256(text) != digest:
+        raise _make_error(
+            ErrorCode.PARA_HASH_MISMATCH,
+            f"paragraph {para_ref}'s text no longer matches expected_sha256; re-read it and retry",
+            {"para_ref": para_ref, "excerpt": text[:80]},
+        )
+    return LocateResult(spans=[(start, end)], rung="para_ref", match_count=1, warnings=_span_warnings(proj, start, end))
+
+
+# ---------------------------------------------------------------------------
+# What the pane is sent (issue #113). The pane searches with Word's own
+# body.search(), which knows nothing of the ladder, so it is given literal
+# document text: the full span when it fits one search (<= 230 UTF-16 units,
+# no line break), otherwise a literal prefix and suffix plus the span's
+# normalized sha256. check_pane_target() replays the pane's own pairing (and
+# its cap of 50 prefix hits) over the server's text, so a target the pane
+# could not single out is refused here, before anything is sent. Lengths are
+# UTF-16 code units because that is what the pane's String.length counts.
+# ---------------------------------------------------------------------------
+
+_LINE_BREAKS = re.compile("[\r\n\v]")
+
+
+def utf16_len(text: str) -> int:
+    """``text.length`` as JavaScript counts it."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _head_utf16(text: str, limit: int) -> str:
+    units = 0
+    for i, ch in enumerate(text):
+        units += 2 if ord(ch) > 0xFFFF else 1
+        if units > limit:
+            return text[:i]
+    return text
+
+
+def _tail_utf16(text: str, limit: int) -> str:
+    return _head_utf16(text[::-1], limit)[::-1]
+
+
+def pane_anchors(span_text: str, suffix_offset: int | None = None) -> tuple[str, str]:
+    """Literal prefix and suffix of *span_text* for the pane's search, each at
+    most 230 UTF-16 units and inside one line. *suffix_offset* is where the
+    caller's own suffix begins in the span (an anchored find); without it (a
+    paragraph target) the suffix is the tail of the span's second half. The
+    prefix runs from the span start toward the suffix, as far as 230 units
+    allow, so the pane's prefix search hits as few places as possible."""
+    if suffix_offset is None:
+        tail = _tail_utf16(span_text[len(span_text) // 2 :], PANE_SEARCH_MAX)
+        suffix_offset = len(span_text) - len(tail)
+    head_region = _LINE_BREAKS.split(span_text[:suffix_offset], maxsplit=1)[0]
+    tail_region = _LINE_BREAKS.split(span_text[suffix_offset:])[-1]
+    prefix = _head_utf16(head_region, PANE_SEARCH_MAX)
+    suffix = _tail_utf16(tail_region, PANE_SEARCH_MAX)
+    if not prefix or not suffix:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "the span begins or ends with a line break, which Word cannot search for; choose a span "
+            "that starts and ends inside a line",
+        )
+    return prefix, suffix
+
+
+def exact_anchored_spans(units: list[tuple[int, str]], prefix: str, suffix: str, digest: str) -> list[tuple[int, int]]:
+    """The pane's pairing, replayed: in each ``(offset, text)`` unit (one
+    paragraph or cell), every literal *prefix* match pairs with the nearest
+    literal *suffix* match after it; spans whose normalized sha256 equals
+    *digest* are returned as absolute ``(start, end)``."""
+    hits: list[tuple[int, int]] = []
+    for offset, text in units:
+        for p_start in _find_all(prefix, text):
+            s_start = text.find(suffix, p_start + len(prefix))
+            if s_start == -1:
+                continue
+            end = s_start + len(suffix)
+            if span_sha256(text[p_start:end]) == digest:
+                hits.append((offset + p_start, offset + end))
+    return hits
+
+
+def check_pane_target(
+    units: list[tuple[int, str]], prefix: str, suffix: str, digest: str, target: tuple[int, int]
+) -> None:
+    """Refuse, before anything is sent, an anchored target the pane would not
+    single out: more than 50 literal prefix hits (the pane looks at the first
+    50 only) or more than one hash-matching pair is AMBIGUOUS_SPAN; a single
+    pair that is not *target* is INVALID_INPUT."""
+    prefix_hits = sum(len(_find_all(prefix, text)) for _offset, text in units)
+    if prefix_hits > ANCHORED_CANDIDATE_LIMIT:
+        raise _make_error(
+            ErrorCode.AMBIGUOUS_SPAN,
+            f"the span's opening words occur {prefix_hits} times and Word's search looks at the first "
+            f"{ANCHORED_CANDIDATE_LIMIT} only; lengthen the prefix (put more of the span before the '…')",
+            {"prefix_hits": prefix_hits, "limit": ANCHORED_CANDIDATE_LIMIT},
+        )
+    hits = exact_anchored_spans(units, prefix, suffix, digest)
+    if len(hits) > 1:
+        raise _make_error(
+            ErrorCode.AMBIGUOUS_SPAN,
+            f"Word's search would find {len(hits)} copies of the target span; nothing was sent",
+            {"total": len(hits)},
+        )
+    if hits != [target]:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            "Word's search cannot single out this span from its literal prefix and suffix (the suffix "
+            "also occurs inside the span); use a longer or different suffix",
+            {"prefix": prefix[:40], "suffix": suffix[-40:]},
+        )
+
+
+def paragraph_units(proj: Projection) -> list[tuple[int, str]]:
+    """``(start, text)`` of every non-empty paragraph in *proj* (cells included)."""
+    return [(s, proj.text[s:e]) for s, e in paragraph_spans(proj).values()]
+
+
+def resolve_anchored_in_units(
+    find: str, units: list[str], *, expected_length: int | None, find_sha256: str | None
+) -> tuple[int, AnchoredSpan]:
+    """``locate_anchored`` over independent strings (an approved run's section
+    paragraphs and cells) instead of a projection: ``(unit index, span)``.
+    A span never crosses a unit, so there is no STRUCTURAL_BOUNDARY here."""
+    parts = require_anchored(find)
+    digest = check_anchored_args(expected_length, find_sha256)
+    prefix, suffix = parts
+    found: list[tuple[int, AnchoredSpan]] = []
+    candidates: list[tuple[int, AnchoredSpan]] = []
+    prefix_count = suffix_count = 0
+    for index, text in enumerate(units):
+        pairs, pc, sc = anchored_pairs(text, prefix, suffix)
+        prefix_count += pc
+        suffix_count += sc
+        candidates.extend((index, p) for p in pairs)
+        found.extend((index, p) for p in pairs if _passes(text, p, expected_length, digest))
+    if len(found) == 1:
+        return found[0]
+
+    def describe(entries: list[tuple[int, AnchoredSpan]]) -> list[dict[str, Any]]:
+        return [
+            {"unit": i, "start": s.start, "end": s.end, "length": normalized_length(units[i][s.start : s.end]),
+             "context": _span_context(units[i], s.start, s.end)}
+            for i, s in entries[:_MATCH_DIAGNOSTIC_MAX]
+        ]
+
+    if found:
+        raise _make_error(
+            ErrorCode.AMBIGUOUS_SPAN,
+            f"the anchored find matches {len(found)} spans; lengthen the prefix or suffix, or pass find_sha256",
+            {"candidates": describe(found), "total": len(found)},
+        )
+    raise _make_error(
+        ErrorCode.ZERO_MATCH,
+        "no prefix -> suffix span with the expected length/sha256 in the section",
+        {
+            "prefix_matches": prefix_count,
+            "suffix_matches": suffix_count,
+            "candidates": describe(_rank(
+                candidates, expected_length, lambda c: normalized_length(units[c[0]][c[1].start : c[1].end])
+            )),
+            "total_candidates": len(candidates),
+        },
     )

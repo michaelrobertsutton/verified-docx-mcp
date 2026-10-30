@@ -80,6 +80,8 @@ class ErrorCode(Enum):
     MATCH_COUNT_MISMATCH = "MATCH_COUNT_MISMATCH"  # match count != expected_matches (D4: expected_matches is required, no default)
     ANCHORED_SHAPES = "ANCHORED_SHAPES"
     STRUCTURAL_BOUNDARY = "STRUCTURAL_BOUNDARY"  # a match crosses a w:p/w:tbl/w:tc boundary
+    AMBIGUOUS_SPAN = "AMBIGUOUS_SPAN"  # issue #113: an anchored find ("<prefix>…<suffix>") or paragraph target names more than one span; up to 5 {start,end,context} plus total in diagnostics. Nothing was written
+    PARA_HASH_MISMATCH = "PARA_HASH_MISMATCH"  # issue #113: a para_ref target's text no longer hashes to expected_sha256; re-read the paragraph
 
     # Tracked changes (tracked_changes.py; WP-07)
     REVISION_ID_NOT_FOUND = "REVISION_ID_NOT_FOUND"  # accept_tracked_changes/reject_tracked_changes named a w:ins/w:del id not present in the document

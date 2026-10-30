@@ -64,8 +64,8 @@ from . import (
     paths,
     projection,
     table_diff,
-    tables,
     table_structure,
+    tables,
     text_edit,
     tracked_changes,
     write_ledger,
@@ -1838,9 +1838,9 @@ def append_markdown(
 @mcp.tool()
 def replace_text(
     path: str,
-    find: str,
-    replace: str,
-    expected_matches: int,
+    find: str | None = None,
+    replace: str | None = None,
+    expected_matches: int | None = None,
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
@@ -1853,8 +1853,34 @@ def replace_text(
     scope: str = "body",
     allow_comment_loss_ids: list[dict[str, Any]] | None = None,
     verbose: bool = False,
+    *,
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
+    para_ref: str | None = None,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Replace every occurrence of `find` with `replace`, atomically.
+    """Replace every occurrence of `find` with `replace`, atomically. `replace` is required.
+
+    Three ways to name the target (issue #113), exactly one per call:
+      - plain `find` + `expected_matches` (required for a plain find).
+      - anchored `find` = "<prefix>…<suffix>" (one U+2026 or "[...]"; prefix
+        and suffix >= 12 characters each) + `expected_length` and/or
+        `find_sha256`. Only these two make a find anchored: without them a
+        literal "…" is ordinary text in a plain find. The span is normalized
+        (straight quotes, whitespace runs -> one space, soft hyphens removed);
+        `expected_length` counts its characters (+-2) and `find_sha256` is the
+        sha256 hex of it (`locate.span_sha256`). Each prefix pairs with the nearest following suffix in the
+        same paragraph; exactly one span must pass the check, else
+        AMBIGUOUS_SPAN (up to 5 candidates) or ZERO_MATCH (candidate lengths).
+        No retyping a long span; no 230-character live limit.
+      - `para_ref` ("pN") + `expected_sha256` (same hash of that paragraph's
+        text): replaces the whole paragraph's text; PARA_HASH_MISMATCH if it changed.
+        No read returns this hash yet: compute it as `locate.span_sha256` does
+        (a read-side paragraph hash is a follow-up).
+    Live mode resolves anchored/para_ref targets on a read of the live body that
+    never re-arms a stale caller; text-box scopes and within_row_containing take a
+    plain find only there. Spans over 230 characters need the pane's
+    "anchored_find_v1" capability (LIVE_CAPABILITY_MISSING otherwise).
 
     `verbose=true` keeps a ZERO_MATCH error's `ladder_report` (a match count of zero per
     normalization rung); without it the error carries `near_miss` only, which is the useful
@@ -2021,6 +2047,8 @@ def replace_text(
                                            pane build predating this feature) -- reload the pane
     """
     try:
+        if replace is None:
+            raise _make_error(ErrorCode.INVALID_INPUT, "replace is required (pass \"\" to delete the text)")
         return text_edit.execute_replace_text(
             path,
             find,
@@ -2037,6 +2065,10 @@ def replace_text(
             inherit_format=inherit_format,
             replacement_segments=replacement_segments,
             allow_concurrent_editor=allow_concurrent_editor,
+            expected_length=expected_length,
+            find_sha256=find_sha256,
+            para_ref=para_ref,
+            expected_sha256=expected_sha256,
         )
     except VerifyError as exc:
         _raise_tool_error(exc, verbose)
@@ -2064,7 +2096,11 @@ def replace_text_batch(
     edit are those of `replace_text` (expected_matches required).
     `within_row_containing` is per edit (see replace_text): it scopes that edit
     to the table row holding that text, so identical text elsewhere does not
-    stop the batch. `allow_comment_loss_ids` is [{"comment_id", "reply_count"}]
+    stop the batch. An edit may instead use an anchored find with
+    "expected_length"/"find_sha256", or "para_ref" + "expected_sha256"
+    (see replace_text; no within_row_containing then); it is resolved against
+    the body as the previous edit left it, and a resolution failure is
+    refused_before_write. `allow_comment_loss_ids` is [{"comment_id", "reply_count"}]
     (see replace_text); `allow_comment_loss` inside an edit is refused.
     `track_changes` and `inherit_format` apply to every edit.
 
@@ -2118,7 +2154,7 @@ def format_text(
     path: str,
     find: str,
     style: dict[str, bool | str],
-    expected_matches: int,
+    expected_matches: int | None = None,
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
@@ -2127,9 +2163,14 @@ def format_text(
     allow_concurrent_editor: bool = False,
     scope: str = "body",
     verbose: bool = False,
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Apply character styling (bold/italic/underline/strike/color) to a
     matched text span, without touching its content.
+
+    `find` may be anchored ("<prefix>…<suffix>" with expected_length and/or
+    find_sha256 instead of expected_matches), exactly as on replace_text.
 
     The text never changes, so the result carries ``text_unchanged: true`` and one
     ``excerpt`` instead of a before and an after, plus ``format_delta`` (only the direct
@@ -2210,6 +2251,8 @@ def format_text(
             scope=scope,
             allow_concurrent_editor=allow_concurrent_editor,
             verbose=verbose,
+            expected_length=expected_length,
+            find_sha256=find_sha256,
         )
     except VerifyError as exc:
         _raise_tool_error(exc, verbose)
@@ -3703,15 +3746,20 @@ def apply_style(
     path: str,
     find: str,
     style_id: str,
-    expected_matches: int,
+    expected_matches: int | None = None,
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
     allow_concurrent_editor: bool = False,
     verbose: bool = False,
+    expected_length: int | None = None,
+    find_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Apply a NAMED style (from list_styles) to text located via find --
     the named-style counterpart to format_text's four boolean toggles.
+
+    `find` may be anchored ("<prefix>…<suffix>" with expected_length and/or
+    find_sha256 instead of expected_matches), exactly as on replace_text.
 
     The text never changes, so the result carries ``text_unchanged: true`` and one
     ``excerpt`` instead of a before and an after, plus ``format_delta`` (only the direct
@@ -3790,6 +3838,7 @@ def apply_style(
             path, find, style_id, expected_matches,
             revision_before=revision_before, force=force, track_changes=track_changes,
             allow_concurrent_editor=allow_concurrent_editor, verbose=verbose,
+            expected_length=expected_length, find_sha256=find_sha256,
         )
     except VerifyError as exc:
         _raise_tool_error(exc, verbose)
@@ -4566,17 +4615,20 @@ def read_textbox(path: str, textbox_id: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=_DESTRUCTIVE)
 def delete_paragraph(path: str, anchor_text: str, revision_before: str,
-                     track_changes: bool = False) -> dict[str, Any]:
+                     track_changes: bool = False, expected_length: int | None = None,
+                     find_sha256: str | None = None) -> dict[str, Any]:
     """Delete exactly one whole live paragraph (body or table cell); refuse anchors,
     comments, revisions, section boundaries, the final body paragraph, a nested
     table's paragraph and a cell's LAST paragraph (issue #107: a cell paragraph
     may go while the cell keeps another; use merge_paragraph_with_next to join).
-    `anchor_text` must equal exactly one paragraph in the whole body.
+    `anchor_text` must equal exactly one paragraph in the whole body: its whole
+    text, or "<prefix>…<suffix>" covering it with expected_length and/or
+    find_sha256 (as replace_text's anchored find).
     """
     from .live.paragraphs_live import delete_paragraph as execute
 
     try:
-        return execute(path, anchor_text, revision_before, track_changes)
+        return execute(path, anchor_text, revision_before, track_changes, expected_length, find_sha256)
     except VerifyError as exc:
         _raise_tool_error(exc)
 
@@ -4813,6 +4865,11 @@ def live_changes_prepare(path: str, operations: list[dict[str, Any]], track_chan
     replace_text args may also include replacement_segments with the complete
     explicit font/hyperlink schema documented on replace_text; concatenated segment
     text must equal replace. The approval preview includes the exact segments.
+    replace_text may name its target as an anchored find ("<prefix>…<suffix>" with
+    expected_length and/or find_sha256) or as {para_ref, expected_sha256} where pN counts
+    the section's paragraphs (p0 = its heading). Prepare resolves it against the section as
+    the earlier operations leave it; the manifest stores the resolved full find (no 230-
+    character limit then; over 230 needs anchored_find_v1) and the preview shows it.
     Requires approved_changes_v1; explicit segments also require formatted_replacements_v1.
     """
     from .live.approved_changes import prepare

@@ -7,14 +7,44 @@ from . import comments_live
 from . import write_mode as wm
 
 
+def _resolve_anchored_paragraph(session, pre: str, anchor_text: str, expected_length: int | None,
+                                find_sha256: str | None) -> str:
+    """Issue #113: an anchored ``anchor_text`` ("<prefix>…<suffix>") resolved on
+    the live body (a non-observing read) to the whole text of one paragraph,
+    as Word's paragraph.text reports it."""
+    from .. import locate, projection
+    from .reads_live import live_projection
+
+    proj = live_projection(session, expected_body_sha256=pre)
+    span = locate.locate_anchored(anchor_text, proj, expected_length=expected_length,
+                                  find_sha256=find_sha256).spans[0]
+    bounds = locate.paragraph_spans(proj)
+    texts = projection.paragraph_texts(proj)
+    for i, meta in enumerate(proj.paragraphs):
+        if bounds.get(meta.para_ref) == span:
+            return texts[i]
+    raise _make_error(ErrorCode.INVALID_INPUT,
+                      "the anchored anchor_text must cover one whole paragraph, from its first to its last character")
+
+
 def delete_paragraph(path: str, anchor_text: str, revision_before: str,
-                     track_changes: bool = False) -> dict[str, Any]:
+                     track_changes: bool = False, expected_length: int | None = None,
+                     find_sha256: str | None = None) -> dict[str, Any]:
+    from .. import locate
+
     if not anchor_text or not revision_before.startswith("live:sha256:"):
         raise _make_error(ErrorCode.INVALID_INPUT, "A whole-paragraph anchor and live body revision are required")
+    # Only expected_length/find_sha256 make anchor_text anchored; a literal "…" is plain text otherwise.
+    anchored = locate.anchored_requested(expected_length, find_sha256)
+    if anchored:
+        locate.require_anchored(anchor_text)
+        locate.check_anchored_args(expected_length, find_sha256)
     session = wm.live_session_for(path)
     wm.require_capability(session, "delete_paragraph", feature_description="whole-paragraph deletion")
     pre = comments_live._request(session, "describe")["bodySha256"]
     wm.check_not_stale(revision_before, pre)
+    if anchored:
+        anchor_text = _resolve_anchored_paragraph(session, pre, anchor_text, expected_length, find_sha256)
     try:
         result = comments_live._request(session, "paragraph_delete", {
             "anchor_text": anchor_text, "expectedBodySha256": pre, "track_changes": track_changes})

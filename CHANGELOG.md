@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Cheaper write inputs (#113 part A): an anchored find, `"<prefix>…<suffix>"` with `expected_length` and/or `find_sha256`, names a long span without retyping it, in `replace_text`, `replace_text_batch`, `format_text`, `apply_style`, `delete_paragraph` and approved-run `replace_text` (no 230-character limit there once resolved). `replace_text` and its batch also take `para_ref` + `expected_sha256` for a whole paragraph. New errors `AMBIGUOUS_SPAN` and `PARA_HASH_MISMATCH`. Spans over 230 UTF-16 units need pane v68 (`anchored_find_v1`). A literal `…` stays plain text unless `expected_length`/`find_sha256` is passed. Paragraph hashes are computed by the caller (`locate.span_sha256`) until a read returns them.
 - Trimmed read payloads (#111):
   - `list_open_items` gains `fields="summary"` (columnar, ~577 tokens for 27 comments; rows under `comment_rows`/`suggestion_rows`, never a `comments` key, `path` kept; scoped results carry `scoped: true`), `section_key`/`within_text` scoping and `include_correlation`. Its default `full` shape drops constant or derivable fields (`modified_time`, `scope`, live `w_id`/`quoted_text`, `reply_count`, empty `replies`, null top-level keys) and is 39.9% smaller on the 27-comment fixture.
   - `list_tables` reports `header_row` and `anchor_section_key`.
