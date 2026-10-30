@@ -69,6 +69,28 @@ await assert.rejects(() => raced.sandbox.api.opReplace({...anchored(LONG.slice(0
 assert.ok(raced.state.text.includes('INCREMENTAL'));
 out.racedRefused = true;
 
+// requireAnchoredText alone: payload.find is rewritten to the moved text, so the plain text
+// compare passes and only the hash re-check at the mutation boundary can refuse.
+const moveAfterSearch = (f) => vm.runInContext(
+  'const realSearch = searchScoped; searchScoped = async (ctx, p) => { const hits = await realSearch(ctx, p); ' +
+  'mutate(); if (p.find !== undefined) p.find = hits[0].text; return hits; };',
+  Object.assign(f.sandbox, {mutate: () => { f.state.text = f.state.text.replace('incremental', 'INCREMENTAL'); }}));
+const hashOnly = make(text);
+moveAfterSearch(hashOnly);
+await assert.rejects(() => hashOnly.sandbox.api.opReplace({...anchored(LONG.slice(0, 60), LONG.slice(-40), sha), replace: 'x'}),
+  e => e.code === 'LIVE_STALE' && /Anchored target changed/.test(e.message));
+assert.ok(hashOnly.state.text.includes('INCREMENTAL') && !hashOnly.state.text.includes('\nx\n'));
+out.hashOnlyRaceRefused = true;
+
+// opFormat has no text compare: its hash re-check refuses a moved span, and nothing is formatted.
+const fmtRace = make(text);
+moveAfterSearch(fmtRace);
+await assert.rejects(() => fmtRace.sandbox.api.opFormat({...anchored(LONG.slice(0, 60), LONG.slice(-40), sha), bold: true}),
+  e => e.code === 'LIVE_STALE');
+const fmtStart = fmtRace.state.text.indexOf('Skyward will modernize the claims platform with');
+assert.ok(fmtRace.state.chars.slice(fmtStart, fmtStart + LONG.length).every(c => !c.bold));
+out.formatRaceRefused = true;
+
 // format_text over the same anchored span.
 const fmt = make(text);
 const formatted = await fmt.sandbox.api.opFormat({...anchored(LONG.slice(0, 60), LONG.slice(-40), sha), bold: true});

@@ -223,14 +223,16 @@ _RESOLVED_ARGS = ("prefix", "suffix", "expected_text_sha256")
 
 def _replace_target_kind(args):
     """"plain" / "anchored" / "para_ref" for replace_text args, or None when malformed."""
-    from ..locate import split_anchored
+    from ..locate import require_anchored
     keys = set(args) - {"replacement_segments"}
     if "para_ref" in keys:
         return "para_ref" if keys == _PARA_ARGS else None
-    find = args.get("find")
-    if isinstance(find, str) and split_anchored(find) is not None:
-        ok = {"find", "replace"} <= keys <= _ANCHORED_ARGS and keys & {"expected_length", "find_sha256"}
-        return "anchored" if ok else None
+    # Only expected_length/find_sha256 make a find anchored; a literal "…" is plain text otherwise.
+    if keys & {"expected_length", "find_sha256"}:
+        if not ({"find", "replace"} <= keys <= _ANCHORED_ARGS and isinstance(args.get("find"), str)):
+            return None
+        require_anchored(args["find"])
+        return "anchored"
     return "plain" if keys == OPS["replace_text"] else None
 
 
@@ -310,29 +312,25 @@ def resolve_target(sections, operation, session):
             raise _make_error(ErrorCode.PARA_HASH_MISMATCH,
                               f"paragraph {args['para_ref']} of the section no longer matches expected_sha256",
                               {"para_ref": args["para_ref"], "excerpt": resolved[:80]})
-        anchors = locate.pane_anchors(resolved) if resolved else ("", "")
+        unit, start, suffix_offset = index, 0, None
     else:
         unit, span = locate.resolve_anchored_in_units(
             args["find"], units, expected_length=args.get("expected_length"), find_sha256=args.get("find_sha256"))
         resolved = units[unit][span.start:span.end]
-        if any(c in resolved for c in "\r\n\v"):
-            raise invalid("The resolved span crosses a line break; approved text replacements stay within one line")
-        anchors = locate.pane_anchors(resolved, span.prefix_end - span.start, span.end - span.suffix_start)
+        start, suffix_offset = span.start, span.suffix_start - span.start
     if not resolved or any(c in resolved for c in "\r\n\v"):
-        raise invalid("The target paragraph is empty or holds a line break; use a plain find")
+        raise invalid("The target is empty or crosses a line break; approved text replacements stay within one line")
+    anchors = locate.pane_anchors(resolved, suffix_offset)
     digest = locate.span_sha256(resolved)
-    if len(resolved) > locate.PANE_SEARCH_MAX:
+    if locate.utf16_len(resolved) > locate.PANE_SEARCH_MAX:
         wm.require_capability(session, "anchored_find_v1",
                               feature_description=f"a {len(resolved)}-character approved replacement")
         offsets, cursor = [], 0
         for text in units:
             offsets.append((cursor, text))
             cursor += len(text) + 1
-        hits = locate.exact_anchored_spans(offsets, anchors[0], anchors[1], digest)
-        if len(hits) != 1:
-            raise _make_error(ErrorCode.AMBIGUOUS_SPAN if len(hits) > 1 else ErrorCode.INVALID_INPUT,
-                              "Word's search cannot single out the resolved span in its section",
-                              {"total": len(hits)})
+        target = (offsets[unit][0] + start, offsets[unit][0] + start + len(resolved))
+        locate.check_pane_target(offsets, anchors[0], anchors[1], digest, target)
     out = {"find": resolved, "replace": args["replace"], "expected_matches": 1,
            "prefix": anchors[0], "suffix": anchors[1], "expected_text_sha256": digest}
     if "replacement_segments" in args:
@@ -425,6 +423,7 @@ def scope_sha(sections):
 
 def apply(path, operation, track_changes=False):
     """Reuse pane mutations and independent target readbacks without describe/body reads."""
+    from .. import locate
     session = wm.live_session_for(path)
     op, args = operation["op"], operation["args"]
     current = _SCOPE.get()
@@ -479,7 +478,7 @@ def apply(path, operation, track_changes=False):
                 wm.require_capability(session, "formatted_replacements_v1", feature_description="explicit formatted replacements")
             before, after = args["find"], args["replace"]
             send = {k: v for k, v in args.items() if k not in _RESOLVED_ARGS}
-            if "expected_text_sha256" in args and len(args["find"]) > 230:
+            if "expected_text_sha256" in args and locate.utf16_len(args["find"]) > locate.PANE_SEARCH_MAX:
                 # Issue #113: longer than one Word search; the pane pairs prefix and suffix and
                 # re-checks the approved span's hash at the mutation boundary.
                 wm.require_capability(session, "anchored_find_v1", feature_description="long approved replacements")

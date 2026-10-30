@@ -192,7 +192,7 @@ def test_pane_target_short_long_and_duplicate():
     }
     long_proj = _proj(_p(LONG))
     target = text_edit.pane_target(None, long_proj, locate.locate_anchored(FIND, long_proj, expected_length=412))
-    assert target["prefix"] == "Skyward will modernize" and target["suffix"] == "batch jobs one workload at a time by 2027."
+    assert target["prefix"] == LONG[:230] and target["suffix"] == "batch jobs one workload at a time by 2027."
     assert target["expected_text_sha256"] == locate.span_sha256(LONG) and target["text"] == LONG
     dup = _proj(_p(LONG), _p(LONG))
     with pytest.raises(VerifyError) as ctx:
@@ -303,7 +303,8 @@ def test_pane_anchored_find_harness_and_hash_parity():
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out["parityNormalized"] == locate.normalize_span_text(out["parityText"])
     assert out["parityHash"] == locate.span_sha256(out["parityText"])
-    for key in ("longReplaced", "ambiguousRefused", "zeroMatchRefused", "invalidRefused", "racedRefused", "formatApplied"):
+    for key in ("longReplaced", "ambiguousRefused", "zeroMatchRefused", "invalidRefused", "racedRefused",
+                "hashOnlyRaceRefused", "formatRaceRefused", "formatApplied"):
         assert out[key] is True, key
 
 

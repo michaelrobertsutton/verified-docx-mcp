@@ -79,7 +79,7 @@ def test_a_600_character_ellipsis_replacement_prepares_previews_and_executes(set
     assert preview["find_sha256"] == locate.span_sha256(PARA)
     args = json.loads(Path(prepared["manifest_path"]).read_text())["operations"][0]["args"]
     assert args["find"] == PARA
-    assert args["prefix"] == "Skyward will operate the help desk"
+    assert args["prefix"] == PARA[:230]
     assert args["suffix"] == "reported monthly to the program office."
     assert args["expected_text_sha256"] == locate.span_sha256(PARA)
     report = runs.execute(path, prepared["run_id"], prepared["manifest_sha256"], "Lead")

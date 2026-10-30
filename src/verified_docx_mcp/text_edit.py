@@ -91,7 +91,6 @@ from .locate import (
     locate_anchored,
     locate_find,
     locate_paragraph,
-    split_anchored,
 )
 from .projection import W_NS, RunEvent
 
@@ -862,7 +861,9 @@ def check_target_args(
         return "para_ref"
     if not isinstance(find, str) or not find:
         raise _make_error(ErrorCode.INVALID_INPUT, "find must not be empty (or pass para_ref + expected_sha256)")
-    if split_anchored(find) is not None:
+    if locate_mod.anchored_requested(expected_length, find_sha256):
+        # Only expected_length/find_sha256 make a find anchored; a literal "…" is plain text otherwise.
+        locate_mod.require_anchored(find)
         locate_mod.check_anchored_expected_matches(expected_matches)
         locate_mod.check_anchored_args(expected_length, find_sha256)
         return "anchored"
@@ -923,7 +924,7 @@ def pane_target(session, proj: projection.Projection, result: LocateResult) -> d
     AMBIGUOUS_SPAN when Word could not single the span out."""
     start, end = result.spans[0]
     text = proj.text[start:end]
-    if len(text) <= locate_mod.PANE_SEARCH_MAX and not any(c in text for c in "\r\n\v"):
+    if locate_mod.utf16_len(text) <= locate_mod.PANE_SEARCH_MAX and not any(c in text for c in "\r\n\v"):
         positions = [(p, p + len(text)) for p in locate_mod._find_all(text, proj.text)]
         if len(positions) != 1:
             raise _ambiguous_text(proj.text, positions, "the target text")
@@ -934,21 +935,9 @@ def pane_target(session, proj: projection.Projection, result: LocateResult) -> d
             ANCHORED_FIND_CAPABILITY,
             feature_description=f"a {len(text)}-character target (longer than one Word search)",
         )
-    if result.anchors is not None:
-        prefix, suffix = locate_mod.pane_anchors(text, result.anchors[0] - start, end - result.anchors[1])
-    else:
-        prefix, suffix = locate_mod.pane_anchors(text)
+    prefix, suffix = locate_mod.pane_anchors(text, result.anchors[1] - start if result.anchors else None)
     digest = locate_mod.span_sha256(text)
-    hits = locate_mod.exact_anchored_spans(locate_mod.paragraph_units(proj), prefix, suffix, digest)
-    if len(hits) > 1:
-        raise _ambiguous_text(proj.text, hits, "the target span")
-    if hits != [(start, end)]:
-        raise _make_error(
-            ErrorCode.INVALID_INPUT,
-            "Word's search cannot single out this span from its literal prefix and suffix (the suffix "
-            "also occurs inside the span); use a longer or different suffix",
-            {"prefix": prefix[:40], "suffix": suffix[-40:]},
-        )
+    locate_mod.check_pane_target(locate_mod.paragraph_units(proj), prefix, suffix, digest, (start, end))
     return {"text": text, "prefix": prefix, "suffix": suffix, "expected_text_sha256": digest}
 
 
@@ -1435,6 +1424,10 @@ def execute_replace_text_batch_live(
                 continue
             except LiveDisconnected as exc:
                 _record(i, "refused_before_write", code=ErrorCode.LIVE_DISCONNECTED.value, message=str(exc))
+                continue
+            except Exception as exc:  # noqa: BLE001 - a read/parse failure before dispatch: nothing was sent
+                _record(i, "refused_before_write", code=ErrorCode.LIVE_OP_FAILED.value,
+                        message=f"could not resolve the edit's target: {type(exc).__name__}: {exc}")
                 continue
         try:
             result = _live_replace_once(

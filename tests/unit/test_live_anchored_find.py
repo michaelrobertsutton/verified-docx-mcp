@@ -59,7 +59,7 @@ class LiveAnchoredTests(LiveWriteBridgeTestCase):
         self.assertEqual(evidence["before"], LONG)
         payload = pane.op_payloads["replace"][-1]
         self.assertNotIn("find", payload)
-        self.assertEqual(payload["prefix"], "Skyward will modernize")
+        self.assertEqual(payload["prefix"], LONG[:230])  # extended toward the suffix, 230 units max
         self.assertEqual(payload["suffix"], "batch jobs one workload at a time by 2027.")
         self.assertEqual(payload["expected_text_sha256"], locate.span_sha256(LONG))
         self.assertEqual(payload["expected_matches"], 1)
@@ -107,7 +107,7 @@ class LiveAnchoredTests(LiveWriteBridgeTestCase):
             find_sha256=locate.span_sha256(LONG), write_mode="live",
         )
         self.assertEqual(evidence["match_count"], 1)
-        self.assertEqual(pane.op_payloads["format"][-1]["prefix"], "Skyward will modernize")
+        self.assertEqual(pane.op_payloads["format"][-1]["prefix"], LONG[:230])
 
     async def test_batch_resolves_each_edit_against_the_previous_edits_output(self) -> None:
         doc, _pane = await self.open()
@@ -137,6 +137,41 @@ class LiveAnchoredTests(LiveWriteBridgeTestCase):
         self.assertEqual([r["status"] for r in result["results"]], ["applied", "refused_before_write", "not_attempted"])
         self.assertEqual(result["results"][1]["code"], "PARA_HASH_MISMATCH")
         self.assertEqual(doc.text, f"Title\n{LONG}\n{SHORT}")
+
+    async def test_batch_a_failed_target_read_is_refused_before_write_and_keeps_earlier_results(self) -> None:
+        doc, _pane = await self.open()
+        real = text_edit.resolve_live_target
+
+        def broken(*args, **kwargs):
+            raise ValueError("unparseable body export")
+
+        text_edit.resolve_live_target = broken
+        try:
+            result = await asyncio.to_thread(
+                text_edit.execute_replace_text_batch_live, str(self.target), [
+                    {"find": "Heading", "expected_matches": 1, "replace": "Title"},
+                    {"find": FIND, "expected_length": 412, "replace": "x"},
+                ], _rev(doc),
+            )
+        finally:
+            text_edit.resolve_live_target = real
+        self.assertEqual(result["batch_status"], "partial")
+        self.assertEqual([r["status"] for r in result["results"]], ["applied", "refused_before_write"])
+        self.assertIn("unparseable body export", result["results"][1]["message"])
+        self.assertTrue(result.get("evidence_ref"))  # the batch audit record was still written
+        self.assertEqual(doc.text, f"Title\n{LONG}\n{SHORT}")
+
+    async def test_literal_ellipsis_is_plain_in_live_replace_batch_and_delete(self) -> None:
+        literal = "Wait… what is this paragraph"
+        doc, _pane = await self.open(text=f"Heading\n{literal}\nTail")
+        result = await asyncio.to_thread(
+            text_edit.execute_replace_text_batch_live, str(self.target),
+            [{"find": "Wait… what", "expected_matches": 1, "replace": "Wait… so what"}], _rev(doc),
+        )
+        self.assertEqual(result["batch_status"], "complete")
+        await asyncio.to_thread(paragraphs_live.delete_paragraph, str(self.target),
+                                "Wait… so what is this paragraph", _rev(doc))
+        self.assertEqual(doc.text, "Heading\nTail")
 
     async def test_batch_edit_validation(self) -> None:
         doc, _pane = await self.open()

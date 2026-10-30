@@ -58,6 +58,10 @@ PRE_MUTATION_REFUSALS = frozenset(
         # Preflight guards in the pane: they refuse before any write is attempted.
         "ANCHORED_SHAPES",
         "WOULD_DELETE_COMMENTS",
+        # Issue #113: the anchored-find search refusals (and the pane's argument checks,
+        # every one of which runs before its op writes anything).
+        "AMBIGUOUS_SPAN",
+        "INVALID_INPUT",
     }
 )
 MAX_FRAME = 72 * 2**20  # body_ooxml can return 48 MiB, with JSON escaping

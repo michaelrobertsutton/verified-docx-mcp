@@ -34,12 +34,11 @@ def delete_paragraph(path: str, anchor_text: str, revision_before: str,
 
     if not anchor_text or not revision_before.startswith("live:sha256:"):
         raise _make_error(ErrorCode.INVALID_INPUT, "A whole-paragraph anchor and live body revision are required")
-    anchored = locate.split_anchored(anchor_text) is not None
+    # Only expected_length/find_sha256 make anchor_text anchored; a literal "…" is plain text otherwise.
+    anchored = locate.anchored_requested(expected_length, find_sha256)
     if anchored:
+        locate.require_anchored(anchor_text)
         locate.check_anchored_args(expected_length, find_sha256)
-    elif expected_length is not None or find_sha256 is not None:
-        raise _make_error(ErrorCode.INVALID_INPUT,
-                          "expected_length/find_sha256 apply only to an anchored anchor_text ('<prefix>…<suffix>')")
     session = wm.live_session_for(path)
     wm.require_capability(session, "delete_paragraph", feature_description="whole-paragraph deletion")
     pre = comments_live._request(session, "describe")["bodySha256"]
