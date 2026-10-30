@@ -655,6 +655,49 @@ class FakeDocument:
         end = len(self.text) if end == -1 else end
         return start, end
 
+    def anchored_positions(self, payload: dict[str, Any]) -> list[tuple[int, int]]:
+        """Issue #113 (anchored_find_v1), as the real pane does it: in each
+        paragraph (a "\\n"-separated line), every literal prefix match pairs with
+        the nearest literal suffix match after it; the span whose normalized
+        sha256 equals expected_text_sha256 must be unique."""
+        from verified_docx_mcp.locate import span_sha256
+
+        prefix, suffix, want = payload.get("prefix"), payload.get("suffix"), payload.get("expected_text_sha256")
+        if (not isinstance(prefix, str) or not isinstance(suffix, str) or not prefix or not suffix
+                or len(prefix) > 230 or len(suffix) > 230 or not isinstance(want, str) or payload.get("find")):
+            raise OpRefused("INVALID_INPUT", "Anchored find needs prefix, suffix, expected_text_sha256 and no find")
+        hits: list[tuple[int, int]] = []
+        offset = 0
+        for line in self.text.split("\n"):
+            for p_start, _p_end in _find_all(line, prefix):
+                s_start = line.find(suffix, p_start + len(prefix))
+                if s_start != -1 and span_sha256(line[p_start : s_start + len(suffix)]) == want:
+                    hits.append((offset + p_start, offset + s_start + len(suffix)))
+            offset += len(line) + 1
+        if not hits:
+            raise OpRefused("zero_match", "no prefix-suffix span matches expected_text_sha256 (found 0)")
+        if len(hits) > 1:
+            raise OpRefused("AMBIGUOUS_SPAN", f"{len(hits)} prefix-suffix spans match expected_text_sha256")
+        return hits
+
+    def flat_opc(self) -> str:
+        """The body as a minimal Flat OPC package (one w:p per "\\n" line), for a
+        pane built with body_ooxml_from_text=True."""
+        from xml.sax.saxutils import escape
+
+        w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        paragraphs = "".join(
+            f'<w:p><w:r><w:t xml:space="preserve">{escape(line)}</w:t></w:r></w:p>' if line else "<w:p/>"
+            for line in self.text.split("\n")
+        )
+        document = f'<w:document xmlns:w="{w}"><w:body>{paragraphs}</w:body></w:document>'
+        ns = "http://schemas.microsoft.com/office/2006/xmlPackage"
+        return (
+            f'<pkg:package xmlns:pkg="{ns}"><pkg:part pkg:name="/word/document.xml" '
+            'pkg:contentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml">'
+            f"<pkg:xmlData>{document}</pkg:xmlData></pkg:part></pkg:package>"
+        )
+
     def _scoped_positions(self, find: str, row_anchor: str | None) -> list[tuple[int, int]]:
         if row_anchor is None:
             return _find_all(self.text, find)
@@ -702,12 +745,17 @@ class FakeDocument:
         row_anchor: str | None = None,
         expected_body_sha256: str | None = None,
         allow_comment_loss_ids: list[dict[str, Any]] | None = None,
+        anchor: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         pre = self.sha256()
         # Issue #82: the real pane refuses a stale caller before touching anything.
         if expected_body_sha256 and expected_body_sha256 != pre:
             raise OpRefused("stale", "the document changed since it was read; nothing was written.")
-        positions = self._scoped_positions(find, row_anchor)
+        if anchor is not None:
+            positions = self.anchored_positions(anchor)
+            find = self.text[positions[0][0] : positions[0][1]]
+        else:
+            positions = self._scoped_positions(find, row_anchor)
         if len(positions) != expected_matches:
             raise OpRefused(
                 "LIVE_OP_FAILED",
@@ -774,9 +822,14 @@ class FakeDocument:
         color: str | None = None,
         track_changes: bool = False,
         row_anchor: str | None = None,
+        anchor: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         pre = self.sha256()
-        positions = self._scoped_positions(find, row_anchor)
+        if anchor is not None:
+            positions = self.anchored_positions(anchor)
+            find = self.text[positions[0][0] : positions[0][1]]
+        else:
+            positions = self._scoped_positions(find, row_anchor)
         if len(positions) != expected_matches:
             raise OpRefused(
                 "LIVE_OP_FAILED",
@@ -945,8 +998,12 @@ class FakePane:
         body_ooxml: str | None = None,
         body_ooxml_error: tuple[str, str] | None = None,
         sections: list[dict[str, Any]] | None = None,
+        body_ooxml_from_text: bool = False,
     ) -> None:
         self.instance_id = instance_id
+        # issue #113: answer body_ooxml with the document's own text as Flat OPC
+        # (FakeDocument.flat_opc), so a live write target resolves against it.
+        self.body_ooxml_from_text = body_ooxml_from_text
         # issue #39: tests set this to rewrite/strip fields of the next
         # comments_list reply (a pane predating comment_counts, a malformed
         # reply, a counts mismatch).
@@ -1101,7 +1158,7 @@ class FakePane:
             if self.body_ooxml_error is not None:
                 raise OpRefused(*self.body_ooxml_error)
             return {
-                "ooxml": self.body_ooxml or "",
+                "ooxml": doc.flat_opc() if self.body_ooxml_from_text else (self.body_ooxml or ""),
                 "bodySha256": doc.sha256(),
                 "documentUrl": self.document_url,
                 "strippedParts": [],
@@ -1122,20 +1179,25 @@ class FakePane:
                 match_whole_word=bool(payload.get("matchWholeWord", False)),
             )
             return {"matches": matches}
+        anchor = payload if "prefix" in payload or "expected_text_sha256" in payload else None
+        if op in ("replace", "format"):
+            self.op_payloads.setdefault(op, []).append(dict(payload))
         if op == "replace":
             return doc.replace(
-                payload["find"],
+                payload.get("find", ""),
                 int(payload["expected_matches"]),
                 payload["replace"],
                 track_changes=bool(payload.get("track_changes", False)),
                 row_anchor=payload.get("rowAnchor"),
                 expected_body_sha256=payload.get("expectedBodySha256"),
                 allow_comment_loss_ids=payload.get("allow_comment_loss_ids"),
+                anchor=anchor,
             )
         if op == "format":
             return doc.format(
-                payload["find"],
+                payload.get("find", ""),
                 int(payload["expected_matches"]),
+                anchor=anchor,
                 bold=payload.get("bold"),
                 italic=payload.get("italic"),
                 underline=payload.get("underline"),
