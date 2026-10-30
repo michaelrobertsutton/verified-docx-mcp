@@ -59,6 +59,7 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import hashlib
+import json
 import re
 import zipfile
 from pathlib import Path
@@ -326,6 +327,10 @@ class DeletedSpan:
     para_ref: str
     author: str | None
     date: str | None
+    # Issue #117: code-point offset within the paragraph's projected text
+    # (``paragraph_texts``) at the deletion point; None only for a span built
+    # outside the walker.
+    offset: int | None = None
 
 
 Event = RunEvent | TableBoundaryEvent | DrawingEvent | FieldEvent
@@ -423,6 +428,19 @@ class _PartWalker:
         # currently inside reports), not a depth counter.
         self._open_comment_ids: set[str] = set()
         self._revision_author_stack: list[str | None] = []
+        # Issue #117 (content digests): per comment w:id, the paragraph
+        # ordinals of its commentRangeStart / commentRangeEnd /
+        # commentReference, plus the document-order sequence of its first
+        # commentRangeStart (``start_seq``) or reference (``ref_seq``).
+        # Recorded from the markers themselves, so a zero-width anchor with no
+        # runs inside is still placed (RunEvent.comment_ids alone misses it).
+        self.comment_anchors: dict[str, dict[str, int]] = {}
+        self._mark_seq = 0
+        # Issue #117: (first paragraph ordinal, w:tbl element) per top-level
+        # table, in document order.
+        self.top_level_tables: list[tuple[int, Any]] = []
+        # Projected length of the current paragraph so far (DeletedSpan.offset).
+        self._para_len = 0
 
     # -- block level -----------------------------------------------------
 
@@ -439,6 +457,8 @@ class _PartWalker:
                     self.walk_block_container(content, chain)
             elif tag in _SKIP_TAGS:
                 continue
+            elif tag in ("commentRangeStart", "commentRangeEnd"):
+                self._note_block_comment_mark(child)
             else:
                 # Defensive: an unrecognized block-level wrapper might still
                 # carry paragraphs (e.g. a future/unknown OOXML extension).
@@ -447,14 +467,20 @@ class _PartWalker:
     def _walk_table(self, tbl: Any, chain: list[dict[str, int]]) -> None:
         table_id = self.ids.next_table_id()
         self.events.append(TableBoundaryEvent("table_start", table_id, element=tbl))
+        if not chain:
+            self.top_level_tables.append((len(self.paragraphs), tbl))
         row_idx = 0
         for row in tbl:
             if _ln(row) != "tr":
+                if _ln(row) in ("commentRangeStart", "commentRangeEnd"):
+                    self._note_block_comment_mark(row)
                 continue
             row_idx += 1
             cell_idx = 0
             for cell in row:
                 if _ln(cell) != "tc":
+                    if _ln(cell) in ("commentRangeStart", "commentRangeEnd"):
+                        self._note_block_comment_mark(cell)
                     continue
                 cell_idx += 1
                 cell_chain = chain + [{"table_id": table_id, "row": row_idx, "cell": cell_idx}]
@@ -466,6 +492,29 @@ class _PartWalker:
             if _ln(child) == local_name:
                 return child
         return None
+
+    # -- comment anchors (issue #117) --------------------------------------
+
+    def _note_comment_mark(self, marker: Any, ordinal: int) -> None:
+        cid = _attr(marker, "id")
+        if cid is None:
+            return
+        kind = {"commentRangeStart": "start", "commentRangeEnd": "end", "commentReference": "ref"}[_ln(marker)]
+        record = self.comment_anchors.setdefault(cid, {})
+        if kind in record:
+            return  # the first marker of each kind wins
+        record[kind] = ordinal
+        if kind != "end":
+            record[f"{kind}_seq"] = self._mark_seq
+            self._mark_seq += 1
+
+    def _note_block_comment_mark(self, marker: Any) -> None:
+        # Between paragraphs: a start belongs to the paragraph that follows,
+        # an end to the one that precedes.
+        if _ln(marker) == "commentRangeStart":
+            self._note_comment_mark(marker, len(self.paragraphs))
+        else:
+            self._note_comment_mark(marker, max(len(self.paragraphs) - 1, 0))
 
     # -- paragraph / run level --------------------------------------------
 
@@ -506,6 +555,7 @@ class _PartWalker:
         if not self._first_para:
             self.events.append(RunEvent("\n", {}, para_ref, f"{para_ref}/break"))
         self._first_para = False
+        self._para_len = 0
 
         run_counter = [0]
         field_stack: list[dict[str, Any]] = []
@@ -560,6 +610,7 @@ class _PartWalker:
                 parent_elem=parent_elem,
             )
         )
+        self._para_len += len(text)
         if in_result:
             field_stack[-1]["result_parts"].append(text)
 
@@ -602,10 +653,12 @@ class _PartWalker:
                 cid = _attr(child, "id")
                 if cid is not None:
                     self._open_comment_ids.add(cid)
+                self._note_comment_mark(child, para_index(para_ref))
             elif tag == "commentRangeEnd":
                 cid = _attr(child, "id")
                 if cid is not None:
                     self._open_comment_ids.discard(cid)
+                self._note_comment_mark(child, para_index(para_ref))
             elif tag == "sdt":
                 content = self._find_child(child, "sdtContent")
                 if content is not None:
@@ -627,7 +680,9 @@ class _PartWalker:
                 continue
             for piece in run:
                 if _ln(piece) == "delText":
-                    self.deleted_spans.append(DeletedSpan(piece.text or "", para_ref, author, date))
+                    self.deleted_spans.append(
+                        DeletedSpan(piece.text or "", para_ref, author, date, offset=self._para_len)
+                    )
 
     def _walk_fld_simple(self, fld: Any, para_ref: str, counter: list[int]) -> None:
         instr = _attr(fld, "instr") or ""
@@ -709,7 +764,9 @@ class _PartWalker:
                 # A delText directly under a bare w:r (not wrapped in
                 # w:del) is malformed, but exclude it from the projection
                 # defensively rather than emit deleted text as if live.
-                self.deleted_spans.append(DeletedSpan(child.text or "", para_ref, None, None))
+                self.deleted_spans.append(DeletedSpan(child.text or "", para_ref, None, None, offset=self._para_len))
+            elif tag == "commentReference":
+                self._note_comment_mark(child, para_index(para_ref))
             elif tag == "drawing":
                 self._emit_drawing(child, para_ref)
             elif tag == "AlternateContent":
@@ -768,6 +825,10 @@ class Projection:
     paragraphs: list[ParagraphMeta]
     deleted_spans: list[DeletedSpan]
     warnings: list[str]
+    # Issue #117 (content digests); see _PartWalker.comment_anchors /
+    # top_level_tables. Empty on a slice.
+    comment_anchors: dict[str, dict[str, int]] = dataclasses.field(default_factory=dict)
+    top_level_tables: list[tuple[int, Any]] = dataclasses.field(default_factory=list)
 
     def locate_offset(self, offset: int) -> tuple[str, str, int] | None:
         """(para_ref, run_ref, run_offset) for *offset* in ``text``, or
@@ -917,6 +978,8 @@ def _finalize_projection(walker: _PartWalker, part_name: str) -> Projection:
         paragraphs=walker.paragraphs,
         deleted_spans=walker.deleted_spans,
         warnings=walker.warnings,
+        comment_anchors=walker.comment_anchors,
+        top_level_tables=walker.top_level_tables,
     )
 
 
@@ -1567,14 +1630,390 @@ def _section_ranges(proj: Projection, headings: list[tuple[int, str]]) -> list[t
     return [(h, headings[i + 1][0] if i + 1 < len(headings) else count) for i, (h, _) in enumerate(headings)]
 
 
+# ---------------------------------------------------------------------------
+# Content digests (issue #117)
+# ---------------------------------------------------------------------------
+
+_COMMENTS_REL = "/comments"
+_COMMENTS_EXT_REL = "/commentsExtended"
+_COMMENTS_IDS_REL = "/commentsIds"
+_DONE_TRUE = ("1", "true", "on")
+
+
+def _comment_part_roots(zf: zipfile.ZipFile, part_name: str) -> tuple[Any | None, Any | None, Any | None]:
+    """Parsed (comments, commentsExtended, commentsIds) roots for *part_name*,
+    resolved through its relationships (relationship type suffix), falling
+    back to the conventional ``word/`` names; None for an absent part."""
+    names = set(zf.namelist())
+    found: dict[str, str] = {}
+    rels_root = load_rels_root(zf, part_name)
+    if rels_root is not None:
+        directory = part_name.rsplit("/", 1)[0] if "/" in part_name else ""
+        for rel in rels_root:
+            rel_type = rel.get("Type") or ""
+            target = rel.get("Target") or ""
+            for suffix in (_COMMENTS_REL, _COMMENTS_EXT_REL, _COMMENTS_IDS_REL):
+                if rel_type.endswith(suffix) and target and suffix not in found:
+                    resolved = target.lstrip("/") if target.startswith("/") else (
+                        f"{directory}/{target}" if directory else target
+                    )
+                    found[suffix] = resolved
+    defaults = {
+        _COMMENTS_REL: "word/comments.xml",
+        _COMMENTS_EXT_REL: "word/commentsExtended.xml",
+        _COMMENTS_IDS_REL: "word/commentsIds.xml",
+    }
+    roots: list[Any | None] = []
+    for suffix in (_COMMENTS_REL, _COMMENTS_EXT_REL, _COMMENTS_IDS_REL):
+        name = found.get(suffix) or defaults[suffix]
+        roots.append(read_part_xml(zf, name) if name in names else None)
+    return roots[0], roots[1], roots[2]
+
+
+def _comment_text(comment_elem: Any) -> str:
+    """A comment's paragraphs' texts (same mapping as ``paragraph_texts``)
+    joined with ``\\n``."""
+    walker = _PartWalker()
+    walker.walk_block_container(comment_elem, [])
+    return "\n".join(paragraph_texts(_finalize_projection(walker, "comment")))
+
+
+def _content_comment_threads(
+    comments_root: Any | None, ext_root: Any | None, ids_root: Any | None
+) -> dict[str, list[Any]]:
+    """Root comments keyed by their ``w:id``: ``{w_id: [author, text,
+    resolved, replies, orphan]}`` (the ``"c"`` item minus its tag). Replies
+    attach to their thread root (following ``w15:paraIdParent`` up), in
+    comments.xml order; ``resolved`` is the root's ``w15:done``. A reply
+    whose parent is missing becomes its own root with ``orphan`` true.
+    Linkage that cannot be interpreted (a comment without ``w:id``, a
+    duplicate ``w:id``, an ambiguous parent paraId, or a parent cycle)
+    raises INVALID_INPUT."""
+    if comments_root is None:
+        return {}
+    done_by_para, parent_by_para, _children = comment_thread_links(ext_root)
+    records: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for elem in comments_root:
+        if _ln(elem) != "comment":
+            continue
+        w_id = _attr(elem, "id")
+        if w_id is None:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                "a w:comment in the comments part has no w:id; its anchor cannot be placed for a content digest.",
+                {"stage": "content_digest", "comment_index": len(records)},
+            )
+        if w_id in seen_ids:
+            raise _make_error(
+                ErrorCode.INVALID_INPUT,
+                f"two comments share w:id {w_id!r}; their anchors are ambiguous for a content digest.",
+                {"stage": "content_digest", "w_id": w_id},
+            )
+        seen_ids.add(w_id)
+        records.append(
+            {
+                "w_id": w_id,
+                "author": _attr(elem, "author") or "",
+                "text": _comment_text(elem),
+                "para_id": identity_para_id(elem, ids_root=ids_root, ext_root=ext_root),
+            }
+        )
+
+    index_by_para: dict[str, int] = {}
+    duplicated: set[str] = set()
+    for i, rec in enumerate(records):
+        pid = rec["para_id"]
+        if pid:
+            if pid in index_by_para:
+                duplicated.add(pid)
+            index_by_para[pid] = i
+
+    def _root_of(i: int) -> tuple[int, bool]:
+        """(root index, root is orphaned) for record *i*."""
+        chain = [i]
+        while True:
+            pid = records[chain[-1]]["para_id"]
+            parent_pid = parent_by_para.get(pid) if pid else None
+            if not parent_pid:
+                return chain[-1], False
+            if parent_pid in duplicated:
+                raise _make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"comment w:id {records[chain[-1]]['w_id']!r} replies to paraId {parent_pid!r}, which more than "
+                    "one comment carries; the thread cannot be interpreted for a content digest.",
+                    {"stage": "content_digest", "w_id": records[chain[-1]]["w_id"], "para_id_parent": parent_pid},
+                )
+            j = index_by_para.get(parent_pid)
+            if j is None:
+                return chain[-1], True
+            if j in chain:
+                raise _make_error(
+                    ErrorCode.INVALID_INPUT,
+                    "comment threading (w15:paraIdParent) forms a cycle; it cannot be interpreted for a content digest.",
+                    {"stage": "content_digest", "w_ids": [records[k]["w_id"] for k in chain]},
+                )
+            chain.append(j)
+
+    roots: dict[int, list[Any]] = {}
+    root_index = [_root_of(i) for i in range(len(records))]
+    for i, (r, orphan) in enumerate(root_index):
+        if r == i:
+            rec = records[i]
+            resolved = (done_by_para.get(rec["para_id"] or "") or "").strip().lower() in _DONE_TRUE
+            roots[i] = [rec["author"], rec["text"], resolved, [], orphan]
+    for i, (r, _orphan) in enumerate(root_index):
+        if r != i:
+            roots[r][3].append([records[i]["author"], records[i]["text"]])
+    return {records[i]["w_id"]: item for i, item in roots.items()}
+
+
+def _cell_tables(container: Any) -> list[Any]:
+    """Tables directly in a cell, through the same wrappers walk_block_container
+    descends (block sdt, unknown wrappers), in document order."""
+    found: list[Any] = []
+    for child in container:
+        tag = _ln(child)
+        if tag == "tbl":
+            found.append(child)
+        elif tag == "p" or tag in _SKIP_TAGS:
+            continue
+        elif tag == "sdt":
+            content = next((c for c in child if _ln(c) == "sdtContent"), None)
+            if content is not None:
+                found.extend(_cell_tables(content))
+        else:
+            found.extend(_cell_tables(child))
+    return found
+
+
+def _table_shape(tbl: Any) -> list[Any]:
+    """``[[grid_span, v_merge, nested], ...]`` per row (see
+    ``section_content_items``)."""
+    rows: list[Any] = []
+    for tr in tbl:
+        if _ln(tr) != "tr":
+            continue
+        cells: list[Any] = []
+        for tc in tr:
+            if _ln(tc) != "tc":
+                continue
+            grid_span = 1
+            v_merge = "none"
+            tc_pr = next((c for c in tc if _ln(c) == "tcPr"), None)
+            if tc_pr is not None:
+                for prop in tc_pr:
+                    if _ln(prop) == "gridSpan":
+                        raw = (_attr(prop, "val") or "1").strip()
+                        if not raw.isdigit():
+                            raise _make_error(
+                                ErrorCode.INVALID_INPUT,
+                                f"a table cell's w:gridSpan is {raw!r}, not a number.",
+                                {"stage": "content_digest", "grid_span": raw},
+                            )
+                        grid_span = int(raw)
+                    elif _ln(prop) == "vMerge":
+                        v_merge = "restart" if _attr(prop, "val") == "restart" else "continue"
+            cells.append([grid_span, v_merge, [_table_shape(t) for t in _cell_tables(tc)]])
+        rows.append(cells)
+    return rows
+
+
+def _content_sha12(items: list[Any]) -> str:
+    canonical = json.dumps(items, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return _sha256_hex(canonical.encode("utf-8"))[:12]
+
+
+def _heading_sections(
+    proj: Projection, styles_by_id: dict[str, dict]
+) -> list[tuple[ParagraphMeta, int, str, str, int, int]]:
+    """``(meta, level, heading_text, section_key, start_idx, end_idx)`` per
+    heading section, flat (each runs to the next heading at any level);
+    *end_idx* exclusive. Headings inside table cells are not boundaries."""
+    para_text_by_ref: dict[str, list[str]] = {}
+    for event in proj.events:
+        if isinstance(event, RunEvent):
+            para_text_by_ref.setdefault(event.para_ref, []).append(event.text)
+    heading_paras: list[tuple[ParagraphMeta, int, str]] = []
+    for meta in proj.paragraphs:
+        level = _resolve_outline_level(meta.style_id, meta.outline_lvl, styles_by_id)
+        if level is None or meta.container_chain:
+            # Headings inside a table cell are out of scope for WP-03's
+            # section model (a table-cell "heading" style is common for
+            # emphasis, not a real document section boundary).
+            continue
+        heading_text = "".join(para_text_by_ref.get(meta.para_ref, [])).strip()
+        heading_paras.append((meta, level, heading_text))
+
+    index_of = {m.para_ref: i for i, m in enumerate(proj.paragraphs)}
+    slug_counts: dict[str, int] = {}
+    out: list[tuple[ParagraphMeta, int, str, str, int, int]] = []
+    for idx, (meta, level, heading_text) in enumerate(heading_paras):
+        base_slug = _slugify(heading_text)
+        slug_counts[base_slug] = slug_counts.get(base_slug, 0) + 1
+        start_idx = index_of[meta.para_ref]
+        end_idx = index_of[heading_paras[idx + 1][0].para_ref] if idx + 1 < len(heading_paras) else len(proj.paragraphs)
+        out.append((meta, level, heading_text, f"{base_slug}-{slug_counts[base_slug]}", start_idx, end_idx))
+    return out
+
+
+def _content_ranges(
+    proj: Projection, headings: list[tuple[ParagraphMeta, int, str, str, int, int]]
+) -> list[tuple[int, int]]:
+    """The preamble's paragraph range, then each heading section's (the same
+    ``max(end, start + 1)`` slice find_sections digests)."""
+    preamble_end = headings[0][4] if headings else len(proj.paragraphs)
+    return [(0, preamble_end)] + [(h[4], max(h[5], h[4] + 1)) for h in headings]
+
+
+def _content_items_by_range(
+    docx_path: Path,
+    part_name: str,
+    proj: Projection,
+    texts: list[str],
+    ranges: list[tuple[int, int]],
+) -> list[list[Any]]:
+    """The canonical item list (see ``section_content_items``) for each
+    ``[start, end)`` paragraph range in *ranges*. *texts* is
+    ``paragraph_texts(proj)``, already trimmed of an ignored trailing empty
+    paragraph (whose ordinal is then out of every range)."""
+    count = len(texts)
+    with zipfile.ZipFile(docx_path) as zf:
+        comments_root, ext_root, ids_root = _comment_part_roots(zf, part_name)
+    threads = _content_comment_threads(comments_root, ext_root, ids_root)
+
+    index_of = {m.para_ref: i for i, m in enumerate(proj.paragraphs)}
+    tables_at: dict[int, list[Any]] = {}
+    for ordinal, tbl in proj.top_level_tables:
+        tables_at.setdefault(ordinal, []).append(tbl)
+    dels_at: dict[int, list[DeletedSpan]] = {}
+    for span in proj.deleted_spans:
+        dels_at.setdefault(index_of[span.para_ref], []).append(span)
+
+    # Root comments with an anchor in this part: (order, first, last) ordinals.
+    placed: list[tuple[int, int, int, list[Any]]] = []
+    last_ordinal = max(count - 1, 0)
+    for w_id, item in threads.items():
+        anchor = proj.comment_anchors.get(w_id)
+        if not anchor or ("start" not in anchor and "ref" not in anchor):
+            continue  # anchored outside this part (or nowhere)
+        first = anchor["start"] if "start" in anchor else anchor["ref"]
+        last = anchor.get("end", first)
+        first, last = min(first, last), max(first, last)
+        order = anchor["start_seq"] if "start_seq" in anchor else anchor["ref_seq"]
+        placed.append((order, min(first, last_ordinal), min(last, last_ordinal), ["c", *item]))
+    placed.sort(key=lambda entry: entry[0])
+
+    out: list[list[Any]] = []
+    for start, end in ranges:
+        items: list[Any] = []
+        for i in range(start, min(end, count)):
+            for tbl in tables_at.get(i, []):
+                items.append(["tbl", _table_shape(tbl)])
+            items.append(["p", texts[i]])
+            for span in dels_at.get(i, []):
+                items.append(["del", i - start, span.offset, span.text])
+        for _order, first, last, item in placed:
+            if first < end and last >= start and start < count:
+                items.append(item)
+        out.append(items)
+    return out
+
+
+def section_content_items(
+    docx_path: Path, part_name: str = DEFAULT_PART, *, ignore_trailing_empty: bool = False
+) -> dict[str, Any]:
+    """The canonical content projection behind ``content_sha12`` (issue #117):
+    ``{"preamble": items, "sections": [(section_key, items), ...]}``, one
+    entry per heading section (same boundaries and keys as find_sections) plus
+    the preamble (paragraphs before the first heading; the whole part when it
+    has no headings).
+
+    Items, in document order (a ``tbl`` just before its first cell paragraph,
+    each ``del`` just after its paragraph's ``p``, then the ``c`` items):
+
+    - ``["p", text]`` per paragraph, table-cell paragraphs included; text
+      exactly as ``paragraph_texts`` (soft break U+000B, tracked insertions
+      included, deletions not).
+    - ``["del", para_ordinal_within_section, offset_in_para, text]`` per
+      tracked deletion (``w:delText``); offset is the code-point offset in the
+      paragraph's projected text at the deletion point.
+    - ``["tbl", rows]`` per top-level table: rows of cells ``[grid_span,
+      v_merge ("none"|"restart"|"continue"), nested]``, *nested* being the
+      cell's nested tables in the same shape. Cell text is in the ``p`` items.
+    - ``["c", author, text, resolved, replies, orphan]`` per ROOT comment
+      anchored in the section, ordered by its commentRangeStart (or, without
+      one, its commentReference). *text* is its paragraphs joined with
+      ``\\n``; *replies* is ``[[author, text], ...]`` in comments.xml order;
+      *resolved* is the root's ``w15:done``. A reply whose parent is missing
+      is its own root with *orphan* true. A comment is anchored by the
+      paragraphs from its commentRangeStart to its commentRangeEnd (a
+      zero-width anchor included) and counts in every section it touches.
+
+    Excluded by construction: rsids, w14:paraId/textId, proofErr,
+    lastRenderedPageBreak, bookmarks, comment dates and ids, all character and
+    paragraph formatting, images, text boxes (their own scopes), comments
+    anchored outside this part, and -- with *ignore_trailing_empty* (a live
+    ``Body.getOoxml()`` export) -- the trailing empty paragraph Word appends.
+
+    Raises INVALID_INPUT when comment linkage cannot be interpreted.
+    """
+    styles_by_id = {s["style_id"]: s for s in list_styles_impl(docx_path) if s["style_id"]}
+    proj = project_part(docx_path, part_name)
+    texts = paragraph_texts(proj)
+    if ignore_trailing_empty and texts and texts[-1] == "":
+        texts = texts[:-1]
+    headings = _heading_sections(proj, styles_by_id)
+    items = _content_items_by_range(docx_path, part_name, proj, texts, _content_ranges(proj, headings))
+    return {"preamble": items[0], "sections": [(h[3], it) for h, it in zip(headings, items[1:], strict=True)]}
+
+
+def section_content_digests(
+    docx_path: Path, part_name: str = DEFAULT_PART, *, ignore_trailing_empty: bool = False
+) -> dict[str, Any]:
+    """``{"preamble_content_sha12": str, "sections": [[section_key,
+    content_sha12], ...]}``: the first 12 hex of the sha256 of
+    ``json.dumps(items, sort_keys=True, separators=(",", ":"),
+    ensure_ascii=False)`` over each ``section_content_items`` list."""
+    content = section_content_items(docx_path, part_name, ignore_trailing_empty=ignore_trailing_empty)
+    return {
+        "preamble_content_sha12": _content_sha12(content["preamble"]),
+        "sections": [[key, _content_sha12(items)] for key, items in content["sections"]],
+    }
+
+
 def find_sections_impl(
     docx_path: Path,
     part_name: str = DEFAULT_PART,
     *,
     digests: bool = False,
     ignore_trailing_empty: bool = False,
+    content_digests: bool = False,
 ) -> list[dict[str, Any]]:
-    """Heading ranges PLUS text-box sub-scopes, both keyed by
+    """find_sections' section list; see ``find_sections_and_preamble``."""
+    return find_sections_and_preamble(
+        docx_path,
+        part_name,
+        digests=digests,
+        ignore_trailing_empty=ignore_trailing_empty,
+        content_digests=content_digests,
+    )[0]
+
+
+def find_sections_and_preamble(
+    docx_path: Path,
+    part_name: str = DEFAULT_PART,
+    *,
+    digests: bool = False,
+    ignore_trailing_empty: bool = False,
+    content_digests: bool = False,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """``(sections, preamble_content_sha12)``; the second is None unless
+    *content_digests*. With *content_digests* each heading entry also carries
+    ``content_sha12`` (see ``section_content_items``), computed from the same
+    projection as ``sha12``.
+
+    Heading ranges PLUS text-box sub-scopes, both keyed by
     ``section_key`` — this is the one discovery call a caller uses to find
     every ``section_key`` read_document(section_key=...) can then address,
     of either kind (each entry's ``"kind"`` is ``"heading"`` or
@@ -1602,24 +2041,7 @@ def find_sections_impl(
     styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
 
     projection = project_part(docx_path, part_name)
-    heading_paras: list[tuple[ParagraphMeta, int, str]] = []
-    para_text_by_ref: dict[str, list[str]] = {}
-    for event in projection.events:
-        if isinstance(event, RunEvent):
-            para_text_by_ref.setdefault(event.para_ref, []).append(event.text)
-
-    for meta in projection.paragraphs:
-        level = _resolve_outline_level(meta.style_id, meta.outline_lvl, styles_by_id)
-        if level is None or meta.container_chain:
-            # Headings inside a table cell are out of scope for WP-03's
-            # section model (a table-cell "heading" style is common for
-            # emphasis, not a real document section boundary).
-            continue
-        heading_text = "".join(para_text_by_ref.get(meta.para_ref, [])).strip()
-        heading_paras.append((meta, level, heading_text))
-
-    slug_counts: dict[str, int] = {}
-    sections: list[dict[str, Any]] = []
+    headings = _heading_sections(projection, styles_by_id)
     all_para_refs = [m.para_ref for m in projection.paragraphs]
     texts = paragraph_texts(projection)
     if ignore_trailing_empty and texts and texts[-1] == "":
@@ -1628,18 +2050,14 @@ def find_sections_impl(
         # digest of a live body read would never match the pane's.
         texts = texts[:-1]
 
-    for idx, (meta, level, heading_text) in enumerate(heading_paras):
-        base_slug = _slugify(heading_text)
-        slug_counts[base_slug] = slug_counts.get(base_slug, 0) + 1
-        section_key = f"{base_slug}-{slug_counts[base_slug]}"
+    content: list[list[Any]] = []
+    preamble_sha: str | None = None
+    if content_digests:
+        content = _content_items_by_range(docx_path, part_name, projection, texts, _content_ranges(projection, headings))
+        preamble_sha = _content_sha12(content[0])
 
-        start_idx = all_para_refs.index(meta.para_ref)
-        if idx + 1 < len(heading_paras):
-            next_meta = heading_paras[idx + 1][0]
-            end_idx = all_para_refs.index(next_meta.para_ref)
-        else:
-            end_idx = len(all_para_refs)
-
+    sections: list[dict[str, Any]] = []
+    for idx, (meta, level, heading_text, section_key, start_idx, end_idx) in enumerate(headings):
         section_texts = texts[start_idx : max(end_idx, start_idx + 1)]
         entry = {
             "section_key": section_key,
@@ -1655,6 +2073,8 @@ def find_sections_impl(
         }
         if digests:
             entry["sha12"] = section_digest(section_texts)
+        if content_digests:
+            entry["content_sha12"] = _content_sha12(content[idx + 1])
         sections.append(entry)
 
     for textbox_scope in iter_textbox_scopes(docx_path, part_name):
@@ -1671,7 +2091,7 @@ def find_sections_impl(
             }
         )
 
-    return sections
+    return sections, preamble_sha
 
 
 # ---------------------------------------------------------------------------
