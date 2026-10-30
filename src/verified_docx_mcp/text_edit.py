@@ -1094,9 +1094,9 @@ def _audit_stale_after_write(exc: VerifyError, *, tool: str, path: str, document
 
 def execute_replace_text_live(
     path: str,
-    find: str,
+    find: str | None,
     replace: str,
-    expected_matches: int,
+    expected_matches: int | None,
     *,
     revision_before: str | None = None,
     track_changes: bool = False,
@@ -1192,9 +1192,9 @@ def execute_replace_text_live(
     try:
         result = _live_replace_once(
             session,
-            find=target["text"] if target else find,
+            find=target["text"] if target else (find or ""),
             replace=replace,
-            expected_matches=1 if target else expected_matches,
+            expected_matches=1 if target else (expected_matches or 0),
             pre_hash=pre_hash,
             target=target,
             track_changes=track_changes,
@@ -1310,7 +1310,7 @@ def _validate_batch_edits(edits: Any) -> list[dict[str, Any]]:
             raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}].find must be a non-empty string")
         if not isinstance(replace, str):
             raise _make_error(ErrorCode.INVALID_INPUT, f"edits[{i}].replace must be a string")
-        target_args = {k: edit.get(k) for k in ("expected_length", "find_sha256", "para_ref", "expected_sha256")}
+        target_args: dict[str, Any] = {k: edit.get(k) for k in ("expected_length", "find_sha256", "para_ref", "expected_sha256")}
         try:
             kind = check_target_args(find, expected, **target_args)
             if kind == "plain" and (isinstance(expected, bool) or not isinstance(expected, int) or expected < 1):
@@ -1656,9 +1656,9 @@ def _resolve_row_span_filter(proj: projection.Projection, within_row_containing:
 
 def execute_replace_text(
     path: str,
-    find: str,
+    find: str | None,
     replace: str,
-    expected_matches: int,
+    expected_matches: int | None,
     *,
     revision_before: str | None = None,
     force: bool = False,
@@ -1680,7 +1680,7 @@ def execute_replace_text(
     anchored ``"<prefix>…<suffix>"`` (with *expected_length* and/or
     *find_sha256*), or None with *para_ref* + *expected_sha256* (the whole
     paragraph). See server.replace_text."""
-    target_args = {"expected_length": expected_length, "find_sha256": find_sha256,
+    target_args: dict[str, Any] = {"expected_length": expected_length, "find_sha256": find_sha256,
                    "para_ref": para_ref, "expected_sha256": expected_sha256}
     kind = check_target_args(find, expected_matches, **target_args)
     if kind == "para_ref" and within_row_containing:
@@ -1789,7 +1789,7 @@ def execute_format_text_live(
     path: str,
     find: str,
     style: dict[str, bool | str],
-    expected_matches: int,
+    expected_matches: int | None,
     *,
     revision_before: str | None = None,
     track_changes: bool = False,
@@ -1989,7 +1989,7 @@ def _execute_format_text(
     path: str,
     find: str,
     style: dict[str, bool | str],
-    expected_matches: int,
+    expected_matches: int | None,
     *,
     revision_before: str | None = None,
     force: bool = False,
@@ -2002,7 +2002,7 @@ def _execute_format_text(
     find_sha256: str | None = None,
 ) -> dict[str, Any]:
     style = _validate_style(style)
-    target_args = {"expected_length": expected_length, "find_sha256": find_sha256}
+    target_args: dict[str, Any] = {"expected_length": expected_length, "find_sha256": find_sha256}
     kind = check_target_args(find, expected_matches, allow_para_ref=False, **target_args)
     mode = live_write_mode.resolve_write_mode(path, write_mode)
     if mode == "live":
@@ -2307,7 +2307,7 @@ def _execute_apply_style(
     path: str,
     find: str,
     style_id: str,
-    expected_matches: int,
+    expected_matches: int | None,
     *,
     revision_before: str | None = None,
     force: bool = False,
@@ -2316,7 +2316,7 @@ def _execute_apply_style(
     expected_length: int | None = None,
     find_sha256: str | None = None,
 ) -> dict[str, Any]:
-    target_args = {"expected_length": expected_length, "find_sha256": find_sha256}
+    target_args: dict[str, Any] = {"expected_length": expected_length, "find_sha256": find_sha256}
     kind = check_target_args(find, expected_matches, allow_para_ref=False, **target_args)
     resolved = paths.resolve_allowed_docx_path(path, must_exist=True)
     pre_revision = mutations._guard_before_write(
