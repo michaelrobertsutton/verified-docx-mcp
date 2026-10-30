@@ -1074,9 +1074,12 @@ class ListOpenItemsLiveTrimTests(LiveCommentsTestCase):
         await self.connect_pane(document=doc, body_ooxml=_flat_body())
         result = await self._list(fields="summary")
         self.assertEqual(result["comment_columns"], ["comment_id", "author", "resolved", "anchor", "reply_count"])
-        self.assertEqual(result["comments"][0][4], 1)
+        self.assertEqual(result["comment_rows"][0][4], 1)
         self.assertNotIn("suggestion_columns", result)
-        self.assertIsNone(result["suggestions"])  # fake pane has no live revisions
+        self.assertIsNone(result["suggestion_rows"])  # fake pane has no live revisions
+        for absent in ("comments", "suggestions", "pending_suggestions"):
+            self.assertNotIn(absent, result)  # JennyStack's recorder keys on a `comments` list
+        self.assertIn("path", result)
         for key in ("complete", "scope", "warnings", "source", "counts"):
             self.assertIn(key, result)
         self.assertEqual(result["source"], "live")
@@ -1089,7 +1092,7 @@ class ListOpenItemsLiveTrimTests(LiveCommentsTestCase):
         doc.comments[0].anchor_text = "x" * 200
         await self.connect_pane(document=doc, body_ooxml=_flat_body())
         result = await self._list(fields="summary")
-        self.assertEqual(result["comments"][0][3], "x" * 60)
+        self.assertEqual(result["comment_rows"][0][3], "x" * 60)
 
     async def test_unknown_fields_value_refused(self):
         await self.connect_pane(document=self._document(), body_ooxml=_flat_body())
@@ -1152,7 +1155,7 @@ class ListOpenItemsLiveTrimTests(LiveCommentsTestCase):
         self.assertTrue(by_id["live:ep1:c-nx"]["scope_uncertain"])
         summary = await self._list(section_key="background-1", fields="summary")
         self.assertEqual(summary["comment_columns"][-1], "scope_uncertain")
-        self.assertTrue(all(c[-1] for c in summary["comments"]))
+        self.assertTrue(all(c[-1] for c in summary["comment_rows"]))
 
     async def test_comment_with_no_paragraph_text_is_kept_and_flagged(self):
         doc = self._document()
@@ -1236,7 +1239,7 @@ class ListOpenItemsLiveTrimTests(LiveCommentsTestCase):
             unittest.mock.patch.object(write_mode, "_check_session_identity", lambda path, session: None),
         ):
             result = await self._list(section_key="background-1", fields="summary")
-        self.assertEqual([c[0] for c in result["comments"]], ["live:ep1:c-bg"])
+        self.assertEqual([c[0] for c in result["comment_rows"]], ["live:ep1:c-bg"])
         self.assertIn("body_ooxml", pane.calls)
         with self.assertRaises(LiveOpFailed) as ctx:
             call(b, "replace")  # still stale: the scoped list did not re-arm it
@@ -1276,11 +1279,11 @@ class ListOpenItemsLivePayloadSizeTests(LiveCommentsTestCase):
     async def test_summary_and_full_are_much_smaller_than_the_old_full_shape(self):
         """Measured on the 27-comment fixture above (compact JSON chars; ~chars/4 tokens):
         old full 19099, new full 11482 (60.1% of old: 23 chars over the 60% target), columnar
-        summary 2351 (under 2400). Closing the last 23 chars of full would mean dropping
+        summary 2308 (keeps `path`; drops summary-only diagnostics). Closing the last 23 chars of full would mean dropping
         information. What remains in full's comments array (~10997): anchor_paragraph_text 3451,
         content 2718, anchor_text 1354, created_time 1134, comment_id 828, author 648, resolved 459,
         replies 350; summary rows ~1997 (anchor 844, comment_id 477, author 405, resolved 162,
-        reply_count 54). Summary omits `pane` and `path`; both modes omit null/empty top-level keys."""
+        reply_count 54). Summary omits `pane` (and keeps `path`); both modes omit null/empty top-level keys."""
         doc = twenty_seven_comment_document()
         await self.connect_pane(document=doc)
         summary = await self.call(
@@ -1288,11 +1291,94 @@ class ListOpenItemsLivePayloadSizeTests(LiveCommentsTestCase):
         )
         full = await self.call(lambda: comments_live.execute_list_open_items_live(str(self.target)))
         old = await self._old_shape_size(doc)
-        self.assertEqual(len(summary["comments"]), 27)
+        self.assertEqual(len(summary["comment_rows"]), 27)
         print(f"\n#111 sizes (chars): old full={old} new full={self._size(full)} summary={self._size(summary)}")
         self.assertLessEqual(self._size(full), old * 0.605)
         self.assertLess(self._size(summary), 2400)
-        for gone in ("pane", "path", "warnings", "file_only_open_comments", "suggestion_columns"):
+        for gone in ("pane", "warnings", "file_only_open_comments", "suggestion_columns", "comments", "suggestions"):
             self.assertNotIn(gone, summary)
+        self.assertIn("path", summary)
         for kept in ("pane", "path"):
             self.assertIn(kept, full)
+
+
+class ListOpenItemsLiveSuggestionScopeTests(LiveCommentsTestCase):
+    """Issue #111 review: a live suggestion's paragraph_context carries w:delText, which the
+    projection-based paragraph index does not; scoping must still place it."""
+
+    fixture_name = "revision/tracked.docx"
+
+    def _patched_revisions(self, revisions):
+        from verified_docx_mcp.live import revisions_live
+
+        return unittest.mock.patch.object(
+            revisions_live, "list_revisions",
+            lambda session: {"revisions": revisions, "coverage": "body" if revisions is not None else "unavailable",
+                             "reason": None},
+        )
+
+    async def test_whole_document_scope_places_insertion_and_deletion_in(self):
+        from verified_docx_mcp.live import revisions_live
+
+        flat = docx_to_flat_opc(self.target)
+        inventory = revisions_live._markup_revisions(flat, "ep1")
+        self.assertEqual({r["markup_type"] for r in inventory}, {"ins", "del"})
+        self.assertIn("he re", inventory[1]["paragraph_context"][0])  # deleted text is in the context
+        await self.connect_pane(document=FakeDocument(text="", author_name="Pat"), body_ooxml=flat)
+        with self._patched_revisions(inventory):
+            result = await self.call(
+                lambda: comments_live.execute_list_open_items_live(
+                    str(self.target), within_text="vision-token base fixture"
+                )
+            )
+        self.assertEqual(len(result["pending_suggestions"]), 2)
+        self.assertFalse(any(s.get("scope_uncertain") for s in result["pending_suggestions"]))
+        self.assertEqual(result["counts"]["in_scope"]["suggestions"], 2)
+        self.assertIs(result["scoped"], True)
+
+    async def test_in_scope_suggestion_count_is_unknown_without_a_revision_inventory(self):
+        flat = docx_to_flat_opc(self.target)
+        await self.connect_pane(document=FakeDocument(text="", author_name="Pat"), body_ooxml=flat)
+        with self._patched_revisions(None):
+            result = await self.call(
+                lambda: comments_live.execute_list_open_items_live(
+                    str(self.target), within_text="vision-token base fixture"
+                )
+            )
+        self.assertIsNone(result["counts"]["in_scope"]["suggestions"])
+        self.assertIsNone(result["pending_suggestions"])
+
+
+class CommentToolsWithListedLiveHandleTests(LiveCommentsTestCase):
+    """Issue #111 review: the MCP tools (not just execute_*) accept the `live:<epoch>:<id>` handle
+    that list_open_items hands out."""
+
+    fixture_name = "frag.docx"
+
+    async def test_reply_and_resolve_tools_accept_a_listed_handle(self):
+        from fastmcp import Client
+
+        doc = FakeDocument(text="The quick brown fox jumps over the lazy dog.")
+        doc.session_epoch = "ep9"
+        await self.connect_pane(document=doc)
+        await self.call(comments_live.execute_add_anchored_comment_live, str(self.target), "brown fox", "x", 1)
+        async with Client(server.mcp) as client:
+            listed = (
+                await client.call_tool("list_open_items", {"path": str(self.target), "source": "live"})
+            ).structured_content
+            handle = listed["comments"][0]["comment_id"]
+            self.assertTrue(handle.startswith("live:ep9:"))
+            replied = await client.call_tool(
+                "reply_to_comment",
+                {"path": str(self.target), "comment_id": handle, "text": "ok", "write_mode": "live"},
+                raise_on_error=False,
+            )
+            self.assertFalse(replied.is_error, replied)
+            resolved = await client.call_tool(
+                "resolve_comment",
+                {"path": str(self.target), "comment_id": handle, "write_mode": "live"},
+                raise_on_error=False,
+            )
+            self.assertFalse(resolved.is_error, resolved)
+        self.assertTrue(doc.comments[0].resolved)
+        self.assertEqual(len(doc.comments[0].replies), 1)

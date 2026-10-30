@@ -303,12 +303,16 @@ def execute_list_open_items(
 
         scope = open_items.paragraph_scope(local_path, proj, section_key, within_text)
         uncertain: set[str] = set()
+        uncertain_sugg: set[int] = set()
         if scope is not None:
             placed = _comment_scope(comments, proj, scope)
             comments = [c for c, _u in placed]
             uncertain = {c["comment_id"] for c, u in placed if u}
             index_by_ref = {m.para_ref: i for i, m in enumerate(proj.paragraphs)}
-            suggestions = [s for s in suggestions if index_by_ref.get(s["para_ref"]) in scope]
+            # A suggestion with no para_ref (text-box content, table-row revisions) cannot be
+            # placed: kept and flagged, like an unplaceable comment, never silently dropped.
+            uncertain_sugg = {id(s) for s in suggestions if s["para_ref"] is None}
+            suggestions = [s for s in suggestions if id(s) in uncertain_sugg or index_by_ref.get(s["para_ref"]) in scope]
 
         counts: dict[str, Any] = {"comments": total_comments, "suggestions": total_suggestions}
         if scope is not None:
@@ -330,6 +334,7 @@ def execute_list_open_items(
                         "kind": s["kind"],
                         "author": s["author"],
                         "anchor": open_items.clip(s["text"] or s["anchor_context"]),
+                        "scope_uncertain": id(s) in uncertain_sugg,
                     }
                     for s in suggestions
                 ],
@@ -340,9 +345,10 @@ def execute_list_open_items(
                     "path": str(resolved),
                     "counts": counts,
                     "comment_columns": ccols,
-                    "comments": crows,
+                    "comment_rows": crows,
                     "suggestion_columns": scols,
-                    "suggestions": srows,
+                    "suggestion_rows": srows,
+                    "scoped": True if scope is not None else None,
                 },
                 summary=True,
             )
@@ -362,6 +368,8 @@ def execute_list_open_items(
         out_suggestions = []
         for s in suggestions:
             row = dict(s)
+            if id(s) in uncertain_sugg:
+                row["scope_uncertain"] = True
             if row["para_ref"] is not None:
                 anchor_contexts.setdefault(row["para_ref"], row.pop("anchor_context"))
             out_suggestions.append(row)
@@ -370,6 +378,7 @@ def execute_list_open_items(
             result["anchor_contexts"] = anchor_contexts
         if scope is not None:
             result["counts"] = counts
+            result["scoped"] = True
         return result
     finally:
         if is_temp:

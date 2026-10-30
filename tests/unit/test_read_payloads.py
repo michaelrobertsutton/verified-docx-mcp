@@ -191,7 +191,7 @@ class LockStatusToolTests(_FileBase):
     def test_default_is_compact_and_verbose_restores_everything(self):
         compact = self.call("lock_status")
         self.assertEqual(set(compact), {"owner_file", "desktop_word", "sync_quiesced", "external_activity"})
-        self.assertEqual(set(compact["external_activity"]), {"divergent", "still_current"})
+        self.assertEqual(set(compact["external_activity"]), {"divergent", "still_current", "recent", "ledger"})
         full = self.call("lock_status", verbose=True)
         self.assertIn("sync_detail", full)
         self.assertNotIn("path", full)  # the lean read envelope drops an echoed path
@@ -223,9 +223,11 @@ class AnnotationTests(unittest.TestCase):
 
     def test_no_mutating_tool_is_marked_read_only(self):
         tools = self.tools()
-        for name in MUTATING_TOOLS:
+        for name in set(tools) - READ_TOOLS:
             ann = tools[name].annotations
             self.assertFalse(ann is not None and ann.readOnlyHint, name)
+        for name in MUTATING_TOOLS:
+            self.assertNotIn(name, READ_TOOLS)
 
     def test_destructive_tools_say_so(self):
         tools = self.tools()

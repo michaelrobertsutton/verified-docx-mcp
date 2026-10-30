@@ -1243,7 +1243,8 @@ def style_near_matches(
 ) -> dict[str, Any]:
     """STYLE_NOT_FOUND diagnostics: up to *limit* styles whose name or id is
     close to *wanted* (``[{style_id, name}]``) plus ``available_count``, in
-    place of the whole style list (which can run to hundreds of entries)."""
+    place of the whole style list (which can run to hundreds of entries). When
+    nothing is close, ``available_sample`` is the first 20 style names, sorted."""
     pool = [s for s in styles if s.get("style_id") and (style_type is None or s.get("type") == style_type)]
     by_key: dict[str, dict[str, Any]] = {}
     for s in pool:
@@ -1256,7 +1257,11 @@ def style_near_matches(
         entry = {"style_id": by_key[key]["style_id"], "name": by_key[key].get("name")}
         if entry not in near:
             near.append(entry)
-    return {"near_matches": near[:limit], "available_count": len(pool)}
+    out: dict[str, Any] = {"near_matches": near[:limit], "available_count": len(pool)}
+    if not out["near_matches"]:
+        # Nothing close (e.g. a localized template): give the caller real names to pick from.
+        out["available_sample"] = sorted({s.get("name") or s["style_id"] for s in pool}, key=str.lower)[:20]
+    return out
 
 
 # ---------------------------------------------------------------------------

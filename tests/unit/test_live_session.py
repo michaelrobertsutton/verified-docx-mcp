@@ -400,6 +400,34 @@ class LiveStatusShapeTests(LiveBridgeTestCase):
         self.assertEqual([s["document_name"] for s in both["sessions"]], ["A.docx"])
         self.assertIn("requirement_sets", both["sessions"][0])
 
+    async def test_live_status_surfaces_locks_by_default_and_filters_by_path(self):
+        import unittest.mock
+        from types import SimpleNamespace
+
+        from verified_docx_mcp import server as server_module
+
+        for name in ("A.docx", "B.docx"):
+            await self.connect_pane(document_url=f"/tmp/{name}")
+        locks = [
+            {"document_url": "/tmp/A.docx", "client_id": "other", "scope": "document", "remaining_s": 41.234},
+            {"document_url": "/tmp/B.docx", "client_id": "me", "scope": "section", "section_key": "s-1",
+             "heading_text": "S", "remaining_s": 9.0},
+        ]
+        real = self.registry
+        shared_registry = SimpleNamespace(
+            list=real.list, collisions=real.collisions,
+            status=lambda: {"owner_pid": 1, "recent_boots": [], "clients": [], "locks": locks, "client_id": "me"},
+        )
+        with unittest.mock.patch.object(
+            server_module.live_bridge, "start_in_background", lambda *a, **k: shared_registry
+        ):
+            everything = server_module.execute_live_status()
+            only_a = server_module.execute_live_status(path="/tmp/A.docx")
+        self.assertEqual({lk["document_url"] for lk in everything["locks"]}, {"/tmp/A.docx", "/tmp/B.docx"})
+        self.assertEqual(everything["client_id"], "me")
+        self.assertNotIn("shared", everything)
+        self.assertEqual([(lk["client_id"], lk["remaining_s"]) for lk in only_a["locks"]], [("other", 41.2)])
+
     async def test_live_status_surfaces_session_collisions(self):
         from verified_docx_mcp import server as server_module
 

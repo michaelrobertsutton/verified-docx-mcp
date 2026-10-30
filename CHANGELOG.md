@@ -3,10 +3,10 @@
 ## Unreleased
 
 - Trimmed read payloads (#111):
-  - `list_open_items` gains `fields="summary"` (columnar, ~590 tokens for 27 comments), `section_key`/`within_text` scoping and `include_correlation`. Its default `full` shape drops constant or derivable fields (`modified_time`, `scope`, live `w_id`/`quoted_text`, `reply_count`, empty `replies`, null top-level keys) and is 39.9% smaller on the 27-comment fixture.
+  - `list_open_items` gains `fields="summary"` (columnar, ~577 tokens for 27 comments; rows under `comment_rows`/`suggestion_rows`, never a `comments` key, `path` kept; scoped results carry `scoped: true`), `section_key`/`within_text` scoping and `include_correlation`. Its default `full` shape drops constant or derivable fields (`modified_time`, `scope`, live `w_id`/`quoted_text`, `reply_count`, empty `replies`, null top-level keys) and is 39.9% smaller on the 27-comment fixture.
   - `list_tables` reports `header_row` and `anchor_section_key`.
   - `list_styles` gains `type`/`name_contains` filters; `STYLE_NOT_FOUND` lists near matches instead of every style.
-  - `live_status(path, verbose)` and `lock_status(verbose)` are compact by default.
+  - `live_status(path, verbose)` and `lock_status(verbose)` are compact by default (`live_status` still shows `locks` and this client's `client_id`; `lock_status` keeps `recent` and `ledger`). `STYLE_NOT_FOUND` adds `available_sample` when nothing is close.
   - A lean read envelope drops echoed paths, empty lists and `revision_detail` (`read_document(verbose=true)` restores it).
   - Read tools carry `readOnlyHint`/`idempotentHint`; destructive tools carry `destructiveHint`.
   - Fix: `resolve_comment`/`reply_to_comment` accept the `live:<epoch>:<id>` handles `list_open_items` returns.

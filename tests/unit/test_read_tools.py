@@ -261,6 +261,17 @@ class StyleNotFoundNearMatchTests(ReadToolsTestCase):
         diagnostics = ctx.exception.envelope.diagnostics
         self.assertEqual(diagnostics["near_matches"], [])
         self.assertGreater(diagnostics["available_count"], 25)
+        # nothing close: the caller still gets real names to choose from
+        sample = diagnostics["available_sample"]
+        self.assertEqual(len(sample), 20)
+        self.assertEqual(sample, sorted(sample, key=str.lower))
+
+    def test_available_sample_only_when_nothing_is_close(self):
+        from verified_docx_mcp import projection
+
+        styles = [{"style_id": "Heading1", "name": "heading 1", "type": "paragraph"}]
+        self.assertNotIn("available_sample", projection.style_near_matches(styles, "headng 1"))
+        self.assertEqual(projection.style_near_matches(styles, "zzzzqq")["available_sample"], ["heading 1"])
 
 
 class ReadsNeverRefuseTests(ReadToolsTestCase):

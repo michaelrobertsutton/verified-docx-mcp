@@ -14,8 +14,10 @@ list_open_items (live or file):
              `replies` are OPTIONAL there (comment_dispositions.py:171-175, 189: a missing count is 0,
              a missing `replies` is [], the thread size is max(count, len(replies))), so full mode
              omits `reply_count` and an empty `replies` (#111).
-  `fields="summary"` is columnar (comment_columns + row lists), which that loader does NOT read:
-             JennyStack must keep asking for `full` until it learns the columnar shape.
+  `fields="summary"` is columnar (comment_columns + `comment_rows` row lists; never a `comments` or
+             `suggestions` key, and `path` is kept), which that loader does NOT read: the recorder
+             (live_doc_stamp.record_list_items) stores only a response whose `comments` is a list, so
+             a summary is not recorded. JennyStack must keep asking for `full` for recorded reads.
   tracked-change rows are recognised by `suggestion_id`, or `kind` in (insertion, deletion), or
   `type` (live: Inserted/Deleted...).
 list_tables / list_styles: no JennyStack script reads either today; the long-standing fields are
@@ -118,11 +120,28 @@ class ListOpenItemsFileContractTests(_FileCase):
     def test_summary_is_columnar_with_complete_ids(self):
         result = self.call("list_open_items", {"fields": "summary"})
         self.assertEqual(result["comment_columns"], SUMMARY_COLUMNS)
-        row = dict(zip(result["comment_columns"], result["comments"][0], strict=True))
+        row = dict(zip(result["comment_columns"], result["comment_rows"][0], strict=True))
         self.assertEqual(row["comment_id"], "654503C0")
         self.assertEqual(row["reply_count"], 1)
         self.assertTrue(row["anchor"])
         self.assertEqual(result["source"], "file")
+
+
+def jennystack_records_list_items(response: dict) -> bool:
+    """JennyStack live_doc_stamp.record_list_items (scripts/live_doc_stamp.py:136): a response is
+    stored as the last list_open_items read only when it is a dict, not an error, and `comments`
+    is a list. comment_dispositions.load_items then skips every non-dict row, so a stored
+    columnar summary would read as an empty table with ok:true."""
+    return isinstance(response, dict) and isinstance(response.get("comments"), list)
+
+
+class SummaryIsNeverRecordedAsCommentsTests(_FileCase):
+    def test_file_summary_is_not_recorded_but_full_is(self):
+        summary = self.call("list_open_items", {"fields": "summary"})
+        self.assertFalse(jennystack_records_list_items(summary))
+        self.assertIn("comment_rows", summary)
+        self.assertEqual(Path(summary["path"]).resolve(), self.target.resolve())
+        self.assertTrue(jennystack_records_list_items(self.call("list_open_items")))
 
 
 class ListOpenItemsTrackedChangeFileContractTests(_FileCase):
@@ -137,7 +156,7 @@ class ListOpenItemsTrackedChangeFileContractTests(_FileCase):
             self.assertIn("author", row)
         summary = self.call("list_open_items", {"fields": "summary"})
         self.assertEqual(summary["suggestion_columns"], ["suggestion_id", "kind", "author", "anchor"])
-        self.assertEqual({r[1] for r in summary["suggestions"]}, {"insertion", "deletion"})
+        self.assertEqual({r[1] for r in summary["suggestion_rows"]}, {"insertion", "deletion"})
 
 
 class ListOpenItemsLiveContractTests(LiveCommentsTestCase):
@@ -176,11 +195,31 @@ class ListOpenItemsLiveContractTests(LiveCommentsTestCase):
         await self.connect_pane(document=self._document())
         result = await call("list_open_items", {"path": str(self.target), "source": "live", "fields": "summary"})
         self.assertEqual(result["comment_columns"], SUMMARY_COLUMNS)
-        row = dict(zip(result["comment_columns"], result["comments"][0], strict=True))
+        row = dict(zip(result["comment_columns"], result["comment_rows"][0], strict=True))
         self.assertEqual(
             (row["comment_id"], row["anchor"], row["reply_count"], row["resolved"]), ("live:ep1:c1", "overview", 1, False)
         )
         self.assertEqual(result["source"], "live")
+
+
+class ListOpenItemsLiveSummaryRecorderTests(LiveCommentsTestCase):
+    fixture_name = "sections.docx"
+
+    async def test_live_summary_is_not_recorded_and_keeps_path(self):
+        doc = FakeDocument(text="", author_name="Pat Reviewer")
+        doc.session_epoch = "ep1"
+        doc.comments = [
+            FakeComment(id="c1", content="x", author_name="Pat", creation_date="2026-10-01T12:00:00.000Z",
+                        anchor_text="overview", anchor_paragraph_text="Some overview text.")
+        ]
+        await self.connect_pane(document=doc)
+        args = {"path": str(self.target), "source": "live"}
+        summary = await call("list_open_items", {**args, "fields": "summary"})
+        self.assertFalse(jennystack_records_list_items(summary))
+        for absent in ("comments", "suggestions", "pending_suggestions"):
+            self.assertNotIn(absent, summary)
+        self.assertEqual(Path(summary["path"]).resolve(), self.target.resolve())  # the "another document" check reads it
+        self.assertTrue(jennystack_records_list_items(await call("list_open_items", args)))
 
 
 class ListTablesAndStylesContractTests(_FileCase):
@@ -259,7 +298,7 @@ class OtherReadToolContractTests(_FileCase):
         result = self.call("lock_status")
         self.assertIn("present", result["owner_file"])
         self.assertIn("sync_quiesced", result)
-        self.assertEqual(set(result["external_activity"]), {"divergent", "still_current"})
+        self.assertEqual(set(result["external_activity"]), {"divergent", "still_current", "recent", "ledger"})
 
 
 if __name__ == "__main__":

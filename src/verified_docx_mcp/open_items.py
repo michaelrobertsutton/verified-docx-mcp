@@ -63,13 +63,18 @@ def columnar(rows: list[dict[str, Any]], columns: list[str]) -> tuple[list[str],
 # Top-level keys kept even when null/empty: JennyStack reads comments/source/path, and a null or []
 # pending_suggestions / suggestions / complete carries meaning (unknown vs none).
 _ALWAYS_KEEP = frozenset({"comments", "source", "path", "pending_suggestions", "suggestions", "complete", "scope",
-                          "correlation"})
+                          "correlation", "comment_rows", "suggestion_rows"})
+_SUMMARY_DROPS = frozenset({"pane", "session_epoch", "revision_coverage", "pending_suggestions_reason",
+                            "file_side_available"})
 
 
 def lean_top(result: dict[str, Any], *, summary: bool) -> dict[str, Any]:
     """Drop top-level keys whose value is None or an empty list/dict (False and 0 stay). In summary
-    mode `pane` and `path` go too (diagnostic metadata; full mode keeps both)."""
-    drop = {"pane", "path"} if summary else set()
+    mode the diagnostics go too: `pane`, `session_epoch` (every live id already carries it),
+    `revision_coverage`, `pending_suggestions_reason` (`suggestion_rows: null` already says the
+    suggestions are unknown) and `file_side_available`; `path` stays (consumers check it names the
+    right document)."""
+    drop = _SUMMARY_DROPS if summary else set()
     return {
         k: v
         for k, v in result.items()
@@ -117,24 +122,48 @@ def _norm(text: str) -> str:
     return " ".join(text.split())
 
 
-def paragraph_text_index(proj: projection.Projection, scope: set[int]) -> dict[str, tuple[int, int]]:
+_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _squash(text: str) -> str:
+    """All whitespace removed (tabs and breaks have no w:t text in the live revision markup)."""
+    return "".join(text.split())
+
+
+def paragraph_markup_texts(proj: projection.Projection) -> list[str]:
+    """Each paragraph's w:t + w:delText text (deleted text included), aligned with
+    ``proj.paragraphs`` -- exactly how revisions_live builds a revision's ``paragraph_context``."""
+    return [
+        "".join(n.text or "" for n in m.element.iter() if n.tag in (_W_NS + "t", _W_NS + "delText"))
+        if m.element is not None
+        else ""
+        for m in proj.paragraphs
+    ]
+
+
+def paragraph_text_index(
+    proj: projection.Projection, scope: set[int], *, markup: bool = False
+) -> dict[str, tuple[int, int]]:
     """normalized paragraph text -> (paragraphs with that text, how many are in *scope*).
-    Live comments only know their anchor paragraph's text, never its position."""
+    Live comments only know their anchor paragraph's text, never its position. ``markup=True``
+    keys on the revision-markup text (deleted text included, whitespace squashed) that live
+    suggestions carry; look those up with ``classify_text(..., squash=True)``."""
     counts: dict[str, list[int]] = {}
-    for i, text in enumerate(projection.paragraph_texts(proj)):
-        entry = counts.setdefault(_norm(text), [0, 0])
+    texts = paragraph_markup_texts(proj) if markup else projection.paragraph_texts(proj)
+    for i, text in enumerate(texts):
+        entry = counts.setdefault(_squash(text) if markup else _norm(text), [0, 0])
         entry[0] += 1
         entry[1] += i in scope
     return {text: (total, inside) for text, (total, inside) in counts.items()}
 
 
-def classify_text(index: dict[str, tuple[int, int]], text: str | None) -> str:
+def classify_text(index: dict[str, tuple[int, int]], text: str | None, *, squash: bool = False) -> str:
     """``"in"`` | ``"out"`` | ``"uncertain"`` for a live item whose paragraph text is *text*.
 
     Uncertain (kept in the result, flagged ``scope_uncertain``) when the text is unknown or not
     found, or when identical paragraphs straddle the scope boundary so the item could be either.
     """
-    key = _norm(text or "")
+    key = _squash(text or "") if squash else _norm(text or "")
     entry = index.get(key) if key else None
     if entry is None:
         return "uncertain"

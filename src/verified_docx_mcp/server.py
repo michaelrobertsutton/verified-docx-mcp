@@ -557,7 +557,8 @@ def _find_tmp_siblings(directory: Path, target_name: str) -> list[str]:
     return hits
 
 
-_EXTERNAL_ACTIVITY_COMPACT_KEYS = ("divergent", "still_current")
+# recent / ledger are what the write guard refuses on (EXTERNAL_EDITOR_ACTIVE), so they stay visible.
+_EXTERNAL_ACTIVITY_COMPACT_KEYS = ("divergent", "still_current", "recent", "ledger")
 
 
 def execute_lock_status(
@@ -627,7 +628,7 @@ def lock_status(path: str, verbose: bool = False) -> dict[str, Any]:
 
     Returns (default) owner_file ({present, path, format, owner_name}),
     desktop_word, sync_quiesced, and external_activity reduced to
-    {divergent, still_current}. verbose=True also returns path, sync_detail
+    {divergent, still_current, recent, ledger} (what the write guard decides on). verbose=True also returns path, sync_detail
     ({sample_1, sample_2, interval_seconds, tmp_siblings}) and the full
     external_activity (issue #27): how the file on
     disk compares with what THIS server last wrote --
@@ -684,7 +685,8 @@ def execute_live_status(path: str | None = None, verbose: bool = False) -> dict[
 
     *path* scopes ``sessions`` to that document's basename; default (non-verbose)
     output omits the per-session counters / ``requirement_sets`` and the top-level
-    ``recent_boots`` and ``shared`` blocks (issue #111).
+    ``recent_boots`` and ``shared`` blocks (issue #111); ``locks`` (and this client's ``client_id``)
+    are always included in shared mode.
 
     Never raises for "no pane connected yet" -- an empty ``sessions``
     list is the normal, expected answer before the lead opens the task
@@ -776,6 +778,20 @@ def execute_live_status(path: str | None = None, verbose: bool = False) -> dict[
         # rather than a silent misroute -- empty when none have happened.
         "session_collisions": registry.collisions(),
     }
+    # Who holds a document lease / section locks is the only way to see the holder behind
+    # LOCKED_BY_OTHER_CLIENT, so `locks` (and this client's id) are always surfaced; the rest of
+    # `shared` stays behind verbose.
+    if shared_status is not None:
+        locks = list(shared_status.get("locks") or [])
+        if wanted_name is not None:
+            urls = {s.document_url for s in registry.list() if s.document_name == wanted_name}
+            locks = [lk for lk in locks if lk.get("document_url") in urls]
+        for lk in locks:
+            if isinstance(lk.get("remaining_s"), float):
+                lk["remaining_s"] = round(lk["remaining_s"], 1)
+        result["locks"] = locks
+        if shared_status.get("client_id"):
+            result["client_id"] = shared_status["client_id"]
     if verbose:
         result["shared"] = shared_status
         result["recent_boots"] = recent_boots
@@ -988,7 +1004,11 @@ def live_status(path: str | None = None, verbose: bool = False) -> dict[str, Any
     path (optional) scopes ``sessions`` to that document's file name.
     verbose=True adds the per-session ``heartbeat_count``,
     ``hash_sample_count`` and ``requirement_sets`` plus the top-level
-    ``recent_boots`` and broker ``shared`` blocks.
+    ``recent_boots`` and broker ``shared`` blocks. In shared-bridge mode the
+    result always carries ``locks`` (document leases and section locks:
+    ``{document_url, client_id, scope, remaining_s, ...}``, filtered to
+    *path*'s document when given) plus this client's ``client_id``: read
+    them to see who holds a lock after LOCKED_BY_OTHER_CLIENT.
 
     Returns ``bridge_running``, ``pid``, ``owner_pid``, ``is_owner``,
     ``mode`` ("local"|"shared"; stated once, never repeated in nested
@@ -2327,26 +2347,35 @@ def list_open_items(
 
     fields (issue #111): "full" (default) is the whole record; "summary"
     is columnar -- `counts`, `comment_columns` ["comment_id", "author",
-    "resolved", "anchor" (first 60 chars), "reply_count"] with `comments`
+    "resolved", "anchor" (first 60 chars), "reply_count"] with `comment_rows`
     as a list of row lists, and `suggestion_columns` (file: suggestion_id,
     kind, author, anchor; live: revision_id, type, author, anchor) with
-    `suggestions` as row lists (a trailing "scope_uncertain" column
-    appears only when scoping flagged a row) -- and keeps `complete`,
-    `scope`, `warnings` and `source`. Ids are complete. Use it for guard
-    reads and to pick ids. NOTE: JennyStack's comment loader expects the
-    "full" shape (objects under `comments`); do not feed it a summary.
-    In full, `reply_count` (== len(replies)) and an empty `replies` are
-    omitted.
+    `suggestion_rows` as row lists (a trailing "scope_uncertain" column
+    appears only when scoping flagged a row) -- and keeps `path`,
+    `complete`, `scope`, `warnings` and `source`. Ids are complete. Use it
+    for guard reads and to pick ids. A summary NEVER has `comments`,
+    `suggestions` or `pending_suggestions` keys: JennyStack's recorder and
+    comment loader treat a `comments` list as full objects, so the rows
+    live under `comment_rows`/`suggestion_rows`. In full, `reply_count`
+    (== len(replies)) and an empty `replies` are omitted.
 
     section_key / within_text scope the result: a find_sections key (the
     heading section), and/or a text span (must match exactly once, like
     replace_text's find; both given = their intersection). `counts` then
-    adds `in_scope` next to the document-wide totals. File mode places a
-    comment by its anchored runs. Live mode only knows a comment's anchor
+    adds `in_scope` next to the document-wide totals, and the response
+    carries top-level `scoped: true` (absent when unscoped) so a consumer
+    can tell a partial `comments` list from a whole-document one. `counts`
+    keys differ by source: file mode has `comments`/`suggestions`; live
+    mode has `live_total`/`live_open`/`returned` (plus `in_scope`, and
+    `open_comments`/`suggestions`, when scoped; an unknown live suggestion
+    inventory is null, not 0). File mode places a
+    comment by its anchored runs; a suggestion with no paragraph (text
+    box, table-row revision) is kept and flagged `scope_uncertain`. Live mode only knows a comment's anchor
     PARAGRAPH TEXT, so it matches that text against the live body (read
     without re-arming your write baseline); an item whose text cannot be
     placed, or that occurs both inside and outside the scope, is kept and
-    flagged `scope_uncertain: true`. An unknown section_key is
+    flagged `scope_uncertain: true`; so is a comment anchored across
+    several paragraphs (live mode sees only one anchor paragraph). An unknown section_key is
     INVALID_INPUT listing the available keys.
 
     Returns `comments` (from word/comments.xml + commentsExtended.xml's

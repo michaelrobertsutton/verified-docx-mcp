@@ -660,8 +660,10 @@ _LIVE_DROPPED_FIELDS = ("quoted_text", "w_id", "modified_time", "scope", "sessio
 
 def _live_scope_index(
     session: LiveSession, section_key: str | None, within_text: str | None
-) -> dict[str, tuple[int, int]]:
-    """Paragraph-text index of the live body for list_open_items scoping.
+) -> tuple[dict[str, tuple[int, int]], dict[str, tuple[int, int]]]:
+    """(comment index, suggestion index) of the live body for list_open_items scoping: the first
+    keys on paragraph text as Word reports it, the second on revision-markup text (deleted text
+    included) as live revisions carry it in ``paragraph_context``.
 
     *session* is the NON-observing session (``write_mode.live_session_for``), so this body read
     never re-arms a shared-bridge client's write baseline: only an explicit read_document does."""
@@ -681,11 +683,14 @@ def _live_scope_index(
         proj = projection.project_part(docx)
         scope = open_items.paragraph_scope(docx, proj, section_key, within_text)
         assert scope is not None
-        return open_items.paragraph_text_index(proj, scope)
+        return (
+            open_items.paragraph_text_index(proj, scope),
+            open_items.paragraph_text_index(proj, scope, markup=True),
+        )
 
 
 def _scope_live(
-    items: list[dict[str, Any]], index: dict[str, tuple[int, int]], text_of: Any
+    items: list[dict[str, Any]], index: dict[str, tuple[int, int]], text_of: Any, *, squash: bool = False
 ) -> tuple[list[dict[str, Any]], set[int]]:
     """(items kept, ids of the uncertain ones) -- the items whose paragraph text *text_of*(item)
     is in scope, plus any that cannot be placed (flagged, never silently dropped)."""
@@ -694,7 +699,7 @@ def _scope_live(
     kept: list[dict[str, Any]] = []
     uncertain: set[int] = set()
     for item in items:
-        verdict = open_items.classify_text(index, text_of(item))
+        verdict = open_items.classify_text(index, text_of(item), squash=squash)
         if verdict == "out":
             continue
         kept.append(item)
@@ -743,10 +748,12 @@ def execute_list_open_items_live(
     uncertain_revisions: set[int] = set()
     scoped = section_key is not None or within_text is not None
     if scoped:
-        index = _live_scope_index(session, section_key, within_text)
+        index, rev_index = _live_scope_index(session, section_key, within_text)
         open_raw, uncertain_comments = _scope_live(open_raw, index, lambda c: c.get("anchorParagraphText"))
         if suggestions is not None:
-            suggestions, uncertain_revisions = _scope_live(suggestions, index, _suggestion_paragraph)
+            suggestions, uncertain_revisions = _scope_live(
+                suggestions, rev_index, _suggestion_paragraph, squash=True
+            )
     open_ids = {f"{_LIVE_HANDLE_PREFIX}{c.get('id')}" for c in open_raw}
 
     # Issue #39: the new fields come FIRST so a client that clips the tail of
@@ -805,7 +812,10 @@ def execute_list_open_items_live(
     if ooxml is not None:
         counts_out["ooxml_open"] = ooxml["open_threads"]
     if scoped:
-        counts_out["in_scope"] = {"comments": len(open_raw), "suggestions": len(suggestions or [])}
+        counts_out["in_scope"] = {
+            "comments": len(open_raw),
+            "suggestions": len(suggestions) if suggestions is not None else None,
+        }
         counts_out["open_comments"] = open_total
         counts_out["suggestions"] = suggestions_total
     if complete is False and ooxml is not None:
@@ -829,6 +839,7 @@ def execute_list_open_items_live(
     result: dict[str, Any] = {
         "counts": counts_out,
         "scope": scope,
+        "scoped": True if scoped else None,
         "pane": {
             "instance_id": session.hello.instance_id,
             "platform": session.hello.platform,
@@ -846,12 +857,14 @@ def execute_list_open_items_live(
             record["scope_uncertain"] = True
     if fields == "summary":
         # Columnar: key names once, rows as lists (ids stay complete: they are write inputs).
-        result["comment_columns"], result["comments"] = open_items.columnar(
+        result["comment_columns"], result["comment_rows"] = open_items.columnar(
             [open_items.summary_comment(r, r["anchor_text"]) for r in records], open_items.COMMENT_COLUMNS
         )
-        result["suggestions"] = None  # unknown (no live revision inventory), not "none"
+        # No `comments`/`suggestions` keys in summary: JennyStack's recorder stores any response whose
+        # `comments` is a list and would read the row lists as objects.
+        result["suggestion_rows"] = None  # unknown (no live revision inventory), not "none"
         if suggestions is not None:
-            result["suggestion_columns"], result["suggestions"] = open_items.columnar(
+            result["suggestion_columns"], result["suggestion_rows"] = open_items.columnar(
                 [
                     {
                         "revision_id": rev.get("revision_id"),

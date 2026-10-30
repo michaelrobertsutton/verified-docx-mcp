@@ -22,6 +22,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest import mock
 
@@ -233,18 +234,21 @@ class ListOpenItemsSummaryAndScopeTests(_TempFixtureCase):
         result = self._list(fields="summary")
         self.assertEqual(result["counts"], {"comments": 3, "suggestions": 6})
         self.assertEqual(result["comment_columns"], ["comment_id", "author", "resolved", "anchor", "reply_count"])
-        self.assertEqual([c[3] for c in result["comments"]], ["overview", "Background text", "steps text"])
+        self.assertEqual([c[3] for c in result["comment_rows"]], ["overview", "Background text", "steps text"])
         self.assertEqual(result["suggestion_columns"], ["suggestion_id", "kind", "author", "anchor"])
-        self.assertEqual(len(result["suggestions"][0]), 4)
+        self.assertEqual(len(result["suggestion_rows"][0]), 4)
         self.assertNotIn("pending_suggestions", result)
+        self.assertNotIn("comments", result)
+        self.assertNotIn("suggestions", result)
+        self.assertIn("path", result)
         full = self._list()
         self.assertLess(len(json.dumps(result)), len(json.dumps(full)))
         # summary ids are exactly the full ids
         self.assertEqual(
-            [c[0] for c in result["comments"]], [c["comment_id"] for c in full["comments"]]
+            [c[0] for c in result["comment_rows"]], [c["comment_id"] for c in full["comments"]]
         )
         self.assertEqual(
-            [s[0] for s in result["suggestions"]],
+            [s[0] for s in result["suggestion_rows"]],
             [s["suggestion_id"] for s in full["pending_suggestions"]],
         )
 
@@ -253,6 +257,8 @@ class ListOpenItemsSummaryAndScopeTests(_TempFixtureCase):
         self.assertEqual([c["content"] for c in result["comments"]], ["c-background"])
         self.assertEqual(result["pending_suggestions"], [])
         self.assertEqual(result["counts"], {"comments": 3, "suggestions": 6, "in_scope": {"comments": 1, "suggestions": 0}})
+        self.assertIs(result["scoped"], True)
+        self.assertNotIn("scoped", self._list())
 
         result = self._list(section_key="overview-1")
         self.assertEqual([c["content"] for c in result["comments"]], ["c-overview"])
@@ -261,9 +267,33 @@ class ListOpenItemsSummaryAndScopeTests(_TempFixtureCase):
 
     def test_section_key_scope_applies_to_summary_too(self):
         result = self._list(fields="summary", section_key="upcoming-steps-1")
-        self.assertEqual([c[3] for c in result["comments"]], ["steps text"])
-        self.assertEqual(len(result["suggestions"]), 4)
+        self.assertEqual([c[3] for c in result["comment_rows"]], ["steps text"])
+        self.assertEqual(len(result["suggestion_rows"]), 4)
+        self.assertIs(result["scoped"], True)
         self.assertEqual(result["counts"]["in_scope"], {"comments": 1, "suggestions": 4})
+
+    def test_unplaceable_suggestions_are_kept_and_flagged_in_file_scope(self):
+        real = tracked_changes._find_pending_suggestions
+
+        def with_orphan(root, para_refs=None):
+            found = real(root, para_refs)
+            found.append(
+                {"para_ref": None, "suggestion_id": "tb-1", "kind": "insertion", "text": "in a text box",
+                 "author": "A", "date": None, "anchor_context": "in a text box"}
+            )
+            return found
+
+        with unittest.mock.patch.object(tracked_changes, "_find_pending_suggestions", with_orphan):
+            full = self._list(section_key="background-1")
+            summary = self._list(section_key="background-1", fields="summary")
+        orphans = [s for s in full["pending_suggestions"] if s["suggestion_id"] == "tb-1"]
+        self.assertEqual(len(orphans), 1)
+        self.assertIs(orphans[0]["scope_uncertain"], True)
+        self.assertEqual([s for s in full["pending_suggestions"] if s["suggestion_id"] != "tb-1"], [])
+        self.assertEqual(full["counts"]["in_scope"]["suggestions"], 1)
+        self.assertEqual(summary["suggestion_columns"][-1], "scope_uncertain")
+        self.assertEqual([r[0] for r in summary["suggestion_rows"]], ["tb-1"])
+        self.assertIs(summary["suggestion_rows"][0][-1], True)
 
     def test_within_text_scopes_to_the_matched_paragraph(self):
         result = self._list(within_text="overview text")
