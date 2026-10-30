@@ -37,7 +37,9 @@ RETRY = {"LIVE_STALE", "LOCKED_BY_OTHER_CLIENT"}
 REFUSED = RETRY | {"MATCH_COUNT_MISMATCH", "ZERO_MATCH", "INVALID_INPUT", "CELL_TEXT_MISMATCH",
                    "LIVE_CAPABILITY_MISSING", "OUTSIDE_LOCKED_SECTION", "ANCHORED_SHAPES",
                    "WOULD_DELETE_COMMENTS", "LOCK_SCOPE_UNRESOLVED", "MIXED_FORMATTING",
-                   "STRUCTURAL_BOUNDARY", "TRACKED_CHANGES_PRESENT"}
+                   "STRUCTURAL_BOUNDARY", "TRACKED_CHANGES_PRESENT",
+                   # issue #108: the pane's formatting check refuses before writing
+                   "FORMAT_DRIFT"}
 
 
 def invalid(message):
@@ -211,7 +213,10 @@ def changed_targets(before, after):
     return changed
 
 
-def validate(operations):
+def validate(operations, *, partial=False):
+    """Check the caller's operations. ``partial=True`` admits replacement_segments formats
+    that leave fields to inheritance; only ``prepare`` passes it, because only prepare
+    resolves them against the live document before the manifest digest binds them."""
     if not isinstance(operations, list) or not 1 <= len(operations) <= 500:
         raise invalid("Supply 1..500 ordered operations")
     for i, item in enumerate(operations):
@@ -227,7 +232,7 @@ def validate(operations):
             raise invalid("Every text operation must name its protected section slug")
         if op == "replace_text":
             from ..formatted_text import validate_segments
-            validate_segments(args.get("replacement_segments"), args["replace"])
+            validate_segments(args.get("replacement_segments"), args["replace"], partial=partial)
         for key, value in args.items():
             if key in {"replacement_segments", "inherit_format"}:
                 continue
@@ -251,7 +256,7 @@ def validate(operations):
 
 def prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = False) -> dict:
     path = str(paths.resolve_allowed_docx_path(path, must_exist=False))
-    validate(operations)
+    validate(operations, partial=True)
     slugs = list(dict.fromkeys(o["section"] for o in operations if o["op"] != "live_save"))
     if not slugs:
         raise invalid("At least one protected text operation is required")
@@ -261,6 +266,12 @@ def prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = F
         ensure_settled(root, sections=slugs)
         if any(o["args"].get("replacement_segments") is not None for o in operations):
             wm.require_capability(session, "formatted_replacements_v1", feature_description="explicit formatted replacements")
+        from ..formatted_text import PARTIAL_CAPABILITY, is_partial
+        partial = [i for i, o in enumerate(operations) if o["op"] == "replace_text"
+                   and is_partial(o["args"].get("replacement_segments"))]
+        if partial:
+            wm.require_capability(session, PARTIAL_CAPABILITY,
+                                  feature_description="partial replacement_segments formats (inherited fields)")
         captured = snapshot(session, slugs, details=True)
         initial = captured["sections"]
         operations = copy.deepcopy(operations)
@@ -278,11 +289,18 @@ def prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = F
             targets.append(keys)
             preconditions.append({key:target_value(current,key) for key in keys})
             current = project(current, operation)
+        for index in partial:
+            _resolve_partial(session, operations, targets, index)
         run_id = uuid.uuid4().hex
         manifest = {"schema": 1, "run_id": run_id, "path": path, "document_url": session.document_url,
                     "sections": initial, "operations": operations, "comments": comments, "track_changes": track_changes, "targets": targets, "preconditions": preconditions}
         if any(o["args"].get("replacement_segments") is not None for o in operations):
             manifest["formatting_policy"] = "explicit-segments-v1"
+        if partial:
+            # The resolved segments AND the baseline they were resolved against are in the
+            # manifest, so the approved digest binds both; execute sends the baseline and the
+            # pane refuses FORMAT_DRIFT if the first run's formatting moved since prepare.
+            manifest["formatting_policy"] = "explicit-segments-v1+first-run-baseline-v1"
         digest = sha(manifest)
         write(root / f"{run_id}.manifest.json", manifest)
         write(root / f"{run_id}.journal.json", {"digest": digest, "next": 0, "status": "prepared", "evidence": [], "verified_indices": [],
@@ -290,6 +308,29 @@ def prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = F
     return {"run_id": run_id, "manifest_sha256": digest, "operation_count": len(operations),
             "sections": slugs, "status": "prepared", "preview": [preview_entry(o) for o in operations],
             "manifest_path": str(root / f"{run_id}.manifest.json")}
+
+
+def _resolve_partial(session, operations, targets, index):
+    """Resolve one operation's partial replacement_segments against the live document (#108).
+
+    Operations run in order, so an earlier operation that rewrites this target would make the
+    prepare-time first run differ from the one execute writes over: refuse, asking for full
+    fields, rather than bind a baseline the run itself invalidates."""
+    from ..formatted_text import request_replacement_font, resolve_segments
+    operation = operations[index]
+    mine = set(targets[index])
+    for earlier in range(index):
+        prior = operations[earlier]
+        if prior["op"] == "live_save" or prior["section"] != operation["section"]:
+            continue
+        if prior["op"] == "delete_paragraph" or mine & set(targets[earlier]):
+            raise invalid(f"Operation {index}: an earlier operation in this run rewrites the same text, so its "
+                          "formatting cannot be inherited at prepare time; give every font field explicitly")
+    args = operation["args"]
+    baseline = request_replacement_font(session, {"find": args["find"], "expected_matches": args["expected_matches"],
+                                                  "scope": "body", "executionTargetSection": operation["section"]})
+    args["replacement_segments"] = resolve_segments(args["replacement_segments"], baseline, args["replace"])
+    operation["font_baseline"] = baseline
 
 
 _PREVIEW_CHARS = 200
@@ -320,6 +361,8 @@ def preview_entry(operation: dict[str, Any]) -> dict[str, Any]:
         entry["expected_matches"] = args.get("expected_matches", 1)
     if "replacement_segments" in args:
         entry["replacement_segments"] = args["replacement_segments"]
+    if operation.get("font_baseline") is not None:
+        entry["font_baseline"] = operation["font_baseline"]  # what inherited fields were resolved from
     if operation["op"] == "replace_cell_markdown":
         entry["inherit_format"] = args.get("inherit_format", "first_run")  # bound into the manifest digest
     return entry
@@ -389,9 +432,14 @@ def apply(path, operation, track_changes=False):
         elif op == "replace_text":
             if args.get("replacement_segments") is not None:
                 wm.require_capability(session, "formatted_replacements_v1", feature_description="explicit formatted replacements")
+            baseline = operation.get("font_baseline")
+            if baseline is not None:
+                from ..formatted_text import PARTIAL_CAPABILITY
+                wm.require_capability(session, PARTIAL_CAPABILITY, feature_description="the approved formatting baseline check")
             before, after = args["find"], args["replace"]
             result = session.request_threadsafe("replace", {**args, **common, "allow_comment_loss": False,
-                                                           "inherit_format": "replaced", "scope": "body"})
+                                                           "inherit_format": "replaced", "scope": "body",
+                                                           **({"expected_first_font": baseline} if baseline is not None else {})})
             if args.get("replacement_segments") is not None:
                 from ..formatted_text import validate_segments
                 returned = result.get("matches", [{}])[0].get("segments")

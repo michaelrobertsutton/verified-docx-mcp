@@ -1761,6 +1761,9 @@ def replace_text(
     (None/Single/Double), strikeThrough, doubleStrikeThrough, subscript, superscript,
     color (#RRGGBB), name, and size (points). Null hyperlink explicitly means no link.
     Mixed spans require explicit segments; no neighbour-format inference is used.
+    A format may name only some fields (pane capability partial_font_segments_v1): the
+    rest are inherited from the effective font of the first replaced run, and the write
+    refuses FORMAT_DRIFT (nothing written) if that run's formatting changed meanwhile.
 
     `write_mode` (issue #106 WP-3, "auto" | "file" | "live", default
     "auto"): whether this call edits the .docx file directly (today's
@@ -4653,10 +4656,13 @@ def live_changes_prepare(path: str, operations: list[dict[str, Any]], track_chan
     lead can approve from the response. It is DERIVED from the manifest: the
     manifest file and its digest remain the authority, and approving that digest
     binds the exact operations, not the clipped preview.
-    replace_text args may also include replacement_segments with the complete
+    replace_text args may also include replacement_segments with the
     explicit font/hyperlink schema documented on replace_text; concatenated segment
     text must equal replace. The approval preview includes the exact segments.
     Requires approved_changes_v1; explicit segments also require formatted_replacements_v1.
+    Formats naming only some fields (partial_font_segments_v1) are resolved here against
+    the first replaced run; the manifest binds the resolved segments and that
+    font_baseline, and execute refuses FORMAT_DRIFT if the run was reformatted since.
     """
     from .live.approved_changes import prepare
     try:
