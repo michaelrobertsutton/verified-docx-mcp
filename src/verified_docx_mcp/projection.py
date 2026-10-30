@@ -57,6 +57,7 @@ so walking both would double-count every drawing and every text box.
 from __future__ import annotations
 
 import dataclasses
+import difflib
 import hashlib
 import re
 import zipfile
@@ -394,6 +395,9 @@ class ParagraphMeta:
     # mirroring GoogleDocs-MCP markdown.py's (listId, nestingLevel).
     num_id: int | None = None
     ilvl: int | None = None
+    # The live w:p this metadata came from (like RunEvent.r_elem): lets a caller that holds
+    # the same tree map an element it found by its own walk back to a para_ref. Not compared.
+    element: Any = dataclasses.field(default=None, repr=False, compare=False)
 
 
 class _PartWalker:
@@ -497,7 +501,7 @@ class _PartWalker:
                     raw_ilvl = _attr(ilvl_el, "val")
                     if raw_ilvl is not None and raw_ilvl.isdigit():
                         ilvl = int(raw_ilvl)
-        self.paragraphs.append(ParagraphMeta(para_ref, style_id, outline_lvl, chain, num_id=num_id, ilvl=ilvl))
+        self.paragraphs.append(ParagraphMeta(para_ref, style_id, outline_lvl, chain, num_id=num_id, ilvl=ilvl, element=p))
 
         if not self._first_para:
             self.events.append(RunEvent("\n", {}, para_ref, f"{para_ref}/break"))
@@ -1217,6 +1221,44 @@ def list_styles_impl(docx_path: Path) -> list[dict[str, Any]]:
         return styles
 
 
+STYLE_TYPES = ("paragraph", "character", "table", "numbering")
+
+
+def filter_styles(
+    styles: list[dict[str, Any]], *, style_type: str | None = None, name_contains: str | None = None
+) -> list[dict[str, Any]]:
+    """*styles* narrowed to one w:type and/or those whose name or style_id
+    contains *name_contains* (case-insensitive)."""
+    needle = name_contains.lower() if name_contains else None
+    return [
+        s
+        for s in styles
+        if (style_type is None or s.get("type") == style_type)
+        and (needle is None or needle in (s.get("name") or "").lower() or needle in (s.get("style_id") or "").lower())
+    ]
+
+
+def style_near_matches(
+    styles: list[dict[str, Any]], wanted: str, *, style_type: str | None = None, limit: int = 5
+) -> dict[str, Any]:
+    """STYLE_NOT_FOUND diagnostics: up to *limit* styles whose name or id is
+    close to *wanted* (``[{style_id, name}]``) plus ``available_count``, in
+    place of the whole style list (which can run to hundreds of entries)."""
+    pool = [s for s in styles if s.get("style_id") and (style_type is None or s.get("type") == style_type)]
+    by_key: dict[str, dict[str, Any]] = {}
+    for s in pool:
+        for key in (s.get("name"), s["style_id"]):
+            if key:
+                by_key.setdefault(key.lower(), s)
+    close = difflib.get_close_matches(wanted.lower(), list(by_key), n=limit * 2, cutoff=0.6)
+    near: list[dict[str, Any]] = []
+    for key in close:
+        entry = {"style_id": by_key[key]["style_id"], "name": by_key[key].get("name")}
+        if entry not in near:
+            near.append(entry)
+    return {"near_matches": near[:limit], "available_count": len(pool)}
+
+
 # ---------------------------------------------------------------------------
 # numbering.xml — w:numId -> {ilvl: numFmt}, WP-03b-a's list rendering.
 # ---------------------------------------------------------------------------
@@ -1372,6 +1414,28 @@ def para_index(para_ref: str) -> int:
     if m is None:
         raise ValueError(f"not a paragraph ref: {para_ref!r}")
     return int(m.group(1))
+
+
+def section_index_ranges(sections: list[dict[str, Any]], proj: Projection) -> list[tuple[str, int, int]]:
+    """[(section_key, start_idx, end_idx)] (inclusive indexes into ``proj.paragraphs``) for
+    the heading sections of a ``find_sections_impl`` result."""
+    index = {m.para_ref: i for i, m in enumerate(proj.paragraphs)}
+    return [
+        (s["section_key"], index[s["start_para_ref"]], index[s["end_para_ref"]])
+        for s in sections
+        if s.get("kind") == "heading" and s.get("start_para_ref") in index and s.get("end_para_ref") in index
+    ]
+
+
+def section_key_at(ranges: list[tuple[str, int, int]], para_index: int | None) -> str | None:
+    """The heading section containing paragraph *para_index*; None before the first
+    heading, in a headingless document, or when *para_index* is None."""
+    if para_index is None:
+        return None
+    for key, start, end in ranges:
+        if start <= para_index <= end:
+            return key
+    return None
 
 
 def paragraph_texts(proj: Projection) -> list[str]:

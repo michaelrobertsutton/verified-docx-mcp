@@ -143,8 +143,7 @@ def _resolve_style_ids(resolved: Path, specs: list[dict[str, Any]]) -> list[str 
             raise _make_error(
                 ErrorCode.STYLE_NOT_FOUND,
                 f"paragraph style {wanted!r} is not a style in this document's styles.xml.",
-                {"style": wanted, "available_paragraph_styles": sorted(
-                    s["name"] for s in records if s.get("type") == "paragraph" and s.get("name"))})
+                {"style": wanted, **projection.style_near_matches(records, wanted, style_type="paragraph")})
         if record.get("type") != "paragraph":
             raise _make_error(
                 ErrorCode.UNSUPPORTED_STYLE_TYPE,

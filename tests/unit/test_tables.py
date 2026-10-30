@@ -149,6 +149,50 @@ class ListTablesReadTests(unittest.TestCase):
         self.assertFalse(info["has_nested_table"])
         self.assertIsNone(info["nested_in_table_id"])
 
+    def test_header_row_and_anchor_section_key_under_a_heading(self):
+        # issue #111: choose "the table under heading X" from one list_tables call.
+        result = tables.list_tables_impl(FIXTURES / "approved-changes.docx")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["header_row"], ["Original 1:1", "Original 1:2", "Original 1:3", "Keep"])
+        self.assertEqual(result[0]["anchor_section_key"], "target-1")
+
+    def test_headingless_documents_have_a_null_anchor_section_key(self):
+        result = tables.list_tables_impl(FIXTURES / "tables.docx")
+        self.assertEqual(result[0]["header_row"], ["R1C1", "R1C2"])
+        self.assertIsNone(result[0]["anchor_section_key"])
+        for info in tables.list_tables_impl(FIXTURES / "tables-merged.docx"):
+            self.assertIsNone(info["anchor_section_key"])
+
+    def test_nested_table_reports_its_own_first_row(self):
+        outer, nested = tables.list_tables_impl(FIXTURES / "tables-merged.docx")
+        self.assertEqual(outer["header_row"], ["H1", "H2"])
+        self.assertEqual(nested["header_row"], ["Nested A"])
+
+    def test_header_cells_are_cut_to_40_chars(self):
+        w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        tbl = ET.fromstring(
+            f'<w:tbl xmlns:w="{w}"><w:tr><w:tc><w:p><w:r><w:t>{"x" * 90}</w:t></w:r></w:p></w:tc>'
+            '<w:tc><w:p><w:r><w:t>two </w:t></w:r></w:p><w:p><w:r><w:t>paras</w:t></w:r></w:p></w:tc></w:tr>'
+            "<w:tr><w:tc><w:p><w:r><w:t>second row</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+        )
+        self.assertEqual(tables._header_row(tbl), ["x" * 40, "two  paras"])
+
+    def test_execute_list_tables_carries_the_new_fields(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        old = os.environ.get(paths._ALLOWED_FILE_ROOTS_ENV)
+        os.environ[paths._ALLOWED_FILE_ROOTS_ENV] = tmp.name
+        self.addCleanup(
+            lambda: os.environ.pop(paths._ALLOWED_FILE_ROOTS_ENV, None)
+            if old is None
+            else os.environ.__setitem__(paths._ALLOWED_FILE_ROOTS_ENV, old)
+        )
+        target = Path(tmp.name) / "approved-changes.docx"
+        shutil.copyfile(FIXTURES / "approved-changes.docx", target)
+        table = tables.execute_list_tables(str(target))["tables"][0]
+        self.assertEqual(table["anchor_section_key"], "target-1")
+        self.assertEqual(table["header_row"][0], "Original 1:1")
+
     def test_merged_and_nested_table(self):
         result = tables.list_tables_impl(FIXTURES / "tables-merged.docx")
         self.assertEqual(len(result), 2)

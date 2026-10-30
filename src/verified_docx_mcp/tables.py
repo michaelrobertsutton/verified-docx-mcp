@@ -202,8 +202,35 @@ def _table_stats(tbl: Any) -> tuple[int, int, bool, bool]:
 # ---------------------------------------------------------------------------
 
 
+_HEADER_CELL_CHARS = 40
+
+
+def _header_row(tbl: Any) -> list[str]:
+    """First row's cell texts (paragraphs joined by a space), each cut to 40 chars."""
+    first = next((r for r in tbl if projection._ln(r) == "tr"), None)
+    if first is None:
+        return []
+    out: list[str] = []
+    for tc in _row_cells(first):
+        paras = ["".join(t.text or "" for t in p.iter() if projection._ln(t) == "t")
+                 for p in tc.iter() if projection._ln(p) == "p"]
+        out.append(" ".join(x for x in paras if x)[:_HEADER_CELL_CHARS])
+    return out
+
+
+def _first_paragraph_index(proj: projection.Projection) -> dict[int, int]:
+    """table_id -> index (into proj.paragraphs) of the first paragraph inside that table."""
+    first: dict[int, int] = {}
+    for idx, meta in enumerate(proj.paragraphs):
+        for link in meta.container_chain:
+            first.setdefault(link["table_id"], idx)
+    return first
+
+
 def list_tables_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dict[str, Any]]:
     proj = projection.project_part(docx_path, part_name)
+    ranges = projection.section_index_ranges(projection.find_sections_impl(docx_path, part_name), proj)
+    first_para = _first_paragraph_index(proj)
     tables: list[dict[str, Any]] = []
     parent_stack: list[int] = []
     for event in proj.events:
@@ -219,6 +246,8 @@ def list_tables_impl(docx_path: Path, part_name: str = DEFAULT_PART) -> list[dic
                     "has_merged_cells": has_merged,
                     "has_nested_table": has_nested,
                     "nested_in_table_id": parent_stack[-1] if parent_stack else None,
+                    "header_row": _header_row(event.element),
+                    "anchor_section_key": projection.section_key_at(ranges, first_para.get(event.table_id)),
                 }
             )
             parent_stack.append(event.table_id)
@@ -2126,7 +2155,7 @@ def execute_insert_table(
         raise _make_error(
             ErrorCode.STYLE_NOT_FOUND,
             f"style_id {style_id!r} is not a table style (w:type=\"table\") in this document's styles.xml.",
-            {"style_id": style_id, "available_table_styles": sorted(table_style_ids)},
+            {"style_id": style_id, **projection.style_near_matches(styles, style_id or "", style_type="table")},
         )
     styles_by_id = {s["style_id"]: s for s in styles if s["style_id"]}
 

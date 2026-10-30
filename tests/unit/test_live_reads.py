@@ -129,6 +129,14 @@ class LiveReadShapeTests(LiveReadsTestCase):
         self.assertEqual(listed["source"], "live")
         self.assertEqual(listed["tables"], tables.list_tables_impl(LIVE_TABLES))
 
+    async def test_list_tables_over_live_has_header_row_and_anchor_section_key(self) -> None:
+        approved = FIXTURES / "approved-changes.docx"
+        await self.connect_live(approved)
+        listed = await self.call(tables.execute_list_tables, str(self.target))
+        self.assertEqual(listed["source"], "live")
+        self.assertEqual(listed["tables"][0]["header_row"][0], "Original 1:1")
+        self.assertEqual(listed["tables"][0]["anchor_section_key"], "target-1")
+
     async def test_a_non_pkg_namespace_prefix_is_fine(self) -> None:
         await self.connect_live(body_ooxml=docx_to_flat_opc(LIVE_BODY, prefix="x1"))
         result = await self.read()
