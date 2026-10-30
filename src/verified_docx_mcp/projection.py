@@ -1952,8 +1952,9 @@ def section_content_items(
 
     Excluded by construction: rsids, w14:paraId/textId, proofErr,
     lastRenderedPageBreak, bookmarks, comment dates and ids, all character and
-    paragraph formatting, images, text boxes (their own scopes), comments
-    anchored outside this part, and -- with *ignore_trailing_empty* (a live
+    paragraph formatting, images, text boxes (their own scopes, so a comment
+    anchored only inside one too), comments anchored outside this part, and
+    -- with *ignore_trailing_empty* (a live
     ``Body.getOoxml()`` export) -- the trailing empty paragraph Word appends.
 
     Raises INVALID_INPUT when comment linkage cannot be interpreted.
