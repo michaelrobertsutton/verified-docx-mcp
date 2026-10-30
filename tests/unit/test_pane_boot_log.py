@@ -75,7 +75,7 @@ def local_bridge(monkeypatch):
 
 
 def test_live_status_has_recent_boots_and_no_warning_by_default(local_bridge):
-    status = server.execute_live_status()
+    status = server.execute_live_status(verbose=True)
     assert status["recent_boots"] == []
     assert "warnings" not in status
 
@@ -84,7 +84,7 @@ def test_pane_reload_loop_warning_at_three_boots_within_120s(local_bridge):
     boot(DOC_A, 100, previous_events=[{"kind": "pagehide"}])
     boot(DOC_A, 50, previous_events=[{"kind": "beforeunload"}])
     boot(DOC_A, 0)
-    status = server.execute_live_status()
+    status = server.execute_live_status(verbose=True)
     (warning,) = status["warnings"]
     assert warning["code"] == "pane_reload_loop"
     assert warning["boots"] == 3
@@ -133,7 +133,7 @@ def test_live_status_in_shared_mode_uses_the_owners_boots(monkeypatch):
     registry = fake_registry(status=lambda: {"owner_pid": os.getpid() + 1, "recent_boots": owner_boots})
     monkeypatch.setattr(bridge, "start_in_background", lambda **kw: registry)
     monkeypatch.setattr(bridge, "current_ports", lambda: None)
-    status = server.execute_live_status()  # this process's own (empty) log is ignored
+    status = server.execute_live_status(verbose=True)  # this process's own (empty) log is ignored
     assert status["mode"] == "shared"
     assert status["recent_boots"] == owner_boots
     assert status["warnings"][0]["code"] == "pane_reload_loop"
@@ -143,6 +143,6 @@ def test_old_owner_without_recent_boots_still_works(monkeypatch):
     registry = fake_registry(status=lambda: {"owner_pid": os.getpid()})
     monkeypatch.setattr(bridge, "start_in_background", lambda **kw: registry)
     monkeypatch.setattr(bridge, "current_ports", lambda: None)
-    status = server.execute_live_status()
+    status = server.execute_live_status(verbose=True)
     assert status["recent_boots"] == []
     assert "warnings" not in status

@@ -390,6 +390,48 @@ files — no Word installation required. `tests/live` needs a real Word
 install and a macOS Automation grant; it is skipped unless `--run-live` is
 passed.
 
+## Auto-allowing the read-only tools
+
+Every read tool carries the MCP annotations `readOnlyHint: true` and
+`idempotentHint: true`; the delete/replace-all/accept/reject tools carry
+`destructiveHint: true`. Clients that honor `readOnlyHint` (and Claude Code
+permission rules) can therefore treat reads differently from writes. To let Claude
+Code run this server's read-only tools without a prompt, add them to
+`permissions.allow` in `.claude/settings.json` (or `settings.local.json`):
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__verified-docx-mcp__read_document",
+      "mcp__verified-docx-mcp__find_sections",
+      "mcp__verified-docx-mcp__list_page_sections",
+      "mcp__verified-docx-mcp__list_tables",
+      "mcp__verified-docx-mcp__get_table",
+      "mcp__verified-docx-mcp__list_open_items",
+      "mcp__verified-docx-mcp__get_comment_thread",
+      "mcp__verified-docx-mcp__list_styles",
+      "mcp__verified-docx-mcp__list_parts",
+      "mcp__verified-docx-mcp__list_shapes",
+      "mcp__verified-docx-mcp__list_textboxes",
+      "mcp__verified-docx-mcp__read_textbox",
+      "mcp__verified-docx-mcp__read_header_footer",
+      "mcp__verified-docx-mcp__diff_body_vs_file",
+      "mcp__verified-docx-mcp__live_status",
+      "mcp__verified-docx-mcp__live_list_sections",
+      "mcp__verified-docx-mcp__live_revision",
+      "mcp__verified-docx-mcp__lock_status",
+      "mcp__verified-docx-mcp__export_pdf",
+      "mcp__verified-docx-mcp__read_audit_evidence"
+    ]
+  }
+}
+```
+
+`export_pdf` writes a PDF next to the document and never modifies the `.docx`;
+`lock_status` may persist a small first-seen timestamp for a divergence. Drop either
+line if you want a prompt for it. Write tools are deliberately not listed.
+
 ## Live mode
 
 A Word task-pane add-in (`addin/`) plus a local bridge

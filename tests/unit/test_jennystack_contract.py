@@ -38,7 +38,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fake_pane import FakeComment, FakeDocument, FakeReply
+from fake_pane import FakeComment, FakeDocument, FakeReply, docx_to_flat_opc
 from fastmcp import Client
 from test_live_comments import LiveCommentsTestCase
 
@@ -200,6 +200,66 @@ class ListTablesAndStylesContractTests(_FileCase):
         filtered = self.call("list_styles", {"type": "paragraph", "name_contains": "Heading"})["styles"]
         self.assertTrue(filtered)
         self.assertLess(len(filtered), len(styles))
+
+
+class ReadDocumentContractTests(_FileCase):
+    """JennyStack live_doc_stamp.py / live_guard_state.resolve_read_response read, from read_document:
+    `path` (must be a str naming the document), `source`, `format`, `text` (or `content` / `markdown`)
+    and `revision`, plus `truncated` / `is_truncated` / `has_more` / `isError` (all absent = fine).
+    The lean read envelope must never drop them."""
+
+    fixture_name = "frag.docx"
+
+    def test_text_read_keeps_every_field_jennystack_reads(self):
+        result = self.call("read_document", {"format": "text"})
+        for key in ("path", "source", "format", "text", "revision"):
+            self.assertIn(key, result)
+        self.assertIsInstance(result["path"], str)
+        self.assertEqual(result["source"], "file")
+        self.assertEqual(result["format"], "text")
+        self.assertIsInstance(result["text"], str)
+
+    def test_markdown_read_keeps_format_and_markdown(self):
+        result = self.call("read_document")
+        for key in ("path", "source", "format", "markdown", "revision"):
+            self.assertIn(key, result)
+
+    def test_nothing_jennystack_reads_is_behind_verbose(self):
+        lean, full = self.call("read_document", {"format": "text"}), self.call("read_document", {"format": "text", "verbose": True})
+        self.assertTrue(set(lean) <= set(full))
+        self.assertEqual(set(full) - set(lean), {"revision_detail", "section_key", "warnings"} & set(full))
+
+
+class ReadDocumentLiveContractTests(LiveCommentsTestCase):
+    fixture_name = "sections.docx"
+
+    async def test_live_text_read_keeps_text_revision_source_path_format(self):
+        await self.connect_pane(body_ooxml=docx_to_flat_opc(FIXTURES / "sections.docx"))
+        result = await call("read_document", {"path": str(self.target), "source": "live", "format": "text"})
+        for key in ("path", "source", "format", "text", "revision"):
+            self.assertIn(key, result)
+        self.assertEqual(result["source"], "live")
+        self.assertTrue(result["revision"].startswith("live:sha256:"))
+        self.assertNotIn("body_sha256", result.get("live", {}))
+
+
+class OtherReadToolContractTests(_FileCase):
+    """No JennyStack script reads find_sections / list_tables / get_table / read_header_footer /
+    live_status / lock_status / live_revision / live_list_sections results today (surveyed in
+    scripts/ and cli/tests/test_live_doc_*.py). Their payload fields that matter are pinned anyway."""
+
+    fixture_name = "approved-changes.docx"
+
+    def test_find_sections_and_tables_keep_their_payload(self):
+        self.assertIn("sections", self.call("find_sections"))
+        self.assertIn("tables", self.call("list_tables"))
+        self.assertIn("headers_and_footers", self.call("read_header_footer"))
+
+    def test_lock_status_default_keeps_the_guard_booleans(self):
+        result = self.call("lock_status")
+        self.assertIn("present", result["owner_file"])
+        self.assertIn("sync_quiesced", result)
+        self.assertEqual(set(result["external_activity"]), {"divergent", "still_current"})
 
 
 if __name__ == "__main__":

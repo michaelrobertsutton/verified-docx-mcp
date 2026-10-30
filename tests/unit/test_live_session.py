@@ -366,8 +366,39 @@ class LiveStatusShapeTests(LiveBridgeTestCase):
         self.assertIn("connected_since", entry)
         self.assertGreaterEqual(entry["last_heartbeat_age_s"], 0)
         self.assertEqual(entry["body_sha256"], doc.sha256())
-        self.assertEqual(entry["requirement_sets"], {"1.4": True, "1.5": False})
+        # Default (issue #111): diagnostics are hidden.
+        for hidden in ("heartbeat_count", "hash_sample_count", "requirement_sets"):
+            self.assertNotIn(hidden, entry)
+        for hidden in ("shared", "recent_boots"):
+            self.assertNotIn(hidden, status_after)
         self.assertEqual(status_after["session_collisions"], [])
+
+        verbose = server_module.execute_live_status(verbose=True)
+        full = verbose["sessions"][0]
+        self.assertEqual(full["requirement_sets"], {"1.4": True, "1.5": False})
+        self.assertIn("heartbeat_count", full)
+        self.assertIn("hash_sample_count", full)
+        self.assertIn("recent_boots", verbose)
+        self.assertIn("shared", verbose)
+        for once in ("owner_pid", "is_owner", "mode"):
+            self.assertIn(once, status_after)
+
+    async def test_live_status_path_scopes_sessions_and_stays_compact(self):
+        import json
+
+        from verified_docx_mcp import server as server_module
+
+        for name in ("A.docx", "B.docx", "C.docx"):
+            await self.connect_pane(document_url=f"/tmp/{name}", requirement_sets={"1.4": True})
+        scoped = server_module.execute_live_status(path="/Users/x/Documents/B.docx")
+        self.assertEqual([s["document_name"] for s in scoped["sessions"]], ["B.docx"])
+        self.assertLess(len(json.dumps(scoped, separators=(",", ":"))), 600)
+        self.assertEqual(len(server_module.execute_live_status()["sessions"]), 3)
+        self.assertEqual(server_module.execute_live_status(path="/tmp/Nope.docx")["sessions"], [])
+        # verbose + path keeps the scoping and restores the extras.
+        both = server_module.execute_live_status(path="/tmp/A.docx", verbose=True)
+        self.assertEqual([s["document_name"] for s in both["sessions"]], ["A.docx"])
+        self.assertIn("requirement_sets", both["sessions"][0])
 
     async def test_live_status_surfaces_session_collisions(self):
         from verified_docx_mcp import server as server_module

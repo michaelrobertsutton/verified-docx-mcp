@@ -181,6 +181,10 @@ class GuardedToolPassThroughTests(_Env):
             bad = await self.call(client, "lock_status")
             data = bad.structured_content or json.loads(bad.content[0].text)
             self.assertFalse(data["external_activity"]["still_current"])
+            self.assertTrue(data["external_activity"]["divergent"])
+            self.assertEqual(set(data["external_activity"]), {"divergent", "still_current"})
+            full = await self.call(client, "lock_status", verbose=True)
+            data = full.structured_content or json.loads(full.content[0].text)
             self.assertTrue(data["external_activity"]["recent"])
 
 
