@@ -35,7 +35,7 @@ _CONSTANTS: dict[str, Any] = {
 }
 
 # The batch hook compares revision_before to the token it sent, so it must always be there.
-_KEEPS_REVISION_BEFORE = frozenset({"replace_text_batch"})
+_KEEPS_REVISION_BEFORE = frozenset({"replace_text_batch", "add_anchored_comment_batch"})
 
 
 def lean_result(tool: str, arguments: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:

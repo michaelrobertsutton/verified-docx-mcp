@@ -80,6 +80,7 @@ class ErrorCode(Enum):
     MATCH_COUNT_MISMATCH = "MATCH_COUNT_MISMATCH"  # match count != expected_matches (D4: expected_matches is required, no default)
     ANCHORED_SHAPES = "ANCHORED_SHAPES"
     STRUCTURAL_BOUNDARY = "STRUCTURAL_BOUNDARY"  # a match crosses a w:p/w:tbl/w:tc boundary
+    AMBIGUOUS_SPAN = "AMBIGUOUS_SPAN"  # a quote that must be unique (add_anchored_comment_batch live + section_key) also occurs outside the named section, so the pane's first-match comment could land in the wrong place; nothing was written
 
     # Tracked changes (tracked_changes.py; WP-07)
     REVISION_ID_NOT_FOUND = "REVISION_ID_NOT_FOUND"  # accept_tracked_changes/reject_tracked_changes named a w:ins/w:del id not present in the document

@@ -55,6 +55,7 @@ from fastmcp import FastMCP
 
 from . import (
     audit,
+    comment_batch,
     comments,
     geometry,
     images,
@@ -63,8 +64,8 @@ from . import (
     paragraph_insert,
     paths,
     projection,
-    tables,
     table_structure,
+    tables,
     text_edit,
     tracked_changes,
     write_ledger,
@@ -72,9 +73,9 @@ from . import (
 from . import render as render_module
 from .errors import ErrorCode, VerifyError, _make_error
 from .lean_envelope import LeanEnvelopeMiddleware
-from .markdown_input import resolve_markdown_input, resolve_table_rows
 from .live import bridge as live_bridge
 from .live import comments_live, reads_live
+from .markdown_input import resolve_markdown_input, resolve_table_rows
 from .middleware import EvidenceEnforcementMiddleware
 
 mcp = FastMCP(
@@ -2610,6 +2611,65 @@ def add_anchored_comment(
             return comments_live.execute_add_anchored_comment_live(path, quote, text, expected_matches)
         return comments.execute_add_anchored_comment(
             path, quote, text, expected_matches, allow_concurrent_editor=allow_concurrent_editor
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
+@mcp.tool()
+def add_anchored_comment_batch(
+    path: str,
+    comments: list[dict[str, Any]],
+    write_mode: str = "auto",
+    revision_before: str | None = None,
+    allow_concurrent_editor: bool = False,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Add 1-50 anchored comments in ONE call (issue #113), instead of one
+    add_anchored_comment call per finding.
+
+    comments: [{quote, content, expected_matches (default 1), section_key
+    (optional)}], validated up front (non-empty quote/content, expected_matches
+    an int >= 1). `quote` is located as in add_anchored_comment; `section_key`
+    (from find_sections) restricts the item to that heading section.
+
+    Same contract as replace_text_batch: the first failure stops the batch and
+    NOTHING IS EVER RETRIED. One audit record per call holds every item's evidence.
+
+    write_mode "auto" | "file" | "live" as in add_anchored_comment.
+    LIVE: one pane comment_add per item, chained on the body hash; earlier comments
+    stay when a later item fails. The pane comments only the FIRST match, so every
+    item needs expected_matches == 1 (INVALID_INPUT otherwise, nothing sent). With a
+    section_key the quote is checked against a non-observing read of the live body
+    (it never re-arms a stale shared-bridge client): it must occur inside that
+    section and nowhere else (ZERO_MATCH if it is not in the section, AMBIGUOUS_SPAN
+    if it also occurs outside). revision_before ("live:sha256:<hex>") is checked once
+    at the start (LIVE_STALE). Item status: "applied" | "refused_before_write" |
+    "unknown" (a failure after dispatch whose outcome cannot be proven: re-read the
+    document before doing anything) | "not_attempted".
+    FILE: every comment is staged on one in-memory document and saved ONCE, guarded
+    (revision_before, allow_concurrent_editor as in add_anchored_comment) and
+    verified. expected_matches comments every match; section_key scopes the search
+    to that section, so the quote may repeat elsewhere (SECTION_NOT_FOUND if the key
+    is unknown). All-or-nothing: if an item fails, nothing is saved: earlier items
+    report "not_persisted", the failing one its code, the rest "not_attempted",
+    batch_status "none_applied"; a failed save makes every item "not_persisted".
+
+    Returns {applied (true only for "complete"), batch_status ("complete" | "partial"
+    | "none_applied" | "unknown"), applied_count, item_count, revision_before,
+    revision_after, results: [{index, status, comment_id? (comment_ids for a
+    multi-match file item), code?, message?}], evidence_ref}. verbose=true adds each
+    applied item's evidence (match_count, revision_after / before excerpt).
+
+    Errors (nothing was written): INVALID_INPUT (bad items, >50, live
+    expected_matches != 1), DOCX_LOCKED / SYNC_IN_FLIGHT / REVISION_CONFLICT /
+    EXTERNAL_EDITOR_ACTIVE / LIVE_SESSION_ACTIVE (file mode guard), LIVE_UNAVAILABLE,
+    LIVE_CAPABILITY_MISSING, LIVE_DISCONNECTED (before the first op).
+    """
+    try:
+        return comment_batch.execute_add_anchored_comment_batch(
+            path, comments, write_mode=write_mode, revision_before=revision_before,
+            allow_concurrent_editor=allow_concurrent_editor, verbose=verbose,
         )
     except VerifyError as exc:
         _raise_tool_error(exc)
