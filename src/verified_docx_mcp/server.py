@@ -55,6 +55,7 @@ from fastmcp import FastMCP
 
 from . import (
     audit,
+    comment_batch,
     comments,
     geometry,
     images,
@@ -75,6 +76,7 @@ from .errors import ErrorCode, VerifyError, _make_error
 from .lean_envelope import LeanEnvelopeMiddleware
 from .live import bridge as live_bridge
 from .live import comments_live, reads_live
+from .markdown_input import resolve_markdown_input, resolve_table_rows
 from .middleware import EvidenceEnforcementMiddleware
 
 _READ_ONLY: dict[str, bool] = {"readOnlyHint": True, "idempotentHint": True}
@@ -1582,13 +1584,20 @@ def list_styles(
 @mcp.tool(annotations=_DESTRUCTIVE)
 def replace_body_markdown(
     path: str,
-    markdown: str,
+    markdown: str | None = None,
+    markdown_file: str | None = None,
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
     allow_concurrent_editor: bool = False,
 ) -> dict[str, Any]:
     """Replace an entire document body's content with markdown, atomically.
+
+    markdown_file (issue #113): a path to a .md/.txt file (UTF-8, <= 2 MB, under the
+    allowed roots; outside them -> DOCX_PATH_ESCAPE) used INSTEAD of `markdown`, so text
+    already on disk need not be re-emitted. Exactly one of the two (else INVALID_INPUT).
+    The text is read once, server-side, before any routing; the response adds
+    markdown_sha256 (hex of its UTF-8 bytes) and markdown_chars.
 
     Rung 4 (last resort) of core/document-backend-protocol.md's backend-
     neutral edit ladder — the whole-document rewrite. Prefer
@@ -1685,9 +1694,10 @@ def replace_body_markdown(
                                           landed, NOT rolled back: details.rollback_skipped)
     """
     try:
-        return mutations.execute_replace_body_markdown(
+        text, extra = resolve_markdown_input(markdown, markdown_file)
+        return extra | mutations.execute_replace_body_markdown(
             path,
-            markdown,
+            text,
             revision_before=revision_before,
             force=force,
             track_changes=track_changes,
@@ -1701,7 +1711,8 @@ def replace_body_markdown(
 def replace_range_markdown(
     path: str,
     section_key: str,
-    markdown: str,
+    markdown: str | None = None,
+    markdown_file: str | None = None,
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
@@ -1709,6 +1720,12 @@ def replace_range_markdown(
 ) -> dict[str, Any]:
     """Replace one heading-delimited section (by section_key, from
     find_sections) with markdown, atomically.
+
+    markdown_file (issue #113): a path to a .md/.txt file (UTF-8, <= 2 MB, under the
+    allowed roots; outside them -> DOCX_PATH_ESCAPE) used INSTEAD of `markdown`, so text
+    already on disk need not be re-emitted. Exactly one of the two (else INVALID_INPUT).
+    The text is read once, server-side, before any routing; the response adds
+    markdown_sha256 (hex of its UTF-8 bytes) and markdown_chars.
 
     Rung 3 of core/document-backend-protocol.md's edit ladder: use this
     when find_sections can locate the target section, ahead of
@@ -1745,10 +1762,11 @@ def replace_range_markdown(
                            some code for this case)
     """
     try:
-        return mutations.execute_replace_range_markdown(
+        text, extra = resolve_markdown_input(markdown, markdown_file)
+        return extra | mutations.execute_replace_range_markdown(
             path,
             section_key,
-            markdown,
+            text,
             revision_before=revision_before,
             force=force,
             track_changes=track_changes,
@@ -1761,7 +1779,8 @@ def replace_range_markdown(
 @mcp.tool()
 def append_markdown(
     path: str,
-    markdown: str,
+    markdown: str | None = None,
+    markdown_file: str | None = None,
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
@@ -1769,6 +1788,12 @@ def append_markdown(
 ) -> dict[str, Any]:
     """Append markdown to the end of a document body (before its trailing
     w:sectPr, if any), atomically.
+
+    markdown_file (issue #113): a path to a .md/.txt file (UTF-8, <= 2 MB, under the
+    allowed roots; outside them -> DOCX_PATH_ESCAPE) used INSTEAD of `markdown`, so text
+    already on disk need not be re-emitted. Exactly one of the two (else INVALID_INPUT).
+    The text is read once, server-side, before any routing; the response adds
+    markdown_sha256 (hex of its UTF-8 bytes) and markdown_chars.
 
     Nothing existing is removed, so there is no comment-anchor/tracked-
     change hazard to scan and force has no effect here — it is accepted
@@ -1805,9 +1830,10 @@ def append_markdown(
       VERIFICATION_FAILED               - post-write verification failed; rolled back
     """
     try:
-        return mutations.execute_append_markdown(
+        text, extra = resolve_markdown_input(markdown, markdown_file)
+        return extra | mutations.execute_append_markdown(
             path,
-            markdown,
+            text,
             revision_before=revision_before,
             force=force,
             track_changes=track_changes,
@@ -2793,6 +2819,65 @@ def add_anchored_comment(
         _raise_tool_error(exc)
 
 
+@mcp.tool()
+def add_anchored_comment_batch(
+    path: str,
+    comments: list[dict[str, Any]],
+    write_mode: str = "auto",
+    revision_before: str | None = None,
+    allow_concurrent_editor: bool = False,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Add 1-50 anchored comments in ONE call (issue #113), instead of one
+    add_anchored_comment call per finding.
+
+    comments: [{quote, content, expected_matches (default 1), section_key
+    (optional)}], validated up front (non-empty quote/content, expected_matches
+    an int >= 1). `quote` is located as in add_anchored_comment; `section_key`
+    (from find_sections) restricts the item to that heading section.
+
+    Same contract as replace_text_batch: the first failure stops the batch and
+    NOTHING IS EVER RETRIED. One audit record per call holds every item's evidence.
+
+    write_mode "auto" | "file" | "live" as in add_anchored_comment.
+    LIVE: one pane comment_add per item, chained on the body hash; earlier comments
+    stay when a later item fails. The pane comments only the FIRST match, so every
+    item needs expected_matches == 1 (INVALID_INPUT otherwise, nothing sent). With a
+    section_key the quote is checked against a non-observing read of the live body
+    (it never re-arms a stale shared-bridge client): it must occur inside that
+    section and nowhere else (ZERO_MATCH if it is not in the section, AMBIGUOUS_SPAN
+    if it also occurs outside). revision_before ("live:sha256:<hex>") is checked once
+    at the start (LIVE_STALE). Item status: "applied" | "refused_before_write" |
+    "unknown" (a failure after dispatch whose outcome cannot be proven: re-read the
+    document before doing anything) | "not_attempted".
+    FILE: every comment is staged on one in-memory document and saved ONCE, guarded
+    (revision_before, allow_concurrent_editor as in add_anchored_comment) and
+    verified. expected_matches comments every match; section_key scopes the search
+    to that section, so the quote may repeat elsewhere (SECTION_NOT_FOUND if the key
+    is unknown). All-or-nothing: if an item fails, nothing is saved: earlier items
+    report "not_persisted", the failing one its code, the rest "not_attempted",
+    batch_status "none_applied"; a failed save makes every item "not_persisted".
+
+    Returns {applied (true only for "complete"), batch_status ("complete" | "partial"
+    | "none_applied" | "unknown"), applied_count, item_count, revision_before,
+    revision_after, results: [{index, status, comment_id? (comment_ids for a
+    multi-match file item), code?, message?}], evidence_ref}. verbose=true adds each
+    applied item's evidence (match_count, revision_after / before excerpt).
+
+    Errors (nothing was written): INVALID_INPUT (bad items, >50, live
+    expected_matches != 1), DOCX_LOCKED / SYNC_IN_FLIGHT / REVISION_CONFLICT /
+    EXTERNAL_EDITOR_ACTIVE / LIVE_SESSION_ACTIVE (file mode guard), LIVE_UNAVAILABLE,
+    LIVE_CAPABILITY_MISSING, LIVE_DISCONNECTED (before the first op).
+    """
+    try:
+        return comment_batch.execute_add_anchored_comment_batch(
+            path, comments, write_mode=write_mode, revision_before=revision_before,
+            allow_concurrent_editor=allow_concurrent_editor, verbose=verbose,
+        )
+    except VerifyError as exc:
+        _raise_tool_error(exc)
+
+
 @mcp.tool(annotations=_READ_ONLY)
 def get_comment_thread(path: str, comment_id: str | None = None,
                        source: str = "auto", session_epoch: str | None = None,
@@ -3376,7 +3461,8 @@ def replace_cell_markdown(
     table_id: int,
     row_index: int,
     cell_index: int,
-    markdown: str,
+    markdown: str | None = None,
+    markdown_file: str | None = None,
     revision_before: str | None = None,
     force: bool = False,
     track_changes: bool = False,
@@ -3389,6 +3475,12 @@ def replace_cell_markdown(
     its own w:tcPr byte-identical -- the only write path safe on a merged
     (w:gridSpan/w:vMerge) cell, and the intended path for an Appendix-A
     style band-and-border table's own cell content.
+
+    markdown_file (issue #113): a path to a .md/.txt file (UTF-8, <= 2 MB, under the
+    allowed roots; outside them -> DOCX_PATH_ESCAPE) used INSTEAD of `markdown`, so text
+    already on disk need not be re-emitted. Exactly one of the two (else INVALID_INPUT).
+    The text is read once, server-side, before any routing; the response adds
+    markdown_sha256 (hex of its UTF-8 bytes) and markdown_chars.
 
     `write_mode` (issue #27, "auto" | "file" | "live", default "auto"):
     "auto" routes through the Live pane when one is connected for this
@@ -3472,8 +3564,9 @@ def replace_cell_markdown(
                                  the read and the write, and a document with nested tables
     """
     try:
-        return tables.execute_replace_cell_markdown(
-            path, table_id, row_index, cell_index, markdown,
+        text, extra = resolve_markdown_input(markdown, markdown_file)
+        return extra | tables.execute_replace_cell_markdown(
+            path, table_id, row_index, cell_index, text,
             revision_before=revision_before, force=force, track_changes=track_changes,
             allow_concurrent_editor=allow_concurrent_editor, write_mode=write_mode,
             expected_before=expected_before, inherit_format=inherit_format,
@@ -3485,7 +3578,8 @@ def replace_cell_markdown(
 @mcp.tool()
 def insert_table(
     path: str,
-    rows: list[list[str | dict[str, Any]]],
+    rows: list[list[str | dict[str, Any]]] | None = None,
+    markdown_file: str | None = None,
     style_id: str | None = None,
     header_rows: int = 0,
     grid_dxa: list[int] | None = None,
@@ -3503,6 +3597,14 @@ def insert_table(
 ) -> dict[str, Any]:
     """Insert a new table, one markdown string OR cell-spec object per
     cell (issue #100: https://github.com/michaelrobertsutton/JennyStack/issues/100).
+
+    markdown_file (issue #113) is an alternative to `rows`: a .md/.txt file (UTF-8,
+    <= 2 MB, under the allowed roots; outside -> DOCX_PATH_ESCAPE) holding a GFM pipe
+    table, parsed into the same `rows` (header row first, the |---| separator row
+    dropped; pass header_rows=1 to repeat the header). Exactly one of rows/markdown_file
+    (else INVALID_INPUT). Assumption: the issue calls this `rows_markdown`, which does
+    not exist, so the file is parsed to `rows` here. The response adds markdown_sha256
+    and markdown_chars.
 
     `write_mode` (issue #34, "auto" | "file" | "live", default "auto"):
     "auto" routes through the Live pane when one is connected for this
@@ -3650,9 +3752,10 @@ def insert_table(
                              LIVE_OP_FAILED here also covers a document with nested tables
     """
     try:
-        return tables.execute_insert_table(
+        table_rows, extra = resolve_table_rows(rows, markdown_file)
+        return extra | tables.execute_insert_table(
             path,
-            rows,
+            table_rows,
             style_id,
             header_rows=header_rows,
             grid_dxa=grid_dxa,
@@ -4870,6 +4973,9 @@ def live_changes_prepare(path: str, operations: list[dict[str, Any]], track_chan
     the section's paragraphs (p0 = its heading). Prepare resolves it against the section as
     the earlier operations leave it; the manifest stores the resolved full find (no 230-
     character limit then; over 230 needs anchored_find_v1) and the preview shows it.
+    replace_cell_markdown args may carry markdown_file (a .md/.txt path, issue #113)
+    instead of markdown: prepare reads it once and stores the CONTENT as markdown in
+    the manifest, so the digest binds the text, not the path.
     Requires approved_changes_v1; explicit segments also require formatted_replacements_v1.
     """
     from .live.approved_changes import prepare
