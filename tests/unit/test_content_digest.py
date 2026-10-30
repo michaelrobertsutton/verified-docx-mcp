@@ -227,6 +227,26 @@ class SingleConcernEditTests(ContentDigestCase):
         self.assertEqual(items_of(path, "next-steps-1")[-1], ["del", 1, len("Next "), "steps"])
         self.assert_only_content_changed(path, {"next-steps-1"})
 
+    def test_a_deletion_split_across_runs_digests_like_one(self) -> None:
+        split_runs = sub1(
+            '<w:r w:rsidDel="00812B71"><w:delText>steps</w:delText></w:r>',
+            '<w:r w:rsidDel="00812B71"><w:delText>st</w:delText></w:r>'
+            '<w:r w:rsidDel="00812B71"><w:rPr><w:b/></w:rPr><w:delText>eps</w:delText></w:r>',
+        )
+        path = variant(self.tmp / "a.docx", {DOC: split_runs})
+        self.assertEqual(len(projection.project_part(path).deleted_spans), 2)
+        self.assertEqual(digests(path), self.base)
+
+    def test_a_deletion_split_across_del_elements_digests_like_one(self) -> None:
+        split_dels = sub1(
+            '<w:r w:rsidDel="00812B71"><w:delText>steps</w:delText></w:r></w:del>',
+            '<w:r w:rsidDel="00812B71"><w:delText>ste</w:delText></w:r></w:del>'
+            '<w:del w:id="66" w:author="Other" w:date="2026-10-30T00:00:00Z">'
+            '<w:r><w:delText>ps</w:delText></w:r></w:del>',
+        )
+        path = variant(self.tmp / "a.docx", {DOC: split_dels})
+        self.assertEqual(digests(path), self.base)
+
 
 class NoiseTests(ContentDigestCase):
     def test_dates_ids_rsids_paraids_proof_bookmarks_change_nothing(self) -> None:
@@ -329,7 +349,7 @@ class AnchoringTests(ContentDigestCase):
         overview = items_of(path, "overview-1")
         self.assertEqual(overview[-1], ["c", "Michael Sutton", "Reply to one", False, [], True])
 
-    def test_comments_order_by_range_start(self) -> None:
+    def test_a_replys_start_does_not_order_its_thread(self) -> None:
         path = variant(
             self.tmp / "a.docx",
             {DOC: sub1('<w:commentRangeStart w:id="0"/><w:commentRangeStart w:id="1"/>',
@@ -337,6 +357,58 @@ class AnchoringTests(ContentDigestCase):
         )
         # Comment 1 is a reply (placed through its root), so only the root's start counts.
         self.assert_only_content_changed(path, set())
+
+    def test_two_roots_order_by_range_start(self) -> None:
+        """A second root in the same heading paragraph: whose commentRangeStart comes
+        first decides the order of the two "c" items, and so the digest."""
+        reference = '<w:r><w:commentReference w:id="9"/></w:r>'
+
+        def second_root(start_before_root_one: bool) -> Callable[[str], str]:
+            def edit(xml: str) -> str:
+                start = '<w:commentRangeStart w:id="9"/>'
+                anchor = '<w:commentRangeStart w:id="0"/><w:commentRangeStart w:id="1"/>'
+                xml = xml.replace(anchor, start + anchor if start_before_root_one else anchor + start, 1)
+                end = '<w:commentRangeEnd w:id="0"/>'
+                return xml.replace(end, end + '<w:commentRangeEnd w:id="9"/>' + reference, 1)
+
+            return edit
+
+        first = variant(self.tmp / "first.docx", {DOC: second_root(True), COMMENTS: self._add_comment("Second root", "9", "0A0B0C0D")})
+        later = variant(self.tmp / "later.docx", {DOC: second_root(False), COMMENTS: self._add_comment("Second root", "9", "0A0B0C0D")})
+        texts = lambda path: [i[2] for i in items_of(path, "overview-1") if i[0] == "c"]
+        self.assertEqual(texts(first), ["Second root", "Root comment one"])
+        self.assertEqual(texts(later), ["Root comment one", "Second root"])
+        self.assertNotEqual(digests(first)[1]["overview-1"], digests(later)[1]["overview-1"])
+        self.assertEqual(digests(first)[0], digests(later)[0])
+
+    def test_comment_anchored_inside_a_tracked_deletion_is_placed(self) -> None:
+        deleted = (
+            '<w:del w:id="80" w:author="R" w:date="2026-10-29T20:06:00Z"><w:commentRangeStart w:id="9"/>'
+            '<w:r><w:delText>gone</w:delText></w:r><w:commentRangeEnd w:id="9"/>'
+            '<w:r><w:commentReference w:id="9"/></w:r></w:del>'
+        )
+        body = sub1("<w:r><w:t>Some overview text.</w:t></w:r>", "<w:r><w:t>Some overview text.</w:t></w:r>" + deleted)
+        path = variant(self.tmp / "a.docx", {DOC: body, COMMENTS: self._add_comment("In a deletion", "9", "0A0B0C0D")})
+        self.assertIn(["c", "Reviewer", "In a deletion", False, [], False], items_of(path, "overview-1"))
+        edited = variant(self.tmp / "b.docx", {DOC: body, COMMENTS: self._add_comment("In a deletion!", "9", "0A0B0C0D")})
+        base_sha, base_content, _ = digests(path)
+        sha, content, _ = digests(edited)
+        self.assertEqual(sha, base_sha)
+        self.assertEqual({k for k in KEYS if content[k] != base_content[k]}, {"overview-1"})
+
+    def test_reference_only_inside_a_deletion_is_placed(self) -> None:
+        deleted = (
+            '<w:del w:id="80" w:author="R" w:date="2026-10-29T20:06:00Z">'
+            '<w:r><w:commentReference w:id="9"/></w:r></w:del>'
+        )
+        path = variant(
+            self.tmp / "a.docx",
+            {
+                DOC: sub1("<w:r><w:t>Some overview text.</w:t></w:r>", "<w:r><w:t>Some overview text.</w:t></w:r>" + deleted),
+                COMMENTS: self._add_comment("Reference only", "9", "0A0B0C0D"),
+            },
+        )
+        self.assertIn(["c", "Reviewer", "Reference only", False, [], False], items_of(path, "overview-1"))
 
     def test_reply_order_follows_comments_xml_order(self) -> None:
         def add_second_reply(xml: str) -> str:
@@ -379,6 +451,42 @@ class MalformedLinkageTests(ContentDigestCase):
     def test_ambiguous_parent_para_id(self) -> None:
         path = variant(self.tmp / "a.docx", {COMMENTS: sub1('w14:paraId="37317D53"', 'w14:paraId="3FADA680"')})
         self.assert_invalid(path)
+
+    def test_non_numeric_grid_span(self) -> None:
+        path = variant(self.tmp / "a.docx", {DOC: sub1('<w:gridSpan w:val="2"/>', '<w:gridSpan w:val="two"/>')})
+        self.assert_invalid(path)
+
+
+class ThreadingScaleTests(unittest.TestCase):
+    def test_three_thousand_comments_thread_in_under_a_second(self) -> None:
+        """Review of #117: the known-paraId lookup is built once, not scanned per comment."""
+        import time
+        import xml.etree.ElementTree as ET
+
+        w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        w14 = "http://schemas.microsoft.com/office/word/2010/wordml"
+        w15 = "http://schemas.microsoft.com/office/word/2012/wordml"
+        w16cid = "http://schemas.microsoft.com/office/word/2016/wordml/cid"
+        comments = ET.Element(f"{{{w}}}comments")
+        ext = ET.Element(f"{{{w15}}}commentsEx")
+        ids = ET.Element(f"{{{w16cid}}}commentsIds")
+        n = 3000
+        for i in range(n):
+            pid = f"{i + 1:08X}"
+            c = ET.SubElement(comments, f"{{{w}}}comment", {f"{{{w}}}id": str(i), f"{{{w}}}author": "A"})
+            p = ET.SubElement(c, f"{{{w}}}p", {f"{{{w14}}}paraId": pid})
+            ET.SubElement(ET.SubElement(p, f"{{{w}}}r"), f"{{{w}}}t").text = f"comment {i}"
+            attrs = {f"{{{w15}}}paraId": pid, f"{{{w15}}}done": "0"}
+            if i % 2:
+                attrs[f"{{{w15}}}paraIdParent"] = f"{i:08X}"  # reply to the previous root
+            ET.SubElement(ext, f"{{{w15}}}commentEx", attrs)
+            ET.SubElement(ids, f"{{{w16cid}}}commentId", {f"{{{w16cid}}}paraId": pid, f"{{{w16cid}}}durableId": pid})
+        t0 = time.perf_counter()
+        threads = projection._content_comment_threads(comments, ext, ids)
+        elapsed = time.perf_counter() - t0
+        self.assertEqual(len(threads), n // 2)
+        self.assertTrue(all(len(item[3]) == 1 for item in threads.values()))
+        self.assertLess(elapsed, 1.0)
 
 
 class PreambleTests(ContentDigestCase):
@@ -430,6 +538,17 @@ class FindSectionsToolTests(ContentDigestCase):
         self.assertEqual({s["section_key"]: s["content_sha12"] for s in heads}, self.base[1])
         self.assertEqual({s["section_key"]: s["sha12"] for s in heads}, self.base[0])
         self.assertEqual(result["preamble_content_sha12"], self.base[2])
+
+    def test_uncanonicalizable_content_keeps_sha12_and_warns(self) -> None:
+        variant(self.tmp / "dup.docx", {COMMENTS: sub1('<w:comment w:id="3"', '<w:comment w:id="2"')})
+        result = server.execute_find_sections(str(self.tmp / "dup.docx"), digests=True)
+        heads = [s for s in result["sections"] if s["kind"] == "heading"]
+        self.assertEqual({s["section_key"]: s["sha12"] for s in heads}, self.base[0])
+        self.assertTrue(all(s["content_sha12"] is None for s in heads))
+        self.assertIsNone(result["preamble_content_sha12"])
+        self.assertIn("content_digest_unavailable", result["warnings"])
+        self.assertIn("w:id", result["content_digest_unavailable"]["reason"])
+        self.assertEqual(result["content_digest_unavailable"]["diagnostics"]["stage"], "content_digest")
 
     def test_digests_false_adds_nothing(self) -> None:
         result = server.execute_find_sections(str(self.doc))
@@ -510,6 +629,39 @@ class LiveContentDigestTests(LiveRevisionTestCase):
 
         plain = await self.call(server.live_list_sections, str(self.target), compact=True)
         self.assertEqual(set(plain), {"sections", "body_sha12"})
+        self.assertNotIn("warnings", compact)
+
+    async def test_live_list_sections_reports_a_key_mismatch_never_pairs_silently(self) -> None:
+        pane_view = pane_sections(FIXTURE)
+        pane_view[1] = {**pane_view[1], "section_key": "background-renamed-1"}
+        await self.connect_live(capabilities=["section_locks", "body_ooxml"], sections=pane_view)
+        compact = await self.call(server.live_list_sections, str(self.target), compact=True, content_digests=True)
+        self.assertIn("content_sections_key_mismatch", compact["warnings"])
+        self.assertEqual(
+            compact["content_sections_key_mismatch"],
+            {"pane_only": ["background-renamed-1"], "server_only": ["background-1"], "order_differs": False},
+        )
+        self.assertEqual([k for k, _ in compact["content_sections"]], KEYS)  # the server's own keys
+
+    async def test_export_fidelity_warnings_are_passed_through(self) -> None:
+        flat = docx_to_flat_opc(FIXTURE)
+        flat, n = re.subn(r'<pkg:part pkg:name="/word/styles\.xml".*?</pkg:part>', "", flat, flags=re.DOTALL)
+        self.assertEqual(n, 1)
+        await self.connect_live(capabilities=["section_locks", "body_ooxml"], body_ooxml=flat)
+        revision = await self.call(reads_live.live_revision, str(self.target), content_digests=True)
+        self.assertIn("live_styles_missing", revision["warnings"])
+        listed = await self.call(server.live_list_sections, str(self.target), compact=True, content_digests=True)
+        self.assertIn("live_styles_missing", listed["warnings"])
+
+    async def test_explicit_content_digests_still_raise_on_bad_threading(self) -> None:
+        dup = variant(Path(self._tmp.name) / "dup.docx", {COMMENTS: sub1('<w:comment w:id="3"', '<w:comment w:id="2"')})
+        await self.connect_live(body_ooxml=docx_to_flat_opc(dup))
+        with self.assertRaises(VerifyError) as ctx:
+            await self.call(reads_live.live_revision, str(self.target), content_digests=True)
+        self.assertEqual(ctx.exception.envelope.error_code, ErrorCode.INVALID_INPUT)
+        live = await self.call(server.execute_find_sections, str(self.target), source="live", digests=True)
+        self.assertIn("content_digest_unavailable", live["warnings"])
+        self.assertTrue(all(len(s["sha12"]) == 12 for s in live["sections"] if s["kind"] == "heading"))
 
 
 # -- shared-bridge observe semantics ---------------------------------------------
