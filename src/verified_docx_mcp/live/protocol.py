@@ -97,6 +97,25 @@ pane must honor.
                      list of ``ReplaceMatchResult`` {before, after}, pre,
                      post -- pre/post are ``body.text`` SHA-256 read
                      before and after the whole op).
+                     ``expected_first_font`` (issue #108, optional --
+                     REQUIRES ``"partial_font_segments_v1"``): the ten-field
+                     baseline partial replacement_segments were resolved
+                     against. The pane re-reads each match's first-run font
+                     in its last preflight sync, right before the write, and
+                     refuses ``FORMAT_DRIFT`` (nothing written) on any
+                     difference.
+
+  replacement_font -- READ-ONLY (issue #108; capability
+                     ``"partial_font_segments_v1"``). Payload: the target
+                     fields of ``replace`` (find, expected_matches, rowAnchor,
+                     scope, executionTargetSection). Same search and count
+                     gate as replace (``zero_match``/``match_count_mismatch``),
+                     then loads the effective font (``range.font``, which
+                     reflects style/theme inheritance) of the first character
+                     of every match. Matches whose first-run fonts differ
+                     refuse ``INVALID_INPUT``. Reply result: ``{font: {bold,
+                     italic, underline, strikeThrough, doubleStrikeThrough,
+                     subscript, superscript, color, name, size}, match_count}``.
 
   format          -- ``FormatPayload`` (find, expected_matches, bold,
                      italic, underline, strike, color, track_changes,
@@ -359,6 +378,8 @@ VALID_OPS: frozenset[str] = frozenset(
         # issue #47: heading sections (key, level, hash) for section locks
         "sections_list",
         "execution_snapshot",
+        # issue #108: the first replaced run's effective font, for partial segments
+        "replacement_font",
     }
 )
 

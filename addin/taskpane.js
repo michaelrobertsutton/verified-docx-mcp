@@ -386,7 +386,7 @@ const OP_LOG_LIMIT = 20;
 // issue #80: "comment_delete" = the comment_delete op (removes a whole comment thread).
 // issue #82: "comment_loss_ids" = replace honors payload.allow_comment_loss_ids (per-thread consent).
 // issue #39: "comments_ooxml_crosscheck" = the unfiltered comments_list adds an `ooxml` open-thread count.
-const PANE_CAPABILITIES = ["paragraph_positions_v1", "cell_paragraph_merge_v1", "cell_font_inheritance_v1", "table_rows_v1", "table_copy_v1", "heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1", "compact_evidence_v1"];
+const PANE_CAPABILITIES = ["partial_font_segments_v1", "paragraph_positions_v1", "cell_paragraph_merge_v1", "cell_font_inheritance_v1", "table_rows_v1", "table_copy_v1", "heartbeat_liveness_v1", "approved_cell_stream_v1", "anchored_text_v1", "formatted_replacements_v1", "approved_changes_v1", "section_locks", "shared_queue", "row_scope", "cell_edit", "cell_multiline", "comments_by_id", "table_edit", "body_ooxml", "live_revisions", "comment_loss_guard", "replacement_formatting", "format_readback", "textboxes", "delete_paragraph", "shape_guard", "comment_counts", "autoopen", "paragraph_insert", "comment_delete", "comment_loss_ids", "table_delete", "paragraphs_unlist", "revisions_scoped", "comments_ooxml_crosscheck", "body_hash_v1", "compact_evidence_v1"];
 
 // issue #39: per-load id, sent in `hello`, so the server can say which pane
 // instance answered. Falls back when crypto.randomUUID is unavailable.
@@ -701,7 +701,7 @@ function enqueuePaneOperation(operation) {
 }
 const READ_ONLY_OPS = new Set(["ping", "describe", "body_ooxml", "body_hash", "search", "comments_list",
   "cell_get", "table_get", "shapes_list", "textboxes_list", "textboxes_read", "scope_describe",
-  "revisions_list", "autoopen_get", "sections_list", "execution_snapshot"]);
+  "revisions_list", "autoopen_get", "sections_list", "execution_snapshot", "replacement_font"]);
 
 async function dispatchOp(op, payload) {
   if (op === "save" && payload.executionSections)
@@ -759,6 +759,8 @@ async function dispatchOpUnchecked(op, payload) {
       return opBodyHash();
     case "search":
       return opSearch(payload);
+    case "replacement_font":
+      return opReplacementFont(payload);
     case "replace":
       return opReplace(payload);
     case "format":
@@ -1406,9 +1408,52 @@ async function verifyAnchoredText(context, boundaries) {
   });
 }
 
+// issue #108: the effective font (range.font reflects style/theme inheritance) of the first
+// character -- so of the first run -- of each match. Returns one Word font proxy per range,
+// loaded with FONT_FIELDS; the caller syncs. A match always starts with find's first
+// character, so the first hit of that character inside the match is the match's first char.
+async function firstRunFonts(context, ranges, find) {
+  const first = Array.from(find || "")[0];
+  if (!first) throw refusalError("Cannot sample the first run of an empty match", "INVALID_INPUT");
+  const token = first === "^" ? "^^" : first === "\t" ? "^t" : first === "\v" ? "^l" : first;
+  const hits = ranges.map(r => r.search(token, {matchCase: true, matchWholeWord: false}));
+  hits.forEach(h => h.load("items"));
+  await context.sync();
+  const fonts = ranges.map((r, i) => (hits[i].items[0] || r).font);
+  fonts.forEach(f => f.load(FONT_FIELDS));
+  return fonts;
+}
+function sameFont(a, b) {
+  return FONT_FIELDS.every(k => String(a[k]).toLowerCase() === String(b[k]).toLowerCase());
+}
+function expectedFirstFont(payload) {
+  const font = payload.expected_first_font;
+  if (font === undefined || font === null) return null;
+  if (typeof font !== "object" || Array.isArray(font) || FONT_FIELDS.some(k => !(k in font)))
+    throw refusalError("expected_first_font must name every font field", "INVALID_INPUT");
+  return font;
+}
+
+async function opReplacementFont(payload) {
+  return measuredWordRun(async (context) => {
+    const matchItems = await searchScoped(context, payload);
+    if (matchItems.length !== payload.expected_matches)
+      throw refusalError(
+        `expected ${payload.expected_matches} match(es) for ${JSON.stringify(payload.find)}, found ${matchItems.length}`,
+        matchItems.length === 0 ? "zero_match" : "match_count_mismatch");
+    const fonts = await firstRunFonts(context, matchItems, payload.find);
+    await context.sync();
+    const snapshots = fonts.map(fontSnapshot);
+    if (snapshots.some(f => !sameFont(f, snapshots[0])))
+      throw refusalError("matches differ in formatting; specify every field", "INVALID_INPUT");
+    return {font: snapshots[0], match_count: matchItems.length};
+  });
+}
+
 async function opReplace(payload) {
   const expectedMatches = payload.expected_matches;
   const segments = explicitSegments(payload);
+  const expectedFont = expectedFirstFont(payload);
   return measuredWordRun(async (context) => {
     if (!payload.executionSections) await requireFreshBody(context, payload.expectedBodySha256);
     await requireFreshScope(context, payload);
@@ -1447,11 +1492,18 @@ async function opReplace(payload) {
       previousMode = context.document.changeTrackingMode;
     }
 
+    // issue #108: partial segments were resolved against the first run's font; locate it now
+    // and re-read it in the LAST preflight sync, the one right before the write.
+    const driftFonts = expectedFont ? await firstRunFonts(context, matchItems, payload.find) : [];
     await (await sectionGuard(context, payload)).check(matchItems); // Fresh protected content at mutation boundary.
     matchItems.forEach(range => range.load("text"));
+    driftFonts.forEach(f => f.load(FONT_FIELDS));
     await context.sync();
     if (matchItems.some(range => range.text !== payload.find))
       throw refusalError("Replacement target changed during preflight", "LIVE_STALE");
+    if (driftFonts.some(f => !sameFont(fontSnapshot(f), expectedFont)))
+      throw refusalError("The first replaced run's formatting changed since the segments were resolved; " +
+        "nothing was written. Retry (or prepare the approved run again).", "FORMAT_DRIFT");
     const matches = matchItems.map((range) => ({ before: range.text, after: payload.replace }));
     try {
       if (previousMode !== null) context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;

@@ -43,6 +43,7 @@ READ_OPS = frozenset(
         "autoopen_get",
         "sections_list",
         "execution_snapshot",
+        "replacement_font",
     }
 )
 # Writes that persist but neither read nor change the body (issue #107): they stay writes for
