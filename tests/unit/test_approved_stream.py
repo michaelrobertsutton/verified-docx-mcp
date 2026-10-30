@@ -47,7 +47,7 @@ def test_only_proven_prewrite_capability_failure_falls_back(setup):  # noqa: F81
     prepared=runs.prepare(path,[cell()])
     assert execute(path,prepared)['status']=='complete'
     assert pane.calls['cell_set']==1
-    assert pane.calls['cell_get']==1
+    assert pane.calls['cell_get']==2  # the first-run font read (issue #107) plus the readback
 
 
 def test_uncertain_stream_is_never_replayed_or_fallen_back(setup):  # noqa: F811

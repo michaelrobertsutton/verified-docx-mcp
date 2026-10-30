@@ -218,15 +218,18 @@ def validate(operations):
         if not isinstance(item, dict) or set(item) != {"op", "section", "args"} or item.get("op") not in OPS:
             raise invalid(f"Operation {i} requires op, section and args from the supported operation set")
         op, args = item["op"], item["args"]
-        if not isinstance(args, dict) or set(args) - ({"replacement_segments"} if op == "replace_text" else set()) != OPS[op]:
+        optional = {"replacement_segments"} if op == "replace_text" else {"inherit_format"} if op == "replace_cell_markdown" else set()
+        if not isinstance(args, dict) or set(args) - optional != OPS[op]:
             raise invalid(f"Operation {i} has unexpected or missing arguments")
+        if args.get("inherit_format", "first_run") not in tables._INHERIT_FORMATS:
+            raise invalid(f"inherit_format must be one of {tables._INHERIT_FORMATS}")
         if op != "live_save" and (not isinstance(item["section"], str) or not item["section"]):
             raise invalid("Every text operation must name its protected section slug")
         if op == "replace_text":
             from ..formatted_text import validate_segments
             validate_segments(args.get("replacement_segments"), args["replace"])
         for key, value in args.items():
-            if key == "replacement_segments":
+            if key in {"replacement_segments", "inherit_format"}:
                 continue
             if key in {"table_id", "row_index", "cell_index"}:
                 if type(value) is not int or value < 1:
@@ -346,7 +349,10 @@ def apply(path, operation, track_changes=False):
                 if len(paragraphs) > 1 or any(r.hard_break for p in paragraphs for r in p):
                     wm.require_capability(session, "cell_multiline", feature_description="multiline cell writes")
                 streamed = "approved_cell_stream_v1" in session.hello.capabilities and os.environ.get("VERIFIED_DOCX_DISABLE_APPROVED_CELL_STREAM") != "1"
+                # issue #107: the cell's first-run font rides in the same write and is read back.
+                _, inherit_font = tables.live_cell_read_with_font(session, address, args.get("inherit_format", "first_run"))
                 cell_payload = {**address, "expected_before_text": before,
+                    **({"inherit_font": inherit_font} if inherit_font else {}),
                     "paragraphs": tables._runs_to_wire(paragraphs),
                     "expected_before_paragraph_count": table.get("paragraph_counts", [[None]*len(r) for r in table["rows"]])[args["row_index"]-1][args["cell_index"]-1]}
                 try:
