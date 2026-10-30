@@ -422,7 +422,8 @@ Code run this server's read-only tools without a prompt, add them to
       "mcp__verified-docx-mcp__live_revision",
       "mcp__verified-docx-mcp__lock_status",
       "mcp__verified-docx-mcp__export_pdf",
-      "mcp__verified-docx-mcp__read_audit_evidence"
+      "mcp__verified-docx-mcp__read_audit_evidence",
+      "mcp__verified-docx-mcp__diff_table_vs_markdown"
     ]
   }
 }

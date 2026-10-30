@@ -35,7 +35,7 @@ JennyStack reads (`tests/unit/test_jennystack_contract.py`).
 
   It also shortens `live_session` to `{document_url, reason}`.
 - **Annotations and instructions**
-  - `readOnlyHint` and `idempotentHint` are set on the 20 read tools; `destructiveHint` is set on the 7 destructive ones.
+  - `readOnlyHint` and `idempotentHint` are set on the 21 read tools (including #109's `diff_table_vs_markdown`, merged meanwhile); `destructiveHint` is set on the 8 destructive ones (including #106's `delete_table_row`).
   - The server instructions gain five workflow lines.
   - The README gains a permission rule for the read-only tools.
 - **Fix found on the way.** `resolve_comment` and `reply_to_comment` refused the `live:<epoch>:<id>` handle that `list_open_items` returns: they sent `<epoch>:<id>` to the pane, which has no such comment.

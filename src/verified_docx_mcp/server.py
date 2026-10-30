@@ -4248,7 +4248,7 @@ def diff_body_vs_file(
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
 def diff_table_vs_markdown(
     path: str,
     table_id: int | None = None,
@@ -4891,7 +4891,7 @@ def insert_table_row(path: str, table_id: int, cells: list[str],
         _raise_tool_error(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"destructiveHint": True})
 def delete_table_row(path: str, table_id: int, row_index: int, expected_text: str,
                      revision_before: str | None = None, track_changes: bool = False,
                      write_mode: str = "auto", allow_concurrent_editor: bool = False) -> dict[str, Any]:

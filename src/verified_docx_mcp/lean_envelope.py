@@ -102,6 +102,7 @@ READ_TOOLS: frozenset[str] = frozenset(
         "lock_status",
         "export_pdf",
         "read_audit_evidence",
+        "diff_table_vs_markdown",
     }
 )
 

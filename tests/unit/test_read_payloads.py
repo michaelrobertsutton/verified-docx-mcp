@@ -37,10 +37,10 @@ LIVE_READ = {
 }
 
 READ_ONLY_TOOLS = frozenset(
-    ["read_document", "find_sections", "list_page_sections", "list_tables", "get_table", "list_open_items", "get_comment_thread", "list_styles", "list_parts", "list_shapes", "list_textboxes", "read_textbox", "read_header_footer", "diff_body_vs_file", "live_status", "live_list_sections", "live_revision", "lock_status", "export_pdf", "read_audit_evidence"]
+    ["read_document", "find_sections", "list_page_sections", "list_tables", "get_table", "list_open_items", "get_comment_thread", "list_styles", "list_parts", "list_shapes", "list_textboxes", "read_textbox", "read_header_footer", "diff_body_vs_file", "live_status", "live_list_sections", "live_revision", "lock_status", "export_pdf", "read_audit_evidence", "diff_table_vs_markdown"]
 )
 DESTRUCTIVE_TOOLS = frozenset(
-    ["delete_paragraph", "delete_table", "delete_comment", "delete_resolved_comments", "replace_body_markdown", "accept_tracked_changes", "reject_tracked_changes"]
+    ["delete_paragraph", "delete_table", "delete_comment", "delete_resolved_comments", "replace_body_markdown", "accept_tracked_changes", "reject_tracked_changes", "delete_table_row"]
 )
 
 
