@@ -336,6 +336,8 @@ VALID_OPS: frozenset[str] = frozenset(
         "approved_cell_set",
         "table_get",
         "table_insert",
+        "table_row_edit",
+        "table_copy",
         "cells_set",
         "paragraph_delete",
         "paragraph_insert",
