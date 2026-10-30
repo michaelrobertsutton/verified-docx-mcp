@@ -357,3 +357,20 @@ class FlatOpcConversionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HeadingSectionLiveReadTests(LiveReadsTestCase):
+    async def test_live_heading_read_matches_the_live_range_read(self):
+        await self.connect_live()
+        for fmt in ("text", "markdown", "runs"):
+            keyed = await self.read(format=fmt, section_key="next-steps-1", source="live")
+            ranged = await self.read(format=fmt, start_para_ref="p4", end_para_ref="p5", source="live")
+            self.assertEqual(keyed["source"], "live")
+            self.assertEqual(keyed[fmt], ranged[fmt], fmt)
+            self.assertEqual((keyed["start_para_ref"], keyed["end_para_ref"]), ("p4", "p5"))
+
+    async def test_live_unknown_heading_key_is_invalid_input(self):
+        await self.connect_live()
+        with self.assertRaises(VerifyError) as ctx:
+            await self.read(section_key="nope-1", source="live")
+        self.assertEqual(_code(ctx.exception), ErrorCode.INVALID_INPUT)

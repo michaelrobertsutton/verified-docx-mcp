@@ -1050,7 +1050,7 @@ def execute_read_document(
     if start_para_ref is not None and section_key is not None:
         raise _make_error(
             ErrorCode.INVALID_INPUT,
-            "A paragraph range cannot be combined with section_key (a text-box scope has its own paragraphs).",
+            "A paragraph range cannot be combined with section_key (a section key already selects its own paragraphs).",
             {"section_key": section_key, "start_para_ref": start_para_ref},
         )
     # Resolve the destination BEFORE the read so a bad path costs nothing and
@@ -1060,7 +1060,14 @@ def execute_read_document(
     )
     with reads_live.read_source(path, source, part) as rs:
         result, paragraph_count = _read_document_from(
-            rs.local_path, rs.resolved, format, part, section_key, start_para_ref, end_para_ref
+            rs.local_path,
+            rs.resolved,
+            format,
+            part,
+            section_key,
+            start_para_ref,
+            end_para_ref,
+            live=rs.source == "live",
         )
         if target is not None:
             result = _written_read_summary(rs.local_path, result, paragraph_count, format, part, target)
@@ -1117,6 +1124,8 @@ def _read_document_from(
     section_key: str | None,
     start_para_ref: str | None = None,
     end_para_ref: str | None = None,
+    *,
+    live: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """The read body plus the number of paragraphs it covers."""
     revision = projection.compute_revision(local_path)
@@ -1144,21 +1153,31 @@ def _read_document_from(
         return result, len(proj.paragraphs)
 
     if section_key is not None:
-        # Only a textbox-<n> sub-scope resolves here (WP-03 scope —
-        # a heading section_key, listed by find_sections alongside
-        # textbox ones, is not yet readable this way; that arrives
-        # with a later WP). None means section_key named no text box
-        # in this part — INVALID_INPUT with the keys that DO exist,
-        # never a silent empty read.
+        # A textbox-<n> key reads that text box's own scope.
         scoped = projection.project_textbox_scope(local_path, part, section_key)
-        if scoped is None:
-            available = [s["section_key"] for s in projection.iter_textbox_scopes(local_path, part)]
+        if scoped is not None:
+            return render(scoped, [])
+        # Otherwise a heading section_key: read that section's paragraph range
+        # exactly as find_sections reports it (original para refs / table ids kept).
+        sections = projection.find_sections_impl(local_path, part, ignore_trailing_empty=live)
+        heading = next((s for s in sections if s["kind"] == "heading" and s["section_key"] == section_key), None)
+        if heading is None:
             raise _make_error(
                 ErrorCode.INVALID_INPUT,
-                f"section_key {section_key!r} does not name a text box in part {part!r}.",
-                {"section_key": section_key, "part": part, "available_textbox_keys": available},
+                f"section_key {section_key!r} does not name a heading section or text box in part {part!r}.",
+                {
+                    "section_key": section_key,
+                    "part": part,
+                    "available_heading_keys": [s["section_key"] for s in sections if s["kind"] == "heading"],
+                    "available_textbox_keys": [s["section_key"] for s in sections if s["kind"] == "textbox"],
+                },
             )
-        return render(scoped, [])
+        whole = projection.project_part(local_path, part)
+        first, last = projection.resolve_para_range(whole, heading["start_para_ref"], heading["end_para_ref"])
+        sliced, partial = projection.slice_projection(whole, first, last)
+        result["start_para_ref"] = heading["start_para_ref"]
+        result["end_para_ref"] = heading["end_para_ref"]
+        return render(sliced, partial)
 
     whole = projection.project_part(local_path, part)
     if start_para_ref is not None and end_para_ref is not None:
@@ -1218,9 +1237,12 @@ def read_document(
     Omitting section_key (the default) reads the whole part named by
     part, in which a text box's own text is absent (by design — it would
     otherwise be double-counted between the host part and the text box's
-    own scope). section_key currently resolves a text-box scope only; a
-    heading section_key (also listed by find_sections) is not yet
-    readable this way.
+    own scope). A heading section_key (also from find_sections) reads that
+    section's paragraph range only, in any format, file or live, with
+    original para_ref/table_id values; the response adds start_para_ref and
+    end_para_ref. A heading read is a content read of that range only, not
+    proof of full-document or comment freshness. An unknown key is
+    INVALID_INPUT listing the available heading and text-box keys.
 
     format="text" returns the flat projected string (runs concatenated in
     document order; a paragraph break is "\\n"). format="runs" returns, in
