@@ -491,14 +491,16 @@ logic is tested against a mock only; see
 
 Issue #107: cell edits keep their formatting. `replace_cell_markdown` inherits the
 cell's first-run font name, size and colour (`inherit_format="none"` opts out);
-`delete_paragraph` may remove a paragraph inside a cell but never its last;
-`merge_paragraph_with_next` joins two adjacent paragraphs of one cell, keeping the
-first paragraph's properties and both paragraphs' runs and hyperlinks (tracked merges
-are refused); `insert_paragraphs` takes `{"after_table_id": N}` or
-`{"empty_paragraph_after_table_id": N}` as a structural anchor;
-`replace_text_batch` honours `within_row_containing` per edit; and `live_save` no
-longer fails `LIVE_STALE` while someone types. Real-Word acceptance is pending; see
-[`docs/acceptance/107-cell-editing.md`](docs/acceptance/107-cell-editing.md).
+`delete_paragraph` may remove a non-final paragraph inside a cell (Word cannot remove
+a cell's final one); `merge_paragraph_with_next` joins two adjacent paragraphs of one
+cell, keeping both paragraphs' runs and hyperlinks (tracked merges are refused; a live
+merge of two paragraphs with different properties is refused too, because Word keeps
+the second's, while file mode keeps the first's); `insert_paragraphs` takes
+`{"after_table_id": N}` or `{"empty_paragraph_after_table_id": N}` as a structural
+anchor; `replace_text_batch` honours `within_row_containing` per edit; and `live_save`
+no longer fails `LIVE_STALE` while someone types. Checked on Word for Mac 16.114.3
+(what was and was not covered is in
+[`docs/acceptance/107-cell-editing.md`](docs/acceptance/107-cell-editing.md)).
 
 Issue #154: every OTHER mutating tool — `apply_style`,
 `insert_image`,

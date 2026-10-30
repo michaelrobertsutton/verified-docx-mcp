@@ -98,20 +98,23 @@ def sizes(element):
     }
 
 
-def add_second_paragraph(path, text="second", bold=True, link=False):
+def add_second_paragraph(path, text="second", bold=True, link=False, same_ppr=False):
+    """A second paragraph in cell (1,1). By default its paragraph style differs from the first's;
+    ``same_ppr=True`` keeps the paragraph properties identical (what a live merge requires)."""
     root, _ = mutations._load_document(path)
     cell = tables._find_table_element(root, 1).findall(W("tr"))[0].findall(W("tc"))[0]
     first = cell.find(W("p"))
     second = copy.deepcopy(first)
-    ppr = second.find(W("pPr"))
-    if ppr is None:
-        ppr = ET.Element(W("pPr"))
-        second.insert(0, ppr)
-    style = ppr.find(W("pStyle"))
-    if style is None:
-        style = ET.Element(W("pStyle"))
-        ppr.insert(0, style)
-    style.set(W("val"), "Normal")
+    if not same_ppr:
+        ppr = second.find(W("pPr"))
+        if ppr is None:
+            ppr = ET.Element(W("pPr"))
+            second.insert(0, ppr)
+        style = ppr.find(W("pStyle"))
+        if style is None:
+            style = ET.Element(W("pStyle"))
+            ppr.insert(0, style)
+        style.set(W("val"), "Normal")
     run = second.find(W("r"))
     run.find(W("t")).text = text
     if bold:
@@ -217,30 +220,41 @@ def test_a_text_run_without_a_direct_font_is_not_overridden_by_a_stray_paragraph
     assert tables._inherited_cell_font(tc) is None  # the style supplies the text's size
 
 
-def test_live_font_read_refuses_ooxml_that_is_not_this_cells():
+@pytest.mark.parametrize(
+    "reported, drop_colour, want",
+    [
+        ({"name": "Arial", "size": 8.5, "color": "#1F3864"}, False, {"name": "Arial", "size": 8.5, "color": "1F3864"}),
+        ({"name": "Arial", "size": 8.5, "color": "#1F3864"}, True, {"name": "Arial", "size": 8.5}),
+        # Word reports Automatic as black: forcing it would pin a colour the cell never had
+        ({"name": "Calibri", "size": 9, "color": "#000000"}, False, {"name": "Calibri", "size": 9.0}),
+        # a mixed value comes back empty / 0: only what is known is applied
+        ({"name": "", "size": 0, "color": ""}, False, None),
+        ({"name": None, "size": None, "color": None}, False, None),
+        ({"size": True}, False, None),
+        (None, False, None),
+        ("not a dict", False, None),
+    ],
+)
+def test_the_font_word_reports_becomes_the_font_to_apply(reported, drop_colour, want):
+    assert tables._wire_font(reported, drop_colour=drop_colour) == want
+
+
+def test_live_font_read_asks_for_the_cell_scoped_font_not_ooxml():
     from types import SimpleNamespace as NS
 
-    ns = projection.W_NS
-    pkg = "http://schemas.microsoft.com/office/2006/xmlPackage"
+    sent = []
 
-    def reply(text):
-        return {"text": "Header", "ooxml": (
-            f'<pkg:package xmlns:pkg="{pkg}"><pkg:part pkg:name="/word/document.xml"><pkg:xmlData>'
-            f'<w:document xmlns:w="{ns}"><w:body><w:p><w:r><w:rPr><w:sz w:val="40"/></w:rPr>'
-            f"<w:t>{text}</w:t></w:r></w:p></w:body></w:document></pkg:xmlData></pkg:part></pkg:package>")}
+    def request(op, payload=None, **kw):
+        sent.append((op, dict(payload or {})))
+        return {"text": "Header", "paragraphs": ["Header"], "font": {"name": "Arial", "size": 8.5, "color": "#000000"}}
 
-    session = NS(hello=NS(capabilities={"cell_font_inheritance_v1"}, ), document_name="x.docx",
-                 request_threadsafe=lambda op, payload=None, **kw: reply("SOMEONE ELSES CELL"))
-    with pytest.raises(VerifyError) as exc:
-        tables.live_cell_read_with_font(session, {"table_index": 1, "row_index": 1, "cell_index": 1}, "first_run")
-    assert exc.value.envelope.error_code == ErrorCode.LIVE_OP_FAILED
-    assert "another cell" in exc.value.envelope.message
-    session.request_threadsafe = lambda op, payload=None, **kw: reply("Header")
-    _, wire = tables.live_cell_read_with_font(session, {"table_index": 1, "row_index": 1, "cell_index": 1}, "first_run")
-    assert wire == {"size": 20.0}
-    _, wire = tables.live_cell_read_with_font(
-        session, {"table_index": 1, "row_index": 1, "cell_index": 1}, "first_run", drop_colour=True)
-    assert wire == {"size": 20.0}
+    session = NS(hello=NS(capabilities={"cell_font_inheritance_v1"}), document_name="x.docx", request_threadsafe=request)
+    address = {"table_index": 1, "row_index": 1, "cell_index": 1}
+    _, wire = tables.live_cell_read_with_font(session, address, "first_run")
+    assert wire == {"name": "Arial", "size": 8.5}
+    assert sent[-1][1].get("include_font") is True and "include_ooxml" not in sent[-1][1]
+    _, none = tables.live_cell_read_with_font(session, address, "none")
+    assert none is None and "include_font" not in sent[-1][1]
 
 
 def test_merge_never_introduces_a_run_format_the_cell_did_not_have(doc):

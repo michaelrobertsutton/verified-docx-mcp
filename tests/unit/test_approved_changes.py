@@ -26,17 +26,8 @@ class Pane:
         self.after = None
         self.fail = None
         self.font_requests = []
-        self.cell_rpr = '<w:rPr><w:sz w:val="17"/></w:rPr>'  # an 8.5pt table
+        self.cell_font = {"size": 8.5}  # what Word reports at the cell's start: an 8.5pt table
         self.cell_payloads = []
-
-    def cell_ooxml(self, text):
-        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-        pkg = "http://schemas.microsoft.com/office/2006/xmlPackage"
-        # An empty cell has no text run: its font lives on the paragraph mark, as in real Word.
-        para = (f"<w:p><w:r>{self.cell_rpr}<w:t>{text}</w:t></w:r></w:p>" if text
-                else f"<w:p><w:pPr>{self.cell_rpr}</w:pPr></w:p>")
-        return (f'<pkg:package xmlns:pkg="{pkg}"><pkg:part pkg:name="/word/document.xml"><pkg:xmlData>'
-                f'<w:document xmlns:w="{ns}"><w:body>{para}</w:body></w:document></pkg:xmlData></pkg:part></pkg:package>')
 
     def request_threadsafe(self, op, payload=None, **kwargs):
         self.calls[op] += 1
@@ -55,9 +46,10 @@ class Pane:
         if op == "cell_get":
             text = row[payload["row_index"]-1][payload["cell_index"]-1]
             reply = {"text": text, "paragraphs": text.split("\n")}
-            if payload.get("include_ooxml"):
-                self.font_requests.append(payload["include_ooxml"])
-                reply["ooxml"] = self.cell_ooxml(text)
+            if payload.get("include_font"):
+                self.font_requests.append(payload["include_font"])
+                if self.cell_font:
+                    reply["font"] = dict(self.cell_font)
             return reply
         if op == "table_get":
             return {"rows": [[{"text": c} for c in r] for r in row], "merged": False,
@@ -177,7 +169,7 @@ def test_approved_cell_write_carries_the_first_run_font_in_its_single_write(setu
 
 def test_approved_cell_without_a_direct_font_sends_no_font(setup):
     path, pane = setup
-    pane.cell_rpr = ""
+    pane.cell_font = None
     assert execute(path, runs.prepare(path, [cell()]))["status"] == "complete"
     assert "inherit_font" not in pane.cell_payloads[0]
 

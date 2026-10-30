@@ -206,11 +206,12 @@ class FakeDocument:
         # self-check outcomes).
         self.merge_cell_paragraphs = False
         self.cell_set_failure: tuple[str, str] | None = None
-        # Issue #107: per-cell direct run properties (a w:rPr XML string, keyed by
-        # 0-based (table, row, cell)) the fake reports as the cell's OOXML; the font
-        # the server asked cell_set to apply is kept in applied_cell_fonts. A key in
-        # font_readback_mismatch makes the fake refuse like the pane's font readback.
-        self.cell_rpr: dict[tuple[int, int, int], str] = {}
+        # Issue #107: the font Word reports at the start of a cell's first paragraph
+        # (cell_get include_font; keyed by 0-based (table, row, cell); absent = nothing
+        # to inherit); the font the server asked cell_set to apply is kept in
+        # applied_cell_fonts. A key in font_readback_mismatch makes the fake refuse like
+        # the pane's font readback.
+        self.cell_font: dict[tuple[int, int, int], dict[str, Any]] = {}
         self.applied_cell_fonts: dict[tuple[int, int, int], dict[str, Any]] = {}
         self.font_readback_mismatch: set[tuple[int, int, int]] = set()
         self.cell_get_payloads: list[dict[str, Any]] = []
@@ -323,16 +324,8 @@ class FakeDocument:
         t, r, c = self._cell(payload)
         text = self.tables[t][r][c]
         reply: dict[str, Any] = {"text": text, "paragraphs": text.split("\n")}
-        if payload.get("include_ooxml"):
-            rpr = self.cell_rpr.get((t, r, c), "")
-            ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-            pkg = "http://schemas.microsoft.com/office/2006/xmlPackage"
-            body = "".join(f"<w:p><w:r>{rpr}<w:t>{p}</w:t></w:r></w:p>" for p in text.split("\n"))
-            reply["ooxml"] = (
-                f'<pkg:package xmlns:pkg="{pkg}"><pkg:part pkg:name="/word/document.xml">'
-                f'<pkg:xmlData><w:document xmlns:w="{ns}"><w:body>{body}</w:body></w:document>'
-                "</pkg:xmlData></pkg:part></pkg:package>"
-            )
+        if payload.get("include_font") and (t, r, c) in self.cell_font:
+            reply["font"] = dict(self.cell_font[(t, r, c)])
         return reply
 
     def cell_set(self, payload: dict[str, Any]) -> dict[str, Any]:

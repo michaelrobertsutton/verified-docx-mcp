@@ -117,9 +117,14 @@ def _locate(root: Any, table_id: int, row_index: int, cell_index: int) -> tuple[
     return table, tables._find_cell(row, cell_index, table_id=table_id, row_index=row_index)
 
 
-def prepare(root, rels, table_id, row_index, cell_index, paragraph_index, expected_text, separator):
+def prepare(root, rels, table_id, row_index, cell_index, paragraph_index, expected_text, separator,
+            *, same_ppr=False):
     """Merge in *root* (a parsed document) and return ``(cell, merged paragraph,
-    before-XML of the pair, the pair's texts, expectations for verification)``."""
+    before-XML of the pair, the pair's texts, expectations for verification)``.
+
+    ``same_ppr``: refuse a pair whose paragraph properties differ. Live mode needs it: real Word
+    (16.114.3) keeps the SECOND paragraph's properties when it joins two, so a differing pair
+    cannot honour "the first paragraph's properties win". File mode keeps the first's."""
     for name, value in (("table_id", table_id), ("row_index", row_index),
                         ("cell_index", cell_index), ("paragraph_index", paragraph_index)):
         ts.positive(value, name)
@@ -134,7 +139,14 @@ def prepare(root, rels, table_id, row_index, cell_index, paragraph_index, expect
         raise _make_error(
             ErrorCode.STRUCTURAL_BOUNDARY, "Other content sits between the two paragraphs; they are not adjacent"
         )
-    texts =[ts.paragraph_text(p) for p in (first, second)]
+    if same_ppr and _ppr_signature(first) != _ppr_signature(second):
+        raise _make_error(
+            ErrorCode.STRUCTURAL_BOUNDARY,
+            "The two paragraphs have different paragraph properties (style, alignment, indents, ...). "
+            "Word keeps the SECOND paragraph's properties when it merges, so a live merge cannot keep the "
+            "first's: make the properties match first, or merge with write_mode='file'.",
+        )
+    texts = [ts.paragraph_text(p) for p in (first, second)]
     if expected_text is not None and texts != expected_text:
         raise _make_error(
             ErrorCode.CELL_TEXT_MISMATCH, "Paragraph texts differ from expected_text", {"actual": texts}
@@ -287,20 +299,18 @@ def _execute_live(path, table_id, row_index, cell_index, paragraph_index, expect
         rels = _load_rels(source.local_path)
         pre = source.live["body_sha256"]
         wm.check_not_stale(revision_before, pre)
-        _, merged, before_xml, texts, expected = prepare(
-            root, rels, table_id, row_index, cell_index, paragraph_index, expected_text, separator
+        # The prepared tree is only used for its expectations and the checks below: the pane joins the
+        # paragraphs itself (no OOXML is sent; Word for Mac throws GeneralException on a cell insertOoxml).
+        _, _, _, texts, expected = prepare(
+            root, rels, table_id, row_index, cell_index, paragraph_index, expected_text, separator,
+            same_ppr=True,
         )
-        body = mutations._find_body(root)
-        body.clear()
-        body.append(copy.deepcopy(merged))
-        ctx = markdown_to_ooxml.StyleContext.build(source.local_path)
-        xml = ts.flat_package(source.local_path, root, raw, ctx)
     try:
         result = tables._live_cell_request(
             session,
             "cell_paragraph_merge",
             {"table_index": table_id, "row_index": row_index, "cell_index": cell_index,
-             "paragraph_index": paragraph_index, "ooxml": xml, "expected_text": texts,
+             "paragraph_index": paragraph_index, "expected_text": texts, "separator": separator,
              "expectedBodySha256": pre, "track_changes": False},
             expected_body_sha256=pre,
         )

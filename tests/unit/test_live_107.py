@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+FIXTURES = REPO / "tests" / "fixtures"
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -28,7 +29,7 @@ from verified_docx_mcp.errors import ErrorCode, VerifyError
 
 mutations._QUIESCE_INTERVAL_SECONDS = 0.02
 
-RPR = '<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:color w:val="1F3864"/><w:sz w:val="17"/></w:rPr>'
+FONT = {"name": "Arial", "size": 8.5, "color": "#1F3864"}  # what Word reports at the cell's start
 
 
 def _audit_tools() -> list[str]:
@@ -54,26 +55,26 @@ class CellFontLiveTests(LiveWriteBridgeTestCase):
 
     async def test_the_first_run_font_is_read_from_the_cell_and_sent_with_the_write(self) -> None:
         doc = _two_by_two()
-        doc.cell_rpr[(0, 0, 0)] = RPR
+        doc.cell_font[(0, 0, 0)] = FONT
         pane = await self.connect_pane(doc)
         evidence = await self.replace("**Bold** text")
         self.assertTrue(evidence["applied"])
         self.assertEqual(doc.applied_cell_fonts[(0, 0, 0)], {"name": "Arial", "size": 8.5, "color": "1F3864"})
-        self.assertEqual([p.get("include_ooxml") for p in doc.cell_get_payloads][:1], [True])
+        self.assertEqual([p.get("include_font") for p in doc.cell_get_payloads][:1], [True])
         # a cell the edit does not touch is not given a font
         self.assertNotIn((0, 0, 1), doc.applied_cell_fonts)
         self.assertIsNotNone(pane)
 
     async def test_markdown_with_a_link_does_not_send_a_colour_that_would_beat_the_link_style(self) -> None:
         doc = _two_by_two()
-        doc.cell_rpr[(0, 0, 0)] = RPR
+        doc.cell_font[(0, 0, 0)] = FONT
         await self.connect_pane(doc)
         await self.replace("see [proof](https://x.test)")
         self.assertEqual(doc.applied_cell_fonts[(0, 0, 0)], {"name": "Arial", "size": 8.5})
 
     async def test_a_font_readback_failure_is_audited_because_the_text_may_have_landed(self) -> None:
         doc = _two_by_two()
-        doc.cell_rpr[(0, 0, 0)] = RPR
+        doc.cell_font[(0, 0, 0)] = FONT
         doc.font_readback_mismatch.add((0, 0, 0))
         await self.connect_pane(doc)
         records = len(_audit_tools())
@@ -89,15 +90,15 @@ class CellFontLiveTests(LiveWriteBridgeTestCase):
 
     async def test_inherit_format_none_neither_reads_nor_applies_the_font(self) -> None:
         doc = _two_by_two()
-        doc.cell_rpr[(0, 0, 0)] = RPR
+        doc.cell_font[(0, 0, 0)] = FONT
         await self.connect_pane(doc)
         self.assertTrue((await self.replace(inherit_format="none"))["applied"])
         self.assertEqual(doc.applied_cell_fonts, {})
-        self.assertFalse(any(p.get("include_ooxml") for p in doc.cell_get_payloads))
+        self.assertFalse(any(p.get("include_font") for p in doc.cell_get_payloads))
 
     async def test_a_font_that_fails_the_pane_readback_is_a_verification_failure(self) -> None:
         doc = _two_by_two()
-        doc.cell_rpr[(0, 0, 0)] = RPR
+        doc.cell_font[(0, 0, 0)] = FONT
         doc.font_readback_mismatch.add((0, 0, 0))
         await self.connect_pane(doc)
         with self.assertRaises(VerifyError) as cm:
@@ -145,7 +146,7 @@ class MergeLiveTests(LiveWriteBridgeTestCase):
 
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
-        add_second_paragraph(self.target, text="second", bold=True)
+        add_second_paragraph(self.target, text="second", bold=True, same_ppr=True)
         self.doc = _two_by_two()
 
     async def connect(self, merged_body: bool = True, **kwargs):
@@ -179,6 +180,9 @@ class MergeLiveTests(LiveWriteBridgeTestCase):
         self.assertEqual((sent["table_index"], sent["row_index"], sent["cell_index"], sent["paragraph_index"]), (1, 1, 1, 1))
         self.assertEqual(sent["expected_text"], ["R1C1", "second"])  # text, not XML: see the pane comment
         self.assertNotIn("before_xml", sent)
+        # no OOXML is imported: Word for Mac throws GeneralException on a cell insertOoxml
+        self.assertNotIn("ooxml", sent)
+        self.assertEqual(sent["separator"], " ")
         self.assertFalse(sent["track_changes"])
         self.assertNotIn("warnings", evidence)
 
@@ -224,6 +228,18 @@ class MergeLiveTests(LiveWriteBridgeTestCase):
         evidence = await self.merge()
         self.assertTrue(evidence["applied"])
         self.assertIn("changed after the merge", evidence["warnings"][0])
+
+    async def test_a_pair_with_different_paragraph_properties_is_refused_before_anything_is_sent(self) -> None:
+        # Real Word keeps the SECOND paragraph's properties when it joins two (16.114.3: the merged
+        # paragraph came back centred), so a live merge of a differing pair cannot keep the first's.
+        shutil.copyfile(FIXTURES / "tables.docx", self.target)
+        add_second_paragraph(self.target, text="second", bold=True)  # second paragraph: a different style
+        pane = await self.connect()
+        with self.assertRaises(VerifyError) as cm:
+            await self.merge()
+        self.assertEqual(cm.exception.envelope.error_code, ErrorCode.STRUCTURAL_BOUNDARY)
+        self.assertIn("different paragraph properties", cm.exception.envelope.message)
+        self.assertEqual(pane.merge_payloads, [])
 
     async def test_tracked_merge_is_refused_before_anything_is_sent(self) -> None:
         pane = await self.connect()

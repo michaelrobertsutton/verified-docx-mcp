@@ -833,57 +833,42 @@ def _require_font_inheritance(session: Any) -> None:
     )
 
 
-def _font_from_cell_ooxml(ooxml: Any) -> dict[str, Any] | None:
-    """The first-run font of a ``cell_get(include_ooxml)`` reply: the same
-    ``_inherited_cell_font`` the file path uses, run over the cell body's flat OPC."""
-    pkg = "http://schemas.microsoft.com/office/2006/xmlPackage"
-    if not isinstance(ooxml, str):
-        raise _make_error(ErrorCode.LIVE_OP_FAILED, "the pane's cell_get reply is missing the cell OOXML")
-    try:
-        package = ET.fromstring(ooxml)
-    except ET.ParseError as exc:
-        raise _make_error(ErrorCode.LIVE_OP_FAILED, f"the pane's cell OOXML did not parse: {exc}") from exc
-    for part in package.findall(f"{{{pkg}}}part"):
-        if part.get(f"{{{pkg}}}name") == "/word/document.xml":
-            body = part.find(f"{{{pkg}}}xmlData/{_w('document')}/{_w('body')}")
-            if body is None:
-                return None, ""
-            text = "".join(
-                "".join(t.text or "" for t in p.iter(_w("t"))) for p in body.iter(_w("p"))
-            )
-            return _inherited_cell_font(body), text
-    raise _make_error(ErrorCode.LIVE_OP_FAILED, "the pane's cell OOXML has no document part")
+def _wire_font(font: Any, *, drop_colour: bool) -> dict[str, Any] | None:
+    """The pane-reported font at the start of the cell, as what ``cell_set`` should apply.
 
-
-def _flat_text(text: str) -> str:
-    return re.sub(r"[\s\u0007]+", "", text or "")
+    Word reports the EFFECTIVE font there (direct formatting resolved with the style), and an
+    empty string / 0 for a mixed value: those are left out, so only what is known is applied.
+    Black is left out too: it is how Word reports Automatic, and forcing it would pin a colour
+    the cell never had. ``drop_colour``: the markdown holds a link, and a direct colour would
+    beat the Hyperlink style (the pane cannot colour only the non-link runs)."""
+    if not isinstance(font, dict):
+        return None
+    wire: dict[str, Any] = {}
+    name = font.get("name")
+    if isinstance(name, str) and name.strip():
+        wire["name"] = name
+    size = font.get("size")
+    if isinstance(size, (int, float)) and not isinstance(size, bool) and size > 0:
+        wire["size"] = float(size)
+    colour = font.get("color")
+    if (not drop_colour and isinstance(colour, str) and re.fullmatch(r"#?[0-9A-Fa-f]{6}", colour)
+            and colour.lstrip("#").upper() != "000000"):
+        wire["color"] = colour.lstrip("#").upper()
+    return wire or None
 
 
 def live_cell_read_with_font(
     session: Any, address: dict[str, Any], inherit_format: str, *, drop_colour: bool = False
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """``cell_get`` plus (when ``inherit_format == "first_run"``) the wire font to
-    inherit, from one pane round trip. The capability is required up front: a pane
-    that cannot report the font must not silently reset it.
-
-    ``drop_colour``: the markdown holds a link, and a direct colour would beat the
-    Hyperlink style (the pane cannot colour only the non-link runs)."""
+    """``cell_get`` plus (when ``inherit_format == "first_run"``) the font to inherit, from one
+    pane round trip (``include_font``: the font at the start of the cell's first paragraph; NOT
+    the cell's OOXML, which real Word returns for the whole table). The capability is required up
+    front: a pane that cannot report the font must not silently reset it."""
     if inherit_format != "first_run":
         return _live_cell_request(session, "cell_get", address), None
     _require_font_inheritance(session)
-    reply = _live_cell_request(session, "cell_get", {**address, "include_ooxml": True})
-    font, ooxml_text = _font_from_cell_ooxml(reply.get("ooxml"))
-    if _flat_text(ooxml_text) != _flat_text(reply.get("text", "")):
-        # e.g. Word wrapped the cell's OOXML in its whole row: the "first run" would be another cell's.
-        raise _make_error(
-            ErrorCode.LIVE_OP_FAILED,
-            "the cell's OOXML does not match its text; refusing to inherit a font that may belong to "
-            "another cell (pass inherit_format='none' to write without it)",
-        )
-    wire = dict(font["wire"]) if font and font["wire"] else None
-    if wire and drop_colour:
-        wire.pop("color", None)
-    return reply, (wire or None)
+    reply = _live_cell_request(session, "cell_get", {**address, "include_font": True})
+    return reply, _wire_font(reply.get("font"), drop_colour=drop_colour)
 
 
 def _runs_to_wire(paragraphs: list[list[markdown_to_ooxml.RunSpec]]) -> list[list[dict[str, Any]]]:

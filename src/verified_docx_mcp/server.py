@@ -3221,14 +3221,16 @@ def replace_cell_markdown(
 
     `inherit_format` (issue #107, "first_run" | "none", default "first_run"):
     markdown carries no font, so by default every rendered run takes the font
-    name, size and colour directly set on the cell's first text run (else its
-    first paragraph mark), where the markdown does not set them; a cell whose
-    font comes only from its style inherits nothing. Without this an 8.5pt
-    table's cell came back at the style's 10.5pt. "none" keeps the old
-    behaviour (the style's font). File mode also carries the complex-script
-    size and verifies every run on re-read; live mode applies name, size and
-    colour (Word's API cannot set the complex-script size) and reads them back
-    (VERIFICATION_FAILED otherwise). A live write with "first_run" needs the
+    name, size and colour of the cell's first text run (else its first paragraph
+    mark), where the markdown does not set them. FILE mode copies that run's
+    DIRECT properties (so a cell whose font comes only from its style inherits
+    nothing), also the complex-script size and the paragraph marks, and verifies
+    every run on re-read. LIVE mode applies the font Word reports at the start of
+    the cell (name, size and colour; Word's API cannot set the complex-script
+    size) and reads it back (VERIFICATION_FAILED otherwise). A link keeps its own
+    colour. Without this a multi-paragraph write into an 8.5pt cell came back at
+    the style's size (reproduced on Word 16.114.3). "none" keeps the old
+    behaviour (the style's font). A live write with "first_run" needs the
     pane's "cell_font_inheritance_v1" capability (LIVE_CAPABILITY_MISSING:
     reload the pane, or pass "none" to accept the style's font).
 
@@ -4361,7 +4363,11 @@ def merge_paragraph_with_next(
     """Merge two adjacent paragraphs of ONE table cell into one (issue #107).
 
     The first paragraph's properties win; both paragraphs' runs and hyperlinks are kept
-    as they are, not flattened to text. All indices are 1-based: `paragraph_index` is the
+    as they are, not flattened to text. LIVE MODE: Word keeps the SECOND paragraph's
+    properties when it joins two (checked on Word 16.114.3), so a live merge of two
+    paragraphs whose properties differ (style, alignment, indents, ...) is refused
+    before anything is written (STRUCTURAL_BOUNDARY): make them match, or use
+    write_mode="file". All indices are 1-based: `paragraph_index` is the
     FIRST of the pair, so it must not be the cell's last paragraph (STRUCTURAL_BOUNDARY).
     `expected_text` ([first, second]) guards both texts (CELL_TEXT_MISMATCH, nothing
     written). `separator` (inline text, default "") is placed between the two texts.
@@ -4483,8 +4489,11 @@ def insert_paragraphs(
     paragraph directly after table N, keeping its own style unless a `style` is
     given; STRUCTURAL_BOUNDARY if there is none, or it holds text, a field,
     bookmark, tab, break, hyperlink, drawing, comment anchor or tracked change).
-    Both need position="after" and expected_matches=1. The result is verified by
-    paragraph count and by the content on either side. Live mode needs the
+    Both need position="after" and expected_matches=1. File mode verifies the
+    paragraph count and the content on either side; live mode verifies the inserted
+    texts and the whole-document paragraph count. Live mode refuses to fill when
+    Word's table numbering and the body's disagree (a table inside a content
+    control). Live mode needs the
     pane's "paragraph_positions_v1" capability (LIVE_CAPABILITY_MISSING:
     reload the pane).
 

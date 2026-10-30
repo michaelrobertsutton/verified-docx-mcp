@@ -1826,12 +1826,14 @@ async function opCellGet(payload) {
     const cell = await resolveTableCell(context, payload);
     cell.body.load("text");
     cell.body.paragraphs.load("items/text");
-    // issue #107: the server derives the cell's first-run font from this OOXML, so
-    // file mode and live mode share one definition of "first run".
-    const ooxml = payload.include_ooxml ? cell.body.getOoxml() : null;
+    // issue #107: the font at the start of the cell's first paragraph (a collapsed range: the first
+    // character, or the paragraph mark of an empty cell). NOT cell.body.getOoxml(): real Word returns the
+    // whole TABLE for that, so a "first run" read from it belongs to another cell.
+    const startFont = payload.include_font ? cell.body.paragraphs.getFirst().getRange("Start").font : null;
+    if (startFont) startFont.load("name,size,color");
     await context.sync();
     const result = { text: cell.body.text || "", paragraphs: cell.body.paragraphs.items.map((p) => p.text || "") };
-    if (ooxml) result.ooxml = ooxml.value;
+    if (startFont) result.font = { name: startFont.name, size: startFont.size, color: startFont.color };
     return result;
   });
 }
@@ -3637,14 +3639,21 @@ async function opParagraphInsertPositional(payload) {
 
 // -- merge two adjacent paragraphs of one cell (issue #107) ------------------
 
-// The server built `ooxml` (one merged paragraph, hyperlink relationships intact) and sends
-// `expected_text` (the pair as it read them). The pair must still read that way, or nothing is written.
-// Tracked merges are not offered: how Word records them through insertOoxml is unproven.
+// The server sends `expected_text` (the pair as it read them) and an optional `separator`. The pair must
+// still read that way, or nothing is written. The paragraphs are joined by deleting the paragraph mark
+// between them through the object model: no OOXML is imported (real Word 16.114.3 throws GeneralException
+// on insertOoxml into a cell range), so runs and hyperlinks stay exactly where they are. Which paragraph's
+// properties survive is Word's rule; the server verifies the merged paragraph still has the first's.
+// Tracked merges are not offered: how Word records them is unproven.
 async function opCellParagraphMerge(payload) {
   if (payload.track_changes) throw refusalError('Tracked paragraph merges are not supported', 'INVALID_INPUT');
+  // Office.js reports a bare "GeneralException": say which stage threw, keeping the error's own code.
+  let stage='hash';
+  const staged=async(name,fn)=>{stage=name;return fn();};
   return measuredWordRun(async context=>{
-    const pre=await mutationHash(context,payload);
-    const cell=await resolveTableCell(context,payload);
+   try {
+    const pre=await staged('hash',()=>mutationHash(context,payload));
+    const cell=await staged('resolve-cell',()=>resolveTableCell(context,payload));
     const paragraphs=cell.body.paragraphs;paragraphs.load('items/text');await context.sync();
     const i=payload.paragraph_index-1;
     if(!Number.isInteger(i) || i<0 || i+1>=paragraphs.items.length)
@@ -3661,19 +3670,28 @@ async function opCellParagraphMerge(payload) {
       if(flat(p.text)!==flat(payload.expected_text[j]))
         throw refusalError('Paragraph changed during preparation','LIVE_STALE');
     });
+    stage='range';
     const range=pair[0].getRange('Content').getRange('Start').expandTo(pair[1].getRange('Content').getRange('End'));
-    await (await sectionGuard(context,payload)).check(()=>[range]);
-    await guardComments(context,[range],false);await guardRevisions(context,[range]);
-    await guardAnchoredParagraphs(context,[range]);await requireFreshBody(context,pre);
-    // Word's own tracking mode applies to insertOoxml even when track_changes is false, which would
+    await staged('section-guard',async()=>(await sectionGuard(context,payload)).check(()=>[range]));
+    await staged('comments-revisions-guard',async()=>{await guardComments(context,[range],false);await guardRevisions(context,[range]);});
+    await staged('anchored-guard',async()=>{await guardAnchoredParagraphs(context,[range]);await requireFreshBody(context,pre);});
+    // Word's own tracking mode applies to the edit even when track_changes is false, which would
     // record the merge as a tracked change: a mode this op declares unsupported. Refuse, don't switch.
-    context.document.load('changeTrackingMode');await context.sync();
+    await staged('tracking-mode',async()=>{context.document.load('changeTrackingMode');await context.sync();});
     if (context.document.changeTrackingMode !== Word.ChangeTrackingMode.off)
       throw refusalError('Track Changes is on in Word; turn it off to merge paragraphs (tracked merges are not supported)','TRACKED_CHANGES_PRESENT');
-    range.insertOoxml(payload.ooxml,'Replace');await context.sync();
-    const after=await readCellParagraphs(context,cell);
+    const separator=typeof payload.separator==='string'?payload.separator:'';
+    await staged('separator',async()=>{if(separator){pair[0].getRange('Content').insertText(separator,'End');await context.sync();}});
+    await staged('delete-paragraph-mark',async()=>{
+      const mark=pair[0].getRange('Content').getRange('End').expandTo(pair[1].getRange('Content').getRange('Start'));
+      mark.delete();await context.sync();});
+    const after=await staged('readback',()=>readCellParagraphs(context,cell));
     if(after.length !== before.length-1)
       throw refusalError('Paragraph merge count differs','VERIFICATION_FAILED');
-    return {applied:true,pre,post:await mutationHash(context,{...payload,expectedBodySha256:undefined})};
+    return {applied:true,pre,post:await staged('post-hash',()=>mutationHash(context,{...payload,expectedBodySha256:undefined}))};
+   } catch (error) {
+    if (error && typeof error.message === 'string' && !error.message.startsWith('[merge stage')) error.message=`[merge stage: ${stage}] ${error.message}`;
+    throw error;
+   }
   });
 }
