@@ -184,7 +184,7 @@ def _spec_problems(specs: list[dict[str, Any]], inserted: list[dict[str, Any]]) 
     return problems
 
 
-def insert_paragraphs(path: str, anchor: str, position: str, paragraphs: list[dict[str, Any]],
+def insert_paragraphs(path: str, anchor: str | dict[str, Any], position: str, paragraphs: list[dict[str, Any]],
                       expected_matches: int, revision_before: str | None = None,
                       track_changes: bool = False) -> dict[str, Any]:
     """Live ``insert_paragraphs`` (issue #77): ``paragraph_insert`` over the ops channel.
@@ -196,14 +196,22 @@ def insert_paragraphs(path: str, anchor: str, position: str, paragraphs: list[di
     """
     session = wm.live_session_for(path)
     wm.require_capability(session, "paragraph_insert", feature_description="paragraph insertion")
+    structural = isinstance(anchor, dict)
+    if structural:
+        wm.require_capability(session, "paragraph_positions_v1", feature_description="structural table anchors")
     pre = comments_live._request(session, "describe")["bodySha256"]
     wm.check_not_stale(revision_before, pre)
     wire = [{key: spec[key] for key in ("text", "style", "color") if spec.get(key) is not None}
             for spec in paragraphs]
+    payload = {
+        "anchor": anchor, "expected_matches": expected_matches, "position": position,
+        "paragraphs": wire, "track_changes": track_changes, "expectedBodySha256": pre}
+    if structural and "empty_paragraph_after_table_id" in anchor:
+        from ..paragraph_insert import EMPTY_PARAGRAPH_FORBIDDEN_TAGS
+
+        payload["forbidden_empty_tags"] = list(EMPTY_PARAGRAPH_FORBIDDEN_TAGS)
     try:
-        result = comments_live._request(session, "paragraph_insert", {
-            "anchor": anchor, "expected_matches": expected_matches, "position": position,
-            "paragraphs": wire, "track_changes": track_changes, "expectedBodySha256": pre})
+        result = comments_live._request(session, "paragraph_insert", payload)
     except VerifyError as exc:
         if exc.envelope.error_code == ErrorCode.VERIFICATION_FAILED:
             wm.audit_live_failure(
@@ -226,7 +234,7 @@ def insert_paragraphs(path: str, anchor: str, position: str, paragraphs: list[di
             "(and Word's Review pane if tracked) and fix by hand.",
             {"problems": problems, "inserted": inserted})
     evidence = wm.live_evidence(
-        shape_result=result, applied=True, match_count=1, rung=1, before=anchor,
+        shape_result=result, applied=True, match_count=1, rung=1, before="" if structural else anchor,
         after="\n".join(item["text"] for item in inserted),
         pre_body_sha256=pre, post_body_sha256=result["post"],
         document_name=session.document_name, tool="insert_paragraphs", path=path)
