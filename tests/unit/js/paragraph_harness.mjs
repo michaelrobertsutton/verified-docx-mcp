@@ -3,9 +3,12 @@ import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
 let texts=['previous','target','next',''];
-let trailer=null; let mode='Off', nesting=0, cellCount=1, anchored=false, section=false, malformed=false, comments=false, revisions=false, broken=false;
+let trailer=null; let mode='Off', nesting=0, cellCount=1, cellTargetFirst=false, anchored=false, section=false, malformed=false, comments=false, revisions=false, broken=false;
 const collection={load(){},get items(){return texts.map((text,i)=>({text,tableNestingLevel:nesting&&i===1?nesting:0,
-  parentTableCell:{body:{paragraphs:{load(){},items:Array.from({length:cellCount},()=>({}))}}},
+  // a cell holding `cellCount` paragraphs; the target ('target') is the LAST one unless cellTargetFirst
+  parentTableCell:{body:{paragraphs:{load(){},items:cellTargetFirst
+    ?[{text:'target'},...Array.from({length:cellCount-1},()=>({text:'other'}))]
+    :[...Array.from({length:cellCount-1},()=>({text:'other'})),{text:'target'}]}}},
   getOoxml:()=>({value:'xml'}),getRange:()=>({getComments:()=>({items:comments?[comment]:[],load(){}}),
     getTrackedChanges:()=>({items:revisions?[{}]:[],load(){}})}),delete(){if(!broken)texts.splice(i,1);}}));}};
 const comment={id:'c',content:'question',authorName:'A',resolved:false,
@@ -25,13 +28,17 @@ for(const flag of ['nested','anchored','section','malformed','comments','revisio
   nesting=0;anchored=section=malformed=comments=revisions=false;
 }
 // issue #107: a paragraph in a (non-nested) cell may be deleted, but never the cell's last one.
+// Real Word keeps a cell's FINAL paragraph (delete() blanks it), so that is refused before any write.
 nesting=1;cellCount=1;
-await assert.rejects(()=>sandbox.op({anchor_text:'target'}),e=>e.code==='STRUCTURAL_BOUNDARY'&&/last paragraph in a cell/.test(e.message));
+await assert.rejects(()=>sandbox.op({anchor_text:'target'}),e=>e.code==='STRUCTURAL_BOUNDARY'&&/last paragraph of a cell/.test(e.message));
 assert.equal(texts.length,4);
-cellCount=2;
+cellCount=2;cellTargetFirst=false; // two paragraphs, target is the final one
+await assert.rejects(()=>sandbox.op({anchor_text:'target'}),e=>e.code==='STRUCTURAL_BOUNDARY'&&/last paragraph of a cell/.test(e.message));
+assert.equal(texts.length,4);
+cellTargetFirst=true; // target has a paragraph after it: it can go
 const cellDelete=await sandbox.op({anchor_text:'target'});
 assert.equal(cellDelete.after_count,3);assert.deepEqual(texts,['previous','next','']);
-nesting=0;cellCount=1;texts=['previous','target','next',''];
+nesting=0;cellCount=1;cellTargetFirst=false;texts=['previous','target','next',''];
 await assert.rejects(()=>sandbox.op({anchor_text:''}),e=>e.code==='STRUCTURAL_BOUNDARY');
 texts=['same','same',''];await assert.rejects(()=>sandbox.op({anchor_text:'same'}));
 texts=['previous','target','next',''];broken=true;

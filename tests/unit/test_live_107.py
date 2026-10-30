@@ -64,6 +64,23 @@ class CellFontLiveTests(LiveWriteBridgeTestCase):
         self.assertNotIn((0, 0, 1), doc.applied_cell_fonts)
         self.assertIsNotNone(pane)
 
+    async def test_markdown_with_a_link_does_not_send_a_colour_that_would_beat_the_link_style(self) -> None:
+        doc = _two_by_two()
+        doc.cell_rpr[(0, 0, 0)] = RPR
+        await self.connect_pane(doc)
+        await self.replace("see [proof](https://x.test)")
+        self.assertEqual(doc.applied_cell_fonts[(0, 0, 0)], {"name": "Arial", "size": 8.5})
+
+    async def test_a_font_readback_failure_is_audited_because_the_text_may_have_landed(self) -> None:
+        doc = _two_by_two()
+        doc.cell_rpr[(0, 0, 0)] = RPR
+        doc.font_readback_mismatch.add((0, 0, 0))
+        await self.connect_pane(doc)
+        records = len(_audit_tools())
+        with self.assertRaises(VerifyError):
+            await self.replace()
+        self.assertIn("replace_cell_markdown:verification_failed", _audit_tools()[records:])
+
     async def test_a_cell_whose_font_comes_from_its_style_sends_nothing(self) -> None:
         doc = _two_by_two()
         await self.connect_pane(doc)
@@ -160,7 +177,8 @@ class MergeLiveTests(LiveWriteBridgeTestCase):
         self.assertEqual(evidence["after"], "R1C1 second")
         sent = pane.merge_payloads[0]
         self.assertEqual((sent["table_index"], sent["row_index"], sent["cell_index"], sent["paragraph_index"]), (1, 1, 1, 1))
-        self.assertEqual(len(sent["before_xml"]), 2)
+        self.assertEqual(sent["expected_text"], ["R1C1", "second"])  # text, not XML: see the pane comment
+        self.assertNotIn("before_xml", sent)
         self.assertFalse(sent["track_changes"])
         self.assertNotIn("warnings", evidence)
 

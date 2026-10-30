@@ -58,7 +58,7 @@ from xml.etree import ElementTree as ET
 
 from . import audit, locate, markdown_to_ooxml, mutations, paths, projection, tracked_changes
 from .author import resolve_author_name
-from .errors import ErrorCode, _make_error
+from .errors import ErrorCode, VerifyError, _make_error
 from .live import protocol as live_protocol
 from .live import reads_live
 from .live import write_mode as live_write_mode
@@ -370,14 +370,17 @@ def _inherited_cell_font(container: Any) -> dict[str, Any] | None:
     ``wire`` is what the live pane applies; it cannot set the complex-script size.
     """
     source = None
+    has_text_run = False
     for run in container.iter(_w("r")):
         if any(t.text for t in run.iter(_w("t"))):
+            has_text_run = True
             source = run.find(_w("rPr"))
             break
-    if source is None or not any(projection._ln(n) in _INHERITED_RPR for n in source):
+    if not has_text_run:
+        # Only a cell with no text at all falls back to its first paragraph mark. A text run that
+        # simply has no direct font means the style supplies it: a stray mark must not shrink it.
         paragraph = next(container.iter(_w("p")), None)
-        mark = paragraph.find(f"{_w('pPr')}/{_w('rPr')}") if paragraph is not None else None
-        source = mark
+        source = paragraph.find(f"{_w('pPr')}/{_w('rPr')}") if paragraph is not None else None
     if source is None:
         return None
     props = [n for n in source if projection._ln(n) in _INHERITED_RPR]
@@ -410,20 +413,41 @@ def _sort_rpr(rpr: Any) -> None:
         rpr.append(child)
 
 
-def _apply_inherited_font(elements: list[Any], font: dict[str, Any]) -> None:
-    """Add the inherited properties to every rendered run that does not set them."""
+def _add_font_props(rpr: Any, font: dict[str, Any], *, keep_colour: bool) -> None:
     import copy
 
+    for prop in font["props"]:
+        if projection._ln(prop) == "color" and not keep_colour:
+            continue
+        if rpr.find(prop.tag) is None:
+            rpr.append(copy.deepcopy(prop))
+    _sort_rpr(rpr)
+
+
+def _apply_inherited_font(elements: list[Any], font: dict[str, Any]) -> None:
+    """Add the inherited properties to every rendered run that does not set them, and to each
+    paragraph mark (so an empty paragraph's height and a list bullet follow the cell's size too).
+
+    A run inside a hyperlink, or one with a character style, keeps its own colour: a direct
+    colour would beat the Hyperlink style and the link would stop looking like a link."""
     for element in elements:
+        linked = {id(r) for link in element.iter(_w("hyperlink")) for r in link.iter(_w("r"))}
         for run in element.iter(_w("r")):
             rpr = run.find(_w("rPr"))
             if rpr is None:
                 rpr = ET.Element(_w("rPr"))
                 run.insert(0, rpr)
-            for prop in font["props"]:
-                if rpr.find(prop.tag) is None:
-                    rpr.append(copy.deepcopy(prop))
-            _sort_rpr(rpr)
+            styled = rpr.find(_w("rStyle")) is not None
+            _add_font_props(rpr, font, keep_colour=id(run) not in linked and not styled)
+        for paragraph in element.iter(_w("p")):
+            ppr = paragraph.find(_w("pPr"))
+            if ppr is None:
+                ppr = ET.Element(_w("pPr"))
+                paragraph.insert(0, ppr)
+            mark = ppr.find(_w("rPr"))
+            if mark is None:
+                mark = ET.SubElement(ppr, _w("rPr"))
+            _add_font_props(mark, font, keep_colour=True)
 
 
 def _rpr_key(node: Any) -> tuple:
@@ -822,20 +846,44 @@ def _font_from_cell_ooxml(ooxml: Any) -> dict[str, Any] | None:
     for part in package.findall(f"{{{pkg}}}part"):
         if part.get(f"{{{pkg}}}name") == "/word/document.xml":
             body = part.find(f"{{{pkg}}}xmlData/{_w('document')}/{_w('body')}")
-            return _inherited_cell_font(body) if body is not None else None
+            if body is None:
+                return None, ""
+            text = "".join(
+                "".join(t.text or "" for t in p.iter(_w("t"))) for p in body.iter(_w("p"))
+            )
+            return _inherited_cell_font(body), text
     raise _make_error(ErrorCode.LIVE_OP_FAILED, "the pane's cell OOXML has no document part")
 
 
-def live_cell_read_with_font(session: Any, address: dict[str, Any], inherit_format: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def _flat_text(text: str) -> str:
+    return re.sub(r"[\s\u0007]+", "", text or "")
+
+
+def live_cell_read_with_font(
+    session: Any, address: dict[str, Any], inherit_format: str, *, drop_colour: bool = False
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """``cell_get`` plus (when ``inherit_format == "first_run"``) the wire font to
     inherit, from one pane round trip. The capability is required up front: a pane
-    that cannot report the font must not silently reset it."""
+    that cannot report the font must not silently reset it.
+
+    ``drop_colour``: the markdown holds a link, and a direct colour would beat the
+    Hyperlink style (the pane cannot colour only the non-link runs)."""
     if inherit_format != "first_run":
         return _live_cell_request(session, "cell_get", address), None
     _require_font_inheritance(session)
     reply = _live_cell_request(session, "cell_get", {**address, "include_ooxml": True})
-    font = _font_from_cell_ooxml(reply.get("ooxml"))
-    return reply, (font["wire"] if font and font["wire"] else None)
+    font, ooxml_text = _font_from_cell_ooxml(reply.get("ooxml"))
+    if _flat_text(ooxml_text) != _flat_text(reply.get("text", "")):
+        # e.g. Word wrapped the cell's OOXML in its whole row: the "first run" would be another cell's.
+        raise _make_error(
+            ErrorCode.LIVE_OP_FAILED,
+            "the cell's OOXML does not match its text; refusing to inherit a font that may belong to "
+            "another cell (pass inherit_format='none' to write without it)",
+        )
+    wire = dict(font["wire"]) if font and font["wire"] else None
+    if wire and drop_colour:
+        wire.pop("color", None)
+    return reply, (wire or None)
 
 
 def _runs_to_wire(paragraphs: list[list[markdown_to_ooxml.RunSpec]]) -> list[list[dict[str, Any]]]:
@@ -953,7 +1001,9 @@ def execute_replace_cell_markdown_live(
         raise _make_error(ErrorCode.LIVE_DISCONNECTED, str(exc)) from exc
     live_write_mode.check_not_stale(revision_before, pre_hash)
 
-    before_reply, inherit_font = live_cell_read_with_font(session, address, inherit_format)
+    before_reply, inherit_font = live_cell_read_with_font(
+        session, address, inherit_format, drop_colour=any(run.link for paragraph in paragraphs for run in paragraph)
+    )
     before_text = before_reply["text"]
     _check_expected_before(
         expected_before, before_text, table_id=table_id, row_index=row_index, cell_index=cell_index
@@ -975,6 +1025,16 @@ def execute_replace_cell_markdown_live(
                 live_protocol.OP_ERROR_CELL_WRITE_NOT_ROLLED_BACK,
             ),
         )
+    except VerifyError as exc:
+        # The pane writes the cell and THEN reads the font back, so a VERIFICATION_FAILED here (the
+        # inherited font did not stick) means the new text may already be in the cell.
+        if exc.envelope.error_code == ErrorCode.VERIFICATION_FAILED:
+            live_write_mode.audit_live_failure(
+                tool="replace_cell_markdown", path=path, document_name=document_name,
+                pre_body_sha256=pre_hash, post_body_sha256=None,
+                reason=f"the pane reported a failed read-back after writing: {exc.envelope.message}",
+            )
+        raise
     except LiveOpFailed as exc:
         rolled_back = exc.code == live_protocol.OP_ERROR_CELL_WRITE_ROLLED_BACK
         if rolled_back:

@@ -320,6 +320,8 @@ def preview_entry(operation: dict[str, Any]) -> dict[str, Any]:
         entry["expected_matches"] = args.get("expected_matches", 1)
     if "replacement_segments" in args:
         entry["replacement_segments"] = args["replacement_segments"]
+    if operation["op"] == "replace_cell_markdown":
+        entry["inherit_format"] = args.get("inherit_format", "first_run")  # bound into the manifest digest
     return entry
 
 
@@ -350,7 +352,10 @@ def apply(path, operation, track_changes=False):
                     wm.require_capability(session, "cell_multiline", feature_description="multiline cell writes")
                 streamed = "approved_cell_stream_v1" in session.hello.capabilities and os.environ.get("VERIFIED_DOCX_DISABLE_APPROVED_CELL_STREAM") != "1"
                 # issue #107: the cell's first-run font rides in the same write and is read back.
-                _, inherit_font = tables.live_cell_read_with_font(session, address, args.get("inherit_format", "first_run"))
+                inherit_font = None
+                if args.get("inherit_format", "first_run") == "first_run":  # "none" costs no extra read
+                    _, inherit_font = tables.live_cell_read_with_font(
+                        session, address, "first_run", drop_colour=any(r.link for p in paragraphs for r in p))
                 cell_payload = {**address, "expected_before_text": before,
                     **({"inherit_font": inherit_font} if inherit_font else {}),
                     "paragraphs": tables._runs_to_wire(paragraphs),

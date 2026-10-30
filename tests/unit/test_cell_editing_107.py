@@ -195,6 +195,71 @@ def test_first_run_definition(xml, want):
     assert (font["wire"] if font else None) == want
 
 
+def test_a_link_keeps_its_link_colour_and_paragraph_marks_follow_the_cells_size(doc):
+    tables.execute_replace_cell_markdown(
+        str(doc), 1, 1, 1, "see [proof](https://x.test)\n\n- a\n- b", write_mode="file"
+    )
+    cell = cell_of(doc)
+    link_runs = [r for link in cell.iter(W("hyperlink")) for r in link.iter(W("r"))]
+    assert link_runs
+    for run in link_runs:  # a direct colour would beat the Hyperlink style
+        assert run.find(f"{W('rPr')}/{W('color')}") is None
+        assert run.find(f"{W('rPr')}/{W('sz')}").get(W("val")) == "17"
+    marks = [p.find(f"{W('pPr')}/{W('rPr')}") for p in cell.iter(W("p"))]
+    assert all(m is not None and m.find(W("sz")).get(W("val")) == "17" for m in marks)  # bullets too
+
+
+def test_a_text_run_without_a_direct_font_is_not_overridden_by_a_stray_paragraph_mark():
+    tc = ET.fromstring(
+        f'<w:tc xmlns:w="{projection.W_NS}"><w:p><w:pPr><w:rPr><w:sz w:val="17"/></w:rPr></w:pPr>'
+        "<w:r><w:t>style-sized</w:t></w:r></w:p></w:tc>"
+    )
+    assert tables._inherited_cell_font(tc) is None  # the style supplies the text's size
+
+
+def test_live_font_read_refuses_ooxml_that_is_not_this_cells():
+    from types import SimpleNamespace as NS
+
+    ns = projection.W_NS
+    pkg = "http://schemas.microsoft.com/office/2006/xmlPackage"
+
+    def reply(text):
+        return {"text": "Header", "ooxml": (
+            f'<pkg:package xmlns:pkg="{pkg}"><pkg:part pkg:name="/word/document.xml"><pkg:xmlData>'
+            f'<w:document xmlns:w="{ns}"><w:body><w:p><w:r><w:rPr><w:sz w:val="40"/></w:rPr>'
+            f"<w:t>{text}</w:t></w:r></w:p></w:body></w:document></pkg:xmlData></pkg:part></pkg:package>")}
+
+    session = NS(hello=NS(capabilities={"cell_font_inheritance_v1"}, ), document_name="x.docx",
+                 request_threadsafe=lambda op, payload=None, **kw: reply("SOMEONE ELSES CELL"))
+    with pytest.raises(VerifyError) as exc:
+        tables.live_cell_read_with_font(session, {"table_index": 1, "row_index": 1, "cell_index": 1}, "first_run")
+    assert exc.value.envelope.error_code == ErrorCode.LIVE_OP_FAILED
+    assert "another cell" in exc.value.envelope.message
+    session.request_threadsafe = lambda op, payload=None, **kw: reply("Header")
+    _, wire = tables.live_cell_read_with_font(session, {"table_index": 1, "row_index": 1, "cell_index": 1}, "first_run")
+    assert wire == {"size": 20.0}
+    _, wire = tables.live_cell_read_with_font(
+        session, {"table_index": 1, "row_index": 1, "cell_index": 1}, "first_run", drop_colour=True)
+    assert wire == {"size": 20.0}
+
+
+def test_merge_never_introduces_a_run_format_the_cell_did_not_have(doc):
+    add_second_paragraph(doc, text="second", bold=True)
+    root, _ = mutations._load_document(doc)
+    cell = tables._find_table_element(root, 1).findall(W("tr"))[0].findall(W("tc"))[0]
+    rels = paragraph_merge._load_rels(doc)
+    _, _, _, _, expected = paragraph_merge.prepare(root, rels, 1, 1, 1, 1, None, " ")
+    fresh, _ = mutations._load_document(doc)
+    # the document as a (hypothetical) live import would leave it: the merged paragraph, one run shrunk
+    prepared_root, _ = mutations._load_document(doc)
+    paragraph_merge.prepare(prepared_root, rels, 1, 1, 1, 1, None, " ")
+    bad = tables._find_table_element(prepared_root, 1).findall(W("tr"))[0].findall(W("tc"))[0]
+    next(bad.iter(W("sz"))).set(W("val"), "21")
+    problems = paragraph_merge.check(prepared_root, rels, 1, 1, 1, 1, expected)
+    assert any("run formatting changed" in p for p in problems)
+    assert fresh is not None and cell is not None
+
+
 def test_invalid_inherit_format_is_refused(doc):
     with pytest.raises(VerifyError) as exc:
         tables.execute_replace_cell_markdown(str(doc), 1, 1, 1, "x", write_mode="file", inherit_format="all")

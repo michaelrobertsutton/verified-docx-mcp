@@ -9,8 +9,8 @@ const sandbox={crypto:webcrypto,TextEncoder,console,DOMParser:class{},document:{
   Office:{onReady(){},context:{requirements:{isSetSupported:()=>true}}},Word:{run:fn=>fn({})}};
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[2],'utf8')+
-  '\nglobalThis.t={applyInheritedFont,verifyInheritedFont,opCellParagraphMerge,PANE_CAPABILITIES};',sandbox);
-const {applyInheritedFont,verifyInheritedFont,opCellParagraphMerge,PANE_CAPABILITIES}=sandbox.t;
+  '\nglobalThis.t={applyInheritedFont,verifyInheritedFont,opCellParagraphMerge,PANE_CAPABILITIES,dispatchOp};',sandbox);
+const {applyInheritedFont,verifyInheritedFont,opCellParagraphMerge,PANE_CAPABILITIES,dispatchOp}=sandbox.t;
 const context={sync:async()=>{}};
 const cell=(font={})=>({body:{font:{name:'Calibri',size:10.5,color:'#000000',load(){},...font}}});
 
@@ -33,6 +33,15 @@ await assert.rejects(()=>verifyInheritedFont(context,cell({color:'#000000'}),{co
 
 // a tracked merge is refused before Word is touched.
 await assert.rejects(()=>opCellParagraphMerge({track_changes:true}),e=>e.code==='INVALID_INPUT');
+
+// A shared-mode save carries a clientId but no body baseline (issue #107; an Opus review reproduced the
+// refusal against this pane). dispatchOp must let it through, and must still demand a baseline of a real
+// content write from the same client.
+sandbox.opShapesList=async()=>({shapes:[]});
+sandbox.dispatchOpUnchecked=async op=>({saved:op==='save'});
+const saved=await dispatchOp('save',{clientId:'c1'});
+assert.equal(saved.saved,true);
+await assert.rejects(()=>dispatchOp('replace',{clientId:'c1'}),e=>e.code==='LIVE_STALE'&&/baseline/.test(e.message));
 
 for(const cap of ['cell_font_inheritance_v1','cell_paragraph_merge_v1','paragraph_positions_v1'])
   assert.ok(PANE_CAPABILITIES.includes(cap),cap);

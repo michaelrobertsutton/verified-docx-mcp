@@ -708,9 +708,13 @@ async function dispatchOp(op, payload) {
   const sectionScoped = !!((payload.ownSections && payload.ownSections.length) ||
     (payload.executionSections && payload.executionSections.length));
   if (!READ_ONLY_OPS.has(op) && payload.clientId && !sectionScoped) {
-    if (!payload.expectedBodySha256)
+    // issue #107: save persists, it neither reads nor changes the body, so it needs no baseline and must
+    // not be refused "because someone is typing" (the broker no longer sends one). A hash that IS
+    // supplied is still honoured, like any other write.
+    if (!payload.expectedBodySha256 && op !== "save")
       throw refusalError("Shared write requires a body baseline", "LIVE_STALE");
-    await measuredWordRun(async context => requireFreshBody(context, payload.expectedBodySha256));
+    if (payload.expectedBodySha256)
+      await measuredWordRun(async context => requireFreshBody(context, payload.expectedBodySha256));
   }
   if (op === "approved_cell_set") return dispatchOpUnchecked(op, payload); // verifies scoped shapes inside its boundary snapshots
   if (!SHAPE_GUARDED_OPS.has(op)) return dispatchOpUnchecked(op, payload);
@@ -2998,10 +3002,14 @@ async function opParagraphDelete(payload) {
       throw refusalError('Cannot delete a paragraph inside a nested table', 'STRUCTURAL_BOUNDARY');
     if (target.tableNestingLevel === 1) {
       const cellParagraphs = target.parentTableCell.body.paragraphs;
-      cellParagraphs.load('items');
+      cellParagraphs.load('items/text');
       await context.sync();
-      if (cellParagraphs.items.length <= 1)
-        throw refusalError('Cannot delete the last paragraph in a cell', 'STRUCTURAL_BOUNDARY');
+      // Real Word (16.114.3): a cell's FINAL paragraph cannot be removed -- delete() blanks its text and
+      // leaves an empty paragraph, so the write would land and then fail read-back. Refuse before writing.
+      // `anchor_text` is unique in the whole body (checked above), so equal text identifies the paragraph.
+      const last = cellParagraphs.items[cellParagraphs.items.length-1];
+      if (cellParagraphs.items.length <= 1 || (last && last.text === payload.anchor_text))
+        throw refusalError("Cannot delete the last paragraph of a cell (Word keeps a cell's final paragraph); delete an earlier one or use merge_paragraph_with_next", 'STRUCTURAL_BOUNDARY');
     } else if (index === before.length-1) {
       throw refusalError('Cannot delete the final body paragraph', 'STRUCTURAL_BOUNDARY');
     }
@@ -3566,7 +3574,12 @@ async function opParagraphInsertPositional(payload) {
       const doc = new DOMParser().parseFromString(ooxml.value, "application/xml");
       const ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
       const children = [...doc.getElementsByTagNameNS(ns, "body")[0].children];
-      const xmlTable = children.filter(n => n.localName === "tbl")[tableId - 1];
+      const xmlTables = children.filter(n => n.localName === "tbl");
+      // Word's table numbering (body.tables) and the body's direct children must agree, or the paragraph
+      // checked here could belong to a different table (a table inside a content control).
+      if (xmlTables.length !== tables.length)
+        throw refusalError("Table numbering differs between Word and the body XML (a table inside a content control?); refusing to fill a paragraph it cannot identify", "STRUCTURAL_BOUNDARY");
+      const xmlTable = xmlTables[tableId - 1];
       const next = xmlTable ? children[children.indexOf(xmlTable) + 1] : null;
       if (!next || next.localName !== "p")
         throw refusalError("There is no paragraph immediately after the table to fill", "STRUCTURAL_BOUNDARY");
@@ -3624,17 +3637,9 @@ async function opParagraphInsertPositional(payload) {
 
 // -- merge two adjacent paragraphs of one cell (issue #107) ------------------
 
-function canonicalMergeNode(node) {
-  if (node.nodeType === 3) return node.nodeValue;
-  if (node.nodeType !== 1) return null;
-  const attrs=[...node.attributes].filter(a=>a.namespaceURI !== 'http://www.w3.org/2000/xmlns/')
-    .map(a=>[a.namespaceURI,a.localName,a.value]).sort();
-  return [node.namespaceURI,node.localName,attrs,[...node.childNodes].map(canonicalMergeNode).filter(n=>n!==null)];
-}
-
-// The server built `ooxml` (one merged paragraph, hyperlink relationships intact) and `before_xml`
-// (the pair as it read them). The pair must still read that way, or nothing is written. Tracked
-// merges are not offered: how Word records them through insertOoxml is unproven.
+// The server built `ooxml` (one merged paragraph, hyperlink relationships intact) and sends
+// `expected_text` (the pair as it read them). The pair must still read that way, or nothing is written.
+// Tracked merges are not offered: how Word records them through insertOoxml is unproven.
 async function opCellParagraphMerge(payload) {
   if (payload.track_changes) throw refusalError('Tracked paragraph merges are not supported', 'INVALID_INPUT');
   return measuredWordRun(async context=>{
@@ -3646,13 +3651,14 @@ async function opCellParagraphMerge(payload) {
       throw refusalError('No next paragraph in this cell','STRUCTURAL_BOUNDARY');
     const before=paragraphs.items.map(p=>p.text);
     const pair=paragraphs.items.slice(i,i+2);
-    const xml=pair.map(p=>p.getOoxml());await context.sync();
-    const parse=text=>new DOMParser().parseFromString(text,'application/xml');
-    const ns='http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+    // The pair must still read as the server read it. Text, not XML: real Word's per-paragraph getOoxml does
+    // not canonicalize like the body export (every merge was refused LIVE_STALE), and the body-hash check
+    // below (requireFreshBody) already guards everything else that could have changed.
+    const flat=t=>String(t||'').replace(/[\r\n\u000b\u0007]/g,'');
+    if(!Array.isArray(payload.expected_text) || payload.expected_text.length!==2)
+      throw refusalError('Merge needs the two paragraph texts','INVALID_INPUT');
     pair.forEach((p,j)=>{
-      const actual=parse(xml[j].value).getElementsByTagNameNS(ns,'p')[0];
-      const expected=parse(payload.before_xml[j]).documentElement;
-      if(JSON.stringify(canonicalMergeNode(actual)) !== JSON.stringify(canonicalMergeNode(expected)))
+      if(flat(p.text)!==flat(payload.expected_text[j]))
         throw refusalError('Paragraph changed during preparation','LIVE_STALE');
     });
     const range=pair[0].getRange('Content').getRange('Start').expandTo(pair[1].getRange('Content').getRange('End'));

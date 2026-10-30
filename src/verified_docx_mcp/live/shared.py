@@ -63,6 +63,13 @@ PRE_MUTATION_REFUSALS = frozenset(
         # Preflight guards in the pane: they refuse before any write is attempted.
         "ANCHORED_SHAPES",
         "WOULD_DELETE_COMMENTS",
+        # issue #107: refusals the new pane ops raise before writing (a refused merge or insert
+        # must not stale everyone else); the pane's own body-hash check remains the backstop.
+        "STRUCTURAL_BOUNDARY",
+        "TRACKED_CHANGES_PRESENT",
+        "TABLE_NOT_FOUND",
+        "CELL_TEXT_MISMATCH",
+        "INVALID_INPUT",
     }
 )
 MAX_FRAME = 72 * 2**20  # body_ooxml can return 48 MiB, with JSON escaping

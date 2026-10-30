@@ -72,6 +72,28 @@ def _hyperlinks(element: Any, rels: dict[str, str]) -> list[tuple[str | None, st
     return out
 
 
+def _run_formats(cell: Any) -> set[tuple]:
+    """The distinct (size, font, bold, italic) combinations of the cell's text runs. A set, not the
+    runs' exact properties: Word legitimately splits and merges runs when it re-serializes, but a
+    merge must never introduce a size, font or weight the cell did not already have (the #107 bug)."""
+    formats = set()
+    for run in cell.iter(ts.w("r")):
+        if not any(t.text for t in run.iter(ts.w("t"))):
+            continue
+        rpr = run.find(ts.w("rPr"))
+
+        def attr(tag: str, name: str = "val", _rpr: Any = rpr) -> str | None:
+            node = _rpr.find(ts.w(tag)) if _rpr is not None else None
+            return node.get(ts.w(name)) if node is not None else None
+
+        def on(tag: str, _rpr: Any = rpr) -> bool:
+            node = _rpr.find(ts.w(tag)) if _rpr is not None else None
+            return node is not None and node.get(ts.w("val"), "1").lower() not in {"0", "false", "off"}
+
+        formats.add((attr("sz"), attr("rFonts", "ascii"), on("b"), on("i")))
+    return formats
+
+
 def _ppr_signature(paragraph: Any) -> tuple:
     props = paragraph.find(ts.w("pPr"))
     return ts.property_signature(props) if props is not None else ()
@@ -156,6 +178,7 @@ def prepare(root, rels, table_id, row_index, cell_index, paragraph_index, expect
         if child.tag != ts.w("pPr"):
             first.append(copy.deepcopy(child))
     cell.remove(second)
+    expected["formats"] = _run_formats(cell)  # the intended state: every run keeps its size/font/weight
     return cell, first, before_xml, texts, expected
 
 
@@ -174,6 +197,11 @@ def check(root, rels, table_id, row_index, cell_index, paragraph_index, expected
         problems.append("the merged paragraph's properties differ from the first paragraph's")
     if _hyperlinks(cell, rels) != expected["links"]:
         problems.append("hyperlink targets or text changed")
+    if _run_formats(cell) != expected["formats"]:
+        problems.append(
+            f"run formatting changed: expected {sorted(map(str, expected['formats']))}, "
+            f"found {sorted(map(str, _run_formats(cell)))}"
+        )
     if _other_cells(table, row_index, cell_index) != expected["others"]:
         problems.append("another cell of the table changed")
     return problems
@@ -272,13 +300,15 @@ def _execute_live(path, table_id, row_index, cell_index, paragraph_index, expect
             session,
             "cell_paragraph_merge",
             {"table_index": table_id, "row_index": row_index, "cell_index": cell_index,
-             "paragraph_index": paragraph_index, "ooxml": xml, "before_xml": before_xml,
+             "paragraph_index": paragraph_index, "ooxml": xml, "expected_text": texts,
              "expectedBodySha256": pre, "track_changes": False},
             expected_body_sha256=pre,
         )
     except VerifyError as exc:
         # The pane runs insertOoxml and THEN checks the paragraph count, so these may have landed.
-        if exc.envelope.error_code in (ErrorCode.VERIFICATION_FAILED, ErrorCode.LIVE_STALE_AFTER_WRITE):
+        if exc.envelope.error_code in (
+            ErrorCode.VERIFICATION_FAILED, ErrorCode.LIVE_STALE_AFTER_WRITE, ErrorCode.LIVE_DISCONNECTED
+        ):
             wm.audit_live_failure(
                 tool="merge_paragraph_with_next", path=path, document_name=session.document_name,
                 pre_body_sha256=pre, post_body_sha256=None, reason=exc.envelope.message,

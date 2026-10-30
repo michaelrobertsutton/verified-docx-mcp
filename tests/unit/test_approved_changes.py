@@ -32,9 +32,11 @@ class Pane:
     def cell_ooxml(self, text):
         ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
         pkg = "http://schemas.microsoft.com/office/2006/xmlPackage"
+        # An empty cell has no text run: its font lives on the paragraph mark, as in real Word.
+        para = (f"<w:p><w:r>{self.cell_rpr}<w:t>{text}</w:t></w:r></w:p>" if text
+                else f"<w:p><w:pPr>{self.cell_rpr}</w:pPr></w:p>")
         return (f'<pkg:package xmlns:pkg="{pkg}"><pkg:part pkg:name="/word/document.xml"><pkg:xmlData>'
-                f'<w:document xmlns:w="{ns}"><w:body><w:p><w:r>{self.cell_rpr}<w:t>{text or "x"}</w:t></w:r></w:p>'
-                "</w:body></w:document></pkg:xmlData></pkg:part></pkg:package>")
+                f'<w:document xmlns:w="{ns}"><w:body>{para}</w:body></w:document></pkg:xmlData></pkg:part></pkg:package>')
 
     def request_threadsafe(self, op, payload=None, **kwargs):
         self.calls[op] += 1
