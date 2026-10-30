@@ -185,7 +185,9 @@ def _is_denylisted_sensitive_path(resolved: Path) -> bool:
     return False
 
 
-def resolve_allowed_docx_path(file_path: str, *, must_exist: bool = True) -> Path:
+def resolve_allowed_docx_path(
+    file_path: str, *, must_exist: bool = True, escape_code: ErrorCode = ErrorCode.INVALID_INPUT
+) -> Path:
     """Resolve *file_path* and enforce the server-wide allowlist + denylist.
 
     Raises INVALID_INPUT (via _make_error) on a denylisted or
@@ -193,6 +195,8 @@ def resolve_allowed_docx_path(file_path: str, *, must_exist: bool = True) -> Pat
     error shape. Does not enforce $DOCS containment — that is
     resolve_docx_pointer's job for an actual docx: pointer; this is the
     floor every resolved path must clear regardless of how it was named.
+    ``escape_code`` is the code for a denylisted/outside-allowlist path
+    (``resolve_input_text_file`` passes DOCX_PATH_ESCAPE).
     """
     requested = Path(file_path).expanduser()
     if must_exist:
@@ -209,7 +213,7 @@ def resolve_allowed_docx_path(file_path: str, *, must_exist: bool = True) -> Pat
 
     if _is_denylisted_sensitive_path(resolved):
         raise _make_error(
-            ErrorCode.INVALID_INPUT,
+            escape_code,
             (
                 "File path resolves to a well-known credential/secrets location "
                 "and is never allowed, regardless of "
@@ -221,7 +225,7 @@ def resolve_allowed_docx_path(file_path: str, *, must_exist: bool = True) -> Pat
     allowed_roots = _allowed_file_roots()
     if not any(resolved.is_relative_to(root) for root in allowed_roots):
         raise _make_error(
-            ErrorCode.INVALID_INPUT,
+            escape_code,
             (
                 "File path is outside the allowed roots for this server. "
                 "By default this is the user's home directory plus the "
@@ -292,6 +296,56 @@ def resolve_text_output_path(output_path: str, *, param: str = "to_file", overwr
             {param: output_path},
         )
     return resolved
+
+
+_INPUT_TEXT_SUFFIXES = frozenset({".md", ".txt"})
+MAX_INPUT_TEXT_BYTES = 2 * 1024 * 1024
+
+
+def resolve_input_text_file(path: str, *, param: str = "markdown_file") -> Path:
+    """Resolve a caller-named markdown/text INPUT file (``markdown_file=``) without reading it.
+
+    Same roots and credential denylist as ``resolve_allowed_docx_path`` (symlinks are
+    resolved first, so a link pointing outside the roots is refused): outside them is
+    DOCX_PATH_ESCAPE. Anything else wrong (missing, not a regular file, suffix other than
+    ``.md``/``.txt``, over 2 MB) is INVALID_INPUT.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise _make_error(ErrorCode.INVALID_INPUT, f"{param} must not be empty")
+    resolved = resolve_allowed_docx_path(path, escape_code=ErrorCode.DOCX_PATH_ESCAPE)
+    details = {param: path, "resolved_path": str(resolved)}
+    if not resolved.is_file():
+        raise _make_error(ErrorCode.INVALID_INPUT, f"{param} is not a regular file: {path!r}", details)
+    if resolved.suffix.lower() not in _INPUT_TEXT_SUFFIXES:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"{param} must end in .md or .txt (got {resolved.suffix or 'no extension'!r}).",
+            details,
+        )
+    return resolved
+
+
+def read_input_text_file(path: str, *, param: str = "markdown_file") -> tuple[Path, str]:
+    """``resolve_input_text_file`` plus ONE read: at most 2 MB, strict UTF-8 (else
+    INVALID_INPUT); a leading BOM is dropped. Returns ``(resolved_path, text)``."""
+    resolved = resolve_input_text_file(path, param=param)
+    details = {param: path, "resolved_path": str(resolved)}
+    try:
+        with open(resolved, "rb") as handle:
+            data = handle.read(MAX_INPUT_TEXT_BYTES + 1)
+    except OSError as exc:
+        raise _make_error(ErrorCode.INVALID_INPUT, f"Could not read {param}: {exc}", details) from exc
+    if len(data) > MAX_INPUT_TEXT_BYTES:
+        raise _make_error(
+            ErrorCode.INVALID_INPUT,
+            f"{param} is larger than {MAX_INPUT_TEXT_BYTES // (1024 * 1024)} MB.",
+            details,
+        )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _make_error(ErrorCode.INVALID_INPUT, f"{param} is not valid UTF-8: {exc}", details) from exc
+    return resolved, text.removeprefix("\ufeff")
 
 
 def write_text_atomic(target: Path, text: str) -> bytes:

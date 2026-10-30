@@ -246,8 +246,27 @@ def validate(operations):
             raise invalid("live_save must be the last operation")
 
 
+def resolve_markdown_files(operations):
+    """Copy of *operations* with every ``markdown_file`` arg replaced by its CONTENT under
+    ``markdown`` (read once, same resolver as the markdown write tools), so the manifest
+    digest binds the text, not the path. A bad shape is left for ``validate`` to refuse."""
+    out = []
+    for item in operations if isinstance(operations, list) else []:
+        args = item.get("args") if isinstance(item, dict) else None
+        if isinstance(args, dict) and "markdown_file" in args and "markdown" in OPS.get(item.get("op"), ()):
+            if "markdown" in args:
+                raise invalid("Pass exactly one of markdown or markdown_file")
+            if not isinstance(args["markdown_file"], str):
+                raise invalid("markdown_file must be text")
+            _, text = paths.read_input_text_file(args["markdown_file"])
+            item = {**item, "args": {**{k: v for k, v in args.items() if k != "markdown_file"}, "markdown": text}}
+        out.append(item)
+    return out if isinstance(operations, list) else operations
+
+
 def prepare(path: str, operations: list[dict[str, Any]], track_changes: bool = False) -> dict:
     path = str(paths.resolve_allowed_docx_path(path, must_exist=False))
+    operations = resolve_markdown_files(operations)
     validate(operations)
     slugs = list(dict.fromkeys(o["section"] for o in operations if o["op"] != "live_save"))
     if not slugs:
