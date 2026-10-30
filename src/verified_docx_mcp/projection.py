@@ -2000,7 +2000,14 @@ def section_content_items(
     -- with *ignore_trailing_empty* (a live
     ``Body.getOoxml()`` export) -- the trailing empty paragraph Word appends.
 
-    Raises INVALID_INPUT when comment linkage cannot be interpreted.
+    Known limits: a tracked insertion is plain text (accepting it changes
+    nothing); anchor moves within the same paragraph(s) are not seen; the
+    ``tblGrid`` column count, ``gridBefore``/``gridAfter``, legacy ``hMerge``,
+    tracked paragraph-mark deletions and footnotes/endnotes are not covered;
+    Word's "remove personal information on save" rewrites saved authors.
+
+    Raises INVALID_INPUT when comment linkage or a ``gridSpan`` cannot be
+    interpreted.
     """
     styles_by_id = {s["style_id"]: s for s in list_styles_impl(docx_path) if s["style_id"]}
     proj = project_part(docx_path, part_name)

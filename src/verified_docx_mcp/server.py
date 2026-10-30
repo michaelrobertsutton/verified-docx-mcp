@@ -1520,10 +1520,16 @@ def find_sections(
     deletions (text and position), table structure (rows, cells, gridSpan,
     vMerge, nested tables) and the root comments anchored in the section (author,
     text, resolved, replies in order, orphaned replies). Formatting, images, text
-    boxes, rsids/paraIds, bookmarks, proofing marks and comment dates/ids are
-    excluded. Computed only by this server from OOXML (a live read uses the
-    pane's body_ooxml export), so file and live agree; live_revision /
-    live_list_sections return the same value with content_digests=true. When the
+    boxes, footnotes/endnotes, rsids/paraIds, bookmarks, proofing marks and
+    comment dates/ids are excluded; so are accepting a tracked insertion (it is
+    plain text), anchor moves within the same paragraph, tblGrid column count,
+    gridBefore/gridAfter, legacy hMerge and tracked paragraph-mark deletions.
+    Computed only by this server from OOXML (a live read uses the pane's
+    body_ooxml export); file and live agreed on Word-saved documents in the
+    real-Word probe (docs/acceptance/117-content-digest.md), though Word's
+    "remove personal information on save" rewrites saved comment authors.
+    live_revision / live_list_sections return the same value with
+    content_digests=true. When the
     comments or tables cannot be canonicalized (duplicate comment ids, a parent
     cycle, a non-numeric gridSpan, ...), content_sha12 and preamble_content_sha12
     are null, sha12 is still returned, and warnings carries
