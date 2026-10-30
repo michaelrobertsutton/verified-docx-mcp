@@ -49,6 +49,8 @@ class Pane:
                 raise LiveOpFailed("VERIFICATION_FAILED", "May have applied")
             if op in shared.READ_OPS:
                 return {"bodySha256": self.last_body_sha256}
+            if op == "save":  # issue #107: persistence carries no body baseline
+                return {"saved": True}
             assert payload["expectedBodySha256"] == self.last_body_sha256
             self.last_body_sha256 = "changed"
             return {"pre": "initial", "post": "changed"}
@@ -971,3 +973,81 @@ def test_heartbeat_sample_cannot_refresh_client_read_baseline(setup_broker):
     with pytest.raises(LiveOpFailed, match='Human content changed'):
         call(a, op='replace')
     assert broker.hashes[(a, pane.document_url)] == 'initial'
+
+
+# -- save is persistence, not a content write or a read (#107) --------------------
+
+
+def test_save_needs_no_baseline_and_is_not_refused_because_someone_else_wrote(setup_broker):
+    pane, _, a, b, call = setup_broker
+    call(a)
+    call(b)
+    call(a, "replace")  # b is now stale for content writes
+    assert call(b, "save")["saved"] is True  # but may still save (no read, no baseline needed)
+    assert "expectedBodySha256" not in pane.calls[-1][1]
+    # A client that never read anything may save too.
+    c = _attach_third(setup_broker)
+    assert call(c, "save")["saved"] is True
+
+
+def _attach_third(setup):
+    _, broker, _, _, _ = setup
+    return broker.dispatch({"action": "attach"})["client_id"]
+
+
+def test_save_neither_acknowledges_a_read_nor_stales_other_clients(setup_broker):
+    pane, broker, a, b, call = setup_broker
+    call(a)
+    call(b)
+    call(a, "replace")
+    versions = dict(broker.versions)
+    seen = dict(broker.seen)
+    hashes = dict(broker.hashes)
+    call(b, "save")
+    # The stale client was not re-armed by saving ...
+    assert (broker.versions, broker.seen, broker.hashes) == (versions, seen, hashes)
+    with pytest.raises(LiveOpFailed, match="LIVE_STALE"):
+        call(b, "replace")
+    # ... and the client that wrote earlier is not staled by b's save.
+    call(a, "save")
+    call(a, "replace")
+
+
+def test_a_failing_save_does_not_stale_other_clients(setup_broker):
+    pane, _, a, b, call = setup_broker
+    call(a)
+    call(b)
+    pane.fail = True
+    with pytest.raises(LiveOpFailed, match="VERIFICATION_FAILED"):
+        call(a, "save")
+    pane.fail = False
+    call(b, "replace")  # a save never changes content, so nobody's baseline moved
+
+
+def test_save_still_honours_the_document_lease(setup_broker):
+    _, _, a, b, call = setup_broker
+    call(a, action="lock")
+    with pytest.raises(LiveOpFailed, match="LOCKED_BY_OTHER_CLIENT"):
+        call(b, "save")
+    assert call(a, "save")["saved"] is True
+
+
+def test_save_still_carries_other_clients_section_locks(sections):
+    pane, _, a, b, call = sections
+    call(a, action="section_lock", sections=["scope-1"])
+    call(b)
+    call(b, "save")
+    forwarded = [p for op, p in pane.sent if op == "save"][-1]
+    assert forwarded["forbiddenSections"] == ["scope"]
+    # The lock holder's save is confined to its own sections and needs no whole-body hash.
+    call(a, "save")
+    own = [p for op, p in pane.sent if op == "save"][-1]
+    assert own["ownSections"] == [{"slug": "scope", "expectedSha256": "s-scope"}]
+
+
+def test_save_needs_the_shared_queue_capability_like_any_write(setup_broker):
+    pane, _, a, _, call = setup_broker
+    pane.hello = HelloMessage(pane.document_url, "Word", "Mac", {}, "initial")
+    with pytest.raises(LiveOpFailed, match="LIVE_CAPABILITY_MISSING"):
+        call(a, "save")
+    assert all(op != "save" for op, _ in pane.calls)

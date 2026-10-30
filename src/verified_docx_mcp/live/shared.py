@@ -44,6 +44,11 @@ READ_OPS = frozenset(
         "execution_snapshot",
     }
 )
+# Writes that persist but neither read nor change the body (issue #107): they stay writes for
+# AUTHORIZATION (document lease, section locks, capabilities), but they need no body baseline and
+# never touch one -- a save must not be refused because someone is typing, must not acknowledge
+# the caller's earlier read, and must not stale other clients.
+BASELINE_EXEMPT_OPS = frozenset({"save"})
 # Pane refusals raised before any mutation; they must not stale other clients.
 PRE_MUTATION_REFUSALS = frozenset(
     {
@@ -299,6 +304,7 @@ class Broker:
                     if (
                         not own
                         and not scoped
+                        and op not in BASELINE_EXEMPT_OPS
                         and self.seen.get((client_id, key)) != version
                         and not (lone and (client_id, key) not in self.seen)
                     ):
@@ -321,7 +327,7 @@ class Broker:
                     payload["ownSections"] = [
                         ({"slug": s} if scoped else {"slug": s, "expectedSha256": v["sha"]}) for s, v in own.items()
                     ]
-                elif scoped:
+                elif scoped or op in BASELINE_EXEMPT_OPS:
                     payload.pop("expectedBodySha256", None)
                 else:
                     expected = request.get("expected_body_sha256") or payload.get(
@@ -347,7 +353,9 @@ class Broker:
                     op,
                     payload,
                     timeout=timeout,
-                    expected_body_sha256=None if own or scoped else request.get("expected_body_sha256"),
+                    expected_body_sha256=None
+                    if own or scoped or op in BASELINE_EXEMPT_OPS
+                    else request.get("expected_body_sha256"),
                 )
             except LiveOpFailed as exc:
                 # Only a refusal the pane raises before touching the document is safe to
@@ -356,7 +364,7 @@ class Broker:
                     mutated = False
                 raise
             finally:
-                if write and mutated:
+                if write and mutated and op not in BASELINE_EXEMPT_OPS:
                     # Failure may be post-mutation. Invalidate other baselines
                     # even when the pane times out or reports verification failure.
                     with self.mutex:
@@ -364,7 +372,9 @@ class Broker:
                     if own and not scoped:
                         self._refresh_baselines(session, key, client_id, timeout)
             with self.mutex:
-                if write and scoped:
+                if op in BASELINE_EXEMPT_OPS:
+                    pass  # persistence: no baseline read, acknowledged or invalidated
+                elif write and scoped:
                     # A protected-section digest is not a whole-body baseline.
                     self.seen[(client_id,key)] = -1
                     self.hashes.pop((client_id,key),None)
