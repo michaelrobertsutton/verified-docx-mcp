@@ -195,6 +195,7 @@ class ReadSource:
     warnings: list[str] = field(default_factory=list)
     live: dict[str, Any] | None = None
     live_session: dict[str, Any] | None = None
+    flat_opc: str | None = None  # Internal import fidelity; never returned.
     revision: str | None = None  # "live:sha256:<hex>" for a live read, else None
 
     def annotate(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -343,6 +344,7 @@ def read_source(path: str, source: str, part: str = DEFAULT_PART, *, observe: bo
                     "stripped_parts": reply.get("strippedParts") or [],
                 },
                 revision=f"{LIVE_REVISION_PREFIX}{reply['bodySha256']}",
+                flat_opc=reply["ooxml"],
             )
         return
 

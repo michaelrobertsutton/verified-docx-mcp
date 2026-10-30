@@ -535,3 +535,17 @@ MIT — see [LICENSE](LICENSE).
 ## Approved live changes
 
 Use `live_changes_prepare`, then one digest-bound `live_changes_execute` request for a live change set. Code handles sequencing, internal verification and durable resume without per-edit model calls. See [the execution contract and acceptance evidence](docs/acceptance/approved-changes.md). Requires the `approved_changes_v1` pane capability.
+
+### Table structure edits
+
+`insert_table_row` uses 1-based `table_id` and exactly one of
+`before_row_index` / `after_row_index`, plus `cells` (one string per column).
+`template_row_index` defaults to the adjacent row. `delete_table_row` requires
+`row_index` and tab-joined `expected_text`; the final row cannot be deleted.
+Both support file/live routing and revision guards. Merged/nested structures
+are refused. Native nonadjacent templates require matching row/cell layout.
+
+`insert_table(like_table_id=...)` inherits direct table, row, cell, paragraph
+and first-run properties; explicit grid, style and font arguments override
+inherited values. Copying immediately after a table adds a separator paragraph
+to keep the two tables distinct. Refresh table IDs after structural edits.

@@ -62,6 +62,8 @@ MUTATING_TOOLS: frozenset[str] = frozenset(
         "replace_table_row",
         "replace_cell_markdown",
         "insert_table",
+        "insert_table_row",
+        "delete_table_row",
         # issue #28 WP-15a (read_header_footer is read-only, not listed here):
         "insert_image",
         "apply_style",
